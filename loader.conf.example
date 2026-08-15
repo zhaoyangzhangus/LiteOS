@@ -1,0 +1,19 @@
+# Paths are UTF-8/ASCII UEFI paths relative to the filesystem root.
+kernel=\EFI\LITEOS\kernel.elf
+# A/B update mode: configure both slots; kernel_a/kernel_b take precedence over kernel.
+# kernel_a=\EFI\LITEOS\kernel_a.elf
+# kernel_b=\EFI\LITEOS\kernel_b.elf
+
+# The string is passed unchanged to the kernel as a NUL-terminated ASCII string.
+cmdline=console=framebuffer loglevel=info
+
+# Optional integrity check. If present, the loader refuses a mismatch.
+# kernel_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+# kernel_signature=512 个十六进制字符；签名覆盖上面的原始内核文件 SHA-256
+# A/B mode may provide one digest per slot.
+# kernel_a_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+# kernel_b_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+# kernel_a_signature=512 个十六进制字符
+# kernel_b_signature=512 个十六进制字符
+# verify=required 要求所选槽位同时具备 SHA-256 和 RSA-2048 PKCS#1 v1.5 签名。
+# verify=required

@@ -1,0 +1,30 @@
+{
+    "configurations": [
+        {
+            "name": "LiteOS (WSL)",
+            "compilerPath": "/usr/bin/gcc",
+            "intelliSenseMode": "linux-gcc-x64",
+            "cStandard": "c11",
+            "cppStandard": "c++11",
+            "includePath": [
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/kernel"
+            ],
+            "defines": [
+                "LITEOS_KERNEL_BUILD"
+            ],
+            "compilerArgs": [
+                "-ffreestanding",
+                "-fno-builtin",
+                "-fno-stack-protector",
+                "-fno-stack-check",
+                "-fno-pic",
+                "-mno-red-zone",
+                "-mno-sse",
+                "-mno-mmx",
+                "-mabi=sysv"
+            ]
+        }
+    ],
+    "version": 4
+}

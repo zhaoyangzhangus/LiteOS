@@ -1,0 +1,40 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "LiteOS: start WSL QEMU debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/run-qemu.sh",
+            "args": [
+                "--debug",
+                "--cpu",
+                "4"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "liteos-qemu",
+                "pattern": {
+                    "regexp": "^(QEMU_DEBUG_READY)$",
+                    "message": 1
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^QEMU_DEBUG_START$",
+                    "endsPattern": "^QEMU_DEBUG_READY$"
+                }
+            }
+        },
+        {
+            "label": "LiteOS: stop WSL QEMU debug",
+            "type": "shell",
+            "command": "${workspaceFolder}/tools/stop-qemu-debug.sh",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}
