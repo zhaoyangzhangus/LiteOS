@@ -1,0 +1,10 @@
+#pragma once
+#include "abi.h"
+#include "syscall.h"
+#include "mm.h"
+#include "io.h"
+#include "process.h"
+#include "wait.h"
+#include "file.h"
+#include "socket.h"
+#include "gpu.h"
