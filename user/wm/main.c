@@ -3,6 +3,8 @@
 
 #include <uapi/all.h>
 
+#include "../font12x24.h"
+
 #define WM_MAX_WINDOWS       64U
 #define WM_TITLEBAR_HEIGHT   24U
 #define WM_TOPBAR_HEIGHT     36U
@@ -85,7 +87,7 @@ static void fill_rect(int32_t x, int32_t y, uint32_t width, uint32_t height,
     }
 }
 
-static const uint8_t *glyph_for(char character) {
+static __attribute__((unused)) const uint8_t *glyph_for(char character) {
     static const uint8_t font[37][7] = {
         {0,0,0,0,0,0,0},
         {30,9,9,30,9,9,0}, {30,9,9,30,9,30,0}, {14,17,16,16,17,14,0},
@@ -109,16 +111,11 @@ static const uint8_t *glyph_for(char character) {
 }
 
 static void draw_text(int32_t x, int32_t y, const char *text, uint32_t color) {
-    for (uint32_t index = 0U; text != 0 && text[index] != '\0'; ++index) {
-        const uint8_t *glyph = glyph_for(text[index]);
-        for (uint32_t row = 0U; row < 7U; ++row) {
-            for (uint32_t column = 0U; column < 5U; ++column) {
-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
-                    fill_rect(x + (int32_t)index * 6 + (int32_t)column,
-                              y + (int32_t)row, 1U, 1U, color);
-                }
-            }
-        }
+    if (text == 0) return;
+    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+        font12x24_draw_glyph(g_frame, g_stride, g_width, g_height,
+                             x + (int32_t)(index * FONT12X24_WIDTH), y,
+                             text[index], color);
     }
 }
 
@@ -314,7 +311,7 @@ static void copy_surface(const os_window_info_t *info) {
 static void render_frame(void) {
     fill_rect(0, 0, g_width, g_height, 0x00101928U);
     fill_rect(0, 0, g_width, WM_TOPBAR_HEIGHT, 0x00213D5AU);
-    draw_text(20, 12, "LITEOS WINDOW SERVER", 0x00E8F1F5U);
+    draw_text(20, 6, "LITEOS WINDOW SERVER", 0x00E8F1F5U);
     for (uint32_t index = 0U; index < g_window_count; ++index) {
         const os_window_info_t *info = &g_windows[index];
         uint32_t frame_color = info->focused != 0U ? 0x005C99C6U : 0x002A3B4BU;
@@ -322,7 +319,7 @@ static void render_frame(void) {
                   info->height + WM_TITLEBAR_HEIGHT + 4U, frame_color);
         fill_rect(info->x + 2, info->y + 2, info->width,
                   WM_TITLEBAR_HEIGHT, info->focused != 0U ? 0x002A6691U : 0x0022394FU);
-        draw_text(info->x + 8, info->y + 9, info->title,
+        draw_text(info->x + 8, info->y + 2, info->title,
                   info->focused != 0U ? 0x00F3FAFFU : 0x00B5C8D8U);
         copy_surface(info);
     }
@@ -336,7 +333,7 @@ static void render_frame(void) {
                       button_width > 12U ? button_width - 12U : button_width,
                       WM_TASKBAR_HEIGHT - 14U,
                       g_windows[index].focused != 0U ? 0x003B7198U : 0x001C2D40U);
-            draw_text(x + 8, (int32_t)g_height - WM_TASKBAR_HEIGHT + 14,
+            draw_text(x + 8, (int32_t)g_height - WM_TASKBAR_HEIGHT + 7,
                       g_windows[index].title, 0x00E8F1F5U);
         }
     }

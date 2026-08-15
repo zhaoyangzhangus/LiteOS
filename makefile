@@ -23,7 +23,7 @@ COMMON_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -Werror -ffreestanding -fno-builti
                 -fno-stack-protector -fno-stack-check -fno-pic -mno-red-zone \
                 -mno-sse -mno-mmx -mno-stack-arg-probe -fshort-wchar -Iinclude -MMD -MP
 KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DLITEOS_KERNEL_BUILD
-USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -Iuser/audiod
+USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -Iuser/audiod -I$(BUILD)/generated
 LOADER_LDFLAGS = -nostdlib -Wl,--entry,efi_main -Wl,--subsystem,10 \
                  -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                  -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
@@ -33,6 +33,11 @@ KERNEL_LDFLAGS = -nostdlib -Wl,--entry,kernel_entry -Wl,--subsystem,0 \
                  -Wl,-Map,$(BUILD)/kernel/kernel.map
 
 BUILD ?= build
+
+FONT_TTF ?= /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+FONT_RASTER_HEIGHT ?= 19
+FONT_GENERATOR = $(BUILD)/font12x24-gen
+FONT_HEADER = $(BUILD)/generated/font12x24_data.h
 
 # GNU objcopy's binary backend derives symbols from its input pathname and
 # replaces every non-alphanumeric separator with an underscore.  Keep the
@@ -70,6 +75,19 @@ all: esp
 $(BUILD)/loader $(BUILD)/kernel $(BUILD)/user $(BUILD)/esp $(BUILD)/esp/EFI/BOOT $(BUILD)/esp/EFI/LITEOS:
 	mkdir -p $@
 
+$(BUILD)/generated:
+	mkdir -p $@
+
+$(FONT_GENERATOR): tools/font12x24_gen.c | $(BUILD)
+	pkg-config --exists freetype2
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror \
+		$$(pkg-config --cflags freetype2) $< -o $@ \
+		$$(pkg-config --libs freetype2)
+
+$(FONT_HEADER): $(FONT_GENERATOR) $(FONT_TTF) | $(BUILD)/generated
+	$(FONT_GENERATOR) "$(FONT_TTF)" "$@.tmp" "$(FONT_RASTER_HEIGHT)"
+	mv "$@.tmp" "$@"
+
 $(BUILD)/esp/boot $(BUILD)/esp/lib $(BUILD)/esp/sbin:
 	mkdir -p $@
 
@@ -102,7 +120,7 @@ USER_GSHELL_LDFLAGS = -nostdlib -Wl,--entry,gshell_entry -Wl,--subsystem,0 \
                       -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                       -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
-$(BUILD)/user/gshell.o: user/gshell/main.c | $(BUILD)/user
+$(BUILD)/user/gshell.o: user/gshell/main.c $(FONT_HEADER) | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_GSHELL_PE): $(BUILD)/user/gshell.o | $(BUILD)/user
@@ -122,7 +140,7 @@ USER_NOTEPAD_LDFLAGS = -nostdlib -Wl,--entry,notepad_entry -Wl,--subsystem,0 \
                        -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                        -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
-$(BUILD)/user/notepad.o: user/notepad/main.c | $(BUILD)/user
+$(BUILD)/user/notepad.o: user/notepad/main.c $(FONT_HEADER) | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_NOTEPAD_PE): $(BUILD)/user/notepad.o | $(BUILD)/user
@@ -142,7 +160,7 @@ USER_FILEMAN_LDFLAGS = -nostdlib -Wl,--entry,fileman_entry -Wl,--subsystem,0 \
                        -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                        -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
-$(BUILD)/user/fileman.o: user/fileman/main.c | $(BUILD)/user
+$(BUILD)/user/fileman.o: user/fileman/main.c $(FONT_HEADER) | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_FILEMAN_PE): $(BUILD)/user/fileman.o | $(BUILD)/user

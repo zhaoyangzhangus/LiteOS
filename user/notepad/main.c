@@ -3,6 +3,8 @@
 
 #include <uapi/all.h>
 
+#include "../font12x24.h"
+
 #define NOTEPAD_TEXT_CAPACITY 8192U
 #define NOTEPAD_MAP_BASE      0x08000000ULL
 #define NOTEPAD_EVENT_TIMEOUT 100000000ULL
@@ -262,7 +264,7 @@ static void redo_document(void) {
     set_status("REDO");
 }
 
-static const uint8_t *glyph_for(char character) {
+static __attribute__((unused)) const uint8_t *glyph_for(char character) {
     if (character == ' ') return g_upper_font[0];
     if (character >= 'A' && character <= 'Z') return g_upper_font[1U + (uint32_t)(character - 'A')];
     if (character >= 'a' && character <= 'z') return g_lower_font[(uint32_t)(character - 'a')];
@@ -288,26 +290,17 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
     if (text == 0) return;
     for (uint32_t index = 0U; text[index] != '\0'; ++index) {
-        const uint8_t *glyph = glyph_for(text[index]);
-        for (uint32_t row = 0U; row < 7U; ++row) {
-            for (uint32_t column = 0U; column < 5U; ++column) {
-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
-                    fill_rect(x + index * 6U + column, y + row, 1U, 1U, color);
-                }
-            }
-        }
+        font12x24_draw_glyph(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             (int32_t)(x + index * FONT12X24_WIDTH),
+                             (int32_t)y, text[index], color);
     }
 }
 
 static void draw_character(uint32_t x, uint32_t y, char character, uint32_t color) {
-    const uint8_t *glyph = glyph_for(character);
-    for (uint32_t row = 0U; row < 7U; ++row) {
-        for (uint32_t column = 0U; column < 5U; ++column) {
-            if ((glyph[row] & (1U << (4U - column))) != 0U) {
-                fill_rect(x + column, y + row, 1U, 1U, color);
-            }
-        }
-    }
+    font12x24_draw_glyph(g_target, g_target_width,
+                         g_target_width, g_target_height,
+                         (int32_t)x, (int32_t)y, character, color);
 }
 
 static void advance_position(char character, uint32_t columns,
@@ -365,11 +358,12 @@ static void ensure_cursor_visible(uint32_t columns, uint32_t visible_lines) {
 }
 
 static void draw_editor(void) {
-    const uint32_t text_top = 28U;
-    const uint32_t status_height = 18U;
-    uint32_t columns = g_target_width > 20U ? (g_target_width - 20U) / 6U : 1U;
+    const uint32_t text_top = 32U;
+    const uint32_t status_height = 32U;
+    uint32_t columns = g_target_width > 20U ?
+        (g_target_width - 20U) / FONT12X24_WIDTH : 1U;
     uint32_t visible_lines = g_target_height > text_top + status_height ?
-        (g_target_height - text_top - status_height) / 9U : 1U;
+        (g_target_height - text_top - status_height) / FONT12X24_HEIGHT : 1U;
     uint32_t line = 0U;
     uint32_t column = 0U;
     uint32_t cursor_line;
@@ -377,24 +371,24 @@ static void draw_editor(void) {
     if (g_follow_cursor) ensure_cursor_visible(columns, visible_lines);
     cursor_position(columns, &cursor_line, &cursor_column);
     fill_rect(0U, 0U, g_target_width, g_target_height, 0x0015222AU);
-    fill_rect(0U, 0U, g_target_width, 22U, 0x00223948U);
-    draw_text(10U, 7U, "LITEOS NOTEPAD", 0x00B9D7E8U);
-    draw_text(130U, 7U, g_dirty ? "*" : " ", 0x008FD6C4U);
-    draw_text(142U, 7U, g_file_path, 0x008FD6C4U);
+    fill_rect(0U, 0U, g_target_width, 32U, 0x00223948U);
+    draw_text(10U, 4U, "LITEOS NOTEPAD", 0x00B9D7E8U);
+    draw_text(184U, 4U, g_dirty ? "*" : " ", 0x008FD6C4U);
+    draw_text(202U, 4U, g_file_path, 0x008FD6C4U);
     for (size_t index = 0U; index < g_text_length; ++index) {
         char character = g_text[index];
         if (character != '\n' && character != '\t' && line >= g_scroll_line &&
             line < g_scroll_line + visible_lines) {
-            draw_character(10U + column * 6U,
-                           text_top + (line - g_scroll_line) * 9U,
+            draw_character(10U + column * FONT12X24_WIDTH,
+                           text_top + (line - g_scroll_line) * FONT12X24_HEIGHT,
                            character, 0x00D9EEF2U);
         }
         if (character == '\t' && line >= g_scroll_line &&
             line < g_scroll_line + visible_lines) {
             uint32_t spaces = 4U - (column & 3U);
             for (uint32_t space = 0U; space < spaces && column + space < columns; ++space) {
-                draw_character(10U + (column + space) * 6U,
-                               text_top + (line - g_scroll_line) * 9U,
+                draw_character(10U + (column + space) * FONT12X24_WIDTH,
+                               text_top + (line - g_scroll_line) * FONT12X24_HEIGHT,
                                ' ', 0x00D9EEF2U);
             }
         }
@@ -402,13 +396,13 @@ static void draw_editor(void) {
     }
     if (cursor_line >= g_scroll_line && cursor_line < g_scroll_line + visible_lines &&
         cursor_column < columns) {
-        fill_rect(10U + cursor_column * 6U,
-                  text_top + (cursor_line - g_scroll_line) * 9U - 1U,
-                  1U, 9U, 0x00F2FFF9U);
+        fill_rect(10U + cursor_column * FONT12X24_WIDTH,
+                  text_top + (cursor_line - g_scroll_line) * FONT12X24_HEIGHT,
+                  2U, FONT12X24_HEIGHT, 0x00F2FFF9U);
     }
     fill_rect(0U, g_target_height - status_height, g_target_width,
               status_height, 0x00102028U);
-    draw_text(10U, g_target_height - 12U, g_status, 0x008FD6C4U);
+    draw_text(10U, g_target_height - 28U, g_status, 0x008FD6C4U);
 }
 
 static bool create_window(void) {

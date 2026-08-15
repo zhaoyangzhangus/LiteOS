@@ -3,6 +3,8 @@
 
 #include <uapi/all.h>
 
+#include "../font12x24.h"
+
 #define SHELL_LINE_CAPACITY 256U
 #define SHELL_OUTPUT_LINES 24U
 #define SHELL_MAP_BASE     0x06000000ULL
@@ -204,7 +206,7 @@ static void clear_output(void) {
     g_output_count = 0U;
 }
 
-static const uint8_t *glyph_for(char character) {
+static __attribute__((unused)) const uint8_t *glyph_for(char character) {
     if (character >= 'a' && character <= 'z') {
         return g_lower_font[(uint32_t)(character - 'a')];
     }
@@ -230,15 +232,12 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
 }
 
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
-    for (uint32_t index = 0U; text != 0 && text[index] != '\0'; ++index) {
-        const uint8_t *glyph = glyph_for(text[index]);
-        for (uint32_t row = 0U; row < 7U; ++row) {
-            for (uint32_t column = 0U; column < 5U; ++column) {
-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
-                    fill_rect(x + index * 6U + column, y + row, 1U, 1U, color);
-                }
-            }
-        }
+    if (text == 0) return;
+    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+        font12x24_draw_glyph(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             (int32_t)(x + index * FONT12X24_WIDTH),
+                             (int32_t)y, text[index], color);
     }
 }
 
@@ -256,36 +255,41 @@ static void draw_input_line(void) {
     uint32_t visible_characters;
     uint32_t view_start = 0U;
     uint32_t cursor_position;
+    uint32_t input_y;
 
     build_prompt(g_display_line);
     prompt_length = text_length(g_display_line);
     append_text(g_display_line, SHELL_LINE_CAPACITY, g_command);
     line_length = text_length(g_display_line);
-    visible_characters = g_target_width > 20U ? (g_target_width - 20U) / 6U : 0U;
+    visible_characters = g_target_width > 20U ?
+        (g_target_width - 20U) / FONT12X24_WIDTH : 0U;
     if (visible_characters == 0U) return;
     if (line_length > visible_characters) view_start = line_length - visible_characters;
-    draw_text(10U, g_target_height - 10U, g_display_line + view_start,
-              0x007FE0AEU);
+    input_y = g_target_height > FONT12X24_HEIGHT + 4U ?
+        g_target_height - FONT12X24_HEIGHT - 4U : 0U;
+    draw_text(10U, input_y, g_display_line + view_start, 0x007FE0AEU);
 
     cursor_position = prompt_length + (uint32_t)g_command_cursor;
     if (cursor_position >= view_start && cursor_position - view_start < visible_characters) {
-        fill_rect(10U + (cursor_position - view_start) * 6U,
-                  g_target_height - 11U, 1U, 9U, 0x00E8FFF4U);
+        fill_rect(10U + (cursor_position - view_start) * FONT12X24_WIDTH,
+                  input_y, 2U, FONT12X24_HEIGHT, 0x00E8FFF4U);
     }
 }
 
 static void draw_terminal(void) {
-    uint32_t visible = g_target_height > 36U ? (g_target_height - 36U) / 10U : 0U;
+    uint32_t visible = g_target_height > 64U ?
+        (g_target_height - 64U) / FONT12X24_HEIGHT : 0U;
     uint32_t first = g_output_count > visible ? g_output_count - visible : 0U;
-    uint32_t y = 10U;
+    uint32_t y = 32U;
+
     fill_rect(0U, 0U, g_target_width, g_target_height, g_shell.color);
-    draw_text(10U, 10U, "LITEOS GRAPHICAL SHELL", 0x00B9D7E8U);
-    y = 28U;
-    for (uint32_t index = first; index < g_output_count && y + 8U < g_target_height;
-         ++index, y += 10U) {
+    draw_text(10U, 4U, "LITEOS GRAPHICAL SHELL", 0x00B9D7E8U);
+    for (uint32_t index = first;
+         index < g_output_count && y + FONT12X24_HEIGHT + 32U <= g_target_height;
+         ++index, y += FONT12X24_HEIGHT) {
         draw_text(10U, y, g_output[index], 0x00C5EAF4U);
     }
-    if (g_target_height >= 12U) draw_input_line();
+    if (g_target_height >= FONT12X24_HEIGHT + 4U) draw_input_line();
 }
 
 static void update_window(void) {

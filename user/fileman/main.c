@@ -3,6 +3,8 @@
 
 #include <uapi/all.h>
 
+#include "../font12x24.h"
+
 #define FILEMAN_MAP_BASE       0x0A000000ULL
 #define FILEMAN_EVENT_TIMEOUT  100000000ULL
 #define FILEMAN_PATH_CAPACITY  256U
@@ -153,7 +155,7 @@ static void append_decimal(char *destination, uint32_t capacity, uint64_t value)
     while (count != 0U) append_character(destination, capacity, digits[--count]);
 }
 
-static const uint8_t *glyph_for(char character) {
+static __attribute__((unused)) const uint8_t *glyph_for(char character) {
     if (character == ' ') return g_upper_font[0];
     if (character >= 'A' && character <= 'Z') {
         return g_upper_font[1U + (uint32_t)(character - 'A')];
@@ -185,14 +187,10 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
     if (text == 0) return;
     for (uint32_t index = 0U; text[index] != '\0'; ++index) {
-        const uint8_t *glyph = glyph_for(text[index]);
-        for (uint32_t row = 0U; row < 7U; ++row) {
-            for (uint32_t column = 0U; column < 5U; ++column) {
-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
-                    fill_rect(x + index * 6U + column, y + row, 1U, 1U, color);
-                }
-            }
-        }
+        font12x24_draw_glyph(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             (int32_t)(x + index * FONT12X24_WIDTH),
+                             (int32_t)y, text[index], color);
     }
 }
 
@@ -325,7 +323,8 @@ static void update_window(void) {
 }
 
 static void render(void) {
-    uint32_t rows = g_window.height > 58U ? (g_window.height - 58U) / 12U : 1U;
+    uint32_t rows = g_window.height > 64U ?
+        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
     g_target = g_window.pixels;
     g_target_width = g_window.width;
     g_target_height = g_window.height;
@@ -333,9 +332,9 @@ static void render(void) {
     if (g_selected < g_first_entry) g_first_entry = g_selected;
     if (g_selected >= g_first_entry + rows) g_first_entry = g_selected - rows + 1U;
     fill_rect(0U, 0U, g_target_width, g_target_height, 0x0015222AU);
-    fill_rect(0U, 0U, g_target_width, 22U, 0x00223948U);
-    draw_text(10U, 7U, "LITEOS FILEMAN", 0x00B9D7E8U);
-    draw_text(120U, 7U, g_path, 0x008FD6C4U);
+    fill_rect(0U, 0U, g_target_width, 32U, 0x00223948U);
+    draw_text(10U, 4U, "LITEOS FILEMAN", 0x00B9D7E8U);
+    draw_text(190U, 4U, g_path, 0x008FD6C4U);
     for (uint32_t row = 0U; row < rows; ++row) {
         uint32_t index = g_first_entry + row;
         if (index >= g_entry_count) break;
@@ -352,12 +351,13 @@ static void render(void) {
             append_text(line, sizeof(line), " B");
         }
         if (index == g_selected) {
-            fill_rect(0U, 26U + row * 12U, g_target_width, 10U, 0x00314F5CU);
+            fill_rect(0U, 32U + row * FONT12X24_HEIGHT,
+                      g_target_width, FONT12X24_HEIGHT, 0x00314F5CU);
         }
-        draw_text(8U, 28U + row * 12U, line, 0x00D9EEF2U);
+        draw_text(8U, 32U + row * FONT12X24_HEIGHT, line, 0x00D9EEF2U);
     }
-    fill_rect(0U, g_target_height - 22U, g_target_width, 22U, 0x00102028U);
-    draw_text(8U, g_target_height - 14U, g_status, 0x008FD6C4U);
+    fill_rect(0U, g_target_height - 32U, g_target_width, 32U, 0x00102028U);
+    draw_text(8U, g_target_height - 28U, g_status, 0x008FD6C4U);
     update_window();
 }
 

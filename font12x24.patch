@@ -1,0 +1,668 @@
+diff --git a/makefile b/makefile
+--- a/makefile
++++ b/makefile
+@@ -23,5 +23,5 @@
+                 -fno-stack-protector -fno-stack-check -fno-pic -mno-red-zone \
+                 -mno-sse -mno-mmx -mno-stack-arg-probe -fshort-wchar -Iinclude -MMD -MP
+ KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DLITEOS_KERNEL_BUILD
+-USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -Iuser/audiod
++USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -Iuser/audiod -I$(BUILD)/generated
+ LOADER_LDFLAGS = -nostdlib -Wl,--entry,efi_main -Wl,--subsystem,10 \
+@@ -35,3 +35,8 @@
+ BUILD ?= build
+ 
++FONT_TTF ?= /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
++FONT_RASTER_HEIGHT ?= 19
++FONT_GENERATOR = $(BUILD)/font12x24-gen
++FONT_HEADER = $(BUILD)/generated/font12x24_data.h
++
+ # GNU objcopy's binary backend derives symbols from its input pathname and
+@@ -70,6 +75,19 @@
+ $(BUILD)/loader $(BUILD)/kernel $(BUILD)/user $(BUILD)/esp $(BUILD)/esp/EFI/BOOT $(BUILD)/esp/EFI/LITEOS:
+ 	mkdir -p $@
+ 
++$(BUILD)/generated:
++	mkdir -p $@
++
++$(FONT_GENERATOR): tools/font12x24_gen.c | $(BUILD)
++	pkg-config --exists freetype2
++	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror \
++		$$(pkg-config --cflags freetype2) $< -o $@ \
++		$$(pkg-config --libs freetype2)
++
++$(FONT_HEADER): $(FONT_GENERATOR) $(FONT_TTF) | $(BUILD)/generated
++	$(FONT_GENERATOR) "$(FONT_TTF)" "$@.tmp" "$(FONT_RASTER_HEIGHT)"
++	mv "$@.tmp" "$@"
++
+ $(BUILD)/esp/boot $(BUILD)/esp/lib $(BUILD)/esp/sbin:
+ 	mkdir -p $@
+ 
+@@ -105,2 +123,2 @@
+-$(BUILD)/user/gshell.o: user/gshell/main.c | $(BUILD)/user
++$(BUILD)/user/gshell.o: user/gshell/main.c $(FONT_HEADER) | $(BUILD)/user
+ 	$(CC) $(USER_CFLAGS) -c $< -o $@
+@@ -125,2 +143,2 @@
+-$(BUILD)/user/notepad.o: user/notepad/main.c | $(BUILD)/user
++$(BUILD)/user/notepad.o: user/notepad/main.c $(FONT_HEADER) | $(BUILD)/user
+ 	$(CC) $(USER_CFLAGS) -c $< -o $@
+@@ -145,2 +163,2 @@
+-$(BUILD)/user/fileman.o: user/fileman/main.c | $(BUILD)/user
++$(BUILD)/user/fileman.o: user/fileman/main.c $(FONT_HEADER) | $(BUILD)/user
+ 	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+diff --git a/tools/font12x24_gen.c b/tools/font12x24_gen.c
+new file mode 100644
+--- /dev/null
++++ b/tools/font12x24_gen.c
+@@ -0,0 +1,177 @@
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <ft2build.h>
++#include FT_FREETYPE_H
++
++#define CELL_WIDTH 12
++#define CELL_HEIGHT 24
++#define FIRST_CHAR 32
++#define LAST_CHAR 126
++#define GLYPH_COUNT (LAST_CHAR - FIRST_CHAR + 1)
++
++static uint8_t bitmap_alpha(const FT_Bitmap *bitmap, unsigned int x,
++                            unsigned int y)
++{
++    const uint8_t *row;
++    int pitch;
++
++    if (bitmap == NULL || bitmap->buffer == NULL ||
++        x >= bitmap->width || y >= bitmap->rows) {
++        return 0U;
++    }
++
++    pitch = bitmap->pitch;
++    if (pitch >= 0) {
++        row = bitmap->buffer + (size_t)y * (size_t)pitch;
++    } else {
++        row = bitmap->buffer +
++              (size_t)(bitmap->rows - 1U - y) * (size_t)(-pitch);
++    }
++
++    if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
++        unsigned int value = row[x];
++        if (bitmap->num_grays <= 1U) return (uint8_t)value;
++        return (uint8_t)((value * 255U) /
++                         ((unsigned int)bitmap->num_grays - 1U));
++    }
++
++    if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
++        return (row[x >> 3U] & (uint8_t)(0x80U >> (x & 7U))) != 0U
++                   ? 255U : 0U;
++    }
++
++    return 0U;
++}
++
++static int emit_font(FILE *output, FT_Face face, unsigned int pixel_height)
++{
++    int ascender;
++    int descender;
++    int baseline;
++
++    if (FT_Set_Pixel_Sizes(face, 0U, pixel_height) != 0) {
++        fputs("font12x24: FT_Set_Pixel_Sizes failed\n", stderr);
++        return 1;
++    }
++
++    ascender = (int)((face->size->metrics.ascender + 63) >> 6);
++    descender = (int)((-face->size->metrics.descender + 63) >> 6);
++    baseline = ascender;
++    if (ascender + descender < CELL_HEIGHT) {
++        baseline += (CELL_HEIGHT - ascender - descender) / 2;
++    }
++
++    fputs("#ifndef LITEOS_GENERATED_FONT12X24_DATA_H\n"
++          "#define LITEOS_GENERATED_FONT12X24_DATA_H\n\n"
++          "#include <stdint.h>\n\n"
++          "static const uint8_t g_font12x24_a8[95][288] = {\n",
++          output);
++
++    for (unsigned int character = FIRST_CHAR;
++         character <= LAST_CHAR; ++character) {
++        uint8_t cell[CELL_HEIGHT][CELL_WIDTH];
++        FT_GlyphSlot glyph;
++        int advance;
++        int pen_x;
++        int dst_x;
++        int dst_y;
++
++        memset(cell, 0, sizeof(cell));
++
++        if (FT_Load_Char(face, character,
++                         FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) != 0) {
++            fprintf(stderr, "font12x24: cannot render U+%04X\n", character);
++            return 1;
++        }
++
++        glyph = face->glyph;
++        advance = (int)((glyph->advance.x + 32) >> 6);
++        pen_x = (CELL_WIDTH - advance) / 2;
++        dst_x = pen_x + glyph->bitmap_left;
++        dst_y = baseline - glyph->bitmap_top;
++
++        for (unsigned int sy = 0U; sy < glyph->bitmap.rows; ++sy) {
++            for (unsigned int sx = 0U; sx < glyph->bitmap.width; ++sx) {
++                int x = dst_x + (int)sx;
++                int y = dst_y + (int)sy;
++                uint8_t alpha = bitmap_alpha(&glyph->bitmap, sx, sy);
++
++                if (alpha == 0U || x < 0 || x >= CELL_WIDTH ||
++                    y < 0 || y >= CELL_HEIGHT) {
++                    continue;
++                }
++
++                cell[y][x] = alpha;
++            }
++        }
++
++        fputs("    {\n", output);
++        for (unsigned int y = 0U; y < CELL_HEIGHT; ++y) {
++            fputs("        ", output);
++            for (unsigned int x = 0U; x < CELL_WIDTH; ++x) {
++                fprintf(output, "0x%02X%s",
++                        (unsigned int)cell[y][x],
++                        (y == CELL_HEIGHT - 1U &&
++                         x == CELL_WIDTH - 1U) ? "" : ",");
++                if (x + 1U != CELL_WIDTH) fputc(' ', output);
++            }
++            fputc('\n', output);
++        }
++        fprintf(output, "    }%s\n",
++                character == LAST_CHAR ? "" : ",");
++    }
++
++    fputs("};\n\n#endif\n", output);
++    return ferror(output) != 0 ? 1 : 0;
++}
++
++int main(int argc, char **argv)
++{
++    FT_Library library;
++    FT_Face face;
++    FILE *output;
++    char *end;
++    unsigned long pixel_height;
++    int result;
++
++    if (argc != 4) {
++        fprintf(stderr, "usage: %s FONT.ttf OUTPUT.h PIXEL_HEIGHT\n", argv[0]);
++        return 1;
++    }
++
++    end = NULL;
++    pixel_height = strtoul(argv[3], &end, 10);
++    if (end == argv[3] || *end != '\0' ||
++        pixel_height < 8UL || pixel_height > 64UL) {
++        fputs("font12x24: invalid pixel height\n", stderr);
++        return 1;
++    }
++
++    if (FT_Init_FreeType(&library) != 0) {
++        fputs("font12x24: FT_Init_FreeType failed\n", stderr);
++        return 1;
++    }
++
++    if (FT_New_Face(library, argv[1], 0, &face) != 0) {
++        fprintf(stderr, "font12x24: cannot open %s\n", argv[1]);
++        FT_Done_FreeType(library);
++        return 1;
++    }
++
++    output = fopen(argv[2], "wb");
++    if (output == NULL) {
++        fprintf(stderr, "font12x24: cannot create %s\n", argv[2]);
++        FT_Done_Face(face);
++        FT_Done_FreeType(library);
++        return 1;
++    }
++
++    result = emit_font(output, face, (unsigned int)pixel_height);
++    if (fclose(output) != 0) result = 1;
++
++    FT_Done_Face(face);
++    FT_Done_FreeType(library);
++    return result;
++}
+
+diff --git a/user/font12x24.h b/user/font12x24.h
+new file mode 100644
+--- /dev/null
++++ b/user/font12x24.h
+@@ -0,0 +1,85 @@
++#ifndef LITEOS_USER_FONT12X24_H
++#define LITEOS_USER_FONT12X24_H
++
++#include <stdint.h>
++
++#include <font12x24_data.h>
++
++#define FONT12X24_WIDTH  12U
++#define FONT12X24_HEIGHT 24U
++#define FONT12X24_FIRST  32U
++#define FONT12X24_LAST   126U
++
++static inline const uint8_t *font12x24_glyph(char character)
++{
++    uint32_t code = (uint8_t)character;
++
++    if (code < FONT12X24_FIRST || code > FONT12X24_LAST) {
++        code = (uint32_t)'?';
++    }
++
++    return g_font12x24_a8[code - FONT12X24_FIRST];
++}
++
++static inline uint32_t font12x24_blend_xrgb8888(uint32_t destination,
++                                                 uint32_t source,
++                                                 uint8_t alpha)
++{
++    uint32_t a = alpha;
++    uint32_t inverse = 255U - a;
++    uint32_t dr = (destination >> 16U) & 0xFFU;
++    uint32_t dg = (destination >> 8U) & 0xFFU;
++    uint32_t db = destination & 0xFFU;
++    uint32_t sr = (source >> 16U) & 0xFFU;
++    uint32_t sg = (source >> 8U) & 0xFFU;
++    uint32_t sb = source & 0xFFU;
++    uint32_t r = (sr * a + dr * inverse + 127U) / 255U;
++    uint32_t g = (sg * a + dg * inverse + 127U) / 255U;
++    uint32_t b = (sb * a + db * inverse + 127U) / 255U;
++
++    return (destination & 0xFF000000U) |
++           (r << 16U) | (g << 8U) | b;
++}
++
++static inline void font12x24_draw_glyph(uint32_t *pixels,
++                                         uint32_t stride,
++                                         uint32_t width,
++                                         uint32_t height,
++                                         int32_t x,
++                                         int32_t y,
++                                         char character,
++                                         uint32_t color)
++{
++    const uint8_t *glyph;
++
++    if (pixels == 0) return;
++    glyph = font12x24_glyph(character);
++
++    for (uint32_t row = 0U; row < FONT12X24_HEIGHT; ++row) {
++        int32_t dy = y + (int32_t)row;
++        if (dy < 0 || dy >= (int32_t)height) continue;
++
++        for (uint32_t column = 0U; column < FONT12X24_WIDTH; ++column) {
++            int32_t dx = x + (int32_t)column;
++            uint8_t alpha;
++            uint32_t *destination;
++
++            if (dx < 0 || dx >= (int32_t)width) continue;
++
++            alpha = glyph[row * FONT12X24_WIDTH + column];
++            if (alpha == 0U) continue;
++
++            destination =
++                &pixels[(uint64_t)(uint32_t)dy * stride + (uint32_t)dx];
++
++            if (alpha == 255U) {
++                *destination = color;
++            } else {
++                *destination =
++                    font12x24_blend_xrgb8888(*destination, color, alpha);
++            }
++        }
++    }
++}
++
++#endif
+
+diff --git a/user/gshell/main.c b/user/gshell/main.c
+--- a/user/gshell/main.c
++++ b/user/gshell/main.c
+@@ -3,4 +3,6 @@
+ 
+ #include <uapi/all.h>
+ 
++#include "../font12x24.h"
++
+ #define SHELL_LINE_CAPACITY 256U
+@@ -207,4 +209,4 @@
+-static const uint8_t *glyph_for(char character) {
++static __attribute__((unused)) const uint8_t *glyph_for(char character) {
+     if (character >= 'a' && character <= 'z') {
+         return g_lower_font[(uint32_t)(character - 'a')];
+     }
+@@ -230,15 +232,12 @@
+ }
+ 
+ static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
+-    for (uint32_t index = 0U; text != 0 && text[index] != '\0'; ++index) {
+-        const uint8_t *glyph = glyph_for(text[index]);
+-        for (uint32_t row = 0U; row < 7U; ++row) {
+-            for (uint32_t column = 0U; column < 5U; ++column) {
+-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
+-                    fill_rect(x + index * 6U + column, y + row, 1U, 1U, color);
+-                }
+-            }
+-        }
++    if (text == 0) return;
++    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
++        font12x24_draw_glyph(g_target, g_target_width,
++                             g_target_width, g_target_height,
++                             (int32_t)(x + index * FONT12X24_WIDTH),
++                             (int32_t)y, text[index], color);
+     }
+ }
+ 
+@@ -256,34 +255,39 @@
+     uint32_t visible_characters;
+     uint32_t view_start = 0U;
+     uint32_t cursor_position;
++    uint32_t input_y;
+ 
+     build_prompt(g_display_line);
+     prompt_length = text_length(g_display_line);
+     append_text(g_display_line, SHELL_LINE_CAPACITY, g_command);
+     line_length = text_length(g_display_line);
+-    visible_characters = g_target_width > 20U ? (g_target_width - 20U) / 6U : 0U;
++    visible_characters = g_target_width > 20U ?
++        (g_target_width - 20U) / FONT12X24_WIDTH : 0U;
+     if (visible_characters == 0U) return;
+     if (line_length > visible_characters) view_start = line_length - visible_characters;
+-    draw_text(10U, g_target_height - 10U, g_display_line + view_start,
+-              0x007FE0AEU);
++    input_y = g_target_height > FONT12X24_HEIGHT + 4U ?
++        g_target_height - FONT12X24_HEIGHT - 4U : 0U;
++    draw_text(10U, input_y, g_display_line + view_start, 0x007FE0AEU);
+ 
+     cursor_position = prompt_length + (uint32_t)g_command_cursor;
+     if (cursor_position >= view_start && cursor_position - view_start < visible_characters) {
+-        fill_rect(10U + (cursor_position - view_start) * 6U,
+-                  g_target_height - 11U, 1U, 9U, 0x00E8FFF4U);
++        fill_rect(10U + (cursor_position - view_start) * FONT12X24_WIDTH,
++                  input_y, 2U, FONT12X24_HEIGHT, 0x00E8FFF4U);
+     }
+ }
+ 
+ static void draw_terminal(void) {
+-    uint32_t visible = g_target_height > 36U ? (g_target_height - 36U) / 10U : 0U;
++    uint32_t visible = g_target_height > 64U ?
++        (g_target_height - 64U) / FONT12X24_HEIGHT : 0U;
+     uint32_t first = g_output_count > visible ? g_output_count - visible : 0U;
+-    uint32_t y = 10U;
++    uint32_t y = 32U;
++
+     fill_rect(0U, 0U, g_target_width, g_target_height, g_shell.color);
+-    draw_text(10U, 10U, "LITEOS GRAPHICAL SHELL", 0x00B9D7E8U);
+-    y = 28U;
+-    for (uint32_t index = first; index < g_output_count && y + 8U < g_target_height;
+-         ++index, y += 10U) {
++    draw_text(10U, 4U, "LITEOS GRAPHICAL SHELL", 0x00B9D7E8U);
++    for (uint32_t index = first;
++         index < g_output_count && y + FONT12X24_HEIGHT + 32U <= g_target_height;
++         ++index, y += FONT12X24_HEIGHT) {
+         draw_text(10U, y, g_output[index], 0x00C5EAF4U);
+     }
+-    if (g_target_height >= 12U) draw_input_line();
++    if (g_target_height >= FONT12X24_HEIGHT + 4U) draw_input_line();
+ }
+
+diff --git a/user/fileman/main.c b/user/fileman/main.c
+--- a/user/fileman/main.c
++++ b/user/fileman/main.c
+@@ -3,4 +3,6 @@
+ 
+ #include <uapi/all.h>
+ 
++#include "../font12x24.h"
++
+ #define FILEMAN_MAP_BASE       0x0A000000ULL
+@@ -156,4 +158,4 @@
+-static const uint8_t *glyph_for(char character) {
++static __attribute__((unused)) const uint8_t *glyph_for(char character) {
+     if (character == ' ') return g_upper_font[0];
+     if (character >= 'A' && character <= 'Z') {
+         return g_upper_font[1U + (uint32_t)(character - 'A')];
+@@ -185,13 +187,9 @@
+ static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
+     if (text == 0) return;
+     for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+-        const uint8_t *glyph = glyph_for(text[index]);
+-        for (uint32_t row = 0U; row < 7U; ++row) {
+-            for (uint32_t column = 0U; column < 5U; ++column) {
+-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
+-                    fill_rect(x + index * 6U + column, y + row, 1U, 1U, color);
+-                }
+-            }
+-        }
++        font12x24_draw_glyph(g_target, g_target_width,
++                             g_target_width, g_target_height,
++                             (int32_t)(x + index * FONT12X24_WIDTH),
++                             (int32_t)y, text[index], color);
+     }
+ }
+@@ -327,5 +325,6 @@
+ static void render(void) {
+-    uint32_t rows = g_window.height > 58U ? (g_window.height - 58U) / 12U : 1U;
++    uint32_t rows = g_window.height > 64U ?
++        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
+     g_target = g_window.pixels;
+     g_target_width = g_window.width;
+     g_target_height = g_window.height;
+@@ -333,9 +332,9 @@
+     if (g_selected < g_first_entry) g_first_entry = g_selected;
+     if (g_selected >= g_first_entry + rows) g_first_entry = g_selected - rows + 1U;
+     fill_rect(0U, 0U, g_target_width, g_target_height, 0x0015222AU);
+-    fill_rect(0U, 0U, g_target_width, 22U, 0x00223948U);
+-    draw_text(10U, 7U, "LITEOS FILEMAN", 0x00B9D7E8U);
+-    draw_text(120U, 7U, g_path, 0x008FD6C4U);
++    fill_rect(0U, 0U, g_target_width, 32U, 0x00223948U);
++    draw_text(10U, 4U, "LITEOS FILEMAN", 0x00B9D7E8U);
++    draw_text(190U, 4U, g_path, 0x008FD6C4U);
+     for (uint32_t row = 0U; row < rows; ++row) {
+         uint32_t index = g_first_entry + row;
+         if (index >= g_entry_count) break;
+@@ -352,11 +351,12 @@
+             append_text(line, sizeof(line), " B");
+         }
+         if (index == g_selected) {
+-            fill_rect(0U, 26U + row * 12U, g_target_width, 10U, 0x00314F5CU);
++            fill_rect(0U, 32U + row * FONT12X24_HEIGHT,
++                      g_target_width, FONT12X24_HEIGHT, 0x00314F5CU);
+         }
+-        draw_text(8U, 28U + row * 12U, line, 0x00D9EEF2U);
++        draw_text(8U, 32U + row * FONT12X24_HEIGHT, line, 0x00D9EEF2U);
+     }
+-    fill_rect(0U, g_target_height - 22U, g_target_width, 22U, 0x00102028U);
+-    draw_text(8U, g_target_height - 14U, g_status, 0x008FD6C4U);
++    fill_rect(0U, g_target_height - 32U, g_target_width, 32U, 0x00102028U);
++    draw_text(8U, g_target_height - 28U, g_status, 0x008FD6C4U);
+     update_window();
+ }
+
+diff --git a/user/notepad/main.c b/user/notepad/main.c
+--- a/user/notepad/main.c
++++ b/user/notepad/main.c
+@@ -3,4 +3,6 @@
+ 
+ #include <uapi/all.h>
+ 
++#include "../font12x24.h"
++
+ #define NOTEPAD_TEXT_CAPACITY 8192U
+@@ -265,4 +267,4 @@
+-static const uint8_t *glyph_for(char character) {
++static __attribute__((unused)) const uint8_t *glyph_for(char character) {
+     if (character == ' ') return g_upper_font[0];
+     if (character >= 'A' && character <= 'Z') return g_upper_font[1U + (uint32_t)(character - 'A')];
+     if (character >= 'a' && character <= 'z') return g_lower_font[(uint32_t)(character - 'a')];
+@@ -288,24 +290,15 @@
+ static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
+     if (text == 0) return;
+     for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+-        const uint8_t *glyph = glyph_for(text[index]);
+-        for (uint32_t row = 0U; row < 7U; ++row) {
+-            for (uint32_t column = 0U; column < 5U; ++column) {
+-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
+-                    fill_rect(x + index * 6U + column, y + row, 1U, 1U, color);
+-                }
+-            }
+-        }
++        font12x24_draw_glyph(g_target, g_target_width,
++                             g_target_width, g_target_height,
++                             (int32_t)(x + index * FONT12X24_WIDTH),
++                             (int32_t)y, text[index], color);
+     }
+ }
+ 
+ static void draw_character(uint32_t x, uint32_t y, char character, uint32_t color) {
+-    const uint8_t *glyph = glyph_for(character);
+-    for (uint32_t row = 0U; row < 7U; ++row) {
+-        for (uint32_t column = 0U; column < 5U; ++column) {
+-            if ((glyph[row] & (1U << (4U - column))) != 0U) {
+-                fill_rect(x + column, y + row, 1U, 1U, color);
+-            }
+-        }
+-    }
++    font12x24_draw_glyph(g_target, g_target_width,
++                         g_target_width, g_target_height,
++                         (int32_t)x, (int32_t)y, character, color);
+ }
+@@ -367,9 +360,10 @@
+ static void draw_editor(void) {
+-    const uint32_t text_top = 28U;
+-    const uint32_t status_height = 18U;
+-    uint32_t columns = g_target_width > 20U ? (g_target_width - 20U) / 6U : 1U;
++    const uint32_t text_top = 32U;
++    const uint32_t status_height = 32U;
++    uint32_t columns = g_target_width > 20U ?
++        (g_target_width - 20U) / FONT12X24_WIDTH : 1U;
+     uint32_t visible_lines = g_target_height > text_top + status_height ?
+-        (g_target_height - text_top - status_height) / 9U : 1U;
++        (g_target_height - text_top - status_height) / FONT12X24_HEIGHT : 1U;
+     uint32_t line = 0U;
+     uint32_t column = 0U;
+     uint32_t cursor_line;
+@@ -377,24 +371,24 @@
+     if (g_follow_cursor) ensure_cursor_visible(columns, visible_lines);
+     cursor_position(columns, &cursor_line, &cursor_column);
+     fill_rect(0U, 0U, g_target_width, g_target_height, 0x0015222AU);
+-    fill_rect(0U, 0U, g_target_width, 22U, 0x00223948U);
+-    draw_text(10U, 7U, "LITEOS NOTEPAD", 0x00B9D7E8U);
+-    draw_text(130U, 7U, g_dirty ? "*" : " ", 0x008FD6C4U);
+-    draw_text(142U, 7U, g_file_path, 0x008FD6C4U);
++    fill_rect(0U, 0U, g_target_width, 32U, 0x00223948U);
++    draw_text(10U, 4U, "LITEOS NOTEPAD", 0x00B9D7E8U);
++    draw_text(184U, 4U, g_dirty ? "*" : " ", 0x008FD6C4U);
++    draw_text(202U, 4U, g_file_path, 0x008FD6C4U);
+     for (size_t index = 0U; index < g_text_length; ++index) {
+         char character = g_text[index];
+         if (character != '\n' && character != '\t' && line >= g_scroll_line &&
+             line < g_scroll_line + visible_lines) {
+-            draw_character(10U + column * 6U,
+-                           text_top + (line - g_scroll_line) * 9U,
++            draw_character(10U + column * FONT12X24_WIDTH,
++                           text_top + (line - g_scroll_line) * FONT12X24_HEIGHT,
+                            character, 0x00D9EEF2U);
+         }
+         if (character == '\t' && line >= g_scroll_line &&
+             line < g_scroll_line + visible_lines) {
+             uint32_t spaces = 4U - (column & 3U);
+             for (uint32_t space = 0U; space < spaces && column + space < columns; ++space) {
+-                draw_character(10U + (column + space) * 6U,
+-                               text_top + (line - g_scroll_line) * 9U,
++                draw_character(10U + (column + space) * FONT12X24_WIDTH,
++                               text_top + (line - g_scroll_line) * FONT12X24_HEIGHT,
+                                ' ', 0x00D9EEF2U);
+             }
+         }
+@@ -402,11 +396,11 @@
+     }
+     if (cursor_line >= g_scroll_line && cursor_line < g_scroll_line + visible_lines &&
+         cursor_column < columns) {
+-        fill_rect(10U + cursor_column * 6U,
+-                  text_top + (cursor_line - g_scroll_line) * 9U - 1U,
+-                  1U, 9U, 0x00F2FFF9U);
++        fill_rect(10U + cursor_column * FONT12X24_WIDTH,
++                  text_top + (cursor_line - g_scroll_line) * FONT12X24_HEIGHT,
++                  2U, FONT12X24_HEIGHT, 0x00F2FFF9U);
+     }
+     fill_rect(0U, g_target_height - status_height, g_target_width,
+               status_height, 0x00102028U);
+-    draw_text(10U, g_target_height - 12U, g_status, 0x008FD6C4U);
++    draw_text(10U, g_target_height - 28U, g_status, 0x008FD6C4U);
+ }
+
+diff --git a/user/wm/main.c b/user/wm/main.c
+--- a/user/wm/main.c
++++ b/user/wm/main.c
+@@ -3,4 +3,6 @@
+ 
+ #include <uapi/all.h>
+ 
++#include "../font12x24.h"
++
+ #define WM_MAX_WINDOWS       64U
+@@ -88,4 +90,4 @@
+-static const uint8_t *glyph_for(char character) {
++static __attribute__((unused)) const uint8_t *glyph_for(char character) {
+     static const uint8_t font[37][7] = {
+         {0,0,0,0,0,0,0},
+         {30,9,9,30,9,9,0}, {30,9,9,30,9,30,0}, {14,17,16,16,17,14,0},
+@@ -109,15 +111,10 @@
+ }
+ 
+ static void draw_text(int32_t x, int32_t y, const char *text, uint32_t color) {
+-    for (uint32_t index = 0U; text != 0 && text[index] != '\0'; ++index) {
+-        const uint8_t *glyph = glyph_for(text[index]);
+-        for (uint32_t row = 0U; row < 7U; ++row) {
+-            for (uint32_t column = 0U; column < 5U; ++column) {
+-                if ((glyph[row] & (1U << (4U - column))) != 0U) {
+-                    fill_rect(x + (int32_t)index * 6 + (int32_t)column,
+-                              y + (int32_t)row, 1U, 1U, color);
+-                }
+-            }
+-        }
++    if (text == 0) return;
++    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
++        font12x24_draw_glyph(g_frame, g_stride, g_width, g_height,
++                             x + (int32_t)(index * FONT12X24_WIDTH), y,
++                             text[index], color);
+     }
+ }
+@@ -314,7 +311,7 @@
+ static void render_frame(void) {
+     fill_rect(0, 0, g_width, g_height, 0x00101928U);
+     fill_rect(0, 0, g_width, WM_TOPBAR_HEIGHT, 0x00213D5AU);
+-    draw_text(20, 12, "LITEOS WINDOW SERVER", 0x00E8F1F5U);
++    draw_text(20, 6, "LITEOS WINDOW SERVER", 0x00E8F1F5U);
+     for (uint32_t index = 0U; index < g_window_count; ++index) {
+         const os_window_info_t *info = &g_windows[index];
+         uint32_t frame_color = info->focused != 0U ? 0x005C99C6U : 0x002A3B4BU;
+@@ -322,7 +319,7 @@
+                   info->height + WM_TITLEBAR_HEIGHT + 4U, frame_color);
+         fill_rect(info->x + 2, info->y + 2, info->width,
+                   WM_TITLEBAR_HEIGHT, info->focused != 0U ? 0x002A6691U : 0x0022394FU);
+-        draw_text(info->x + 8, info->y + 9, info->title,
++        draw_text(info->x + 8, info->y + 2, info->title,
+                   info->focused != 0U ? 0x00F3FAFFU : 0x00B5C8D8U);
+         copy_surface(info);
+     }
+@@ -336,7 +333,7 @@
+                       button_width > 12U ? button_width - 12U : button_width,
+                       WM_TASKBAR_HEIGHT - 14U,
+                       g_windows[index].focused != 0U ? 0x003B7198U : 0x001C2D40U);
+-            draw_text(x + 8, (int32_t)g_height - WM_TASKBAR_HEIGHT + 14,
++            draw_text(x + 8, (int32_t)g_height - WM_TASKBAR_HEIGHT + 7,
+                       g_windows[index].title, 0x00E8F1F5U);
+         }
+     }
