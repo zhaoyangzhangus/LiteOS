@@ -298,7 +298,7 @@ static bool create_window(void) {
     request.y = 36;
     request.width = display.width > 72U ? display.width - 72U : display.width;
     request.height = display.height > 72U ? display.height - 72U : display.height;
-    request.flags = OS_WINDOW_VISIBLE;
+    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
     request.background = 0x0015222AU;
     request.title[0] = 'F'; request.title[1] = 'I'; request.title[2] = 'L';
     request.title[3] = 'E'; request.title[4] = 'M'; request.title[5] = 'A';
@@ -319,6 +319,8 @@ static void update_window(void) {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_window.identifier;
+    request.width = g_window.width;
+    request.height = g_window.height;
     (void)fileman_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
 }
 
@@ -394,8 +396,10 @@ static void remove_selected(void) {
 
 static void handle_key(const os_window_event_t *event) {
     const os_input_event_t *input = event != 0 ? &event->input : 0;
-    uint32_t rows = g_window.height > 58U ? (g_window.height - 58U) / 12U : 1U;
-    if (input == 0 || input->type != OS_INPUT_EVENT_KEY) return;
+    uint32_t rows = g_window.height > 64U ?
+        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
+    if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT ||
+        input == 0 || input->type != OS_INPUT_EVENT_KEY) return;
     if (input->code == 0xE0U || input->code == 0xE4U) {
         g_ctrl = input->value != OS_INPUT_VALUE_RELEASE;
         return;
@@ -434,6 +438,22 @@ static void handle_key(const os_window_event_t *event) {
     render();
 }
 
+static void handle_event(const os_window_event_t *event) {
+    uint64_t pixels;
+
+    if (event == 0) return;
+    if (event->type == OS_WINDOW_EVENT_RESIZE) {
+        if (event->resize.width == 0U || event->resize.height == 0U) return;
+        pixels = (uint64_t)event->resize.width * event->resize.height;
+        if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return;
+        g_window.width = event->resize.width;
+        g_window.height = event->resize.height;
+        render();
+        return;
+    }
+    handle_key(event);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && (argv == 0 || argv[1] == 0 || !set_path(argv[1]))) {
         fileman_exit(1U);
@@ -449,7 +469,7 @@ int main(int argc, char **argv) {
         request.timeout_ns = FILEMAN_EVENT_TIMEOUT;
         int64_t status = fileman_syscall_one(OS_SYS_WINDOW_EVENT_READ,
                                              (uint64_t)&request);
-        if (status == 0) handle_key(&request.event);
+        if (status == 0) handle_event(&request.event);
         else if (status != -11 && status != -110) __asm__ volatile ("pause");
     }
 }

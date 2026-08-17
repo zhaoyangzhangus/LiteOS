@@ -2439,7 +2439,7 @@ static int64_t sys_window_create(uint64_t arguments_pointer, uint64_t unused1,
     if (status != K_OK) return status;
     if (!versioned_header_valid(&arguments.hdr, sizeof(arguments)) ||
         arguments.reserved != 0U ||
-        (arguments.flags & ~OS_WINDOW_VISIBLE) != 0U ||
+        (arguments.flags & ~(OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE)) != 0U ||
         arguments.width == 0U || arguments.height == 0U) return K_EINVAL;
     status = window_server_create(process, arguments.x, arguments.y,
                                   arguments.width, arguments.height,

@@ -5,7 +5,8 @@
 
 /* 窗口由应用拥有内容缓冲，由 Ring0 Window Server 负责摆放和合成。 */
 enum os_window_flags {
-    OS_WINDOW_VISIBLE = 1u << 0,
+    OS_WINDOW_VISIBLE   = 1u << 0,
+    OS_WINDOW_RESIZABLE = 1u << 1,
 };
 
 typedef struct os_window_create {
@@ -80,10 +81,26 @@ typedef struct os_window_focus {
     uint32_t reserved;
 } os_window_focus_t;
 
+enum os_window_event_type {
+    /* INPUT remains zero so old zero-initialized event slots keep their meaning. */
+    OS_WINDOW_EVENT_INPUT  = 0u,
+    OS_WINDOW_EVENT_RESIZE = 1u,
+};
+
+typedef struct os_window_resize_event {
+    uint32_t width;
+    uint32_t height;
+    uint64_t buffer_size;
+    uint64_t reserved;
+} os_window_resize_event_t;
+
 typedef struct os_window_event {
     uint32_t identifier;
-    uint32_t reserved;
-    os_input_event_t input;
+    uint32_t type;
+    union {
+        os_input_event_t input;
+        os_window_resize_event_t resize;
+    };
 } os_window_event_t;
 
 typedef struct os_window_event_read {

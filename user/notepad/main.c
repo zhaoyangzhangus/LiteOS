@@ -418,7 +418,7 @@ static bool create_window(void) {
     request.y = 24;
     request.width = display.width > 48U ? display.width - 48U : display.width;
     request.height = display.height > 48U ? display.height - 48U : display.height;
-    request.flags = OS_WINDOW_VISIBLE;
+    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
     request.background = 0x0015222AU;
     request.title[0] = 'N'; request.title[1] = 'O'; request.title[2] = 'T';
     request.title[3] = 'E'; request.title[4] = 'P'; request.title[5] = 'A';
@@ -439,6 +439,8 @@ static void update_window(void) {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_window.identifier;
+    request.width = g_window.width;
+    request.height = g_window.height;
     (void)notepad_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
 }
 
@@ -619,7 +621,8 @@ static void delete_character(void) {
 }
 
 static void move_vertical_by(int32_t direction, uint32_t distance) {
-    uint32_t columns = g_window.width > 20U ? (g_window.width - 20U) / 6U : 1U;
+    uint32_t columns = g_window.width > 20U ?
+        (g_window.width - 20U) / FONT12X24_WIDTH : 1U;
     uint32_t line = 0U;
     uint32_t column = 0U;
     cursor_position(columns, &line, &column);
@@ -638,9 +641,10 @@ static void move_vertical(int32_t direction) {
 }
 
 static void scroll_editor(int32_t direction) {
-    uint32_t columns = g_window.width > 20U ? (g_window.width - 20U) / 6U : 1U;
-    uint32_t visible_lines = g_window.height > 46U ?
-        (g_window.height - 46U) / 9U : 1U;
+    uint32_t columns = g_window.width > 20U ?
+        (g_window.width - 20U) / FONT12X24_WIDTH : 1U;
+    uint32_t visible_lines = g_window.height > 64U ?
+        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
     uint32_t line = 0U;
     uint32_t column = 0U;
     uint32_t total_lines;
@@ -664,7 +668,8 @@ static void scroll_editor(int32_t direction) {
 }
 
 static void page_editor(int32_t direction) {
-    uint32_t page = g_window.height > 46U ? (g_window.height - 46U) / 9U : 1U;
+    uint32_t page = g_window.height > 64U ?
+        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
     if (page > 1000000000U) page = 1000000000U;
     scroll_editor(direction < 0 ? -(int32_t)page : (int32_t)page);
 }
@@ -678,7 +683,8 @@ static bool key_matches(const os_input_event_t *input, uint32_t hid_code,
 static bool handle_key(const os_window_event_t *event) {
     const os_input_event_t *input = event != 0 ? &event->input : 0;
     char character;
-    if (event == 0 || input == 0 || input->type != OS_INPUT_EVENT_KEY) return false;
+    if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT ||
+        input == 0 || input->type != OS_INPUT_EVENT_KEY) return false;
     if (input->code == 0xE1U || input->code == 0xE5U) {
         g_shift = input->value != OS_INPUT_VALUE_RELEASE;
         return false;
@@ -738,8 +744,24 @@ static bool handle_key(const os_window_event_t *event) {
 }
 
 static bool handle_event(const os_window_event_t *event) {
-    const os_input_event_t *input = event != 0 ? &event->input : 0;
-    if (input != 0 && input->type == OS_INPUT_EVENT_RELATIVE &&
+    const os_input_event_t *input;
+    uint64_t pixels;
+
+    if (event == 0) return false;
+    if (event->type == OS_WINDOW_EVENT_RESIZE) {
+        if (event->resize.width == 0U || event->resize.height == 0U) return false;
+        pixels = (uint64_t)event->resize.width * event->resize.height;
+        if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return false;
+        g_window.width = event->resize.width;
+        g_window.height = event->resize.height;
+        g_follow_cursor = true;
+        render();
+        return true;
+    }
+    if (event->type != OS_WINDOW_EVENT_INPUT) return false;
+
+    input = &event->input;
+    if (input->type == OS_INPUT_EVENT_RELATIVE &&
         input->code == OS_INPUT_REL_WHEEL && input->value != 0) {
         scroll_editor(input->value > 0 ? -3 : 3);
         render();

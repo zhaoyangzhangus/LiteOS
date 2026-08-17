@@ -30,6 +30,7 @@ typedef struct window_server_window {
     uint64_t buffer_size;
     uint64_t owner_address;
     bool dirty;
+    bool resize_pending;
     char title[32];
     os_window_event_t events[WINDOW_EVENT_CAPACITY];
     uint32_t event_read;

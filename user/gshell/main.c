@@ -298,7 +298,8 @@ static void update_window(void) {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_shell.identifier;
-    /* 0,0,0,0 means the complete client surface. */
+    request.width = g_shell.width;
+    request.height = g_shell.height;
     (void)gshell_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
 }
 
@@ -320,7 +321,7 @@ static bool create_window(int32_t x, int32_t y, uint32_t width,
     request.y = y;
     request.width = width;
     request.height = height;
-    request.flags = OS_WINDOW_VISIBLE;
+    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
     request.background = g_shell.color;
     for (uint32_t i = 0U; i < 31U && g_shell.title[i] != '\0'; ++i) {
         request.title[i] = g_shell.title[i];
@@ -1187,7 +1188,8 @@ static bool handle_key(const os_window_event_t *event) {
     char character;
     /* EVENT_READ 已按 g_shell.identifier 过滤；不要因某个输入后端未回填
      * event.identifier 而丢弃本来属于 shell 的按键。 */
-    if (event == 0 || input == 0 || input->type != OS_INPUT_EVENT_KEY) return false;
+    if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT ||
+        input == 0 || input->type != OS_INPUT_EVENT_KEY) return false;
     if (input->code == 0xE1U || input->code == 0xE5U) {
         g_shift = input->value != OS_INPUT_VALUE_RELEASE;
         return false;
@@ -1238,6 +1240,22 @@ static bool handle_key(const os_window_event_t *event) {
     return true;
 }
 
+static bool handle_event(const os_window_event_t *event) {
+    uint64_t pixels;
+
+    if (event == 0) return false;
+    if (event->type == OS_WINDOW_EVENT_RESIZE) {
+        if (event->resize.width == 0U || event->resize.height == 0U) return false;
+        pixels = (uint64_t)event->resize.width * event->resize.height;
+        if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return false;
+        g_shell.width = event->resize.width;
+        g_shell.height = event->resize.height;
+        render_window();
+        return true;
+    }
+    return handle_key(event);
+}
+
 __attribute__((noreturn)) void gshell_entry(void) {
     if (!setup_windows()) gshell_exit(1U);
     append_output("LITEOS GRAPHICAL SHELL READY");
@@ -1253,7 +1271,7 @@ __attribute__((noreturn)) void gshell_entry(void) {
         request.timeout_ns = SHELL_EVENT_TIMEOUT;
         status = gshell_syscall_one(OS_SYS_WINDOW_EVENT_READ, (uint64_t)&request);
         if (status == 0) {
-            (void)handle_key(&request.event);
+            (void)handle_event(&request.event);
         } else if (status != -11 && status != -110) {
             __asm__ volatile ("pause");
         }

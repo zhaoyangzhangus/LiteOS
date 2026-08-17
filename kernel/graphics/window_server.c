@@ -13,6 +13,16 @@
 #define WINDOW_CURSOR_HEIGHT 24U
 #define WINDOW_CURSOR_HOTSPOT_X 3U
 #define WINDOW_CURSOR_HOTSPOT_Y 1U
+#define WINDOW_RESIZE_GRAB 6U
+#define WINDOW_MIN_WIDTH 160U
+#define WINDOW_MIN_HEIGHT 96U
+
+enum {
+    WINDOW_RESIZE_LEFT   = 1U << 0,
+    WINDOW_RESIZE_RIGHT  = 1U << 1,
+    WINDOW_RESIZE_TOP    = 1U << 2,
+    WINDOW_RESIZE_BOTTOM = 1U << 3,
+};
 
 typedef struct window_damage_rect {
     uint32_t left;
@@ -52,6 +62,7 @@ static struct {
     uint32_t dragging_identifier;
     int32_t drag_offset_x;
     int32_t drag_offset_y;
+    uint32_t resize_edges;
     bool kernel_ready;
     bool dirty;
     bool composing;
@@ -117,6 +128,7 @@ bool window_server_init(void) {
         g_window_server.dragging_identifier = 0U;
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
+        g_window_server.resize_edges = 0U;
         g_window_server.kernel_ready = false;
         g_window_server.dirty = false;
         g_window_server.composing = false;
@@ -221,6 +233,7 @@ static void remove_window_locked(window_server_window_t *window) {
             g_window_server.dragging_identifier = 0U;
             g_window_server.drag_offset_x = 0;
             g_window_server.drag_offset_y = 0;
+            g_window_server.resize_edges = 0U;
         }
         window_mark_window_locked(new_focused);
         object_put(window); /* registry reference */
@@ -655,9 +668,17 @@ static void compositor_surface_locked(const window_server_window_t *window) {
             (uint64_t)(uint32_t)destination_y * g_window_server.display_stride +
             (uint32_t)(surface_x + first_column);
         for (int64_t column = first_column; column < last_column; ++column) {
-            uint64_t index = (uint64_t)row * window->width + column;
-            uint64_t source = window->owner_address + index * sizeof(uint32_t);
+            uint64_t index;
+            uint64_t source;
             uint32_t pixel = window->background;
+
+            if (window->resize_pending) {
+                *destination++ = window->background;
+                continue;
+            }
+
+            index = (uint64_t)row * window->width + column;
+            source = window->owner_address + index * sizeof(uint32_t);
             if (window_source_pixel_locked(window, source, &pixel,
                                            &cached_page, &cached_base)) {
                 *destination++ = pixel;
@@ -816,13 +837,54 @@ static void window_enqueue_event_locked(window_server_window_t *window,
         --window->event_count;
     }
     window->events[window->event_write].identifier = window->identifier;
-    window->events[window->event_write].reserved = 0U;
+    window->events[window->event_write].type = OS_WINDOW_EVENT_INPUT;
     window->events[window->event_write].input.timestamp = event->timestamp;
     window->events[window->event_write].input.device_id = event->device_id;
     window->events[window->event_write].input.type = event->type;
     window->events[window->event_write].input.flags = event->flags;
     window->events[window->event_write].input.code = event->code;
     window->events[window->event_write].input.value = event->value;
+    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
+    ++window->event_count;
+}
+
+static void window_enqueue_resize_event_locked(window_server_window_t *window) {
+    os_window_event_t *queued;
+    uint32_t slot;
+
+    if (window == 0) return;
+
+    /*
+     * During a live resize only the newest size matters.  If the previous
+     * queued event is already RESIZE, overwrite it instead of filling the
+     * per-window queue with every mouse delta.
+     */
+    if (window->event_count != 0U) {
+        slot = (window->event_write + WINDOW_EVENT_CAPACITY - 1U) %
+               WINDOW_EVENT_CAPACITY;
+        queued = &window->events[slot];
+        if (queued->identifier == window->identifier &&
+            queued->type == OS_WINDOW_EVENT_RESIZE) {
+            queued->resize.width = window->width;
+            queued->resize.height = window->height;
+            queued->resize.buffer_size = window->buffer_size;
+            queued->resize.reserved = 0U;
+            return;
+        }
+    }
+
+    if (window->event_count >= WINDOW_EVENT_CAPACITY) {
+        window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
+        --window->event_count;
+    }
+
+    queued = &window->events[window->event_write];
+    queued->identifier = window->identifier;
+    queued->type = OS_WINDOW_EVENT_RESIZE;
+    queued->resize.width = window->width;
+    queued->resize.height = window->height;
+    queued->resize.buffer_size = window->buffer_size;
+    queued->resize.reserved = 0U;
     window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
     ++window->event_count;
 }
@@ -847,15 +909,37 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     shared_section_t *section = 0;
     window_server_window_t *window;
     window_server_window_t *old_focused;
+
     if (out == 0 || owner == 0 || !window_server_init() || width == 0U ||
         height == 0U || width > UINT32_MAX / height ||
-        (flags & ~OS_WINDOW_VISIBLE) != 0U) return K_EINVAL;
-    pixels = (uint64_t)width * height;
+        (flags & ~(OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE)) != 0U) {
+        return K_EINVAL;
+    }
+
+    /*
+     * Resizable windows get a stable virtual surface mapping large enough for
+     * any on-screen size.  VM_OBJECT_SHARED is demand-paged, so this reserves
+     * virtual capacity without eagerly allocating a full-screen physical
+     * buffer.
+     */
+    if ((flags & OS_WINDOW_RESIZABLE) != 0U) {
+        if (!window_server_kernel_ready()) return K_EIO;
+        if (width > g_window_server.display_width ||
+            height > g_window_server.display_height) {
+            return K_EINVAL;
+        }
+        pixels = (uint64_t)g_window_server.display_width *
+                 g_window_server.display_height;
+    } else {
+        pixels = (uint64_t)width * height;
+    }
+
     if (pixels > UINT64_MAX / sizeof(uint32_t)) return K_EINVAL;
     bytes = pixels * sizeof(uint32_t);
     if (bytes > UINT64_MAX - (PAGE_SIZE - 1U)) return K_EINVAL;
     bytes = (bytes + PAGE_SIZE - 1U) &
             ~(uint64_t)(PAGE_SIZE - 1U);
+
     if (shared_section_create(bytes, &section) != K_OK) return K_ENOMEM;
     window = (window_server_window_t *)kzalloc(sizeof(*window), 0);
     if (window == 0) {
@@ -879,6 +963,7 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->buffer_size = bytes;
     window->owner_address = 0U;
     window->dirty = true;
+    window->resize_pending = false;
     window->event_read = 0U;
     window->event_write = 0U;
     window->event_count = 0U;
@@ -895,7 +980,9 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     }
     old_focused = find_window_locked(g_window_server.focused_identifier);
     window->identifier = g_window_server.next_identifier++;
-    if (window->identifier == 0U) window->identifier = g_window_server.next_identifier++;
+    if (window->identifier == 0U) {
+        window->identifier = g_window_server.next_identifier++;
+    }
     g_window_server.windows[g_window_server.count++] = window;
     object_get(window); /* registry reference */
     if ((window->flags & OS_WINDOW_VISIBLE) != 0U) {
@@ -1066,7 +1153,7 @@ kstatus_t window_server_dispatch(uint32_t identifier, const os_input_event_t *ev
         --window->event_count;
     }
     window->events[window->event_write].identifier = identifier;
-    window->events[window->event_write].reserved = 0U;
+    window->events[window->event_write].type = OS_WINDOW_EVENT_INPUT;
     window->events[window->event_write].input = *event;
     window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
     ++window->event_count;
@@ -1127,26 +1214,160 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
         window_unlock();
         return K_EPERM;
     }
-    /* x/y/width/height 是 surface 内的 damage；0,0,0,0 表示整窗。 */
+
+    /*
+     * A resizable client acknowledges the current row stride by submitting a
+     * full-surface damage rectangle with exactly the current width/height.
+     * A stale redraw for an older resize cannot expose mis-strided pixels.
+     */
+    if (window->resize_pending && x == 0 && y == 0 &&
+        width == window->width && height == window->height) {
+        window->resize_pending = false;
+    }
+
     window->dirty = true;
     if (width == 0U) {
         window_mark_window_locked(window);
     } else {
         window_mark_surface_locked(window, x, y, width, height);
     }
-    /* 只登记 damage；由 Ring0 主循环统一合成，避免每个窗口 syscall
-     * 都独占窗口锁并重复扫描整个 z-order。 */
     window_unlock();
     return K_OK;
 }
 
+static uint32_t window_resize_edges_locked(const window_server_window_t *window,
+                                           uint32_t x, uint32_t y) {
+    int64_t relative_x;
+    int64_t relative_y;
+    int64_t outer_width;
+    int64_t outer_height;
+    uint32_t edges = 0U;
+
+    if (window == 0 || (window->flags & OS_WINDOW_RESIZABLE) == 0U) return 0U;
+
+    relative_x = (int64_t)x - window->x;
+    relative_y = (int64_t)y - window->y;
+    outer_width = (int64_t)window->width + WINDOW_FRAME_EXTRA;
+    outer_height = (int64_t)window->height + WINDOW_FRAME_EXTRA;
+    if (relative_x < 0 || relative_y < 0 ||
+        relative_x >= outer_width || relative_y >= outer_height) {
+        return 0U;
+    }
+
+    if (relative_x < WINDOW_RESIZE_GRAB) {
+        edges |= WINDOW_RESIZE_LEFT;
+    } else if (relative_x >= outer_width - WINDOW_RESIZE_GRAB) {
+        edges |= WINDOW_RESIZE_RIGHT;
+    }
+
+    if (relative_y < WINDOW_RESIZE_GRAB) {
+        edges |= WINDOW_RESIZE_TOP;
+    } else if (relative_y >= outer_height - WINDOW_RESIZE_GRAB) {
+        edges |= WINDOW_RESIZE_BOTTOM;
+    }
+    return edges;
+}
+
+static bool window_resize_locked(window_server_window_t *window,
+                                 int32_t delta_x, int32_t delta_y) {
+    int32_t old_x;
+    int32_t old_y;
+    uint32_t old_width;
+    uint32_t old_height;
+    uint32_t max_width;
+    uint32_t max_height;
+    uint32_t min_width;
+    uint32_t min_height;
+    int64_t left;
+    int64_t top;
+    int64_t right;
+    int64_t bottom;
+    int64_t minimum;
+    int64_t maximum;
+    uint32_t new_width;
+    uint32_t new_height;
+
+    if (window == 0 || g_window_server.resize_edges == 0U ||
+        (window->flags & OS_WINDOW_RESIZABLE) == 0U) {
+        return false;
+    }
+
+    max_width = g_window_server.display_width;
+    max_height = g_window_server.display_height;
+    if (max_width == 0U || max_height == 0U) return false;
+    min_width = max_width < WINDOW_MIN_WIDTH ? max_width : WINDOW_MIN_WIDTH;
+    min_height = max_height < WINDOW_MIN_HEIGHT ? max_height : WINDOW_MIN_HEIGHT;
+
+    old_x = window->x;
+    old_y = window->y;
+    old_width = window->width;
+    old_height = window->height;
+
+    left = window->x;
+    top = window->y;
+    right = left + (int64_t)window->width + WINDOW_FRAME_EXTRA;
+    bottom = top + (int64_t)window->height + WINDOW_FRAME_EXTRA;
+
+    if ((g_window_server.resize_edges & WINDOW_RESIZE_LEFT) != 0U) {
+        left += delta_x;
+        minimum = right - (int64_t)max_width - WINDOW_FRAME_EXTRA;
+        maximum = right - (int64_t)min_width - WINDOW_FRAME_EXTRA;
+        if (left < minimum) left = minimum;
+        if (left > maximum) left = maximum;
+    } else if ((g_window_server.resize_edges & WINDOW_RESIZE_RIGHT) != 0U) {
+        right += delta_x;
+        minimum = left + (int64_t)min_width + WINDOW_FRAME_EXTRA;
+        maximum = left + (int64_t)max_width + WINDOW_FRAME_EXTRA;
+        if (right < minimum) right = minimum;
+        if (right > maximum) right = maximum;
+    }
+
+    if ((g_window_server.resize_edges & WINDOW_RESIZE_TOP) != 0U) {
+        top += delta_y;
+        minimum = bottom - (int64_t)max_height - WINDOW_FRAME_EXTRA;
+        maximum = bottom - (int64_t)min_height - WINDOW_FRAME_EXTRA;
+        if (top < minimum) top = minimum;
+        if (top > maximum) top = maximum;
+    } else if ((g_window_server.resize_edges & WINDOW_RESIZE_BOTTOM) != 0U) {
+        bottom += delta_y;
+        minimum = top + (int64_t)min_height + WINDOW_FRAME_EXTRA;
+        maximum = top + (int64_t)max_height + WINDOW_FRAME_EXTRA;
+        if (bottom < minimum) bottom = minimum;
+        if (bottom > maximum) bottom = maximum;
+    }
+
+    new_width = (uint32_t)(right - left - WINDOW_FRAME_EXTRA);
+    new_height = (uint32_t)(bottom - top - WINDOW_FRAME_EXTRA);
+    if (left == old_x && top == old_y &&
+        new_width == old_width && new_height == old_height) {
+        return false;
+    }
+
+    window_mark_rect_locked(old_x, old_y,
+                            old_width + WINDOW_FRAME_EXTRA,
+                            old_height + WINDOW_FRAME_EXTRA);
+    window->x = (int32_t)left;
+    window->y = (int32_t)top;
+    window->width = new_width;
+    window->height = new_height;
+    window->dirty = true;
+    window->resize_pending = true;
+    window_mark_window_locked(window);
+    window_enqueue_resize_event_locked(window);
+    return true;
+}
+
 static void route_input_locked(const input_event_t *event) {
     window_server_window_t *target = 0;
+    bool deliver_input = true;
+
     if (event == 0) return;
+
     if (event->type == INPUT_EVENT_RELATIVE) {
         uint32_t old_pointer_x = g_window_server.pointer_x;
         uint32_t old_pointer_y = g_window_server.pointer_y;
         int64_t next;
+
         if (event->code == INPUT_REL_X) {
             next = (int64_t)g_window_server.pointer_x + event->value;
             if (next < 0) next = 0;
@@ -1164,10 +1385,25 @@ static void route_input_locked(const input_event_t *event) {
             }
             g_window_server.pointer_y = (uint32_t)next;
         }
+
         if (g_window_server.dragging_identifier != 0U) {
             window_server_window_t *dragged =
                 find_window_locked(g_window_server.dragging_identifier);
-            if (dragged != 0) {
+            if (dragged == 0 || (dragged->flags & OS_WINDOW_VISIBLE) == 0U) {
+                g_window_server.dragging_identifier = 0U;
+                g_window_server.drag_offset_x = 0;
+                g_window_server.drag_offset_y = 0;
+                g_window_server.resize_edges = 0U;
+            } else if (g_window_server.resize_edges != 0U) {
+                int32_t delta_x =
+                    (int32_t)((int64_t)g_window_server.pointer_x - old_pointer_x);
+                int32_t delta_y =
+                    (int32_t)((int64_t)g_window_server.pointer_y - old_pointer_y);
+                (void)window_resize_locked(dragged, delta_x, delta_y);
+                target = dragged;
+                /* Decoration capture: mouse deltas belong to Ring0, not client. */
+                deliver_input = false;
+            } else {
                 int32_t old_x = dragged->x;
                 int32_t old_y = dragged->y;
                 dragged->x = (int32_t)g_window_server.pointer_x -
@@ -1180,32 +1416,54 @@ static void route_input_locked(const input_event_t *event) {
                     dragged->height + WINDOW_FRAME_EXTRA);
                 dragged->dirty = true;
                 target = dragged;
+                deliver_input = false;
             }
         }
-        if (target == 0) target = window_at_locked(g_window_server.pointer_x,
-                                                    g_window_server.pointer_y);
+
+        if (target == 0) {
+            target = window_at_locked(g_window_server.pointer_x,
+                                      g_window_server.pointer_y);
+        }
         window_mark_moved_cursor_locked(old_pointer_x, old_pointer_y,
                                         g_window_server.pointer_x,
                                         g_window_server.pointer_y);
     } else if (event->type == INPUT_EVENT_BUTTON) {
         target = window_at_locked(g_window_server.pointer_x,
                                   g_window_server.pointer_y);
+
         if (event->code == INPUT_BUTTON_LEFT &&
             event->value == INPUT_VALUE_PRESS && target != 0) {
+            uint32_t resize_edges;
             focus_locked(target);
-            if ((int64_t)g_window_server.pointer_y - target->y <
-                WINDOW_DRAG_REGION_HEIGHT) {
+            resize_edges = window_resize_edges_locked(
+                target, g_window_server.pointer_x, g_window_server.pointer_y);
+
+            if (resize_edges != 0U) {
+                g_window_server.dragging_identifier = target->identifier;
+                g_window_server.drag_offset_x = 0;
+                g_window_server.drag_offset_y = 0;
+                g_window_server.resize_edges = resize_edges;
+                deliver_input = false;
+            } else if ((int64_t)g_window_server.pointer_y - target->y <
+                       WINDOW_DRAG_REGION_HEIGHT) {
                 g_window_server.dragging_identifier = target->identifier;
                 g_window_server.drag_offset_x =
                     (int32_t)g_window_server.pointer_x - target->x;
                 g_window_server.drag_offset_y =
                     (int32_t)g_window_server.pointer_y - target->y;
+                g_window_server.resize_edges = 0U;
+                deliver_input = false;
             }
         } else if (event->code == INPUT_BUTTON_LEFT &&
                    event->value == INPUT_VALUE_RELEASE) {
+            if (g_window_server.dragging_identifier != 0U) {
+                target = find_window_locked(g_window_server.dragging_identifier);
+                deliver_input = false;
+            }
             g_window_server.dragging_identifier = 0U;
             g_window_server.drag_offset_x = 0;
             g_window_server.drag_offset_y = 0;
+            g_window_server.resize_edges = 0U;
         }
     } else if (event->type == INPUT_EVENT_KEY) {
         if (event->value != INPUT_VALUE_RELEASE && event->code == 0x2BU) {
@@ -1222,8 +1480,10 @@ static void route_input_locked(const input_event_t *event) {
                 }
                 for (uint32_t offset = 1U; offset <= g_window_server.count; ++offset) {
                     uint32_t index = (position + offset) % g_window_server.count;
-                    window_server_window_t *candidate = g_window_server.windows[index];
-                    if (candidate != 0 && (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+                    window_server_window_t *candidate =
+                        g_window_server.windows[index];
+                    if (candidate != 0 &&
+                        (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
                         focus_locked(candidate);
                         break;
                     }
@@ -1232,11 +1492,14 @@ static void route_input_locked(const input_event_t *event) {
         }
         target = keyboard_window_locked();
     }
+
     if (event->type == INPUT_EVENT_RELATIVE ||
         event->type == INPUT_EVENT_BUTTON) {
         window_coalesce_damage_locked();
     }
-    if (target != 0) window_enqueue_event_locked(target, event);
+    if (deliver_input && target != 0) {
+        window_enqueue_event_locked(target, event);
+    }
 }
 
 void window_server_pump_input(void) {
