@@ -1715,19 +1715,6 @@ compositor_surface_cache_get(
 
     reference = view->reference;
 
-    /*
-     * Existing window section means the direct-page table remains valid.
-     * Avoid recomputing page_count on the normal path.
-     */
-    cache =
-        (compositor_surface_page_cache_t *)
-            reference->compositor_cache;
-
-    if (cache != 0 &&
-        cache->section == view->section) {
-        return cache;
-    }
-
     page_count64 =
         (view->buffer_size + PAGE_SIZE - 1U) >>
         PAGE_SHIFT;
@@ -1736,6 +1723,10 @@ compositor_surface_cache_get(
         page_count64 > UINT32_MAX) {
         return 0;
     }
+
+    cache =
+        (compositor_surface_page_cache_t *)
+            reference->compositor_cache;
 
     /*
      * The current implementation keeps a stable section for a window.
@@ -1794,14 +1785,13 @@ compositor_surface_cache_get(
  *
  * No VM lock, no backing-page list traversal.
  */
-static inline kstatus_t compositor_surface_page_direct(
+static kstatus_t compositor_surface_page_direct(
     const compositor_window_view_t *view,
     vm_object_t *object,
     uint64_t offset,
     bool create,
     uint8_t **out) {
 
-    window_server_window_t *reference;
     compositor_surface_page_cache_t *cache;
     uint64_t page_index;
     uint8_t *base;
@@ -1816,30 +1806,10 @@ static inline kstatus_t compositor_surface_page_direct(
     page_index =
         offset >> PAGE_SHIFT;
 
-    reference =
-        view->reference;
-
-    /*
-     * Ultra-hot path.
-     *
-     * Once the per-window cache exists, do NOT call
-     * compositor_surface_cache_get() on every surface page.
-     *
-     * Normal repaint path becomes:
-     *
-     *     window
-     *       -> cache
-     *       -> pages[index]
-     *       -> direct address
-     */
     cache =
-        reference != 0 ?
-        (compositor_surface_page_cache_t *)
-            reference->compositor_cache :
-        0;
+        compositor_surface_cache_get(view);
 
     if (cache != 0 &&
-        cache->section == view->section &&
         page_index < cache->page_count) {
 
         base =
@@ -1849,34 +1819,11 @@ static inline kstatus_t compositor_surface_page_direct(
             *out = base;
             return K_OK;
         }
-    } else {
-        /*
-         * Slow initialization/stale-cache path.
-         *
-         * This normally runs only before the first positive page mapping for
-         * the window, or if a future implementation replaces its section.
-         */
-        cache =
-            compositor_surface_cache_get(view);
-
-        if (cache != 0 &&
-            page_index < cache->page_count) {
-
-            base =
-                cache->pages[page_index];
-
-            if (base != 0) {
-                *out = base;
-                return K_OK;
-            }
-        }
     }
 
     /*
-     * Cache miss.
-     *
-     * With create=false this is a pure lookup: the compositor still never
-     * allocates an untouched shared-surface page merely because it reads it.
+     * Current compositor path passes create=false, so reading an untouched
+     * surface page still does not allocate physical memory.
      */
     status =
         vm_object_shared_page_direct(
@@ -1890,15 +1837,11 @@ static inline kstatus_t compositor_surface_page_direct(
     }
 
     /*
-     * Positive mappings are stable for the lifetime of the shared section.
-     * Cache only successful mappings. A missing page remains NULL so Ring3
-     * can fault it in later and a subsequent compositor pass can discover it.
+     * Cache positive mappings only.
+     *
+     * A missing page must remain NULL so that a later Ring3 page fault can
+     * create it and a later compositor frame can discover it.
      */
-    if (cache == 0) {
-        cache =
-            compositor_surface_cache_get(view);
-    }
-
     if (cache != 0 &&
         page_index < cache->page_count &&
         *out != 0) {

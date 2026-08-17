@@ -93,14 +93,6 @@ typedef struct compositor_snapshot {
 
     uint32_t desktop_hovered_app;
 
-    /*
-     * Non-zero means this frame was produced while a window was being
-     * dragged/resized.  The compositor can still render old/new damage
-     * independently, but scanout publication must behave as one move
-     * transaction to avoid exposing half-updated window positions.
-     */
-    uint32_t dragging_identifier;
-
     uint32_t damage_count;
     window_damage_rect_t damage_rects[WINDOW_DAMAGE_MAX_RECTS];
 
@@ -284,12 +276,6 @@ bool window_server_kernel_ready(void) {
 static void window_object_destroy(void *raw_object) {
     window_server_window_t *window = (window_server_window_t *)raw_object;
     if (window == 0) return;
-
-    if (window->compositor_cache != 0) {
-        kfree(window->compositor_cache);
-        window->compositor_cache = 0;
-    }
-
     if (window->section != 0) {
         object_put(window->section);
         window->section = 0;
@@ -677,6 +663,40 @@ static void window_coalesce_damage_locked(void) {
     }
 }
 
+static void compositor_blend_pixel_locked(int32_t x, int32_t y,
+                                           uint32_t color, uint32_t alpha) {
+    volatile uint32_t *destination;
+    uint32_t current;
+    uint32_t inverse;
+    uint32_t red;
+    uint32_t green;
+    uint32_t blue;
+    if (!g_window_server.kernel_ready ||
+        g_window_server.composite_framebuffer == 0 || alpha == 0U ||
+        x < 0 || y < 0 || x >= (int32_t)g_window_server.display_width ||
+        y >= (int32_t)g_window_server.display_height ||
+        (uint32_t)x < g_compositor_snapshot.damage_left ||
+        (uint32_t)x >= g_compositor_snapshot.damage_right ||
+        (uint32_t)y < g_compositor_snapshot.damage_top ||
+        (uint32_t)y >= g_compositor_snapshot.damage_bottom) return;
+    destination = g_window_server.composite_framebuffer +
+        (uint64_t)(uint32_t)y * g_window_server.display_stride +
+        (uint32_t)x;
+    if (alpha >= 255U) {
+        *destination = color;
+        return;
+    }
+    current = *destination;
+    inverse = 255U - alpha;
+    red = ((((current >> 16) & 0xFFU) * inverse) +
+           (((color >> 16) & 0xFFU) * alpha) + 127U) / 255U;
+    green = ((((current >> 8) & 0xFFU) * inverse) +
+             (((color >> 8) & 0xFFU) * alpha) + 127U) / 255U;
+    blue = (((current & 0xFFU) * inverse) +
+            ((color & 0xFFU) * alpha) + 127U) / 255U;
+    *destination = (red << 16) | (green << 8) | blue;
+}
+
 /*
  * 圆角半径固定为 WINDOW_CORNER_RADIUS，因此不在合成热路径中计算平方和。
  * 每一项表示该扫描线从左、右各裁掉的像素数；下半部分反向索引即可。
@@ -694,67 +714,6 @@ static uint32_t compositor_corner_inset(uint32_t row, uint32_t width,
     if (row < WINDOW_CORNER_RADIUS) return g_window_corner_inset[row];
     return 0U;
 }
-
-
-/*
- * Fast solid-color fill into the normal WB composite framebuffer.
- *
- * Two XRGB8888 pixels are packed into one 64-bit value and REP STOSQ handles
- * the bulk span. No XMM/YMM/FPU state is touched.
- */
-static inline void compositor_fill_span_wb(
-    volatile uint32_t *destination,
-    uint32_t pixels,
-    uint32_t color) {
-
-    uint64_t pattern;
-    uint64_t qwords;
-    void *out;
-
-    if (destination == 0 || pixels == 0U) {
-        return;
-    }
-
-    /*
-     * Align the destination to 8 bytes first.
-     */
-    if ((((uintptr_t)destination) & 7U) != 0U) {
-        *destination++ = color;
-        --pixels;
-
-        if (pixels == 0U) {
-            return;
-        }
-    }
-
-    pattern =
-        (uint64_t)color |
-        ((uint64_t)color << 32U);
-
-    qwords = pixels >> 1U;
-
-    if (qwords != 0U) {
-        out = (void *)(uintptr_t)destination;
-
-        __asm__ volatile (
-            "rep stosq"
-            : "+D"(out),
-              "+c"(qwords)
-            : "a"(pattern)
-            : "memory");
-
-        destination =
-            (volatile uint32_t *)(uintptr_t)out;
-    }
-
-    /*
-     * Odd pixel tail.
-     */
-    if ((pixels & 1U) != 0U) {
-        *destination = color;
-    }
-}
-
 
 static void compositor_fill_rounded_locked(int32_t x, int32_t y,
                                            uint32_t width, uint32_t height,
@@ -805,16 +764,12 @@ static void compositor_fill_rounded_locked(int32_t x, int32_t y,
         if (span_left < left) span_left = left;
         if (span_right > right) span_right = right;
         if (span_left >= span_right) continue;
-        volatile uint32_t *destination =
-            g_window_server.composite_framebuffer +
-            (uint64_t)(uint32_t)row *
-                g_window_server.display_stride +
+        volatile uint32_t *destination = g_window_server.composite_framebuffer +
+            (uint64_t)(uint32_t)row * g_window_server.display_stride +
             (uint32_t)span_left;
-
-        compositor_fill_span_wb(
-            destination,
-            (uint32_t)(span_right - span_left),
-            color);
+        for (int64_t column = span_left; column < span_right; ++column) {
+            *destination++ = color;
+        }
     }
 }
 
@@ -1664,253 +1619,6 @@ static void compositor_fill_surface_pixels(
  * tail of one row and the beginning of the next does not need to be resolved
  * twice.
  */
-
-/*
- * Persistent direct-page table for a window surface.
- *
- * VM_OBJECT_SHARED pages do not move while their object remains alive.
- * The compositor snapshot holds a reference to the live window, therefore
- * positive direct mappings may safely be reused across compositor frames.
- *
- * Missing pages are NEVER cached.  If Ring3 faults a new page later, the next
- * compositor lookup will see an empty slot and resolve it normally.
- */
-typedef struct compositor_surface_page_cache {
-    shared_section_t *section;
-    uint32_t page_count;
-    uint32_t reserved;
-
-    /*
-     * Flexible array:
-     *
-     *     pages[page_index] -> kernel direct-map address
-     *
-     * NULL means "not resolved yet", not "page permanently absent".
-     */
-    uint8_t *pages[];
-} compositor_surface_page_cache_t;
-
-
-/*
- * Return/create the per-window direct-page table.
- *
- * Allocation failure is harmless: the compositor simply falls back to the
- * normal VM lookup path.
- */
-static compositor_surface_page_cache_t *
-compositor_surface_cache_get(
-    const compositor_window_view_t *view) {
-
-    window_server_window_t *reference;
-    compositor_surface_page_cache_t *cache;
-    uint64_t page_count64;
-    size_t bytes;
-
-    if (view == 0 ||
-        view->reference == 0 ||
-        view->section == 0 ||
-        view->buffer_size == 0U) {
-        return 0;
-    }
-
-    reference = view->reference;
-
-    /*
-     * Existing window section means the direct-page table remains valid.
-     * Avoid recomputing page_count on the normal path.
-     */
-    cache =
-        (compositor_surface_page_cache_t *)
-            reference->compositor_cache;
-
-    if (cache != 0 &&
-        cache->section == view->section) {
-        return cache;
-    }
-
-    page_count64 =
-        (view->buffer_size + PAGE_SIZE - 1U) >>
-        PAGE_SHIFT;
-
-    if (page_count64 == 0U ||
-        page_count64 > UINT32_MAX) {
-        return 0;
-    }
-
-    /*
-     * The current implementation keeps a stable section for a window.
-     * Still validate it here so a future section replacement cannot expose
-     * stale direct pointers.
-     */
-    if (cache != 0 &&
-        cache->section == view->section &&
-        cache->page_count == (uint32_t)page_count64) {
-        return cache;
-    }
-
-    if (cache != 0) {
-        reference->compositor_cache = 0;
-        kfree(cache);
-        cache = 0;
-    }
-
-    /*
-     * page_count is bounded to uint32_t and the kernel is 64-bit, so this
-     * multiplication is safely representable as size_t.
-     */
-    bytes =
-        sizeof(compositor_surface_page_cache_t) +
-        (size_t)page_count64 * sizeof(uint8_t *);
-
-    cache =
-        (compositor_surface_page_cache_t *)
-            kzalloc(bytes, 0);
-
-    if (cache == 0) {
-        return 0;
-    }
-
-    cache->section =
-        view->section;
-
-    cache->page_count =
-        (uint32_t)page_count64;
-
-    cache->reserved = 0U;
-
-    reference->compositor_cache =
-        cache;
-
-    return cache;
-}
-
-
-/*
- * Cached wrapper around vm_object_shared_page_direct().
- *
- * Fast hit:
- *
- *     page_index -> pointer array -> direct address
- *
- * No VM lock, no backing-page list traversal.
- */
-static inline kstatus_t compositor_surface_page_direct(
-    const compositor_window_view_t *view,
-    vm_object_t *object,
-    uint64_t offset,
-    bool create,
-    uint8_t **out) {
-
-    window_server_window_t *reference;
-    compositor_surface_page_cache_t *cache;
-    uint64_t page_index;
-    uint8_t *base;
-    kstatus_t status;
-
-    if (view == 0 ||
-        object == 0 ||
-        out == 0) {
-        return K_EINVAL;
-    }
-
-    page_index =
-        offset >> PAGE_SHIFT;
-
-    reference =
-        view->reference;
-
-    /*
-     * Ultra-hot path.
-     *
-     * Once the per-window cache exists, do NOT call
-     * compositor_surface_cache_get() on every surface page.
-     *
-     * Normal repaint path becomes:
-     *
-     *     window
-     *       -> cache
-     *       -> pages[index]
-     *       -> direct address
-     */
-    cache =
-        reference != 0 ?
-        (compositor_surface_page_cache_t *)
-            reference->compositor_cache :
-        0;
-
-    if (cache != 0 &&
-        cache->section == view->section &&
-        page_index < cache->page_count) {
-
-        base =
-            cache->pages[page_index];
-
-        if (base != 0) {
-            *out = base;
-            return K_OK;
-        }
-    } else {
-        /*
-         * Slow initialization/stale-cache path.
-         *
-         * This normally runs only before the first positive page mapping for
-         * the window, or if a future implementation replaces its section.
-         */
-        cache =
-            compositor_surface_cache_get(view);
-
-        if (cache != 0 &&
-            page_index < cache->page_count) {
-
-            base =
-                cache->pages[page_index];
-
-            if (base != 0) {
-                *out = base;
-                return K_OK;
-            }
-        }
-    }
-
-    /*
-     * Cache miss.
-     *
-     * With create=false this is a pure lookup: the compositor still never
-     * allocates an untouched shared-surface page merely because it reads it.
-     */
-    status =
-        vm_object_shared_page_direct(
-            object,
-            offset,
-            create,
-            out);
-
-    if (status != K_OK) {
-        return status;
-    }
-
-    /*
-     * Positive mappings are stable for the lifetime of the shared section.
-     * Cache only successful mappings. A missing page remains NULL so Ring3
-     * can fault it in later and a subsequent compositor pass can discover it.
-     */
-    if (cache == 0) {
-        cache =
-            compositor_surface_cache_get(view);
-    }
-
-    if (cache != 0 &&
-        page_index < cache->page_count &&
-        *out != 0) {
-
-        cache->pages[page_index] =
-            *out;
-    }
-
-    return K_OK;
-}
-
-
 static void compositor_copy_surface_span(
     const compositor_window_view_t *window,
     uint32_t row,
@@ -2056,7 +1764,7 @@ static void compositor_copy_surface_span(
         if (*cached_page != page) {
             uint8_t *base = 0;
 
-            if (compositor_surface_page_direct(window,
+            if (vm_object_shared_page_direct(
                     object,
                     page,
                     true,
@@ -2315,315 +2023,21 @@ static const uint32_t g_linux_cursor_argb[WINDOW_CURSOR_WIDTH * WINDOW_CURSOR_HE
 };
 
 static void compositor_cursor_locked(void) {
-    int64_t origin_x;
-    int64_t origin_y;
-
-    int64_t cursor_clip_left;
-    int64_t cursor_clip_top;
-    int64_t cursor_clip_right;
-    int64_t cursor_clip_bottom;
-
-    if (g_window_server.composite_framebuffer == 0 ||
-        g_window_server.display_width == 0U ||
-        g_window_server.display_height == 0U) {
-        return;
-    }
-
-    origin_x =
-        (int64_t)g_compositor_snapshot.pointer_x -
-        WINDOW_CURSOR_HOTSPOT_X;
-
-    origin_y =
-        (int64_t)g_compositor_snapshot.pointer_y -
-        WINDOW_CURSOR_HOTSPOT_Y;
-
-    /*
-     * Clip once:
-     *
-     *     cursor rectangle
-     *       ∩ screen
-     *       ∩ current damage
-     *
-     * The old implementation visited all 24x24 source pixels and repeated
-     * these bounds checks inside compositor_blend_pixel_locked().
-     */
-    cursor_clip_left = origin_x;
-    cursor_clip_top = origin_y;
-
-    cursor_clip_right =
-        origin_x + WINDOW_CURSOR_WIDTH;
-
-    cursor_clip_bottom =
-        origin_y + WINDOW_CURSOR_HEIGHT;
-
-    if (cursor_clip_left < 0) {
-        cursor_clip_left = 0;
-    }
-
-    if (cursor_clip_top < 0) {
-        cursor_clip_top = 0;
-    }
-
-    if (cursor_clip_right >
-        (int64_t)g_window_server.display_width) {
-        cursor_clip_right =
-            g_window_server.display_width;
-    }
-
-    if (cursor_clip_bottom >
-        (int64_t)g_window_server.display_height) {
-        cursor_clip_bottom =
-            g_window_server.display_height;
-    }
-
-    if (cursor_clip_left <
-        (int64_t)g_compositor_snapshot.damage_left) {
-        cursor_clip_left =
-            g_compositor_snapshot.damage_left;
-    }
-
-    if (cursor_clip_top <
-        (int64_t)g_compositor_snapshot.damage_top) {
-        cursor_clip_top =
-            g_compositor_snapshot.damage_top;
-    }
-
-    if (cursor_clip_right >
-        (int64_t)g_compositor_snapshot.damage_right) {
-        cursor_clip_right =
-            g_compositor_snapshot.damage_right;
-    }
-
-    if (cursor_clip_bottom >
-        (int64_t)g_compositor_snapshot.damage_bottom) {
-        cursor_clip_bottom =
-            g_compositor_snapshot.damage_bottom;
-    }
-
-    if (cursor_clip_left >= cursor_clip_right ||
-        cursor_clip_top >= cursor_clip_bottom) {
-        return;
-    }
-
-    for (int64_t y = cursor_clip_top;
-         y < cursor_clip_bottom;
-         ++y) {
-
-        uint32_t source_row =
-            (uint32_t)(y - origin_y);
-
-        uint32_t source_column =
-            (uint32_t)(cursor_clip_left - origin_x);
-
-        volatile uint32_t *destination =
-            g_window_server.composite_framebuffer +
-            (uint64_t)y *
-                g_window_server.display_stride +
-            (uint32_t)cursor_clip_left;
-
-        const uint32_t *source =
-            &g_linux_cursor_argb[
-                source_row * WINDOW_CURSOR_WIDTH +
-                source_column];
-
-        uint32_t pixels =
-            (uint32_t)(
-                cursor_clip_right -
-                cursor_clip_left);
-
-        for (uint32_t column = 0U;
-             column < pixels;
-             ++column) {
-
-            uint32_t pixel =
-                source[column];
-
-            uint32_t alpha =
-                pixel >> 24;
-
-            if (alpha == 0U) {
-                ++destination;
-                continue;
-            }
-
-            uint32_t color =
-                pixel & 0x00FFFFFFU;
-
-            /*
-             * Most solid cursor pixels take this cheap path.
-             */
-            if (alpha >= 255U) {
-                *destination++ = color;
-                continue;
-            }
-
-            uint32_t current =
-                *destination;
-
-            uint32_t inverse =
-                255U - alpha;
-
-            uint32_t red =
-                ((((current >> 16) & 0xFFU) *
-                      inverse) +
-                 (((color >> 16) & 0xFFU) *
-                      alpha) +
-                 127U) /
-                255U;
-
-            uint32_t green =
-                ((((current >> 8) & 0xFFU) *
-                      inverse) +
-                 (((color >> 8) & 0xFFU) *
-                      alpha) +
-                 127U) /
-                255U;
-
-            uint32_t blue =
-                (((current & 0xFFU) *
-                      inverse) +
-                 ((color & 0xFFU) *
-                      alpha) +
-                 127U) /
-                255U;
-
-            *destination++ =
-                (red << 16) |
-                (green << 8) |
-                blue;
+    const int32_t origin_x = (int32_t)g_compositor_snapshot.pointer_x -
+                             (int32_t)WINDOW_CURSOR_HOTSPOT_X;
+    const int32_t origin_y = (int32_t)g_compositor_snapshot.pointer_y -
+                             (int32_t)WINDOW_CURSOR_HOTSPOT_Y;
+    for (uint32_t row = 0U; row < WINDOW_CURSOR_HEIGHT; ++row) {
+        for (uint32_t column = 0U; column < WINDOW_CURSOR_WIDTH; ++column) {
+            uint32_t pixel = g_linux_cursor_argb[
+                row * WINDOW_CURSOR_WIDTH + column];
+            uint32_t alpha = pixel >> 24;
+            if (alpha == 0U) continue;
+            compositor_blend_pixel_locked(
+                origin_x + (int32_t)column, origin_y + (int32_t)row,
+                pixel & 0x00FFFFFFU, alpha);
         }
     }
-}
-
-
-
-/*
- * Return true only when the COMPLETE current damage rectangle lies inside an
- * unquestionably opaque part of this window.
- *
- * Do not attempt precise rounded-corner subtraction here.  Instead remove
- * WINDOW_CORNER_RADIUS pixels from every side and use only the central
- * rectangle.  This is deliberately conservative:
- *
- *     +---------------- window ----------------+
- *     | rounded / uncertain edge               |
- *     |    +-------- guaranteed opaque -----+  |
- *     |    |                                |  |
- *     |    +--------------------------------+  |
- *     +-----------------------------------------+
- *
- * A false result only loses an optimization; it never affects correctness.
- */
-static bool compositor_window_fully_covers_damage(
-    const compositor_window_view_t *window) {
-
-    int64_t frame_left;
-    int64_t frame_top;
-    int64_t frame_right;
-    int64_t frame_bottom;
-
-    int64_t opaque_left;
-    int64_t opaque_top;
-    int64_t opaque_right;
-    int64_t opaque_bottom;
-
-    uint64_t frame_width;
-    uint64_t frame_height;
-
-    if (window == 0 ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return false;
-    }
-
-    frame_width =
-        (uint64_t)window->width +
-        WINDOW_FRAME_EXTRA;
-
-    frame_height =
-        (uint64_t)window->height +
-        WINDOW_FRAME_EXTRA;
-
-    /*
-     * Tiny windows do not have a useful conservative interior.
-     */
-    if (frame_width <=
-            WINDOW_CORNER_RADIUS * 2U ||
-        frame_height <=
-            WINDOW_CORNER_RADIUS * 2U) {
-        return false;
-    }
-
-    frame_left = window->x;
-    frame_top = window->y;
-
-    frame_right =
-        frame_left +
-        (int64_t)frame_width;
-
-    frame_bottom =
-        frame_top +
-        (int64_t)frame_height;
-
-    opaque_left =
-        frame_left +
-        WINDOW_CORNER_RADIUS;
-
-    opaque_top =
-        frame_top +
-        WINDOW_CORNER_RADIUS;
-
-    opaque_right =
-        frame_right -
-        WINDOW_CORNER_RADIUS;
-
-    opaque_bottom =
-        frame_bottom -
-        WINDOW_CORNER_RADIUS;
-
-    return
-        (int64_t)g_compositor_snapshot.damage_left >=
-            opaque_left &&
-
-        (int64_t)g_compositor_snapshot.damage_top >=
-            opaque_top &&
-
-        (int64_t)g_compositor_snapshot.damage_right <=
-            opaque_right &&
-
-        (int64_t)g_compositor_snapshot.damage_bottom <=
-            opaque_bottom;
-}
-
-
-/*
- * Find the highest Z-order window that completely hides everything below it
- * for the current damage rectangle.
- *
- * Windows in the snapshot are bottom -> top, so scan backwards.
- *
- * UINT32_MAX means the desktop is still required.
- */
-static uint32_t compositor_topmost_damage_cover(void) {
-
-    uint32_t count =
-        g_compositor_snapshot.window_count;
-
-    while (count != 0U) {
-        uint32_t index =
-            count - 1U;
-
-        const compositor_window_view_t *window =
-            &g_compositor_snapshot.windows[index];
-
-        if (compositor_window_fully_covers_damage(
-                window)) {
-            return index;
-        }
-
-        count = index;
-    }
-
-    return UINT32_MAX;
 }
 
 
@@ -2649,20 +2063,11 @@ static void compositor_region_locked(void) {
      * Desktop rendering is now also based on snapshot damage, pointer and
      * hover state.  It does not consume mutable scene state.
      */
-    uint32_t first_window =
-        compositor_topmost_damage_cover();
+    desktop_draw_wallpaper_locked();
 
-    if (first_window == UINT32_MAX) {
-        /*
-         * No window completely hides this damage; rebuild the desktop and
-         * compose from the bottom as usual.
-         */
-        desktop_draw_wallpaper_locked();
-        first_window = 0U;
-    }
-
-
-    for (uint32_t index = first_window; index < g_compositor_snapshot.window_count; ++index) {
+    for (uint32_t index = 0U;
+         index < g_compositor_snapshot.window_count;
+         ++index) {
 
         const compositor_window_view_t *window =
             &g_compositor_snapshot.windows[index];
@@ -2751,9 +2156,6 @@ static bool compositor_snapshot_begin_locked(void) {
 
     snapshot->desktop_hovered_app =
         g_window_server.desktop_hovered_app;
-
-    snapshot->dragging_identifier =
-        g_window_server.dragging_identifier;
 
     /*
      * Snapshot the current damage before clearing the producer side.
@@ -2976,143 +2378,64 @@ static void compositor_copy_wc_scanline(
 
 
 static void compositor_commit_snapshot(void) {
-    bool commit_as_move_transaction;
-
     if (g_window_server.framebuffer == 0 ||
         g_window_server.composite_framebuffer == 0 ||
         g_window_server.composite_framebuffer ==
-            g_window_server.framebuffer ||
-        g_compositor_snapshot.damage_count == 0U) {
+            g_window_server.framebuffer) {
         return;
     }
 
-    commit_as_move_transaction =
-        g_compositor_snapshot.dragging_identifier != 0U &&
-        g_compositor_snapshot.damage_count > 1U;
-
     /*
-     * Only GOP publication is non-preemptible.  All expensive scene
-     * composition has already completed in normal WB memory.
+     * Keep only the final GOP publication non-preemptible.
+     *
+     * The expensive desktop/window composition remains fully preemptible.
+     * This short section prevents a task switch from leaving scanout with
+     * only half of a window-move transaction visible.
      */
     sched_preempt_disable();
 
-    if (commit_as_move_transaction) {
-        uint32_t left =
-            g_window_server.display_width;
+    for (uint32_t region = 0U;
+         region < g_compositor_snapshot.damage_count;
+         ++region) {
 
-        uint32_t top =
-            g_window_server.display_height;
+        const window_damage_rect_t *rect =
+            &g_compositor_snapshot.damage_rects[region];
 
-        uint32_t right = 0U;
-        uint32_t bottom = 0U;
+        uint32_t left = rect->left;
+        uint32_t top = rect->top;
+        uint32_t right = rect->right;
+        uint32_t bottom = rect->bottom;
 
-        /*
-         * A window move usually contributes:
-         *
-         *   old window
-         *   new window
-         *   old cursor
-         *   new cursor
-         *
-         * They were rendered independently into the backbuffer for
-         * efficiency, but publishing them independently lets scanout observe
-         * the old area after it has been erased and before the new titlebar
-         * has arrived.  Publish their bounding transaction instead.
-         */
-        for (uint32_t region = 0U;
-             region < g_compositor_snapshot.damage_count;
-             ++region) {
-
-            const window_damage_rect_t *rect =
-                &g_compositor_snapshot.damage_rects[region];
-
-            if (rect->left < left) {
-                left = rect->left;
-            }
-
-            if (rect->top < top) {
-                top = rect->top;
-            }
-
-            if (rect->right > right) {
-                right = rect->right;
-            }
-
-            if (rect->bottom > bottom) {
-                bottom = rect->bottom;
-            }
+        if (left >= right || top >= bottom) {
+            continue;
         }
 
-        if (left < right && top < bottom) {
-            for (uint32_t row = top;
-                 row < bottom;
-                 ++row) {
+        for (uint32_t row = top;
+             row < bottom;
+             ++row) {
 
-                volatile uint32_t *destination =
-                    g_window_server.framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
+            volatile uint32_t *destination =
+                g_window_server.framebuffer +
+                (uint64_t)row *
+                    g_window_server.display_stride +
+                left;
 
-                const volatile uint32_t *source =
-                    g_window_server.composite_framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
+            const volatile uint32_t *source =
+                g_window_server.composite_framebuffer +
+                (uint64_t)row *
+                    g_window_server.display_stride +
+                left;
 
-                compositor_copy_wc_scanline(
-                    destination,
-                    source,
-                    right - left);
-            }
-        }
-    } else {
-        /*
-         * Ordinary unrelated damages remain separate.  This preserves the
-         * small-damage optimization for cursor movement, app updates, etc.
-         */
-        for (uint32_t region = 0U;
-             region < g_compositor_snapshot.damage_count;
-             ++region) {
-
-            const window_damage_rect_t *rect =
-                &g_compositor_snapshot.damage_rects[region];
-
-            uint32_t left = rect->left;
-            uint32_t top = rect->top;
-            uint32_t right = rect->right;
-            uint32_t bottom = rect->bottom;
-
-            if (left >= right || top >= bottom) {
-                continue;
-            }
-
-            for (uint32_t row = top;
-                 row < bottom;
-                 ++row) {
-
-                volatile uint32_t *destination =
-                    g_window_server.framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
-
-                const volatile uint32_t *source =
-                    g_window_server.composite_framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
-
-                compositor_copy_wc_scanline(
-                    destination,
-                    source,
-                    right - left);
-            }
+            compositor_copy_wc_scanline(
+                destination,
+                source,
+                right - left);
         }
     }
 
     /*
-     * Complete all WC stores before scanout may observe the transaction.
+     * GOP framebuffer is WC mapped. Publish all dirty rectangles as one
+     * ordered frame transaction.
      */
     __asm__ volatile (
         "sfence"
@@ -3346,7 +2669,6 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->background = background;
     window->buffer_size = bytes;
     window->owner_address = 0U;
-    window->compositor_cache = 0;
     window->dirty = true;
     window->resize_pending = false;
     window->event_read = 0U;

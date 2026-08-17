@@ -95,7 +95,7 @@ fi
 mkdir -p "$build_dir"
 qemu_args=(
     -machine q35
-    -m 256M
+    -m 4096M
     -cpu qemu64
     -smp "$cpu_count"
     -drive "if=pflash,format=raw,readonly=on,file=$firmware"

@@ -22,18 +22,6 @@ typedef struct anon_page_node {
 typedef struct {
     spinlock_t lock;
     anon_page_node_t *pages;
-
-    /*
-     * Sequential lookup cursor.
-     *
-     * The ordered page list remains the authoritative structure.
-     * VM_OBJECT_SHARED surface access normally walks page indexes in
-     * increasing order, so remember the last useful node and continue from
-     * there instead of restarting at pages every time.
-     *
-     * Protected by lock.
-     */
-    anon_page_node_t *lookup_hint;
 } anon_store_t;
 
 typedef struct {
@@ -476,163 +464,43 @@ static kstatus_t clone_anon_object(vm_object_t *source, vm_object_t **out) {
     return K_OK;
 }
 
-static kstatus_t anon_page_get(vm_object_t *object,
-                               uint64_t index,
-                               bool create,
+static kstatus_t anon_page_get(vm_object_t *object, uint64_t index, bool create,
                                page_t **out) {
-    anon_store_t *store;
-    anon_page_node_t *node;
-    anon_page_node_t *previous = 0;
-
-    if (object == 0 ||
-        out == 0 ||
-        (object->type != VM_OBJECT_ANON &&
-         object->type != VM_OBJECT_SHARED)) {
+    if (object == 0 || out == 0 ||
+        (object->type != VM_OBJECT_ANON && object->type != VM_OBJECT_SHARED)) {
         return K_EINVAL;
     }
-
-    store =
-        object->type == VM_OBJECT_ANON ?
-        (anon_store_t *)object->u.anon.anon_root :
-        (anon_store_t *)object->u.shared.shared_root;
-
-    if (store == 0) {
-        return K_EINVAL;
-    }
-
+    anon_store_t *store = object->type == VM_OBJECT_ANON ?
+                          (anon_store_t *)object->u.anon.anon_root :
+                          (anon_store_t *)object->u.shared.shared_root;
+    if (store == 0) return K_EINVAL;
     spin_lock_local(&store->lock);
-
-    /*
-     * Shared window surfaces are normally scanned in increasing page-index
-     * order.  If the previous lookup cursor is still behind this request,
-     * continue from there.
-     *
-     * Requests that move backwards simply fall back to the list head.
-     */
-    if (object->type == VM_OBJECT_SHARED &&
-        store->lookup_hint != 0 &&
-        store->lookup_hint->index <= index) {
-
-        previous = store->lookup_hint;
-
-        if (previous->index == index) {
-            *out = previous->page;
-
-            spin_unlock_local(
-                &store->lock);
-
-            return K_OK;
-        }
-
-        node = previous->next;
-    } else {
-        node = store->pages;
-    }
-
-    /*
-     * Ordered-list traversal.
-     *
-     * For sequential shared-surface access this normally advances zero or
-     * one node instead of walking from page zero again.
-     */
-    while (node != 0 &&
-           node->index < index) {
-
-        previous = node;
-        node = node->next;
-    }
-
-    if (node != 0 &&
-        node->index == index) {
-
-        if (object->type == VM_OBJECT_SHARED) {
-            store->lookup_hint = node;
-        }
-
-        *out = node->page;
-
-        spin_unlock_local(
-            &store->lock);
-
+    anon_page_node_t **link = &store->pages;
+    while (*link != 0 && (*link)->index < index) link = &(*link)->next;
+    if (*link != 0 && (*link)->index == index) {
+        *out = (*link)->page;
+        spin_unlock_local(&store->lock);
         return K_OK;
     }
-
-    /*
-     * Missing shared pages are important too.  Keep the predecessor as the
-     * cursor so the next increasing lookup does not repeat this traversal.
-     */
-    if (object->type == VM_OBJECT_SHARED &&
-        previous != 0) {
-
-        store->lookup_hint = previous;
-    }
-
     if (!create) {
-        spin_unlock_local(
-            &store->lock);
-
+        spin_unlock_local(&store->lock);
         return K_ENOENT;
     }
-
-    page_t *page =
-        page_alloc(
-            0,
-            PAGE_ALLOC_ZERO);
-
-    anon_page_node_t *new_node =
-        (anon_page_node_t *)
-            kmalloc(
-                sizeof(*new_node),
-                0);
-
-    if (page == 0 ||
-        new_node == 0) {
-
-        if (page != 0) {
-            page_free(page);
-        }
-
-        kfree(new_node);
-
-        spin_unlock_local(
-            &store->lock);
-
+    page_t *page = page_alloc(0, PAGE_ALLOC_ZERO);
+    anon_page_node_t *node = (anon_page_node_t *)kmalloc(sizeof(*node), 0);
+    if (page == 0 || node == 0) {
+        if (page != 0) page_free(page);
+        kfree(node);
+        spin_unlock_local(&store->lock);
         return K_ENOMEM;
     }
-
-    page->owner =
-        PAGE_OWNER_ANON;
-
-    new_node->index = index;
-    new_node->page = page;
-
-    /*
-     * Preserve the original sorted-list invariant.
-     */
-    if (previous != 0) {
-        new_node->next =
-            previous->next;
-
-        previous->next =
-            new_node;
-    } else {
-        new_node->next =
-            store->pages;
-
-        store->pages =
-            new_node;
-    }
-
-    if (object->type == VM_OBJECT_SHARED) {
-        store->lookup_hint =
-            new_node;
-    }
-
+    page->owner = PAGE_OWNER_ANON;
+    node->index = index;
+    node->page = page;
+    node->next = *link;
+    *link = node;
     *out = page;
-
-    spin_unlock_local(
-        &store->lock);
-
+    spin_unlock_local(&store->lock);
     return K_OK;
 }
 

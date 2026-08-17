@@ -29,13 +29,6 @@ typedef struct window_server_window {
     uint32_t background;
     uint64_t buffer_size;
     uint64_t owner_address;
-
-    /*
-     * Ring0 compositor-private cache.
-     * The concrete structure lives in window_server.c.
-     */
-    void *compositor_cache;
-
     bool dirty;
     bool resize_pending;
     char title[32];
