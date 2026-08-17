@@ -50,8 +50,6 @@ typedef struct window_server_window {
      * width/height always remain client dimensions.
      */
     bool maximized;
-    bool minimized;
-
     int32_t restore_x;
     int32_t restore_y;
     uint32_t restore_width;

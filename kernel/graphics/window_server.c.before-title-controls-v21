@@ -15,22 +15,6 @@
 
 #define WINDOW_TITLEBAR_HEIGHT 30U
 
-/*
- * Flat modern Ring0 window controls.
- *
- * Buttons live completely inside the titlebar and stay clear of the
- * WINDOW_RESIZE_GRAB edge.
- */
-#define WINDOW_TITLE_BUTTON_SIZE          20U
-#define WINDOW_TITLE_BUTTON_GAP            4U
-#define WINDOW_TITLE_BUTTON_RIGHT_MARGIN   6U
-
-#define WINDOW_TITLE_CONTROLS_WIDTH \
-    (WINDOW_TITLE_BUTTON_RIGHT_MARGIN + \
-     WINDOW_TITLE_BUTTON_SIZE * 3U + \
-     WINDOW_TITLE_BUTTON_GAP * 2U)
-
-
 #define WINDOW_CLIENT_OFFSET_X     WINDOW_FRAME_BORDER
 
 #define WINDOW_CLIENT_OFFSET_Y     (WINDOW_FRAME_BORDER + WINDOW_TITLEBAR_HEIGHT)
@@ -75,15 +59,6 @@ enum {
     WINDOW_RESIZE_BOTTOM = 1U << 3,
 };
 
-
-enum {
-    WINDOW_TITLE_BUTTON_NONE = 0U,
-    WINDOW_TITLE_BUTTON_MINIMIZE = 1U,
-    WINDOW_TITLE_BUTTON_MAXIMIZE = 2U,
-    WINDOW_TITLE_BUTTON_CLOSE = 3U,
-};
-
-
 typedef struct window_damage_rect {
     uint32_t left;
     uint32_t top;
@@ -118,7 +93,6 @@ typedef struct compositor_window_view {
     char title[32];
 
     bool resize_pending;
-    bool maximized;
 } compositor_window_view_t;
 
 typedef struct compositor_snapshot {
@@ -192,16 +166,6 @@ static struct {
     int32_t drag_offset_x;
     int32_t drag_offset_y;
     uint32_t resize_edges;
-
-    /*
-     * Decoration-button capture.
-     *
-     * A control activates only if press and release occur on the same
-     * window/button pair.
-     */
-    uint32_t title_pressed_identifier;
-    uint32_t title_pressed_button;
-
     bool kernel_ready;
     bool dirty;
     bool composing;
@@ -230,7 +194,6 @@ static void window_mark_moved_rect_locked(int32_t old_x, int32_t old_y,
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
                                             uint32_t new_x, uint32_t new_y);
 static void window_coalesce_damage_locked(void);
-static void focus_locked(window_server_window_t *window);
 
 static void window_lock(void) {
     sched_preempt_disable();
@@ -274,9 +237,6 @@ bool window_server_init(void) {
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
         g_window_server.resize_edges = 0U;
-        g_window_server.title_pressed_identifier = 0U;
-        g_window_server.title_pressed_button =
-            WINDOW_TITLE_BUTTON_NONE;
         g_window_server.kernel_ready = false;
         g_window_server.dirty = false;
         g_window_server.composing = false;
@@ -376,22 +336,13 @@ static void remove_window_locked(window_server_window_t *window) {
             for (uint32_t j = g_window_server.count; j != 0U; --j) {
                 window_server_window_t *candidate =
                     g_window_server.windows[j - 1U];
-                if (!candidate->minimized &&
-                    (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+                if ((candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
                     g_window_server.focused_identifier = candidate->identifier;
                     new_focused = candidate;
                     break;
                 }
             }
         }
-        if (g_window_server.title_pressed_identifier ==
-            window->identifier) {
-
-            g_window_server.title_pressed_identifier = 0U;
-            g_window_server.title_pressed_button =
-                WINDOW_TITLE_BUTTON_NONE;
-        }
-
         if (g_window_server.dragging_identifier == window->identifier) {
             g_window_server.dragging_identifier = 0U;
             g_window_server.drag_offset_x = 0;
@@ -2087,125 +2038,6 @@ static const char *desktop_program_path(uint32_t app) {
     return 0;
 }
 
-
-static const char *desktop_app_window_title(
-    uint32_t app) {
-
-    if (app == DESKTOP_APP_FILES) {
-        return "FILEMAN";
-    }
-
-    if (app == DESKTOP_APP_TERMINAL) {
-        return "SHELL";
-    }
-
-    if (app == DESKTOP_APP_NOTES) {
-        return "NOTEPAD";
-    }
-
-    if (app == DESKTOP_APP_NETWORK) {
-        return "NETWORK";
-    }
-
-    return 0;
-}
-
-
-static bool window_title_matches(
-    const char *title,
-    const char *expected) {
-
-    uint32_t index = 0U;
-
-    if (title == 0 ||
-        expected == 0) {
-        return false;
-    }
-
-    while (index < 32U) {
-        if (title[index] != expected[index]) {
-            return false;
-        }
-
-        if (expected[index] == '\0') {
-            return true;
-        }
-
-        ++index;
-    }
-
-    return false;
-}
-
-
-/*
- * Dock activation first restores an existing minimized instance.
- *
- * Only if no minimized window for this desktop application exists does the
- * normal launcher create another process.
- */
-static bool desktop_restore_minimized_app(
-    uint32_t app) {
-
-    const char *expected =
-        desktop_app_window_title(app);
-
-    window_server_window_t *window = 0;
-
-    if (expected == 0) {
-        return false;
-    }
-
-    window_lock();
-
-    for (uint32_t index = g_window_server.count;
-         index != 0U;
-         --index) {
-
-        window_server_window_t *candidate =
-            g_window_server.windows[index - 1U];
-
-        if (candidate == 0 ||
-            !candidate->minimized ||
-            (candidate->flags &
-             OS_WINDOW_VISIBLE) == 0U ||
-            !window_title_matches(
-                candidate->title,
-                expected)) {
-
-            continue;
-        }
-
-        window = candidate;
-        break;
-    }
-
-    if (window == 0) {
-        window_unlock();
-        return false;
-    }
-
-    window->minimized = false;
-    window->dirty = true;
-
-    /*
-     * focus_locked() also raises it to the top of Z-order and damages both
-     * old/new focused decoration.
-     */
-    focus_locked(window);
-
-    window_mark_window_locked(
-        window);
-
-    window_unlock();
-
-    (void)wake_all(
-        &g_window_server.event_waitq);
-
-    return true;
-}
-
-
 static kstatus_t desktop_launch_program(uint32_t app) {
     const char *path = desktop_program_path(app);
     file_t *file = 0;
@@ -2277,11 +2109,7 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
         int64_t relative_x;
         int64_t relative_y;
         uint32_t inset;
-        if (window == 0 ||
-            window->minimized ||
-            (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-            continue;
-        }
+        if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) continue;
         relative_x = (int64_t)x - window->x;
         relative_y = (int64_t)y - window->y;
         if (relative_x < 0 || relative_y < 0 ||
@@ -2305,14 +2133,10 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
 static window_server_window_t *keyboard_window_locked(void) {
     window_server_window_t *window =
         find_window_locked(g_window_server.focused_identifier);
-    if (window != 0 &&
-        !window->minimized &&
-        (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
+    if (window != 0 && (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
     for (uint32_t index = g_window_server.count; index != 0U; --index) {
         window = g_window_server.windows[index - 1U];
-        if (window != 0 &&
-            !window->minimized &&
-            (window->flags & OS_WINDOW_VISIBLE) != 0U) {
+        if (window != 0 && (window->flags & OS_WINDOW_VISIBLE) != 0U) {
             g_window_server.focused_identifier = window->identifier;
             return window;
         }
@@ -2323,11 +2147,7 @@ static window_server_window_t *keyboard_window_locked(void) {
 static void focus_locked(window_server_window_t *window) {
     window_server_window_t *old_focused;
     uint32_t position = 0U;
-    if (window == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return;
-    }
+    if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) return;
     old_focused = find_window_locked(g_window_server.focused_identifier);
     for (; position < g_window_server.count; ++position) {
         if (g_window_server.windows[position] == window) break;
@@ -3524,347 +3344,6 @@ static uint32_t compositor_topmost_damage_cover(void) {
 
 
 
-
-/*
- * Return the screen-space rectangle of one titlebar button.
- *
- * slot from right:
- *
- *     close      = 0
- *     maximize   = 1
- *     minimize   = 2
- */
-static bool window_title_button_rect(
-    int32_t window_x,
-    int32_t window_y,
-    uint32_t window_width,
-    uint32_t button,
-    int32_t *out_x,
-    int32_t *out_y) {
-
-    uint32_t slot;
-    int64_t x;
-
-    if (out_x == 0 ||
-        out_y == 0 ||
-        window_width <
-            WINDOW_TITLE_CONTROLS_WIDTH) {
-        return false;
-    }
-
-    switch (button) {
-        case WINDOW_TITLE_BUTTON_CLOSE:
-            slot = 0U;
-            break;
-
-        case WINDOW_TITLE_BUTTON_MAXIMIZE:
-            slot = 1U;
-            break;
-
-        case WINDOW_TITLE_BUTTON_MINIMIZE:
-            slot = 2U;
-            break;
-
-        default:
-            return false;
-    }
-
-    x =
-        (int64_t)window_x +
-        WINDOW_FRAME_BORDER +
-        window_width -
-        WINDOW_TITLE_BUTTON_RIGHT_MARGIN -
-        WINDOW_TITLE_BUTTON_SIZE -
-        (uint64_t)slot *
-            (WINDOW_TITLE_BUTTON_SIZE +
-             WINDOW_TITLE_BUTTON_GAP);
-
-    if (x < -2147483648LL ||
-        x > 2147483647LL) {
-        return false;
-    }
-
-    *out_x =
-        (int32_t)x;
-
-    *out_y =
-        window_y +
-        (int32_t)WINDOW_FRAME_BORDER +
-        (int32_t)(
-            (WINDOW_TITLEBAR_HEIGHT -
-             WINDOW_TITLE_BUTTON_SIZE) /
-            2U);
-
-    return true;
-}
-
-
-/*
- * Ring0 decoration hit testing.
- *
- * A title-control hit is consumed by the window server and must never become
- * client input or start a titlebar drag.
- */
-static uint32_t window_title_button_at_locked(
-    const window_server_window_t *window,
-    uint32_t pointer_x,
-    uint32_t pointer_y) {
-
-    static const uint32_t buttons[] = {
-        WINDOW_TITLE_BUTTON_CLOSE,
-        WINDOW_TITLE_BUTTON_MAXIMIZE,
-        WINDOW_TITLE_BUTTON_MINIMIZE,
-    };
-
-    if (window == 0) {
-        return WINDOW_TITLE_BUTTON_NONE;
-    }
-
-    for (uint32_t index = 0U;
-         index <
-             sizeof(buttons) /
-             sizeof(buttons[0]);
-         ++index) {
-
-        int32_t x;
-        int32_t y;
-
-        if (!window_title_button_rect(
-                window->x,
-                window->y,
-                window->width,
-                buttons[index],
-                &x,
-                &y)) {
-            continue;
-        }
-
-        if ((int64_t)pointer_x >= x &&
-            (int64_t)pointer_y >= y &&
-            (int64_t)pointer_x <
-                (int64_t)x +
-                WINDOW_TITLE_BUTTON_SIZE &&
-            (int64_t)pointer_y <
-                (int64_t)y +
-                WINDOW_TITLE_BUTTON_SIZE) {
-
-            return buttons[index];
-        }
-    }
-
-    return WINDOW_TITLE_BUTTON_NONE;
-}
-
-
-/*
- * Flat controls: no shadow, no extra framebuffer and no alpha surface.
- */
-static void compositor_title_controls_locked(
-    const compositor_window_view_t *window) {
-
-    static const uint32_t buttons[] = {
-        WINDOW_TITLE_BUTTON_MINIMIZE,
-        WINDOW_TITLE_BUTTON_MAXIMIZE,
-        WINDOW_TITLE_BUTTON_CLOSE,
-    };
-
-    bool focused;
-
-    if (window == 0) {
-        return;
-    }
-
-    focused =
-        window->identifier ==
-        g_compositor_snapshot.focused_identifier;
-
-    for (uint32_t index = 0U;
-         index <
-             sizeof(buttons) /
-             sizeof(buttons[0]);
-         ++index) {
-
-        uint32_t button =
-            buttons[index];
-
-        int32_t x;
-        int32_t y;
-
-        uint32_t background;
-        uint32_t glyph;
-
-        if (!window_title_button_rect(
-                window->x,
-                window->y,
-                window->width,
-                button,
-                &x,
-                &y)) {
-            continue;
-        }
-
-        background =
-            focused ?
-                0x001E2A36U :
-                0x00182028U;
-
-        glyph =
-            focused ?
-                0x00B7C3D0U :
-                0x007F8B96U;
-
-        /*
-         * Keep close visually identifiable without a permanent bright-red
-         * Windows-style rectangle.
-         */
-        if (button ==
-            WINDOW_TITLE_BUTTON_CLOSE) {
-
-            background =
-                focused ?
-                    0x002C2228U :
-                    0x00241C20U;
-
-            glyph =
-                focused ?
-                    0x00E28A92U :
-                    0x009B6870U;
-        }
-
-        compositor_fill_rounded_locked(
-            x,
-            y,
-            WINDOW_TITLE_BUTTON_SIZE,
-            WINDOW_TITLE_BUTTON_SIZE,
-            WINDOW_CORNER_RADIUS,
-            background);
-
-        if (button ==
-            WINDOW_TITLE_BUTTON_MINIMIZE) {
-
-            compositor_fill_locked(
-                x + 6,
-                y + 11,
-                8U,
-                1U,
-                glyph);
-
-        } else if (
-            button ==
-            WINDOW_TITLE_BUTTON_MAXIMIZE) {
-
-            if (!window->maximized) {
-                /*
-                 * Normal maximize glyph.
-                 */
-                compositor_fill_locked(
-                    x + 6,
-                    y + 6,
-                    8U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 6,
-                    y + 13,
-                    8U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 6,
-                    y + 6,
-                    1U,
-                    8U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 13,
-                    y + 6,
-                    1U,
-                    8U,
-                    glyph);
-
-            } else {
-                /*
-                 * Restore glyph: two overlapping rectangles.
-                 */
-                compositor_fill_locked(
-                    x + 8,
-                    y + 6,
-                    7U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 14,
-                    y + 6,
-                    1U,
-                    7U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 7,
-                    y + 8,
-                    7U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 7,
-                    y + 8,
-                    1U,
-                    7U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 7,
-                    y + 14,
-                    7U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 13,
-                    y + 8,
-                    1U,
-                    7U,
-                    glyph);
-            }
-        } else if (
-            button ==
-            WINDOW_TITLE_BUTTON_CLOSE) {
-
-            /*
-             * Small X.
-             */
-            for (uint32_t step = 0U;
-                 step < 7U;
-                 ++step) {
-
-                compositor_fill_locked(
-                    x + 7 +
-                        (int32_t)step,
-                    y + 7 +
-                        (int32_t)step,
-                    1U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 13 -
-                        (int32_t)step,
-                    y + 7 +
-                        (int32_t)step,
-                    1U,
-                    1U,
-                    glyph);
-            }
-        }
-    }
-}
-
-
 static void compositor_titlebar_locked(
     const compositor_window_view_t *window,
     uint32_t frame_color) {
@@ -3974,22 +3453,15 @@ static void compositor_titlebar_locked(
         1U,
         separator_color);
 
-    compositor_title_controls_locked(
-        window);
-
     /*
      * Window title using the existing 8x16 kernel font.
-     * Keep it out of the control-button area.
      */
-    if (window->width <=
-        WINDOW_TITLE_CONTROLS_WIDTH + 24U) {
+    if (window->width <= 24U) {
         return;
     }
 
     max_chars =
-        (window->width -
-         WINDOW_TITLE_CONTROLS_WIDTH -
-         24U) /
+        (window->width - 24U) /
         8U;
 
     if (max_chars > 31U) {
@@ -4185,7 +3657,6 @@ static bool compositor_snapshot_begin_locked(void) {
         compositor_window_view_t *view;
 
         if (window == 0 ||
-            window->minimized ||
             (window->flags & OS_WINDOW_VISIBLE) == 0U) {
             continue;
         }
@@ -4230,9 +3701,6 @@ static bool compositor_snapshot_begin_locked(void) {
 
         view->resize_pending =
             window->resize_pending;
-
-        view->maximized =
-            window->maximized;
 
         for (uint32_t title_index = 0U;
              title_index <
@@ -4700,60 +4168,6 @@ static void compositor_snapshot_finish(void) {
     window_unlock();
 }
 
-
-static int32_t window_pointer_clamp_i32(
-    int64_t value) {
-
-    if (value < -2147483648LL) {
-        return (-2147483647 - 1);
-    }
-
-    if (value > 2147483647LL) {
-        return 2147483647;
-    }
-
-    return (int32_t)value;
-}
-
-
-/*
- * Convert the global Ring0 pointer position into the coordinate system used
- * by the application's client surface.
- *
- * The titlebar and outer border are not part of Ring3 coordinates.
- */
-static void window_event_set_pointer_locked(
-    const window_server_window_t *window,
-    os_window_event_t *event) {
-
-    int64_t local_x;
-    int64_t local_y;
-
-    if (window == 0 ||
-        event == 0) {
-        return;
-    }
-
-    local_x =
-        (int64_t)g_window_server.pointer_x -
-        (int64_t)window->x -
-        (int64_t)WINDOW_CLIENT_OFFSET_X;
-
-    local_y =
-        (int64_t)g_window_server.pointer_y -
-        (int64_t)window->y -
-        (int64_t)WINDOW_CLIENT_OFFSET_Y;
-
-    event->pointer_x =
-        window_pointer_clamp_i32(
-            local_x);
-
-    event->pointer_y =
-        window_pointer_clamp_i32(
-            local_y);
-}
-
-
 static void window_enqueue_event_locked(window_server_window_t *window,
                                          const input_event_t *event) {
     if (window == 0 || event == 0) return;
@@ -4769,91 +4183,9 @@ static void window_enqueue_event_locked(window_server_window_t *window,
     window->events[window->event_write].input.flags = event->flags;
     window->events[window->event_write].input.code = event->code;
     window->events[window->event_write].input.value = event->value;
-
-    window_event_set_pointer_locked(
-        window,
-        &window->events[
-            window->event_write]);
-
-window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
+    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
     ++window->event_count;
 }
-
-
-/*
- * Queue one cooperative window-close request.
- *
- * No handle is closed and no process is terminated here. Ring3 remains the
- * owner of normal shutdown policy.
- */
-static void window_enqueue_close_request_locked(
-    window_server_window_t *window) {
-
-    os_window_event_t *queued;
-
-    if (window == 0) {
-        return;
-    }
-
-    /*
-     * A close request is level-like from the application's point of view.
-     * Avoid filling the fixed event queue with repeated close clicks while
-     * the first request is still pending.
-     */
-    for (uint32_t offset = 0U;
-         offset < window->event_count;
-         ++offset) {
-
-        uint32_t slot =
-            (window->event_read + offset) %
-            WINDOW_EVENT_CAPACITY;
-
-        queued =
-            &window->events[slot];
-
-        if (queued->identifier ==
-                window->identifier &&
-            queued->type ==
-                OS_WINDOW_EVENT_CLOSE_REQUEST) {
-
-            return;
-        }
-    }
-
-    if (window->event_count >=
-        WINDOW_EVENT_CAPACITY) {
-
-        window->event_read =
-            (window->event_read + 1U) %
-            WINDOW_EVENT_CAPACITY;
-
-        --window->event_count;
-    }
-
-    queued =
-        &window->events[
-            window->event_write];
-
-    /*
-     * Clear the complete slot so the unused union payload never exposes
-     * stale bytes from a previous INPUT/RESIZE event.
-     */
-    *queued =
-        (os_window_event_t){0};
-
-    queued->identifier =
-        window->identifier;
-
-    queued->type =
-        OS_WINDOW_EVENT_CLOSE_REQUEST;
-
-    window->event_write =
-        (window->event_write + 1U) %
-        WINDOW_EVENT_CAPACITY;
-
-    ++window->event_count;
-}
-
 
 static void window_enqueue_resize_event_locked(window_server_window_t *window) {
     os_window_event_t *queued;
@@ -4972,12 +4304,6 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->compositor_cache = 0;
     window->dirty = true;
     window->resize_pending = false;
-    window->maximized = false;
-    window->minimized = false;
-    window->restore_x = x;
-    window->restore_y = y;
-    window->restore_width = width;
-    window->restore_height = height;
     window->event_read = 0U;
     window->event_write = 0U;
     window->event_count = 0U;
@@ -5249,242 +4575,6 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
     return K_OK;
 }
 
-
-/*
- * Toggle a resizable window between normal and maximized geometry.
- *
- * width/height are always CLIENT dimensions. Decoration dimensions are
- * subtracted from the available work area before producing the resize event.
- */
-
-/*
- * Hide a window without destroying its object, surface or client geometry.
- */
-static bool window_minimize_locked(
-    window_server_window_t *window) {
-
-    window_server_window_t *new_focused = 0;
-
-    if (window == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return false;
-    }
-
-    /*
-     * Erase the currently visible geometry.
-     */
-    window_mark_window_locked(
-        window);
-
-    window->minimized = true;
-    window->dirty = true;
-
-    /*
-     * Cancel all decoration capture owned by this window.
-     */
-    if (g_window_server.dragging_identifier ==
-        window->identifier) {
-
-        g_window_server.dragging_identifier = 0U;
-        g_window_server.drag_offset_x = 0;
-        g_window_server.drag_offset_y = 0;
-        g_window_server.resize_edges = 0U;
-    }
-
-    if (g_window_server.title_pressed_identifier ==
-        window->identifier) {
-
-        g_window_server.title_pressed_identifier = 0U;
-        g_window_server.title_pressed_button =
-            WINDOW_TITLE_BUTTON_NONE;
-    }
-
-    /*
-     * Transfer focus to the topmost remaining normal window.
-     */
-    if (g_window_server.focused_identifier ==
-        window->identifier) {
-
-        g_window_server.focused_identifier = 0U;
-
-        for (uint32_t index = g_window_server.count;
-             index != 0U;
-             --index) {
-
-            window_server_window_t *candidate =
-                g_window_server.windows[index - 1U];
-
-            if (candidate == 0 ||
-                candidate == window ||
-                candidate->minimized ||
-                (candidate->flags &
-                 OS_WINDOW_VISIBLE) == 0U) {
-                continue;
-            }
-
-            new_focused = candidate;
-            g_window_server.focused_identifier =
-                candidate->identifier;
-
-            break;
-        }
-    }
-
-    if (new_focused != 0) {
-        window_mark_window_locked(
-            new_focused);
-    }
-
-    return true;
-}
-
-
-static bool window_toggle_maximize_locked(
-    window_server_window_t *window) {
-
-    int32_t new_x;
-    int32_t new_y;
-
-    uint32_t new_width;
-    uint32_t new_height;
-
-    uint32_t available_height;
-
-    if (window == 0 ||
-        (window->flags &
-         OS_WINDOW_RESIZABLE) == 0U ||
-        g_window_server.display_width <=
-            WINDOW_FRAME_EXTRA ||
-        g_window_server.display_height <=
-            DESKTOP_TOPBAR_HEIGHT +
-            WINDOW_TITLEBAR_HEIGHT +
-            WINDOW_FRAME_EXTRA) {
-
-        return false;
-    }
-
-    /*
-     * Damage old geometry before mutating it.
-     */
-    window_mark_window_locked(
-        window);
-
-    if (!window->maximized) {
-        /*
-         * Preserve the exact normal client geometry.
-         */
-        window->restore_x =
-            window->x;
-
-        window->restore_y =
-            window->y;
-
-        window->restore_width =
-            window->width;
-
-        window->restore_height =
-            window->height;
-
-        new_x = 0;
-        new_y =
-            (int32_t)
-                DESKTOP_TOPBAR_HEIGHT;
-
-        new_width =
-            g_window_server.display_width -
-            WINDOW_FRAME_EXTRA;
-
-        available_height =
-            g_window_server.display_height -
-            DESKTOP_TOPBAR_HEIGHT;
-
-        new_height =
-            available_height -
-            WINDOW_TITLEBAR_HEIGHT -
-            WINDOW_FRAME_EXTRA;
-
-        window->maximized =
-            true;
-
-    } else {
-        /*
-         * Restore the exact geometry captured on entry to maximized state.
-         */
-        new_x =
-            window->restore_x;
-
-        new_y =
-            window->restore_y;
-
-        new_width =
-            window->restore_width;
-
-        new_height =
-            window->restore_height;
-
-        if (new_width == 0U ||
-            new_height == 0U) {
-
-            return false;
-        }
-
-        window->maximized =
-            false;
-    }
-
-    window->x =
-        new_x;
-
-    window->y =
-        new_y;
-
-    window->width =
-        new_width;
-
-    window->height =
-        new_height;
-
-    window->dirty =
-        true;
-
-    /*
-     * Until Ring3 acknowledges the new stride/geometry with a full-surface
-     * update, compositor keeps the resize-safe path.
-     */
-    window->resize_pending =
-        true;
-
-    /*
-     * Maximizing while a decoration capture exists must not leave any stale
-     * drag/resize state behind.
-     */
-    if (g_window_server.dragging_identifier ==
-        window->identifier) {
-
-        g_window_server.dragging_identifier =
-            0U;
-
-        g_window_server.drag_offset_x =
-            0;
-
-        g_window_server.drag_offset_y =
-            0;
-
-        g_window_server.resize_edges =
-            0U;
-    }
-
-    window_mark_window_locked(
-        window);
-
-    window_enqueue_resize_event_locked(
-        window);
-
-    return true;
-}
-
-
 static uint32_t window_resize_edges_locked(const window_server_window_t *window,
                                            uint32_t x, uint32_t y) {
     int64_t relative_x;
@@ -5493,12 +4583,7 @@ static uint32_t window_resize_edges_locked(const window_server_window_t *window,
     int64_t outer_height;
     uint32_t edges = 0U;
 
-    if (window == 0 ||
-        window->maximized ||
-        (window->flags & OS_WINDOW_RESIZABLE) == 0U) {
-
-        return 0U;
-    }
+    if (window == 0 || (window->flags & OS_WINDOW_RESIZABLE) == 0U) return 0U;
 
     relative_x = (int64_t)x - window->x;
     relative_y = (int64_t)y - window->y;
@@ -5643,8 +4728,6 @@ static bool window_resize_locked(window_server_window_t *window,
 static void route_input_locked(const input_event_t *event) {
     window_server_window_t *target = 0;
     bool deliver_input = true;
-    uint32_t title_button =
-        WINDOW_TITLE_BUTTON_NONE;
 
     if (event == 0) return;
 
@@ -5758,96 +4841,6 @@ static void route_input_locked(const input_event_t *event) {
         target = window_at_locked(g_window_server.pointer_x,
                                   g_window_server.pointer_y);
 
-        if (target != 0) {
-            title_button =
-                window_title_button_at_locked(
-                    target,
-                    g_window_server.pointer_x,
-                    g_window_server.pointer_y);
-        }
-
-        /*
-         * Button semantics are connected in the next step.
-         *
-         * For now establish correct Ring0 ownership:
-         *   - never deliver title-control clicks to Ring3
-         *   - never start titlebar dragging from a control
-         *   - pressing a control still focuses its window
-         */
-        if (event->code ==
-                INPUT_BUTTON_LEFT &&
-            title_button !=
-                WINDOW_TITLE_BUTTON_NONE) {
-
-            deliver_input = false;
-
-            if (event->value ==
-                    INPUT_VALUE_PRESS &&
-                target != 0) {
-
-                /*
-                 * Decoration capture begins here.
-                 *
-                 * Merely pressing a control focuses the window but performs
-                 * no destructive action.
-                 */
-                focus_locked(target);
-
-                g_window_server.title_pressed_identifier =
-                    target->identifier;
-
-                g_window_server.title_pressed_button =
-                    title_button;
-
-            } else if (
-                event->value ==
-                    INPUT_VALUE_RELEASE) {
-
-                /*
-                 * Activate only if:
-                 *
-                 *   press window  == release window
-                 *   press button  == release button
-                 *
-                 * Dragging away before release therefore cancels the action.
-                 */
-                if (target != 0 &&
-                    g_window_server.title_pressed_identifier ==
-                        target->identifier &&
-                    g_window_server.title_pressed_button ==
-                        title_button) {
-
-                    if (title_button ==
-                        WINDOW_TITLE_BUTTON_CLOSE) {
-
-                        window_enqueue_close_request_locked(
-                            target);
-
-                    } else if (
-                        title_button ==
-                        WINDOW_TITLE_BUTTON_MAXIMIZE) {
-
-                        (void)window_toggle_maximize_locked(
-                            target);
-
-                    } else if (
-                        title_button ==
-                        WINDOW_TITLE_BUTTON_MINIMIZE) {
-
-                        (void)window_minimize_locked(
-                            target);
-                    }
-                }
-
-                g_window_server.title_pressed_identifier =
-                    0U;
-
-                g_window_server.title_pressed_button =
-                    WINDOW_TITLE_BUTTON_NONE;
-            }
-        }
-
-
         if (event->code == INPUT_BUTTON_LEFT &&
             event->value == INPUT_VALUE_PRESS && target == 0) {
             uint32_t app = desktop_app_at_locked(g_window_server.pointer_x,
@@ -5861,24 +4854,8 @@ static void route_input_locked(const input_event_t *event) {
             }
         }
 
-        if (event->code ==
-                INPUT_BUTTON_LEFT &&
-            event->value ==
-                INPUT_VALUE_PRESS &&
-            title_button ==
-                WINDOW_TITLE_BUTTON_NONE) {
-
-            g_window_server.title_pressed_identifier =
-                0U;
-
-            g_window_server.title_pressed_button =
-                WINDOW_TITLE_BUTTON_NONE;
-        }
-
         if (event->code == INPUT_BUTTON_LEFT &&
-            event->value == INPUT_VALUE_PRESS &&
-            target != 0 &&
-            title_button == WINDOW_TITLE_BUTTON_NONE) {
+            event->value == INPUT_VALUE_PRESS && target != 0) {
             uint32_t resize_edges;
             focus_locked(target);
             resize_edges = window_resize_edges_locked(
@@ -5890,11 +4867,8 @@ static void route_input_locked(const input_event_t *event) {
                 g_window_server.drag_offset_y = 0;
                 g_window_server.resize_edges = resize_edges;
                 deliver_input = false;
-            } else if (
-                !target->maximized &&
-                (int64_t)g_window_server.pointer_y -
-                    target->y <
-                    WINDOW_DRAG_REGION_HEIGHT) {
+            } else if ((int64_t)g_window_server.pointer_y - target->y <
+                       WINDOW_DRAG_REGION_HEIGHT) {
                 g_window_server.dragging_identifier = target->identifier;
                 g_window_server.drag_offset_x =
                     (int32_t)g_window_server.pointer_x - target->x;
@@ -5903,20 +4877,6 @@ static void route_input_locked(const input_event_t *event) {
                 g_window_server.resize_edges = 0U;
                 deliver_input = false;
             }
-        if (event->code ==
-                INPUT_BUTTON_LEFT &&
-            event->value ==
-                INPUT_VALUE_RELEASE &&
-            title_button ==
-                WINDOW_TITLE_BUTTON_NONE) {
-
-            g_window_server.title_pressed_identifier =
-                0U;
-
-            g_window_server.title_pressed_button =
-                WINDOW_TITLE_BUTTON_NONE;
-        }
-
         } else if (event->code == INPUT_BUTTON_LEFT &&
                    event->value == INPUT_VALUE_RELEASE) {
             if (g_window_server.dragging_identifier != 0U) {
@@ -6377,9 +5337,7 @@ void window_server_pump_input(void) {
         }
 
         if (app != DESKTOP_APP_NONE) {
-            if (!desktop_restore_minimized_app(app)) {
-                (void)desktop_launch_program(app);
-            }
+            (void)desktop_launch_program(app);
         }
     }
 

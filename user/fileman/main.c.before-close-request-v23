@@ -442,14 +442,6 @@ static void handle_event(const os_window_event_t *event) {
     uint64_t pixels;
 
     if (event == 0) return;
-
-    /* V2.3 cooperative close */
-    if (event->type ==
-        OS_WINDOW_EVENT_CLOSE_REQUEST) {
-
-        fileman_exit(0U);
-    }
-
     if (event->type == OS_WINDOW_EVENT_RESIZE) {
         if (event->resize.width == 0U || event->resize.height == 0U) return;
         pixels = (uint64_t)event->resize.width * event->resize.height;

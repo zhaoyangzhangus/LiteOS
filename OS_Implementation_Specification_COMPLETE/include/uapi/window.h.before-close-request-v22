@@ -83,16 +83,8 @@ typedef struct os_window_focus {
 
 enum os_window_event_type {
     /* INPUT remains zero so old zero-initialized event slots keep their meaning. */
-    OS_WINDOW_EVENT_INPUT         = 0u,
-    OS_WINDOW_EVENT_RESIZE        = 1u,
-
-    /*
-     * Ring0 decoration asks the owning application to close this window.
-     *
-     * This is a request, not forced destruction. The application may save
-     * state, reject/delay the close, or terminate normally.
-     */
-    OS_WINDOW_EVENT_CLOSE_REQUEST = 2u,
+    OS_WINDOW_EVENT_INPUT  = 0u,
+    OS_WINDOW_EVENT_RESIZE = 1u,
 };
 
 typedef struct os_window_resize_event {
@@ -109,15 +101,6 @@ typedef struct os_window_event {
         os_input_event_t input;
         os_window_resize_event_t resize;
     };
-
-    /*
-     * Pointer position relative to the Ring3 client surface.
-     *
-     * Valid for OS_WINDOW_EVENT_INPUT. Values may be negative while the
-     * pointer is over Ring0-owned decorations.
-     */
-    int32_t pointer_x;
-    int32_t pointer_y;
 } os_window_event_t;
 
 typedef struct os_window_event_read {

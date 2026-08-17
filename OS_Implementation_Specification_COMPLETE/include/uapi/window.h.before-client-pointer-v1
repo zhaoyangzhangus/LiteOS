@@ -109,15 +109,6 @@ typedef struct os_window_event {
         os_input_event_t input;
         os_window_resize_event_t resize;
     };
-
-    /*
-     * Pointer position relative to the Ring3 client surface.
-     *
-     * Valid for OS_WINDOW_EVENT_INPUT. Values may be negative while the
-     * pointer is over Ring0-owned decorations.
-     */
-    int32_t pointer_x;
-    int32_t pointer_y;
 } os_window_event_t;
 
 typedef struct os_window_event_read {

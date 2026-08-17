@@ -11,13 +11,8 @@
 #define WINDOW_RIGHT_ALL          0x00000003U
 #define WINDOW_EVENT_CAPACITY     64U
 #define WINDOW_SERVER_MAX_WINDOWS 64U
-/*
- * Ring0 titlebar occupies the complete window drag region:
- *
- *   1px outer border
- *   30px titlebar
- */
-#define WINDOW_DRAG_REGION_HEIGHT 31U
+/* 仅作为窗口移动的默认输入区域，内核不绘制标题栏。 */
+#define WINDOW_DRAG_REGION_HEIGHT 24U
 /* 固定圆角半径，合成器使用预计算的扫描线表。 */
 #define WINDOW_CORNER_RADIUS      6U
 
@@ -43,20 +38,6 @@ typedef struct window_server_window {
 
     bool dirty;
     bool resize_pending;
-
-    /*
-     * Ring0 window-state geometry.
-     *
-     * width/height always remain client dimensions.
-     */
-    bool maximized;
-    bool minimized;
-
-    int32_t restore_x;
-    int32_t restore_y;
-    uint32_t restore_width;
-    uint32_t restore_height;
-
     char title[32];
     os_window_event_t events[WINDOW_EVENT_CAPACITY];
     uint32_t event_read;

@@ -12,44 +12,17 @@
 #define WINDOW_DAMAGE_MAX_RECTS 16U
 #define WINDOW_FRAME_BORDER 1U
 #define WINDOW_FRAME_EXTRA (WINDOW_FRAME_BORDER * 2U)
-
-#define WINDOW_TITLEBAR_HEIGHT 30U
-
-/*
- * Flat modern Ring0 window controls.
- *
- * Buttons live completely inside the titlebar and stay clear of the
- * WINDOW_RESIZE_GRAB edge.
- */
-#define WINDOW_TITLE_BUTTON_SIZE          20U
-#define WINDOW_TITLE_BUTTON_GAP            4U
-#define WINDOW_TITLE_BUTTON_RIGHT_MARGIN   6U
-
-#define WINDOW_TITLE_CONTROLS_WIDTH \
-    (WINDOW_TITLE_BUTTON_RIGHT_MARGIN + \
-     WINDOW_TITLE_BUTTON_SIZE * 3U + \
-     WINDOW_TITLE_BUTTON_GAP * 2U)
-
-
-#define WINDOW_CLIENT_OFFSET_X     WINDOW_FRAME_BORDER
-
-#define WINDOW_CLIENT_OFFSET_Y     (WINDOW_FRAME_BORDER + WINDOW_TITLEBAR_HEIGHT)
-
 #define WINDOW_CURSOR_WIDTH 24U
 #define WINDOW_CURSOR_HEIGHT 24U
 #define WINDOW_CURSOR_HOTSPOT_X 3U
 #define WINDOW_CURSOR_HOTSPOT_Y 1U
 
 /* LiteOS desktop shell: wallpaper, icons and launcher. */
-#define DESKTOP_TOPBAR_HEIGHT        38U
-
-#define DESKTOP_DOCK_HEIGHT          84U
-#define DESKTOP_DOCK_BOTTOM          18U
-#define DESKTOP_DOCK_PADDING_X       16U
-#define DESKTOP_DOCK_ICON_GAP        8U
-
-#define DESKTOP_ICON_CELL_WIDTH      88U
-#define DESKTOP_ICON_CELL_HEIGHT     68U
+#define DESKTOP_TOPBAR_HEIGHT        34U
+#define DESKTOP_DOCK_HEIGHT          54U
+#define DESKTOP_DOCK_BOTTOM          12U
+#define DESKTOP_ICON_CELL_WIDTH      112U
+#define DESKTOP_ICON_CELL_HEIGHT     90U
 #define DESKTOP_ICON_START_X         24
 #define DESKTOP_ICON_START_Y         58
 #define DESKTOP_ICON_GAP_Y           12U
@@ -74,15 +47,6 @@ enum {
     WINDOW_RESIZE_TOP    = 1U << 2,
     WINDOW_RESIZE_BOTTOM = 1U << 3,
 };
-
-
-enum {
-    WINDOW_TITLE_BUTTON_NONE = 0U,
-    WINDOW_TITLE_BUTTON_MINIMIZE = 1U,
-    WINDOW_TITLE_BUTTON_MAXIMIZE = 2U,
-    WINDOW_TITLE_BUTTON_CLOSE = 3U,
-};
-
 
 typedef struct window_damage_rect {
     uint32_t left;
@@ -115,10 +79,7 @@ typedef struct compositor_window_view {
     uint64_t buffer_size;
     uint64_t owner_address;
 
-    char title[32];
-
     bool resize_pending;
-    bool maximized;
 } compositor_window_view_t;
 
 typedef struct compositor_snapshot {
@@ -192,16 +153,6 @@ static struct {
     int32_t drag_offset_x;
     int32_t drag_offset_y;
     uint32_t resize_edges;
-
-    /*
-     * Decoration-button capture.
-     *
-     * A control activates only if press and release occur on the same
-     * window/button pair.
-     */
-    uint32_t title_pressed_identifier;
-    uint32_t title_pressed_button;
-
     bool kernel_ready;
     bool dirty;
     bool composing;
@@ -230,7 +181,6 @@ static void window_mark_moved_rect_locked(int32_t old_x, int32_t old_y,
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
                                             uint32_t new_x, uint32_t new_y);
 static void window_coalesce_damage_locked(void);
-static void focus_locked(window_server_window_t *window);
 
 static void window_lock(void) {
     sched_preempt_disable();
@@ -274,9 +224,6 @@ bool window_server_init(void) {
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
         g_window_server.resize_edges = 0U;
-        g_window_server.title_pressed_identifier = 0U;
-        g_window_server.title_pressed_button =
-            WINDOW_TITLE_BUTTON_NONE;
         g_window_server.kernel_ready = false;
         g_window_server.dirty = false;
         g_window_server.composing = false;
@@ -376,22 +323,13 @@ static void remove_window_locked(window_server_window_t *window) {
             for (uint32_t j = g_window_server.count; j != 0U; --j) {
                 window_server_window_t *candidate =
                     g_window_server.windows[j - 1U];
-                if (!candidate->minimized &&
-                    (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+                if ((candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
                     g_window_server.focused_identifier = candidate->identifier;
                     new_focused = candidate;
                     break;
                 }
             }
         }
-        if (g_window_server.title_pressed_identifier ==
-            window->identifier) {
-
-            g_window_server.title_pressed_identifier = 0U;
-            g_window_server.title_pressed_button =
-                WINDOW_TITLE_BUTTON_NONE;
-        }
-
         if (g_window_server.dragging_identifier == window->identifier) {
             g_window_server.dragging_identifier = 0U;
             g_window_server.drag_offset_x = 0;
@@ -544,7 +482,7 @@ static void window_mark_window_locked(const window_server_window_t *window) {
     if (window == 0) return;
     window_mark_rect_locked(window->x, window->y,
                             window->width + WINDOW_FRAME_EXTRA,
-                            window->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT);
+                            window->height + WINDOW_FRAME_EXTRA);
 }
 
 static void window_mark_surface_locked(const window_server_window_t *window,
@@ -556,10 +494,7 @@ static void window_mark_surface_locked(const window_server_window_t *window,
     int64_t bottom;
     if (window == 0 || width == 0U || height == 0U) return;
     left = (int64_t)window->x + WINDOW_FRAME_BORDER + x;
-    top =
-        (int64_t)window->y +
-        WINDOW_CLIENT_OFFSET_Y +
-        y;
+    top = (int64_t)window->y + WINDOW_FRAME_BORDER + y;
     right = left + width;
     bottom = top + height;
     if (right <= 0 || bottom <= 0 ||
@@ -1059,88 +994,6 @@ static const desktop_icon_entry_t g_desktop_icons[] = {
       "Network" },
 };
 
-
-/*
- * Modern centered dock layout.
- *
- * g_desktop_icons keeps application metadata, while geometry is calculated
- * from the live display size. Hit testing, damage and rendering therefore
- * always use exactly the same rectangle.
- */
-static bool desktop_icon_layout_locked(
-    uint32_t index,
-    int32_t *out_x,
-    int32_t *out_y) {
-
-    const uint32_t icon_count =
-        (uint32_t)(
-            sizeof(g_desktop_icons) /
-            sizeof(g_desktop_icons[0]));
-
-    uint32_t content_width;
-    uint32_t dock_width;
-
-    int32_t dock_x;
-    int32_t dock_y;
-
-    if (index >= icon_count ||
-        out_x == 0 ||
-        out_y == 0 ||
-        icon_count == 0U) {
-        return false;
-    }
-
-    content_width =
-        icon_count *
-            DESKTOP_ICON_CELL_WIDTH +
-        (icon_count - 1U) *
-            DESKTOP_DOCK_ICON_GAP;
-
-    dock_width =
-        content_width +
-        DESKTOP_DOCK_PADDING_X * 2U;
-
-    if (g_window_server.display_width <
-            dock_width + 16U ||
-        g_window_server.display_height <
-            DESKTOP_TOPBAR_HEIGHT +
-            DESKTOP_DOCK_HEIGHT +
-            DESKTOP_DOCK_BOTTOM +
-            32U) {
-        return false;
-    }
-
-    dock_x =
-        (int32_t)(
-            g_window_server.display_width -
-            dock_width) /
-        2;
-
-    dock_y =
-        (int32_t)
-            g_window_server.display_height -
-        (int32_t)DESKTOP_DOCK_HEIGHT -
-        (int32_t)DESKTOP_DOCK_BOTTOM;
-
-    *out_x =
-        dock_x +
-        (int32_t)DESKTOP_DOCK_PADDING_X +
-        (int32_t)(
-            index *
-            (DESKTOP_ICON_CELL_WIDTH +
-             DESKTOP_DOCK_ICON_GAP));
-
-    *out_y =
-        dock_y +
-        (int32_t)(
-            DESKTOP_DOCK_HEIGHT -
-            DESKTOP_ICON_CELL_HEIGHT) /
-        2;
-
-    return true;
-}
-
-
 static uint32_t desktop_text_length(const char *text) {
     uint32_t length = 0U;
     if (text == 0) return 0U;
@@ -1192,79 +1045,31 @@ static void desktop_draw_text_locked(int32_t x, int32_t y,
     }
 }
 
-static uint32_t desktop_app_at_locked(
-    uint32_t x,
-    uint32_t y) {
-
+static uint32_t desktop_app_at_locked(uint32_t x, uint32_t y) {
     for (uint32_t index = 0U;
-         index <
-             sizeof(g_desktop_icons) /
-             sizeof(g_desktop_icons[0]);
+         index < sizeof(g_desktop_icons) / sizeof(g_desktop_icons[0]);
          ++index) {
-
-        int32_t icon_x;
-        int32_t icon_y;
-
-        if (!desktop_icon_layout_locked(
-                index,
-                &icon_x,
-                &icon_y)) {
-            continue;
-        }
-
-        if ((int64_t)x >= icon_x &&
-            (int64_t)y >= icon_y &&
-
-            (int64_t)x <
-                (int64_t)icon_x +
-                DESKTOP_ICON_CELL_WIDTH &&
-
-            (int64_t)y <
-                (int64_t)icon_y +
-                DESKTOP_ICON_CELL_HEIGHT) {
-
-            return
-                g_desktop_icons[index].app;
+        const desktop_icon_entry_t *icon = &g_desktop_icons[index];
+        int64_t right = (int64_t)icon->x + DESKTOP_ICON_CELL_WIDTH;
+        int64_t bottom = (int64_t)icon->y + DESKTOP_ICON_CELL_HEIGHT;
+        if ((int64_t)x >= icon->x && (int64_t)y >= icon->y &&
+            (int64_t)x < right && (int64_t)y < bottom) {
+            return icon->app;
         }
     }
-
     return DESKTOP_APP_NONE;
 }
 
-static void desktop_mark_app_locked(
-    uint32_t app) {
-
-    if (app == DESKTOP_APP_NONE) {
-        return;
-    }
-
+static void desktop_mark_app_locked(uint32_t app) {
+    if (app == DESKTOP_APP_NONE) return;
     for (uint32_t index = 0U;
-         index <
-             sizeof(g_desktop_icons) /
-             sizeof(g_desktop_icons[0]);
+         index < sizeof(g_desktop_icons) / sizeof(g_desktop_icons[0]);
          ++index) {
-
-        int32_t icon_x;
-        int32_t icon_y;
-
-        if (g_desktop_icons[index].app !=
-            app) {
-            continue;
-        }
-
-        if (!desktop_icon_layout_locked(
-                index,
-                &icon_x,
-                &icon_y)) {
-            return;
-        }
-
-        window_mark_rect_locked(
-            icon_x,
-            icon_y,
-            DESKTOP_ICON_CELL_WIDTH,
-            DESKTOP_ICON_CELL_HEIGHT);
-
+        const desktop_icon_entry_t *icon = &g_desktop_icons[index];
+        if (icon->app != app) continue;
+        window_mark_rect_locked(icon->x, icon->y,
+                                DESKTOP_ICON_CELL_WIDTH,
+                                DESKTOP_ICON_CELL_HEIGHT);
         return;
     }
 }
@@ -1317,427 +1122,110 @@ static void desktop_draw_network_icon_locked(int32_t x, int32_t y) {
                                    WINDOW_CORNER_RADIUS, 0x007FE0AEU);
 }
 
-static void desktop_draw_icon_locked(
-    uint32_t index,
-    const desktop_icon_entry_t *icon) {
-
+static void desktop_draw_icon_locked(const desktop_icon_entry_t *icon) {
     uint32_t text_width;
-
-    int32_t cell_x;
-    int32_t cell_y;
-
     int32_t image_x;
     int32_t image_y;
     int32_t text_x;
 
-    bool hovered;
+    if (icon == 0) return;
 
-    if (icon == 0 ||
-        !desktop_icon_layout_locked(
-            index,
-            &cell_x,
-            &cell_y)) {
-        return;
+    if (g_compositor_snapshot.desktop_hovered_app == icon->app) {
+        compositor_fill_rounded_locked(icon->x, icon->y,
+                                       DESKTOP_ICON_CELL_WIDTH,
+                                       DESKTOP_ICON_CELL_HEIGHT,
+                                       WINDOW_CORNER_RADIUS, 0x00213A52U);
+        compositor_fill_locked(icon->x + 8,
+                               icon->y + (int32_t)DESKTOP_ICON_CELL_HEIGHT - 2,
+                               DESKTOP_ICON_CELL_WIDTH - 16U, 1U,
+                               0x004C7794U);
     }
 
-    hovered =
-        g_compositor_snapshot.desktop_hovered_app ==
-        icon->app;
-
-    /*
-     * Modern launcher card.
-     *
-     * Static cache stores the normal state. On hover this card is simply
-     * painted over the cached icon and then the icon itself is redrawn.
-     */
-    if (hovered) {
-        compositor_fill_rounded_locked(
-            cell_x,
-            cell_y,
-            DESKTOP_ICON_CELL_WIDTH,
-            DESKTOP_ICON_CELL_HEIGHT,
-            WINDOW_CORNER_RADIUS,
-            0x00263A53U);
-
-        compositor_fill_rounded_locked(
-            cell_x + 1,
-            cell_y + 1,
-            DESKTOP_ICON_CELL_WIDTH - 2U,
-            DESKTOP_ICON_CELL_HEIGHT - 2U,
-            WINDOW_CORNER_RADIUS,
-            0x00203349U);
-
-        /*
-         * Accent indicator.
-         */
-        compositor_fill_rounded_locked(
-            cell_x +
-                (int32_t)
-                    (DESKTOP_ICON_CELL_WIDTH - 24U) /
-                    2,
-            cell_y + 2,
-            24U,
-            2U,
-            WINDOW_CORNER_RADIUS,
-            0x006EA8FEU);
-    }
-
-    image_x =
-        cell_x +
-        (int32_t)(
-            DESKTOP_ICON_CELL_WIDTH -
-            DESKTOP_ICON_IMAGE_WIDTH) /
-        2;
-
-    image_y =
-        cell_y + 3;
+    image_x = icon->x +
+              (int32_t)(DESKTOP_ICON_CELL_WIDTH - DESKTOP_ICON_IMAGE_WIDTH) / 2;
+    image_y = icon->y + 7;
 
     if (icon->app == DESKTOP_APP_FILES) {
-        desktop_draw_folder_icon_locked(
-            image_x,
-            image_y);
-
-    } else if (
-        icon->app ==
-        DESKTOP_APP_TERMINAL) {
-
-        desktop_draw_terminal_icon_locked(
-            image_x,
-            image_y);
-
-    } else if (
-        icon->app ==
-        DESKTOP_APP_NOTES) {
-
-        desktop_draw_notes_icon_locked(
-            image_x,
-            image_y);
-
-    } else if (
-        icon->app ==
-        DESKTOP_APP_NETWORK) {
-
-        desktop_draw_network_icon_locked(
-            image_x,
-            image_y);
+        desktop_draw_folder_icon_locked(image_x, image_y);
+    } else if (icon->app == DESKTOP_APP_TERMINAL) {
+        desktop_draw_terminal_icon_locked(image_x, image_y);
+    } else if (icon->app == DESKTOP_APP_NOTES) {
+        desktop_draw_notes_icon_locked(image_x, image_y);
+    } else if (icon->app == DESKTOP_APP_NETWORK) {
+        desktop_draw_network_icon_locked(image_x, image_y);
     }
 
-    text_width =
-        desktop_text_length(icon->label) *
-        8U;
-
-    text_x =
-        cell_x +
-        (int32_t)(
-            DESKTOP_ICON_CELL_WIDTH -
-            (text_width <
-                     DESKTOP_ICON_CELL_WIDTH ?
-                 text_width :
-                 DESKTOP_ICON_CELL_WIDTH)) /
-        2;
-
-    desktop_draw_text_locked(
-        text_x,
-        cell_y + 50,
-        icon->label,
-        hovered ?
-            0x00F5F8FCU :
-            0x00B7C5D6U);
+    text_width = desktop_text_length(icon->label) * 8U;
+    text_x = icon->x +
+             (int32_t)(DESKTOP_ICON_CELL_WIDTH -
+                       (text_width < DESKTOP_ICON_CELL_WIDTH ?
+                        text_width : DESKTOP_ICON_CELL_WIDTH)) / 2;
+    desktop_draw_text_locked(text_x, icon->y + 63, icon->label, 0x00E8F2F7U);
 }
 
 static void desktop_render_static_locked(void) {
-    uint32_t height =
-        g_window_server.display_height;
-
-    uint32_t width =
-        g_window_server.display_width;
-
-    uint32_t left =
-        g_compositor_snapshot.damage_left;
-
-    uint32_t right =
-        g_compositor_snapshot.damage_right;
-
-    uint32_t top =
-        g_compositor_snapshot.damage_top;
-
-    uint32_t bottom =
-        g_compositor_snapshot.damage_bottom;
-
-    const uint32_t icon_count =
-        (uint32_t)(
-            sizeof(g_desktop_icons) /
-            sizeof(g_desktop_icons[0]));
+    uint32_t height = g_window_server.display_height;
+    uint32_t width = g_window_server.display_width;
+    uint32_t left = g_compositor_snapshot.damage_left;
+    uint32_t right = g_compositor_snapshot.damage_right;
+    uint32_t top = g_compositor_snapshot.damage_top;
+    uint32_t bottom = g_compositor_snapshot.damage_bottom;
 
     if (g_window_server.composite_framebuffer == 0 ||
-        left >= right ||
-        top >= bottom) {
+        left >= right || top >= bottom) {
         return;
     }
 
-    /*
-     * Deep navy modern wallpaper.
-     *
-     * Keep it row-based so the allocation-failure fallback remains cheap.
-     */
-    for (uint32_t row = top;
-         row < bottom;
-         ++row) {
-
-        uint32_t t =
-            height > 1U ?
-            (uint32_t)(
-                ((uint64_t)row * 255U) /
-                (height - 1U)) :
-            0U;
-
-        uint32_t red =
-            6U +
-            (10U * t) /
-            255U;
-
-        uint32_t green =
-            13U +
-            (22U * t) /
-            255U;
-
-        uint32_t blue =
-            27U +
-            (31U * t) /
-            255U;
-
-        /*
-         * Slightly cooler lower third.
-         */
-        if (row >
-            (height * 2U) / 3U) {
-
-            blue += 4U;
-            green += 2U;
-        }
-
-        uint32_t color =
-            (red << 16) |
-            (green << 8) |
-            blue;
-
+    for (uint32_t row = top; row < bottom; ++row) {
+        uint32_t t = height > 1U ?
+            (uint32_t)(((uint64_t)row * 255U) / (height - 1U)) : 0U;
+        uint32_t red = 8U + (7U * t) / 255U;
+        uint32_t green = 20U + (23U * t) / 255U;
+        uint32_t blue = 36U + (31U * t) / 255U;
+        uint32_t color = (red << 16) | (green << 8) | blue;
         volatile uint32_t *destination =
             g_window_server.composite_framebuffer +
-            (uint64_t)row *
-                g_window_server.display_stride +
-            left;
-
-        compositor_fill_span_wb(
-            destination,
-            right - left,
-            color);
-    }
-
-    /*
-     * Subtle wallpaper accent bands.
-     */
-    if (width > 800U &&
-        height > 500U) {
-
-        compositor_fill_rounded_locked(
-            (int32_t)width - 620,
-            (int32_t)height / 3,
-            420U,
-            2U,
-            WINDOW_CORNER_RADIUS,
-            0x001C4666U);
-
-        compositor_fill_rounded_locked(
-            (int32_t)width - 540,
-            (int32_t)height / 3 + 24,
-            310U,
-            1U,
-            WINDOW_CORNER_RADIUS,
-            0x00215A78U);
-
-        compositor_fill_rounded_locked(
-            150,
-            (int32_t)height - 220,
-            280U,
-            1U,
-            WINDOW_CORNER_RADIUS,
-            0x001B4968U);
-    }
-
-    /*
-     * Top bar.
-     */
-    compositor_fill_locked(
-        0,
-        0,
-        width,
-        DESKTOP_TOPBAR_HEIGHT,
-        0x000A1220U);
-
-    compositor_fill_locked(
-        0,
-        (int32_t)DESKTOP_TOPBAR_HEIGHT - 1,
-        width,
-        1U,
-        0x00213247U);
-
-    /*
-     * LiteOS logo tile.
-     */
-    compositor_fill_rounded_locked(
-        14,
-        8,
-        24U,
-        22U,
-        WINDOW_CORNER_RADIUS,
-        0x006EA8FEU);
-
-    desktop_draw_text_locked(
-        22,
-        11,
-        "L",
-        0x00FFFFFFU);
-
-    desktop_draw_text_locked(
-        48,
-        11,
-        "LiteOS",
-        0x00F1F5F9U);
-
-    /*
-     * Center workspace pill.
-     */
-    if (width > 400U) {
-        int32_t workspace_x =
-            (int32_t)width / 2 -
-            56;
-
-        compositor_fill_rounded_locked(
-            workspace_x,
-            7,
-            112U,
-            24U,
-            WINDOW_CORNER_RADIUS,
-            0x00131F30U);
-
-        desktop_draw_text_locked(
-            workspace_x + 12,
-            11,
-            "Workspace 1",
-            0x00AFC0D2U);
-    }
-
-    /*
-     * Right-side healthy system indicator.
-     */
-    if (width > 220U) {
-        compositor_fill_rounded_locked(
-            (int32_t)width - 86,
-            15,
-            8U,
-            8U,
-            WINDOW_CORNER_RADIUS,
-            0x004ADE80U);
-
-        desktop_draw_text_locked(
-            (int32_t)width - 70,
-            11,
-            "Ready",
-            0x00AFC0D2U);
-    }
-
-    /*
-     * Floating glass-like dock.
-     *
-     * We do not require alpha blending here: layered solid surfaces provide a
-     * clean glass-panel appearance while keeping desktop caching extremely
-     * cheap.
-     */
-    if (icon_count != 0U) {
-        uint32_t content_width =
-            icon_count *
-                DESKTOP_ICON_CELL_WIDTH +
-            (icon_count - 1U) *
-                DESKTOP_DOCK_ICON_GAP;
-
-        uint32_t dock_width =
-            content_width +
-            DESKTOP_DOCK_PADDING_X * 2U;
-
-        if (width >= dock_width + 16U &&
-            height >
-                DESKTOP_DOCK_HEIGHT +
-                DESKTOP_DOCK_BOTTOM +
-                DESKTOP_TOPBAR_HEIGHT) {
-
-            int32_t dock_x =
-                (int32_t)(
-                    width -
-                    dock_width) /
-                2;
-
-            int32_t dock_y =
-                (int32_t)height -
-                (int32_t)DESKTOP_DOCK_HEIGHT -
-                (int32_t)DESKTOP_DOCK_BOTTOM;
-
-            /*
-             * Shadow.
-             */
-            compositor_fill_rounded_locked(
-                dock_x + 3,
-                dock_y + 5,
-                dock_width,
-                DESKTOP_DOCK_HEIGHT,
-                WINDOW_CORNER_RADIUS,
-                0x0004080FU);
-
-            /*
-             * Outer shell.
-             */
-            compositor_fill_rounded_locked(
-                dock_x,
-                dock_y,
-                dock_width,
-                DESKTOP_DOCK_HEIGHT,
-                WINDOW_CORNER_RADIUS,
-                0x00182738U);
-
-            /*
-             * Inner glass surface.
-             */
-            compositor_fill_rounded_locked(
-                dock_x + 1,
-                dock_y + 1,
-                dock_width - 2U,
-                DESKTOP_DOCK_HEIGHT - 2U,
-                WINDOW_CORNER_RADIUS,
-                0x00111D2CU);
-
-            /*
-             * Highlight along upper edge.
-             */
-            compositor_fill_locked(
-                dock_x + 14,
-                dock_y + 4,
-                dock_width - 28U,
-                1U,
-                0x002A4057U);
+            (uint64_t)row * g_window_server.display_stride + left;
+        for (uint32_t column = left; column < right; ++column) {
+            *destination++ = color;
         }
     }
 
-    /*
-     * App launchers.
-     */
-    for (uint32_t index = 0U;
-         index <
-             sizeof(g_desktop_icons) /
-             sizeof(g_desktop_icons[0]);
-         ++index) {
+    compositor_fill_locked(0, 0, width, DESKTOP_TOPBAR_HEIGHT, 0x00101C2BU);
+    compositor_fill_locked(0, (int32_t)DESKTOP_TOPBAR_HEIGHT - 1,
+                           width, 1U, 0x00294B63U);
+    desktop_draw_text_locked(18, 9, "LiteOS", 0x00EDF7FAU);
+    if (width > 150U) {
+        desktop_draw_text_locked((int32_t)width - 76, 9,
+                                 "Desktop", 0x009FB7C7U);
+    }
 
-        desktop_draw_icon_locked(
-            index,
-            &g_desktop_icons[index]);
+    if (height > DESKTOP_DOCK_HEIGHT + DESKTOP_DOCK_BOTTOM + 8U &&
+        width > 40U) {
+        uint32_t dock_width = width > 430U ? 430U : width - 24U;
+        int32_t dock_x = (int32_t)(width - dock_width) / 2;
+        int32_t dock_y = (int32_t)height -
+                         (int32_t)DESKTOP_DOCK_HEIGHT -
+                         (int32_t)DESKTOP_DOCK_BOTTOM;
+        uint32_t label_width =
+            desktop_text_length("Files  Terminal  Notes  Network") * 8U;
+        compositor_fill_rounded_locked(dock_x, dock_y, dock_width,
+                                       DESKTOP_DOCK_HEIGHT,
+                                       WINDOW_CORNER_RADIUS, 0x00132232U);
+        compositor_fill_locked(dock_x + 12, dock_y + 5,
+                               dock_width > 24U ? dock_width - 24U : 0U,
+                               1U, 0x002C4A61U);
+        desktop_draw_text_locked(
+            dock_x + (int32_t)(dock_width -
+                               (label_width < dock_width ?
+                                label_width : dock_width)) / 2,
+            dock_y + 20, "Files  Terminal  Notes  Network", 0x009EB9C8U);
+    }
+
+    for (uint32_t index = 0U;
+         index < sizeof(g_desktop_icons) / sizeof(g_desktop_icons[0]);
+         ++index) {
+        desktop_draw_icon_locked(&g_desktop_icons[index]);
     }
 }
 
@@ -2021,7 +1509,6 @@ static void desktop_draw_hover_locked(void) {
         }
 
         desktop_draw_icon_locked(
-            index,
             &g_desktop_icons[index]);
 
         return;
@@ -2086,125 +1573,6 @@ static const char *desktop_program_path(uint32_t app) {
     if (app == DESKTOP_APP_NETWORK) return "/sbin/netmgr";
     return 0;
 }
-
-
-static const char *desktop_app_window_title(
-    uint32_t app) {
-
-    if (app == DESKTOP_APP_FILES) {
-        return "FILEMAN";
-    }
-
-    if (app == DESKTOP_APP_TERMINAL) {
-        return "SHELL";
-    }
-
-    if (app == DESKTOP_APP_NOTES) {
-        return "NOTEPAD";
-    }
-
-    if (app == DESKTOP_APP_NETWORK) {
-        return "NETWORK";
-    }
-
-    return 0;
-}
-
-
-static bool window_title_matches(
-    const char *title,
-    const char *expected) {
-
-    uint32_t index = 0U;
-
-    if (title == 0 ||
-        expected == 0) {
-        return false;
-    }
-
-    while (index < 32U) {
-        if (title[index] != expected[index]) {
-            return false;
-        }
-
-        if (expected[index] == '\0') {
-            return true;
-        }
-
-        ++index;
-    }
-
-    return false;
-}
-
-
-/*
- * Dock activation first restores an existing minimized instance.
- *
- * Only if no minimized window for this desktop application exists does the
- * normal launcher create another process.
- */
-static bool desktop_restore_minimized_app(
-    uint32_t app) {
-
-    const char *expected =
-        desktop_app_window_title(app);
-
-    window_server_window_t *window = 0;
-
-    if (expected == 0) {
-        return false;
-    }
-
-    window_lock();
-
-    for (uint32_t index = g_window_server.count;
-         index != 0U;
-         --index) {
-
-        window_server_window_t *candidate =
-            g_window_server.windows[index - 1U];
-
-        if (candidate == 0 ||
-            !candidate->minimized ||
-            (candidate->flags &
-             OS_WINDOW_VISIBLE) == 0U ||
-            !window_title_matches(
-                candidate->title,
-                expected)) {
-
-            continue;
-        }
-
-        window = candidate;
-        break;
-    }
-
-    if (window == 0) {
-        window_unlock();
-        return false;
-    }
-
-    window->minimized = false;
-    window->dirty = true;
-
-    /*
-     * focus_locked() also raises it to the top of Z-order and damages both
-     * old/new focused decoration.
-     */
-    focus_locked(window);
-
-    window_mark_window_locked(
-        window);
-
-    window_unlock();
-
-    (void)wake_all(
-        &g_window_server.event_waitq);
-
-    return true;
-}
-
 
 static kstatus_t desktop_launch_program(uint32_t app) {
     const char *path = desktop_program_path(app);
@@ -2277,21 +1645,17 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
         int64_t relative_x;
         int64_t relative_y;
         uint32_t inset;
-        if (window == 0 ||
-            window->minimized ||
-            (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-            continue;
-        }
+        if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) continue;
         relative_x = (int64_t)x - window->x;
         relative_y = (int64_t)y - window->y;
         if (relative_x < 0 || relative_y < 0 ||
             relative_x >= (int64_t)window->width + WINDOW_FRAME_EXTRA ||
-            relative_y >= (int64_t)window->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT) {
+            relative_y >= (int64_t)window->height + WINDOW_FRAME_EXTRA) {
             continue;
         }
         inset = compositor_corner_inset(
             (uint32_t)relative_y, window->width + WINDOW_FRAME_EXTRA,
-            window->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT);
+            window->height + WINDOW_FRAME_EXTRA);
         if (relative_x >= (int64_t)inset &&
             relative_x < (int64_t)window->width + WINDOW_FRAME_EXTRA - inset) {
             return window;
@@ -2305,14 +1669,10 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
 static window_server_window_t *keyboard_window_locked(void) {
     window_server_window_t *window =
         find_window_locked(g_window_server.focused_identifier);
-    if (window != 0 &&
-        !window->minimized &&
-        (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
+    if (window != 0 && (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
     for (uint32_t index = g_window_server.count; index != 0U; --index) {
         window = g_window_server.windows[index - 1U];
-        if (window != 0 &&
-            !window->minimized &&
-            (window->flags & OS_WINDOW_VISIBLE) != 0U) {
+        if (window != 0 && (window->flags & OS_WINDOW_VISIBLE) != 0U) {
             g_window_server.focused_identifier = window->identifier;
             return window;
         }
@@ -2323,11 +1683,7 @@ static window_server_window_t *keyboard_window_locked(void) {
 static void focus_locked(window_server_window_t *window) {
     window_server_window_t *old_focused;
     uint32_t position = 0U;
-    if (window == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return;
-    }
+    if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) return;
     old_focused = find_window_locked(g_window_server.focused_identifier);
     for (; position < g_window_server.count; ++position) {
         if (g_window_server.windows[position] == window) break;
@@ -2962,7 +2318,7 @@ static void compositor_surface_locked(
 
     frame_height =
         (int64_t)window->height +
-        WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT;
+        WINDOW_FRAME_EXTRA;
 
     surface_x =
         (int64_t)window->x +
@@ -2970,7 +2326,7 @@ static void compositor_surface_locked(
 
     surface_y =
         (int64_t)window->y +
-        WINDOW_CLIENT_OFFSET_Y;
+        WINDOW_FRAME_BORDER;
 
     for (uint32_t row = 0U;
          row < window->height;
@@ -3119,7 +2475,7 @@ static bool compositor_window_intersects_damage_locked(
     left = window->x;
     top = window->y;
     right = left + (int64_t)window->width + WINDOW_FRAME_EXTRA;
-    bottom = top + (int64_t)window->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT;
+    bottom = top + (int64_t)window->height + WINDOW_FRAME_EXTRA;
     return left < (int64_t)g_compositor_snapshot.damage_right &&
            right > (int64_t)g_compositor_snapshot.damage_left &&
            top < (int64_t)g_compositor_snapshot.damage_bottom &&
@@ -3388,7 +2744,7 @@ static inline bool compositor_damage_inside_surface_interior(
 
     top =
         (int64_t)window->y +
-        WINDOW_CLIENT_OFFSET_Y +
+        WINDOW_FRAME_BORDER +
         WINDOW_CORNER_RADIUS;
 
     right =
@@ -3399,7 +2755,7 @@ static inline bool compositor_damage_inside_surface_interior(
 
     bottom =
         (int64_t)window->y +
-        WINDOW_CLIENT_OFFSET_Y +
+        WINDOW_FRAME_BORDER +
         (int64_t)window->height -
         WINDOW_CORNER_RADIUS;
 
@@ -3437,7 +2793,8 @@ static bool compositor_window_fully_covers_damage(
         WINDOW_FRAME_EXTRA;
 
     frame_height =
-        (uint64_t)window->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT;
+        (uint64_t)window->height +
+        WINDOW_FRAME_EXTRA;
 
     /*
      * Tiny windows do not have a useful conservative interior.
@@ -3523,504 +2880,6 @@ static uint32_t compositor_topmost_damage_cover(void) {
 }
 
 
-
-
-/*
- * Return the screen-space rectangle of one titlebar button.
- *
- * slot from right:
- *
- *     close      = 0
- *     maximize   = 1
- *     minimize   = 2
- */
-static bool window_title_button_rect(
-    int32_t window_x,
-    int32_t window_y,
-    uint32_t window_width,
-    uint32_t button,
-    int32_t *out_x,
-    int32_t *out_y) {
-
-    uint32_t slot;
-    int64_t x;
-
-    if (out_x == 0 ||
-        out_y == 0 ||
-        window_width <
-            WINDOW_TITLE_CONTROLS_WIDTH) {
-        return false;
-    }
-
-    switch (button) {
-        case WINDOW_TITLE_BUTTON_CLOSE:
-            slot = 0U;
-            break;
-
-        case WINDOW_TITLE_BUTTON_MAXIMIZE:
-            slot = 1U;
-            break;
-
-        case WINDOW_TITLE_BUTTON_MINIMIZE:
-            slot = 2U;
-            break;
-
-        default:
-            return false;
-    }
-
-    x =
-        (int64_t)window_x +
-        WINDOW_FRAME_BORDER +
-        window_width -
-        WINDOW_TITLE_BUTTON_RIGHT_MARGIN -
-        WINDOW_TITLE_BUTTON_SIZE -
-        (uint64_t)slot *
-            (WINDOW_TITLE_BUTTON_SIZE +
-             WINDOW_TITLE_BUTTON_GAP);
-
-    if (x < -2147483648LL ||
-        x > 2147483647LL) {
-        return false;
-    }
-
-    *out_x =
-        (int32_t)x;
-
-    *out_y =
-        window_y +
-        (int32_t)WINDOW_FRAME_BORDER +
-        (int32_t)(
-            (WINDOW_TITLEBAR_HEIGHT -
-             WINDOW_TITLE_BUTTON_SIZE) /
-            2U);
-
-    return true;
-}
-
-
-/*
- * Ring0 decoration hit testing.
- *
- * A title-control hit is consumed by the window server and must never become
- * client input or start a titlebar drag.
- */
-static uint32_t window_title_button_at_locked(
-    const window_server_window_t *window,
-    uint32_t pointer_x,
-    uint32_t pointer_y) {
-
-    static const uint32_t buttons[] = {
-        WINDOW_TITLE_BUTTON_CLOSE,
-        WINDOW_TITLE_BUTTON_MAXIMIZE,
-        WINDOW_TITLE_BUTTON_MINIMIZE,
-    };
-
-    if (window == 0) {
-        return WINDOW_TITLE_BUTTON_NONE;
-    }
-
-    for (uint32_t index = 0U;
-         index <
-             sizeof(buttons) /
-             sizeof(buttons[0]);
-         ++index) {
-
-        int32_t x;
-        int32_t y;
-
-        if (!window_title_button_rect(
-                window->x,
-                window->y,
-                window->width,
-                buttons[index],
-                &x,
-                &y)) {
-            continue;
-        }
-
-        if ((int64_t)pointer_x >= x &&
-            (int64_t)pointer_y >= y &&
-            (int64_t)pointer_x <
-                (int64_t)x +
-                WINDOW_TITLE_BUTTON_SIZE &&
-            (int64_t)pointer_y <
-                (int64_t)y +
-                WINDOW_TITLE_BUTTON_SIZE) {
-
-            return buttons[index];
-        }
-    }
-
-    return WINDOW_TITLE_BUTTON_NONE;
-}
-
-
-/*
- * Flat controls: no shadow, no extra framebuffer and no alpha surface.
- */
-static void compositor_title_controls_locked(
-    const compositor_window_view_t *window) {
-
-    static const uint32_t buttons[] = {
-        WINDOW_TITLE_BUTTON_MINIMIZE,
-        WINDOW_TITLE_BUTTON_MAXIMIZE,
-        WINDOW_TITLE_BUTTON_CLOSE,
-    };
-
-    bool focused;
-
-    if (window == 0) {
-        return;
-    }
-
-    focused =
-        window->identifier ==
-        g_compositor_snapshot.focused_identifier;
-
-    for (uint32_t index = 0U;
-         index <
-             sizeof(buttons) /
-             sizeof(buttons[0]);
-         ++index) {
-
-        uint32_t button =
-            buttons[index];
-
-        int32_t x;
-        int32_t y;
-
-        uint32_t background;
-        uint32_t glyph;
-
-        if (!window_title_button_rect(
-                window->x,
-                window->y,
-                window->width,
-                button,
-                &x,
-                &y)) {
-            continue;
-        }
-
-        background =
-            focused ?
-                0x001E2A36U :
-                0x00182028U;
-
-        glyph =
-            focused ?
-                0x00B7C3D0U :
-                0x007F8B96U;
-
-        /*
-         * Keep close visually identifiable without a permanent bright-red
-         * Windows-style rectangle.
-         */
-        if (button ==
-            WINDOW_TITLE_BUTTON_CLOSE) {
-
-            background =
-                focused ?
-                    0x002C2228U :
-                    0x00241C20U;
-
-            glyph =
-                focused ?
-                    0x00E28A92U :
-                    0x009B6870U;
-        }
-
-        compositor_fill_rounded_locked(
-            x,
-            y,
-            WINDOW_TITLE_BUTTON_SIZE,
-            WINDOW_TITLE_BUTTON_SIZE,
-            WINDOW_CORNER_RADIUS,
-            background);
-
-        if (button ==
-            WINDOW_TITLE_BUTTON_MINIMIZE) {
-
-            compositor_fill_locked(
-                x + 6,
-                y + 11,
-                8U,
-                1U,
-                glyph);
-
-        } else if (
-            button ==
-            WINDOW_TITLE_BUTTON_MAXIMIZE) {
-
-            if (!window->maximized) {
-                /*
-                 * Normal maximize glyph.
-                 */
-                compositor_fill_locked(
-                    x + 6,
-                    y + 6,
-                    8U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 6,
-                    y + 13,
-                    8U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 6,
-                    y + 6,
-                    1U,
-                    8U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 13,
-                    y + 6,
-                    1U,
-                    8U,
-                    glyph);
-
-            } else {
-                /*
-                 * Restore glyph: two overlapping rectangles.
-                 */
-                compositor_fill_locked(
-                    x + 8,
-                    y + 6,
-                    7U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 14,
-                    y + 6,
-                    1U,
-                    7U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 7,
-                    y + 8,
-                    7U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 7,
-                    y + 8,
-                    1U,
-                    7U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 7,
-                    y + 14,
-                    7U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 13,
-                    y + 8,
-                    1U,
-                    7U,
-                    glyph);
-            }
-        } else if (
-            button ==
-            WINDOW_TITLE_BUTTON_CLOSE) {
-
-            /*
-             * Small X.
-             */
-            for (uint32_t step = 0U;
-                 step < 7U;
-                 ++step) {
-
-                compositor_fill_locked(
-                    x + 7 +
-                        (int32_t)step,
-                    y + 7 +
-                        (int32_t)step,
-                    1U,
-                    1U,
-                    glyph);
-
-                compositor_fill_locked(
-                    x + 13 -
-                        (int32_t)step,
-                    y + 7 +
-                        (int32_t)step,
-                    1U,
-                    1U,
-                    glyph);
-            }
-        }
-    }
-}
-
-
-static void compositor_titlebar_locked(
-    const compositor_window_view_t *window,
-    uint32_t frame_color) {
-
-    bool focused;
-
-    uint32_t title_color;
-    uint32_t separator_color;
-    uint32_t text_color;
-
-    uint32_t outer_width;
-    uint32_t outer_height;
-
-    uint32_t max_chars;
-
-    int32_t text_x;
-    int32_t text_y;
-
-    if (window == 0) {
-        return;
-    }
-
-    focused =
-        window->identifier ==
-        g_compositor_snapshot.focused_identifier;
-
-    title_color =
-        focused ?
-            0x00172230U :
-            0x00131921U;
-
-    separator_color =
-        focused ?
-            0x0030475FU :
-            0x00232D37U;
-
-    text_color =
-        focused ?
-            0x00ECF3FAU :
-            0x009AA8B7U;
-
-    outer_width =
-        window->width +
-        WINDOW_FRAME_EXTRA;
-
-    outer_height =
-        window->height +
-        WINDOW_FRAME_EXTRA +
-        WINDOW_TITLEBAR_HEIGHT;
-
-    /*
-     * Complete flat outer frame.
-     */
-    compositor_fill_rounded_locked(
-        window->x,
-        window->y,
-        outer_width,
-        outer_height,
-        WINDOW_CORNER_RADIUS,
-        frame_color);
-
-    /*
-     * Keep the topmost rounded corner pixels owned by the outer frame.
-     */
-    if (window->width >
-        WINDOW_CORNER_RADIUS * 2U) {
-
-        compositor_fill_locked(
-            window->x +
-                (int32_t)WINDOW_CORNER_RADIUS,
-            window->y +
-                (int32_t)WINDOW_FRAME_BORDER,
-            window->width -
-                WINDOW_CORNER_RADIUS * 2U,
-            WINDOW_TITLEBAR_HEIGHT,
-            title_color);
-    }
-
-    /*
-     * Fill the central/lower titlebar portion.
-     */
-    if (WINDOW_TITLEBAR_HEIGHT >
-        WINDOW_CORNER_RADIUS) {
-
-        compositor_fill_locked(
-            window->x +
-                (int32_t)WINDOW_FRAME_BORDER,
-            window->y +
-                (int32_t)WINDOW_CORNER_RADIUS,
-            window->width,
-            WINDOW_TITLEBAR_HEIGHT -
-                WINDOW_CORNER_RADIUS +
-                WINDOW_FRAME_BORDER,
-            title_color);
-    }
-
-    /*
-     * Client/titlebar separator.
-     */
-    compositor_fill_locked(
-        window->x +
-            (int32_t)WINDOW_FRAME_BORDER,
-        window->y +
-            (int32_t)WINDOW_CLIENT_OFFSET_Y -
-            1,
-        window->width,
-        1U,
-        separator_color);
-
-    compositor_title_controls_locked(
-        window);
-
-    /*
-     * Window title using the existing 8x16 kernel font.
-     * Keep it out of the control-button area.
-     */
-    if (window->width <=
-        WINDOW_TITLE_CONTROLS_WIDTH + 24U) {
-        return;
-    }
-
-    max_chars =
-        (window->width -
-         WINDOW_TITLE_CONTROLS_WIDTH -
-         24U) /
-        8U;
-
-    if (max_chars > 31U) {
-        max_chars = 31U;
-    }
-
-    text_x =
-        window->x + 12;
-
-    text_y =
-        window->y +
-        (int32_t)WINDOW_FRAME_BORDER +
-        (int32_t)(
-            (WINDOW_TITLEBAR_HEIGHT - 16U) /
-            2U);
-
-    for (uint32_t index = 0U;
-         index < max_chars &&
-         window->title[index] != '\0';
-         ++index) {
-
-        desktop_draw_small_glyph_locked(
-            text_x +
-                (int32_t)(index * 8U),
-            text_y,
-            window->title[index],
-            text_color);
-    }
-}
-
-
 static void compositor_region_locked(void) {
     uint32_t damage_left =
         g_compositor_snapshot.damage_left;
@@ -4070,12 +2929,23 @@ static void compositor_region_locked(void) {
 
         frame_color =
             window->identifier ==
-            g_compositor_snapshot.focused_identifier ?
-                0x005F8FC4U :
-                0x0028323EU;
+                g_compositor_snapshot.focused_identifier ?
+            0x005DADE2U :
+            0x0026384AU;
 
         if (!compositor_damage_inside_surface_interior(window)) {
-            compositor_titlebar_locked(window, frame_color);
+            compositor_fill_rounded_locked(
+                        window->x,
+                        window->y,
+
+                        window->width +
+                            WINDOW_FRAME_EXTRA,
+
+                        window->height +
+                            WINDOW_FRAME_EXTRA,
+
+                        WINDOW_CORNER_RADIUS,
+                        frame_color);
         }
 
         compositor_surface_locked(window);
@@ -4185,7 +3055,6 @@ static bool compositor_snapshot_begin_locked(void) {
         compositor_window_view_t *view;
 
         if (window == 0 ||
-            window->minimized ||
             (window->flags & OS_WINDOW_VISIBLE) == 0U) {
             continue;
         }
@@ -4230,27 +3099,6 @@ static bool compositor_snapshot_begin_locked(void) {
 
         view->resize_pending =
             window->resize_pending;
-
-        view->maximized =
-            window->maximized;
-
-        for (uint32_t title_index = 0U;
-             title_index <
-                 sizeof(view->title);
-             ++title_index) {
-
-            view->title[title_index] =
-                window->title[title_index];
-
-            if (window->title[title_index] ==
-                '\0') {
-                break;
-            }
-        }
-
-        view->title[
-            sizeof(view->title) - 1U] =
-            '\0';
     }
 
     /*
@@ -4700,60 +3548,6 @@ static void compositor_snapshot_finish(void) {
     window_unlock();
 }
 
-
-static int32_t window_pointer_clamp_i32(
-    int64_t value) {
-
-    if (value < -2147483648LL) {
-        return (-2147483647 - 1);
-    }
-
-    if (value > 2147483647LL) {
-        return 2147483647;
-    }
-
-    return (int32_t)value;
-}
-
-
-/*
- * Convert the global Ring0 pointer position into the coordinate system used
- * by the application's client surface.
- *
- * The titlebar and outer border are not part of Ring3 coordinates.
- */
-static void window_event_set_pointer_locked(
-    const window_server_window_t *window,
-    os_window_event_t *event) {
-
-    int64_t local_x;
-    int64_t local_y;
-
-    if (window == 0 ||
-        event == 0) {
-        return;
-    }
-
-    local_x =
-        (int64_t)g_window_server.pointer_x -
-        (int64_t)window->x -
-        (int64_t)WINDOW_CLIENT_OFFSET_X;
-
-    local_y =
-        (int64_t)g_window_server.pointer_y -
-        (int64_t)window->y -
-        (int64_t)WINDOW_CLIENT_OFFSET_Y;
-
-    event->pointer_x =
-        window_pointer_clamp_i32(
-            local_x);
-
-    event->pointer_y =
-        window_pointer_clamp_i32(
-            local_y);
-}
-
-
 static void window_enqueue_event_locked(window_server_window_t *window,
                                          const input_event_t *event) {
     if (window == 0 || event == 0) return;
@@ -4769,91 +3563,9 @@ static void window_enqueue_event_locked(window_server_window_t *window,
     window->events[window->event_write].input.flags = event->flags;
     window->events[window->event_write].input.code = event->code;
     window->events[window->event_write].input.value = event->value;
-
-    window_event_set_pointer_locked(
-        window,
-        &window->events[
-            window->event_write]);
-
-window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
+    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
     ++window->event_count;
 }
-
-
-/*
- * Queue one cooperative window-close request.
- *
- * No handle is closed and no process is terminated here. Ring3 remains the
- * owner of normal shutdown policy.
- */
-static void window_enqueue_close_request_locked(
-    window_server_window_t *window) {
-
-    os_window_event_t *queued;
-
-    if (window == 0) {
-        return;
-    }
-
-    /*
-     * A close request is level-like from the application's point of view.
-     * Avoid filling the fixed event queue with repeated close clicks while
-     * the first request is still pending.
-     */
-    for (uint32_t offset = 0U;
-         offset < window->event_count;
-         ++offset) {
-
-        uint32_t slot =
-            (window->event_read + offset) %
-            WINDOW_EVENT_CAPACITY;
-
-        queued =
-            &window->events[slot];
-
-        if (queued->identifier ==
-                window->identifier &&
-            queued->type ==
-                OS_WINDOW_EVENT_CLOSE_REQUEST) {
-
-            return;
-        }
-    }
-
-    if (window->event_count >=
-        WINDOW_EVENT_CAPACITY) {
-
-        window->event_read =
-            (window->event_read + 1U) %
-            WINDOW_EVENT_CAPACITY;
-
-        --window->event_count;
-    }
-
-    queued =
-        &window->events[
-            window->event_write];
-
-    /*
-     * Clear the complete slot so the unused union payload never exposes
-     * stale bytes from a previous INPUT/RESIZE event.
-     */
-    *queued =
-        (os_window_event_t){0};
-
-    queued->identifier =
-        window->identifier;
-
-    queued->type =
-        OS_WINDOW_EVENT_CLOSE_REQUEST;
-
-    window->event_write =
-        (window->event_write + 1U) %
-        WINDOW_EVENT_CAPACITY;
-
-    ++window->event_count;
-}
-
 
 static void window_enqueue_resize_event_locked(window_server_window_t *window) {
     os_window_event_t *queued;
@@ -4972,12 +3684,6 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->compositor_cache = 0;
     window->dirty = true;
     window->resize_pending = false;
-    window->maximized = false;
-    window->minimized = false;
-    window->restore_x = x;
-    window->restore_y = y;
-    window->restore_width = width;
-    window->restore_height = height;
     window->event_read = 0U;
     window->event_write = 0U;
     window->event_count = 0U;
@@ -5249,242 +3955,6 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
     return K_OK;
 }
 
-
-/*
- * Toggle a resizable window between normal and maximized geometry.
- *
- * width/height are always CLIENT dimensions. Decoration dimensions are
- * subtracted from the available work area before producing the resize event.
- */
-
-/*
- * Hide a window without destroying its object, surface or client geometry.
- */
-static bool window_minimize_locked(
-    window_server_window_t *window) {
-
-    window_server_window_t *new_focused = 0;
-
-    if (window == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return false;
-    }
-
-    /*
-     * Erase the currently visible geometry.
-     */
-    window_mark_window_locked(
-        window);
-
-    window->minimized = true;
-    window->dirty = true;
-
-    /*
-     * Cancel all decoration capture owned by this window.
-     */
-    if (g_window_server.dragging_identifier ==
-        window->identifier) {
-
-        g_window_server.dragging_identifier = 0U;
-        g_window_server.drag_offset_x = 0;
-        g_window_server.drag_offset_y = 0;
-        g_window_server.resize_edges = 0U;
-    }
-
-    if (g_window_server.title_pressed_identifier ==
-        window->identifier) {
-
-        g_window_server.title_pressed_identifier = 0U;
-        g_window_server.title_pressed_button =
-            WINDOW_TITLE_BUTTON_NONE;
-    }
-
-    /*
-     * Transfer focus to the topmost remaining normal window.
-     */
-    if (g_window_server.focused_identifier ==
-        window->identifier) {
-
-        g_window_server.focused_identifier = 0U;
-
-        for (uint32_t index = g_window_server.count;
-             index != 0U;
-             --index) {
-
-            window_server_window_t *candidate =
-                g_window_server.windows[index - 1U];
-
-            if (candidate == 0 ||
-                candidate == window ||
-                candidate->minimized ||
-                (candidate->flags &
-                 OS_WINDOW_VISIBLE) == 0U) {
-                continue;
-            }
-
-            new_focused = candidate;
-            g_window_server.focused_identifier =
-                candidate->identifier;
-
-            break;
-        }
-    }
-
-    if (new_focused != 0) {
-        window_mark_window_locked(
-            new_focused);
-    }
-
-    return true;
-}
-
-
-static bool window_toggle_maximize_locked(
-    window_server_window_t *window) {
-
-    int32_t new_x;
-    int32_t new_y;
-
-    uint32_t new_width;
-    uint32_t new_height;
-
-    uint32_t available_height;
-
-    if (window == 0 ||
-        (window->flags &
-         OS_WINDOW_RESIZABLE) == 0U ||
-        g_window_server.display_width <=
-            WINDOW_FRAME_EXTRA ||
-        g_window_server.display_height <=
-            DESKTOP_TOPBAR_HEIGHT +
-            WINDOW_TITLEBAR_HEIGHT +
-            WINDOW_FRAME_EXTRA) {
-
-        return false;
-    }
-
-    /*
-     * Damage old geometry before mutating it.
-     */
-    window_mark_window_locked(
-        window);
-
-    if (!window->maximized) {
-        /*
-         * Preserve the exact normal client geometry.
-         */
-        window->restore_x =
-            window->x;
-
-        window->restore_y =
-            window->y;
-
-        window->restore_width =
-            window->width;
-
-        window->restore_height =
-            window->height;
-
-        new_x = 0;
-        new_y =
-            (int32_t)
-                DESKTOP_TOPBAR_HEIGHT;
-
-        new_width =
-            g_window_server.display_width -
-            WINDOW_FRAME_EXTRA;
-
-        available_height =
-            g_window_server.display_height -
-            DESKTOP_TOPBAR_HEIGHT;
-
-        new_height =
-            available_height -
-            WINDOW_TITLEBAR_HEIGHT -
-            WINDOW_FRAME_EXTRA;
-
-        window->maximized =
-            true;
-
-    } else {
-        /*
-         * Restore the exact geometry captured on entry to maximized state.
-         */
-        new_x =
-            window->restore_x;
-
-        new_y =
-            window->restore_y;
-
-        new_width =
-            window->restore_width;
-
-        new_height =
-            window->restore_height;
-
-        if (new_width == 0U ||
-            new_height == 0U) {
-
-            return false;
-        }
-
-        window->maximized =
-            false;
-    }
-
-    window->x =
-        new_x;
-
-    window->y =
-        new_y;
-
-    window->width =
-        new_width;
-
-    window->height =
-        new_height;
-
-    window->dirty =
-        true;
-
-    /*
-     * Until Ring3 acknowledges the new stride/geometry with a full-surface
-     * update, compositor keeps the resize-safe path.
-     */
-    window->resize_pending =
-        true;
-
-    /*
-     * Maximizing while a decoration capture exists must not leave any stale
-     * drag/resize state behind.
-     */
-    if (g_window_server.dragging_identifier ==
-        window->identifier) {
-
-        g_window_server.dragging_identifier =
-            0U;
-
-        g_window_server.drag_offset_x =
-            0;
-
-        g_window_server.drag_offset_y =
-            0;
-
-        g_window_server.resize_edges =
-            0U;
-    }
-
-    window_mark_window_locked(
-        window);
-
-    window_enqueue_resize_event_locked(
-        window);
-
-    return true;
-}
-
-
 static uint32_t window_resize_edges_locked(const window_server_window_t *window,
                                            uint32_t x, uint32_t y) {
     int64_t relative_x;
@@ -5493,20 +3963,12 @@ static uint32_t window_resize_edges_locked(const window_server_window_t *window,
     int64_t outer_height;
     uint32_t edges = 0U;
 
-    if (window == 0 ||
-        window->maximized ||
-        (window->flags & OS_WINDOW_RESIZABLE) == 0U) {
-
-        return 0U;
-    }
+    if (window == 0 || (window->flags & OS_WINDOW_RESIZABLE) == 0U) return 0U;
 
     relative_x = (int64_t)x - window->x;
     relative_y = (int64_t)y - window->y;
     outer_width = (int64_t)window->width + WINDOW_FRAME_EXTRA;
-    outer_height =
-        (int64_t)window->height +
-        WINDOW_FRAME_EXTRA +
-        WINDOW_TITLEBAR_HEIGHT;
+    outer_height = (int64_t)window->height + WINDOW_FRAME_EXTRA;
     if (relative_x < 0 || relative_y < 0 ||
         relative_x >= outer_width || relative_y >= outer_height) {
         return 0U;
@@ -5564,11 +4026,7 @@ static bool window_resize_locked(window_server_window_t *window,
     left = window->x;
     top = window->y;
     right = left + (int64_t)window->width + WINDOW_FRAME_EXTRA;
-    bottom =
-        top +
-        (int64_t)window->height +
-        WINDOW_FRAME_EXTRA +
-        WINDOW_TITLEBAR_HEIGHT;
+    bottom = top + (int64_t)window->height + WINDOW_FRAME_EXTRA;
 
     if ((g_window_server.resize_edges & WINDOW_RESIZE_LEFT) != 0U) {
         left += delta_x;
@@ -5586,41 +4044,20 @@ static bool window_resize_locked(window_server_window_t *window,
 
     if ((g_window_server.resize_edges & WINDOW_RESIZE_TOP) != 0U) {
         top += delta_y;
-        minimum =
-            bottom -
-            (int64_t)max_height -
-            WINDOW_FRAME_EXTRA -
-            WINDOW_TITLEBAR_HEIGHT;
-        maximum =
-            bottom -
-            (int64_t)min_height -
-            WINDOW_FRAME_EXTRA -
-            WINDOW_TITLEBAR_HEIGHT;
+        minimum = bottom - (int64_t)max_height - WINDOW_FRAME_EXTRA;
+        maximum = bottom - (int64_t)min_height - WINDOW_FRAME_EXTRA;
         if (top < minimum) top = minimum;
         if (top > maximum) top = maximum;
     } else if ((g_window_server.resize_edges & WINDOW_RESIZE_BOTTOM) != 0U) {
         bottom += delta_y;
-        minimum =
-            top +
-            (int64_t)min_height +
-            WINDOW_FRAME_EXTRA +
-            WINDOW_TITLEBAR_HEIGHT;
-        maximum =
-            top +
-            (int64_t)max_height +
-            WINDOW_FRAME_EXTRA +
-            WINDOW_TITLEBAR_HEIGHT;
+        minimum = top + (int64_t)min_height + WINDOW_FRAME_EXTRA;
+        maximum = top + (int64_t)max_height + WINDOW_FRAME_EXTRA;
         if (bottom < minimum) bottom = minimum;
         if (bottom > maximum) bottom = maximum;
     }
 
     new_width = (uint32_t)(right - left - WINDOW_FRAME_EXTRA);
-    new_height =
-        (uint32_t)(
-            bottom -
-            top -
-            WINDOW_FRAME_EXTRA -
-            WINDOW_TITLEBAR_HEIGHT);
+    new_height = (uint32_t)(bottom - top - WINDOW_FRAME_EXTRA);
     if (left == old_x && top == old_y &&
         new_width == old_width && new_height == old_height) {
         return false;
@@ -5628,7 +4065,7 @@ static bool window_resize_locked(window_server_window_t *window,
 
     window_mark_rect_locked(old_x, old_y,
                             old_width + WINDOW_FRAME_EXTRA,
-                            old_height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT);
+                            old_height + WINDOW_FRAME_EXTRA);
     window->x = (int32_t)left;
     window->y = (int32_t)top;
     window->width = new_width;
@@ -5643,8 +4080,6 @@ static bool window_resize_locked(window_server_window_t *window,
 static void route_input_locked(const input_event_t *event) {
     window_server_window_t *target = 0;
     bool deliver_input = true;
-    uint32_t title_button =
-        WINDOW_TITLE_BUTTON_NONE;
 
     if (event == 0) return;
 
@@ -5740,7 +4175,7 @@ static void route_input_locked(const input_event_t *event) {
                 window_mark_moved_rect_locked(
                     old_x, old_y, dragged->x, dragged->y,
                     dragged->width + WINDOW_FRAME_EXTRA,
-                    dragged->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT);
+                    dragged->height + WINDOW_FRAME_EXTRA);
                 dragged->dirty = true;
                 target = dragged;
                 deliver_input = false;
@@ -5758,96 +4193,6 @@ static void route_input_locked(const input_event_t *event) {
         target = window_at_locked(g_window_server.pointer_x,
                                   g_window_server.pointer_y);
 
-        if (target != 0) {
-            title_button =
-                window_title_button_at_locked(
-                    target,
-                    g_window_server.pointer_x,
-                    g_window_server.pointer_y);
-        }
-
-        /*
-         * Button semantics are connected in the next step.
-         *
-         * For now establish correct Ring0 ownership:
-         *   - never deliver title-control clicks to Ring3
-         *   - never start titlebar dragging from a control
-         *   - pressing a control still focuses its window
-         */
-        if (event->code ==
-                INPUT_BUTTON_LEFT &&
-            title_button !=
-                WINDOW_TITLE_BUTTON_NONE) {
-
-            deliver_input = false;
-
-            if (event->value ==
-                    INPUT_VALUE_PRESS &&
-                target != 0) {
-
-                /*
-                 * Decoration capture begins here.
-                 *
-                 * Merely pressing a control focuses the window but performs
-                 * no destructive action.
-                 */
-                focus_locked(target);
-
-                g_window_server.title_pressed_identifier =
-                    target->identifier;
-
-                g_window_server.title_pressed_button =
-                    title_button;
-
-            } else if (
-                event->value ==
-                    INPUT_VALUE_RELEASE) {
-
-                /*
-                 * Activate only if:
-                 *
-                 *   press window  == release window
-                 *   press button  == release button
-                 *
-                 * Dragging away before release therefore cancels the action.
-                 */
-                if (target != 0 &&
-                    g_window_server.title_pressed_identifier ==
-                        target->identifier &&
-                    g_window_server.title_pressed_button ==
-                        title_button) {
-
-                    if (title_button ==
-                        WINDOW_TITLE_BUTTON_CLOSE) {
-
-                        window_enqueue_close_request_locked(
-                            target);
-
-                    } else if (
-                        title_button ==
-                        WINDOW_TITLE_BUTTON_MAXIMIZE) {
-
-                        (void)window_toggle_maximize_locked(
-                            target);
-
-                    } else if (
-                        title_button ==
-                        WINDOW_TITLE_BUTTON_MINIMIZE) {
-
-                        (void)window_minimize_locked(
-                            target);
-                    }
-                }
-
-                g_window_server.title_pressed_identifier =
-                    0U;
-
-                g_window_server.title_pressed_button =
-                    WINDOW_TITLE_BUTTON_NONE;
-            }
-        }
-
-
         if (event->code == INPUT_BUTTON_LEFT &&
             event->value == INPUT_VALUE_PRESS && target == 0) {
             uint32_t app = desktop_app_at_locked(g_window_server.pointer_x,
@@ -5861,24 +4206,8 @@ static void route_input_locked(const input_event_t *event) {
             }
         }
 
-        if (event->code ==
-                INPUT_BUTTON_LEFT &&
-            event->value ==
-                INPUT_VALUE_PRESS &&
-            title_button ==
-                WINDOW_TITLE_BUTTON_NONE) {
-
-            g_window_server.title_pressed_identifier =
-                0U;
-
-            g_window_server.title_pressed_button =
-                WINDOW_TITLE_BUTTON_NONE;
-        }
-
         if (event->code == INPUT_BUTTON_LEFT &&
-            event->value == INPUT_VALUE_PRESS &&
-            target != 0 &&
-            title_button == WINDOW_TITLE_BUTTON_NONE) {
+            event->value == INPUT_VALUE_PRESS && target != 0) {
             uint32_t resize_edges;
             focus_locked(target);
             resize_edges = window_resize_edges_locked(
@@ -5890,11 +4219,8 @@ static void route_input_locked(const input_event_t *event) {
                 g_window_server.drag_offset_y = 0;
                 g_window_server.resize_edges = resize_edges;
                 deliver_input = false;
-            } else if (
-                !target->maximized &&
-                (int64_t)g_window_server.pointer_y -
-                    target->y <
-                    WINDOW_DRAG_REGION_HEIGHT) {
+            } else if ((int64_t)g_window_server.pointer_y - target->y <
+                       WINDOW_DRAG_REGION_HEIGHT) {
                 g_window_server.dragging_identifier = target->identifier;
                 g_window_server.drag_offset_x =
                     (int32_t)g_window_server.pointer_x - target->x;
@@ -5903,20 +4229,6 @@ static void route_input_locked(const input_event_t *event) {
                 g_window_server.resize_edges = 0U;
                 deliver_input = false;
             }
-        if (event->code ==
-                INPUT_BUTTON_LEFT &&
-            event->value ==
-                INPUT_VALUE_RELEASE &&
-            title_button ==
-                WINDOW_TITLE_BUTTON_NONE) {
-
-            g_window_server.title_pressed_identifier =
-                0U;
-
-            g_window_server.title_pressed_button =
-                WINDOW_TITLE_BUTTON_NONE;
-        }
-
         } else if (event->code == INPUT_BUTTON_LEFT &&
                    event->value == INPUT_VALUE_RELEASE) {
             if (g_window_server.dragging_identifier != 0U) {
@@ -6194,7 +4506,8 @@ static bool window_route_drag_motion_batch_locked(
                 new_y,
                 dragged->width +
                     WINDOW_FRAME_EXTRA,
-                dragged->height + WINDOW_FRAME_EXTRA + WINDOW_TITLEBAR_HEIGHT);
+                dragged->height +
+                    WINDOW_FRAME_EXTRA);
 
             dragged->dirty =
                 true;
@@ -6377,9 +4690,7 @@ void window_server_pump_input(void) {
         }
 
         if (app != DESKTOP_APP_NONE) {
-            if (!desktop_restore_minimized_app(app)) {
-                (void)desktop_launch_program(app);
-            }
+            (void)desktop_launch_program(app);
         }
     }
 

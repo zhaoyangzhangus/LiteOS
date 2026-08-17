@@ -230,7 +230,6 @@ static void window_mark_moved_rect_locked(int32_t old_x, int32_t old_y,
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
                                             uint32_t new_x, uint32_t new_y);
 static void window_coalesce_damage_locked(void);
-static void focus_locked(window_server_window_t *window);
 
 static void window_lock(void) {
     sched_preempt_disable();
@@ -376,8 +375,7 @@ static void remove_window_locked(window_server_window_t *window) {
             for (uint32_t j = g_window_server.count; j != 0U; --j) {
                 window_server_window_t *candidate =
                     g_window_server.windows[j - 1U];
-                if (!candidate->minimized &&
-                    (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+                if ((candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
                     g_window_server.focused_identifier = candidate->identifier;
                     new_focused = candidate;
                     break;
@@ -2087,125 +2085,6 @@ static const char *desktop_program_path(uint32_t app) {
     return 0;
 }
 
-
-static const char *desktop_app_window_title(
-    uint32_t app) {
-
-    if (app == DESKTOP_APP_FILES) {
-        return "FILEMAN";
-    }
-
-    if (app == DESKTOP_APP_TERMINAL) {
-        return "SHELL";
-    }
-
-    if (app == DESKTOP_APP_NOTES) {
-        return "NOTEPAD";
-    }
-
-    if (app == DESKTOP_APP_NETWORK) {
-        return "NETWORK";
-    }
-
-    return 0;
-}
-
-
-static bool window_title_matches(
-    const char *title,
-    const char *expected) {
-
-    uint32_t index = 0U;
-
-    if (title == 0 ||
-        expected == 0) {
-        return false;
-    }
-
-    while (index < 32U) {
-        if (title[index] != expected[index]) {
-            return false;
-        }
-
-        if (expected[index] == '\0') {
-            return true;
-        }
-
-        ++index;
-    }
-
-    return false;
-}
-
-
-/*
- * Dock activation first restores an existing minimized instance.
- *
- * Only if no minimized window for this desktop application exists does the
- * normal launcher create another process.
- */
-static bool desktop_restore_minimized_app(
-    uint32_t app) {
-
-    const char *expected =
-        desktop_app_window_title(app);
-
-    window_server_window_t *window = 0;
-
-    if (expected == 0) {
-        return false;
-    }
-
-    window_lock();
-
-    for (uint32_t index = g_window_server.count;
-         index != 0U;
-         --index) {
-
-        window_server_window_t *candidate =
-            g_window_server.windows[index - 1U];
-
-        if (candidate == 0 ||
-            !candidate->minimized ||
-            (candidate->flags &
-             OS_WINDOW_VISIBLE) == 0U ||
-            !window_title_matches(
-                candidate->title,
-                expected)) {
-
-            continue;
-        }
-
-        window = candidate;
-        break;
-    }
-
-    if (window == 0) {
-        window_unlock();
-        return false;
-    }
-
-    window->minimized = false;
-    window->dirty = true;
-
-    /*
-     * focus_locked() also raises it to the top of Z-order and damages both
-     * old/new focused decoration.
-     */
-    focus_locked(window);
-
-    window_mark_window_locked(
-        window);
-
-    window_unlock();
-
-    (void)wake_all(
-        &g_window_server.event_waitq);
-
-    return true;
-}
-
-
 static kstatus_t desktop_launch_program(uint32_t app) {
     const char *path = desktop_program_path(app);
     file_t *file = 0;
@@ -2277,11 +2156,7 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
         int64_t relative_x;
         int64_t relative_y;
         uint32_t inset;
-        if (window == 0 ||
-            window->minimized ||
-            (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-            continue;
-        }
+        if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) continue;
         relative_x = (int64_t)x - window->x;
         relative_y = (int64_t)y - window->y;
         if (relative_x < 0 || relative_y < 0 ||
@@ -2305,14 +2180,10 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
 static window_server_window_t *keyboard_window_locked(void) {
     window_server_window_t *window =
         find_window_locked(g_window_server.focused_identifier);
-    if (window != 0 &&
-        !window->minimized &&
-        (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
+    if (window != 0 && (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
     for (uint32_t index = g_window_server.count; index != 0U; --index) {
         window = g_window_server.windows[index - 1U];
-        if (window != 0 &&
-            !window->minimized &&
-            (window->flags & OS_WINDOW_VISIBLE) != 0U) {
+        if (window != 0 && (window->flags & OS_WINDOW_VISIBLE) != 0U) {
             g_window_server.focused_identifier = window->identifier;
             return window;
         }
@@ -2323,11 +2194,7 @@ static window_server_window_t *keyboard_window_locked(void) {
 static void focus_locked(window_server_window_t *window) {
     window_server_window_t *old_focused;
     uint32_t position = 0U;
-    if (window == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return;
-    }
+    if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) return;
     old_focused = find_window_locked(g_window_server.focused_identifier);
     for (; position < g_window_server.count; ++position) {
         if (g_window_server.windows[position] == window) break;
@@ -4185,7 +4052,6 @@ static bool compositor_snapshot_begin_locked(void) {
         compositor_window_view_t *view;
 
         if (window == 0 ||
-            window->minimized ||
             (window->flags & OS_WINDOW_VISIBLE) == 0U) {
             continue;
         }
@@ -4700,60 +4566,6 @@ static void compositor_snapshot_finish(void) {
     window_unlock();
 }
 
-
-static int32_t window_pointer_clamp_i32(
-    int64_t value) {
-
-    if (value < -2147483648LL) {
-        return (-2147483647 - 1);
-    }
-
-    if (value > 2147483647LL) {
-        return 2147483647;
-    }
-
-    return (int32_t)value;
-}
-
-
-/*
- * Convert the global Ring0 pointer position into the coordinate system used
- * by the application's client surface.
- *
- * The titlebar and outer border are not part of Ring3 coordinates.
- */
-static void window_event_set_pointer_locked(
-    const window_server_window_t *window,
-    os_window_event_t *event) {
-
-    int64_t local_x;
-    int64_t local_y;
-
-    if (window == 0 ||
-        event == 0) {
-        return;
-    }
-
-    local_x =
-        (int64_t)g_window_server.pointer_x -
-        (int64_t)window->x -
-        (int64_t)WINDOW_CLIENT_OFFSET_X;
-
-    local_y =
-        (int64_t)g_window_server.pointer_y -
-        (int64_t)window->y -
-        (int64_t)WINDOW_CLIENT_OFFSET_Y;
-
-    event->pointer_x =
-        window_pointer_clamp_i32(
-            local_x);
-
-    event->pointer_y =
-        window_pointer_clamp_i32(
-            local_y);
-}
-
-
 static void window_enqueue_event_locked(window_server_window_t *window,
                                          const input_event_t *event) {
     if (window == 0 || event == 0) return;
@@ -4769,13 +4581,7 @@ static void window_enqueue_event_locked(window_server_window_t *window,
     window->events[window->event_write].input.flags = event->flags;
     window->events[window->event_write].input.code = event->code;
     window->events[window->event_write].input.value = event->value;
-
-    window_event_set_pointer_locked(
-        window,
-        &window->events[
-            window->event_write]);
-
-window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
+    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
     ++window->event_count;
 }
 
@@ -4973,7 +4779,6 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->dirty = true;
     window->resize_pending = false;
     window->maximized = false;
-    window->minimized = false;
     window->restore_x = x;
     window->restore_y = y;
     window->restore_width = width;
@@ -5256,90 +5061,6 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
  * width/height are always CLIENT dimensions. Decoration dimensions are
  * subtracted from the available work area before producing the resize event.
  */
-
-/*
- * Hide a window without destroying its object, surface or client geometry.
- */
-static bool window_minimize_locked(
-    window_server_window_t *window) {
-
-    window_server_window_t *new_focused = 0;
-
-    if (window == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return false;
-    }
-
-    /*
-     * Erase the currently visible geometry.
-     */
-    window_mark_window_locked(
-        window);
-
-    window->minimized = true;
-    window->dirty = true;
-
-    /*
-     * Cancel all decoration capture owned by this window.
-     */
-    if (g_window_server.dragging_identifier ==
-        window->identifier) {
-
-        g_window_server.dragging_identifier = 0U;
-        g_window_server.drag_offset_x = 0;
-        g_window_server.drag_offset_y = 0;
-        g_window_server.resize_edges = 0U;
-    }
-
-    if (g_window_server.title_pressed_identifier ==
-        window->identifier) {
-
-        g_window_server.title_pressed_identifier = 0U;
-        g_window_server.title_pressed_button =
-            WINDOW_TITLE_BUTTON_NONE;
-    }
-
-    /*
-     * Transfer focus to the topmost remaining normal window.
-     */
-    if (g_window_server.focused_identifier ==
-        window->identifier) {
-
-        g_window_server.focused_identifier = 0U;
-
-        for (uint32_t index = g_window_server.count;
-             index != 0U;
-             --index) {
-
-            window_server_window_t *candidate =
-                g_window_server.windows[index - 1U];
-
-            if (candidate == 0 ||
-                candidate == window ||
-                candidate->minimized ||
-                (candidate->flags &
-                 OS_WINDOW_VISIBLE) == 0U) {
-                continue;
-            }
-
-            new_focused = candidate;
-            g_window_server.focused_identifier =
-                candidate->identifier;
-
-            break;
-        }
-    }
-
-    if (new_focused != 0) {
-        window_mark_window_locked(
-            new_focused);
-    }
-
-    return true;
-}
-
-
 static bool window_toggle_maximize_locked(
     window_server_window_t *window) {
 
@@ -5828,13 +5549,6 @@ static void route_input_locked(const input_event_t *event) {
                         WINDOW_TITLE_BUTTON_MAXIMIZE) {
 
                         (void)window_toggle_maximize_locked(
-                            target);
-
-                    } else if (
-                        title_button ==
-                        WINDOW_TITLE_BUTTON_MINIMIZE) {
-
-                        (void)window_minimize_locked(
                             target);
                     }
                 }
@@ -6377,9 +6091,7 @@ void window_server_pump_input(void) {
         }
 
         if (app != DESKTOP_APP_NONE) {
-            if (!desktop_restore_minimized_app(app)) {
-                (void)desktop_launch_program(app);
-            }
+            (void)desktop_launch_program(app);
         }
     }
 
