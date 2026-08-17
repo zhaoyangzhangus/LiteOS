@@ -2,6 +2,8 @@
 
 #include <kernel/base.h>
 
+struct message_port;
+
 /* 网络管理器只维护链路和地址状态；DHCP/DNS 等策略由用户态服务负责。 */
 typedef struct net_manager_status {
     bool initialized;
@@ -24,3 +26,5 @@ void net_manager_poll(void);
 bool net_manager_get_status(net_manager_status_t *status);
 bool net_manager_ready(void);
 bool net_manager_self_test(void);
+
+kstatus_t net_manager_subscribe(struct message_port *port);

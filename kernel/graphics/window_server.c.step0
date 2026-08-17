@@ -325,78 +325,14 @@ static void window_mark_rect_locked(int32_t x, int32_t y,
     };
     for (uint32_t index = 0U; index < g_window_server.damage_count; ++index) {
         window_damage_rect_t *current = &g_window_server.damage_rects[index];
-        uint32_t merged_left;
-        uint32_t merged_top;
-        uint32_t merged_right;
-        uint32_t merged_bottom;
-        uint32_t overlap_left;
-        uint32_t overlap_top;
-        uint32_t overlap_right;
-        uint32_t overlap_bottom;
-        uint64_t current_area;
-        uint64_t candidate_area;
-        uint64_t overlap_area = 0U;
-        uint64_t union_area;
-        uint64_t merged_area;
-
-        if (candidate.right < current->left ||
-            current->right < candidate.left ||
-            candidate.bottom < current->top ||
-            current->bottom < candidate.top) {
+        if (candidate.right < current->left || current->right < candidate.left ||
+            candidate.bottom < current->top || current->bottom < candidate.top) {
             continue;
         }
-
-        merged_left = candidate.left < current->left ?
-                      candidate.left : current->left;
-        merged_top = candidate.top < current->top ?
-                     candidate.top : current->top;
-        merged_right = candidate.right > current->right ?
-                       candidate.right : current->right;
-        merged_bottom = candidate.bottom > current->bottom ?
-                        candidate.bottom : current->bottom;
-
-        overlap_left = candidate.left > current->left ?
-                       candidate.left : current->left;
-        overlap_top = candidate.top > current->top ?
-                      candidate.top : current->top;
-        overlap_right = candidate.right < current->right ?
-                        candidate.right : current->right;
-        overlap_bottom = candidate.bottom < current->bottom ?
-                         candidate.bottom : current->bottom;
-
-        current_area =
-            (uint64_t)(current->right - current->left) *
-            (current->bottom - current->top);
-        candidate_area =
-            (uint64_t)(candidate.right - candidate.left) *
-            (candidate.bottom - candidate.top);
-
-        if (overlap_left < overlap_right &&
-            overlap_top < overlap_bottom) {
-            overlap_area =
-                (uint64_t)(overlap_right - overlap_left) *
-                (overlap_bottom - overlap_top);
-        }
-
-        union_area = current_area + candidate_area - overlap_area;
-
-        merged_area =
-            (uint64_t)(merged_right - merged_left) *
-            (merged_bottom - merged_top);
-
-        /*
-         * Bounding-box merge is only worthwhile when it wastes at most 25%
-         * compared with the real union.  This prevents a diagonal chain of
-         * small mouse damages from gradually becoming one huge rectangle.
-         */
-        if (merged_area > union_area + union_area / 4U) {
-            continue;
-        }
-
-        current->left = merged_left;
-        current->top = merged_top;
-        current->right = merged_right;
-        current->bottom = merged_bottom;
+        if (candidate.left < current->left) current->left = candidate.left;
+        if (candidate.top < current->top) current->top = candidate.top;
+        if (candidate.right > current->right) current->right = candidate.right;
+        if (candidate.bottom > current->bottom) current->bottom = candidate.bottom;
         return;
     }
     if (g_window_server.damage_count >= WINDOW_DAMAGE_MAX_RECTS) {
@@ -468,129 +404,43 @@ static void window_mark_moved_rect_locked(int32_t old_x, int32_t old_y,
 
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
                                             uint32_t new_x, uint32_t new_y) {
-    int32_t old_left;
-    int32_t old_top;
-    int32_t new_left;
-    int32_t new_top;
-
-    /* pointer_x/y 是 cursor hotspot，不是 sprite 左上角。 */
-    old_left = (int32_t)old_x - (int32_t)WINDOW_CURSOR_HOTSPOT_X;
-    old_top = (int32_t)old_y - (int32_t)WINDOW_CURSOR_HOTSPOT_Y;
-    new_left = (int32_t)new_x - (int32_t)WINDOW_CURSOR_HOTSPOT_X;
-    new_top = (int32_t)new_y - (int32_t)WINDOW_CURSOR_HOTSPOT_Y;
-
-    /*
-     * Old/new cursor locations are independent damages.  Do not create a
-     * potentially screen-sized bounding box when the pointer jumps.
-     */
-    window_mark_rect_locked(old_left, old_top,
-                            WINDOW_CURSOR_WIDTH, WINDOW_CURSOR_HEIGHT);
-
-    if (old_left != new_left || old_top != new_top) {
-        window_mark_rect_locked(new_left, new_top,
-                                WINDOW_CURSOR_WIDTH, WINDOW_CURSOR_HEIGHT);
-    }
+    /* pointer_x/y 是 Linux 光标的 hotspot，不是 sprite 左上角。 */
+    window_mark_moved_rect_locked(
+        (int32_t)old_x - (int32_t)WINDOW_CURSOR_HOTSPOT_X,
+        (int32_t)old_y - (int32_t)WINDOW_CURSOR_HOTSPOT_Y,
+        (int32_t)new_x - (int32_t)WINDOW_CURSOR_HOTSPOT_X,
+        (int32_t)new_y - (int32_t)WINDOW_CURSOR_HOTSPOT_Y,
+                                  WINDOW_CURSOR_WIDTH, WINDOW_CURSOR_HEIGHT);
 }
 
 /* 一次鼠标事务只允许一次 framebuffer 区域提交。焦点、任务栏、被拖动
  * 窗口和光标可能分别产生 damage；分开提交会让 GOP 扫描到半帧状态。 */
 static void window_coalesce_damage_locked(void) {
-    uint32_t first = 0U;
-
-    if (g_window_server.damage_full ||
-        g_window_server.damage_count <= 1U) {
+    uint32_t left;
+    uint32_t top;
+    uint32_t right;
+    uint32_t bottom;
+    if (g_window_server.damage_full || g_window_server.damage_count <= 1U) return;
+    left = g_window_server.display_width;
+    top = g_window_server.display_height;
+    right = 0U;
+    bottom = 0U;
+    for (uint32_t index = 0U; index < g_window_server.damage_count; ++index) {
+        const window_damage_rect_t *rect = &g_window_server.damage_rects[index];
+        if (rect->left < left) left = rect->left;
+        if (rect->top < top) top = rect->top;
+        if (rect->right > right) right = rect->right;
+        if (rect->bottom > bottom) bottom = rect->bottom;
+    }
+    if (left >= right || top >= bottom) {
+        g_window_server.damage_count = 0U;
         return;
     }
-
-    /*
-     * Keep independent damage rectangles independent.  Merge a pair only
-     * when the bounding rectangle adds <=25% wasted pixels over their real
-     * union.  At most WINDOW_DAMAGE_MAX_RECTS exist, so this O(n^2) pass is
-     * tiny compared with repainting a needlessly large framebuffer region.
-     */
-    while (first < g_window_server.damage_count) {
-        uint32_t second = first + 1U;
-        bool merged_any = false;
-
-        while (second < g_window_server.damage_count) {
-            window_damage_rect_t *a =
-                &g_window_server.damage_rects[first];
-            const window_damage_rect_t *b =
-                &g_window_server.damage_rects[second];
-
-            uint32_t left = a->left < b->left ? a->left : b->left;
-            uint32_t top = a->top < b->top ? a->top : b->top;
-            uint32_t right = a->right > b->right ? a->right : b->right;
-            uint32_t bottom =
-                a->bottom > b->bottom ? a->bottom : b->bottom;
-
-            uint32_t overlap_left =
-                a->left > b->left ? a->left : b->left;
-            uint32_t overlap_top =
-                a->top > b->top ? a->top : b->top;
-            uint32_t overlap_right =
-                a->right < b->right ? a->right : b->right;
-            uint32_t overlap_bottom =
-                a->bottom < b->bottom ? a->bottom : b->bottom;
-
-            uint64_t area_a =
-                (uint64_t)(a->right - a->left) *
-                (a->bottom - a->top);
-            uint64_t area_b =
-                (uint64_t)(b->right - b->left) *
-                (b->bottom - b->top);
-            uint64_t overlap_area = 0U;
-            uint64_t union_area;
-            uint64_t merged_area;
-
-            if (overlap_left < overlap_right &&
-                overlap_top < overlap_bottom) {
-                overlap_area =
-                    (uint64_t)(overlap_right - overlap_left) *
-                    (overlap_bottom - overlap_top);
-            }
-
-            union_area = area_a + area_b - overlap_area;
-            merged_area =
-                (uint64_t)(right - left) *
-                (bottom - top);
-
-            if (merged_area <= union_area + union_area / 4U) {
-                a->left = left;
-                a->top = top;
-                a->right = right;
-                a->bottom = bottom;
-
-                for (uint32_t index = second + 1U;
-                     index < g_window_server.damage_count;
-                     ++index) {
-                    g_window_server.damage_rects[index - 1U] =
-                        g_window_server.damage_rects[index];
-                }
-
-                --g_window_server.damage_count;
-                merged_any = true;
-
-                /*
-                 * a changed, so retry it against every remaining rectangle.
-                 */
-                second = first + 1U;
-                continue;
-            }
-
-            ++second;
-        }
-
-        if (!merged_any) {
-            ++first;
-        } else {
-            /*
-             * No pair with this newly expanded rectangle remains mergeable
-             * after the restarted scan.
-             */
-            ++first;
-        }
-    }
+    g_window_server.damage_rects[0].left = left;
+    g_window_server.damage_rects[0].top = top;
+    g_window_server.damage_rects[0].right = right;
+    g_window_server.damage_rects[0].bottom = bottom;
+    g_window_server.damage_count = 1U;
 }
 
 static void compositor_blend_pixel_locked(int32_t x, int32_t y,
@@ -2098,185 +1948,33 @@ static void route_input_locked(const input_event_t *event) {
     }
 }
 
-
-typedef struct window_motion_batch {
-    bool active;
-    uint32_t device_id;
-    uint16_t flags;
-    uint64_t timestamp;
-    int64_t delta_x;
-    int64_t delta_y;
-} window_motion_batch_t;
-
-/*
- * Feed an accumulated relative axis back through the normal window routing
- * path.  int64_t accumulation prevents a burst of raw events from overflowing
- * before it is emitted as one or more ABI-sized int32_t events.
- */
-static void window_route_motion_axis_locked(
-    const window_motion_batch_t *batch,
-    uint32_t code,
-    int64_t delta) {
-
-    input_event_t event = {0};
-
-    if (batch == 0 || delta == 0) return;
-
-    event.timestamp = batch->timestamp;
-    event.device_id = batch->device_id;
-    event.type = INPUT_EVENT_RELATIVE;
-    event.flags = batch->flags;
-    event.code = code;
-
-    while (delta != 0) {
-        int64_t chunk;
-
-        if (delta > 2147483647LL) {
-            chunk = 2147483647LL;
-        } else if (delta < -2147483648LL) {
-            chunk = -2147483648LL;
-        } else {
-            chunk = delta;
-        }
-
-        event.value = (int32_t)chunk;
-        route_input_locked(&event);
-        delta -= chunk;
-    }
-}
-
-static void window_flush_motion_batch_locked(window_motion_batch_t *batch) {
-    if (batch == 0 || !batch->active) return;
-
-    /*
-     * Two axis events are enough to represent an arbitrary burst of ordinary
-     * mouse motion.  The normal routing path still owns pointer clamping,
-     * dragging, resize, hit-testing and client delivery.
-     */
-    window_route_motion_axis_locked(
-        batch, INPUT_REL_X, batch->delta_x);
-
-    window_route_motion_axis_locked(
-        batch, INPUT_REL_Y, batch->delta_y);
-
-    batch->active = false;
-    batch->delta_x = 0;
-    batch->delta_y = 0;
-}
-
 void window_server_pump_input(void) {
     input_event_t event;
-    window_motion_batch_t motion = {0};
     bool wake = false;
-    uint32_t consumed = 0U;
-
     if (!window_server_kernel_ready()) return;
-
-    /*
-     * Raw HID/PS2 backends commonly enqueue X and Y as separate events.
-     * Accumulate consecutive pointer motion and route the whole burst only
-     * once per axis.
-     *
-     * Any non-X/Y event is an ordering barrier.  Therefore button presses,
-     * wheel events and keys always observe all preceding pointer movement.
-     */
-    while (consumed < WINDOW_EVENT_CAPACITY &&
-           input_core_pop(&event) == K_OK) {
-        bool is_motion =
-            event.type == INPUT_EVENT_RELATIVE &&
-            (event.code == INPUT_REL_X ||
-             event.code == INPUT_REL_Y);
-
-        ++consumed;
-        wake = true;
-
-        if (is_motion) {
-            /*
-             * Never merge events belonging to different physical devices or
-             * carrying different backend flags.
-             */
-            if (motion.active &&
-                (motion.device_id != event.device_id ||
-                 motion.flags != event.flags)) {
-
-                window_lock();
-                window_flush_motion_batch_locked(&motion);
-                window_unlock();
-            }
-
-            if (!motion.active) {
-                motion.active = true;
-                motion.device_id = event.device_id;
-                motion.flags = event.flags;
-                motion.timestamp = event.timestamp;
-                motion.delta_x = 0;
-                motion.delta_y = 0;
-            }
-
-            /*
-             * Use the newest timestamp for the merged motion event.
-             */
-            motion.timestamp = event.timestamp;
-
-            if (event.code == INPUT_REL_X) {
-                motion.delta_x += event.value;
-            } else {
-                motion.delta_y += event.value;
-            }
-
-            continue;
-        }
-
-        /*
-         * Button/key/wheel/absolute events are ordering barriers.
-         */
+    for (uint32_t count = 0U; count < WINDOW_EVENT_CAPACITY &&
+         input_core_pop(&event) == K_OK; ++count) {
         window_lock();
-
-        window_flush_motion_batch_locked(&motion);
         route_input_locked(&event);
-
         window_unlock();
+        wake = true;
     }
-
-    /*
-     * Flush a trailing mouse-motion burst once, under one lock acquisition.
-     */
-    if (motion.active) {
-        window_lock();
-        window_flush_motion_batch_locked(&motion);
-        window_unlock();
-    }
-
-    if (wake) {
-        (void)wake_all(&g_window_server.event_waitq);
-    }
+    if (wake) (void)wake_all(&g_window_server.event_waitq);
 
     for (;;) {
         uint32_t app;
         bool cycle_focus;
 
         window_lock();
-
         app = g_window_server.desktop_pending_launch;
         g_window_server.desktop_pending_launch = DESKTOP_APP_NONE;
-
-        cycle_focus =
-            g_window_server.desktop_focus_cycle_requested;
+        cycle_focus = g_window_server.desktop_focus_cycle_requested;
         g_window_server.desktop_focus_cycle_requested = false;
-
         window_unlock();
 
-        if (app == DESKTOP_APP_NONE && !cycle_focus) {
-            break;
-        }
-
-        if (cycle_focus) {
-            desktop_cycle_window_focus();
-        }
-
-        if (app != DESKTOP_APP_NONE) {
-            (void)desktop_launch_program(app);
-        }
+        if (app == DESKTOP_APP_NONE && !cycle_focus) break;
+        if (cycle_focus) desktop_cycle_window_focus();
+        if (app != DESKTOP_APP_NONE) (void)desktop_launch_program(app);
     }
 
     window_lock();

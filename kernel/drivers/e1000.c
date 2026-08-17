@@ -927,11 +927,12 @@ static bool e1000_transmit(e1000_state_t *state, const uint8_t *frame, size_t le
     dma_wmb();
     state->tx_tail = (state->tx_tail + 1U) % E1000_RING_COUNT;
     e1000_write(state, E1000_REG_TDT, state->tx_tail);
-    for (uint32_t spin = 0; spin < 1000000U; ++spin) {
-        if ((descriptor->status & E1000_TX_STATUS_DD) != 0) return true;
-        __asm__ volatile ("pause");
-    }
-    return false;
+
+    /*
+     * TX submission is asynchronous. DD is checked before slot reuse, so
+     * waiting here only stalls the caller after ringing the hardware doorbell.
+     */
+    return true;
 }
 
 static kstatus_t e1000_device_transmit(void *context, const void *frame,

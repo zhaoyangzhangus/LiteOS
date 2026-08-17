@@ -1,11 +1,15 @@
 #include <kernel/e1000.h>
+#include <kernel/message_port.h>
 #include <kernel/net_manager.h>
 #include <kernel/spinlock.h>
+#include <uapi/network.h>
+#include <uapi/syscall.h>
 
 static net_manager_status_t g_net_manager;
 static spinlock_t g_net_manager_lock;
 static atomic_uint g_net_manager_init_state;
 static uint32_t g_net_manager_poll_divider;
+static message_port_t *g_net_manager_event_port;
 
 static void net_manager_lock(void) {
     while (atomic_exchange_explicit(&g_net_manager_lock.state, 1U,
@@ -49,6 +53,25 @@ bool net_manager_init(void) {
     return true;
 }
 
+kstatus_t net_manager_subscribe(struct message_port *raw_port) {
+    message_port_t *port = (message_port_t *)raw_port;
+    message_port_t *old_port;
+
+    if (port != 0 && port->object.type != KOBJECT_TYPE_MESSAGE_PORT) {
+        return K_EINVAL;
+    }
+
+    if (port != 0) object_get(port);
+
+    net_manager_lock();
+    old_port = g_net_manager_event_port;
+    g_net_manager_event_port = port;
+    net_manager_unlock();
+
+    if (old_port != 0) object_put(old_port);
+    return K_OK;
+}
+
 void net_manager_poll(void) {
     bool hardware_present;
     bool link_up = false;
@@ -58,6 +81,9 @@ void net_manager_poll(void) {
     uint8_t ipv6_address[16] = {0};
     uint8_t mac[6] = {0};
     bool ipv6_configured = false;
+    bool link_changed = false;
+    message_port_t *event_port = 0;
+    os_net_event_t event = {0};
     if (atomic_load_explicit(&g_net_manager_init_state, memory_order_acquire) != 2U) {
         return;
     }
@@ -77,10 +103,11 @@ void net_manager_poll(void) {
         (void)e1000_get_mac_address(mac);
     }
     net_manager_lock();
-    if (g_net_manager.hardware_present != hardware_present ||
-        g_net_manager.link_up != link_up) {
-        ++g_net_manager.link_transitions;
-    }
+    link_changed =
+        g_net_manager.hardware_present != hardware_present ||
+        g_net_manager.link_up != link_up;
+    if (link_changed) ++g_net_manager.link_transitions;
+
     g_net_manager.hardware_present = hardware_present;
     g_net_manager.link_up = link_up;
     g_net_manager.ipv4_address = ipv4_address;
@@ -89,12 +116,35 @@ void net_manager_poll(void) {
     g_net_manager.ipv6_configured = ipv6_configured;
     net_manager_copy(g_net_manager.mac, mac, sizeof(mac));
     net_manager_zero(g_net_manager.mac_reserved, sizeof(g_net_manager.mac_reserved));
+
     if (ipv6_configured) {
-        net_manager_copy(g_net_manager.ipv6_address, ipv6_address, sizeof(ipv6_address));
+        net_manager_copy(g_net_manager.ipv6_address,
+                         ipv6_address,
+                         sizeof(ipv6_address));
     } else {
-        net_manager_zero(g_net_manager.ipv6_address, sizeof(g_net_manager.ipv6_address));
+        net_manager_zero(g_net_manager.ipv6_address,
+                         sizeof(g_net_manager.ipv6_address));
     }
+
+    if (link_changed && g_net_manager_event_port != 0 &&
+        object_try_get(g_net_manager_event_port)) {
+        event_port = g_net_manager_event_port;
+    }
+
+    event.hdr.size = sizeof(event);
+    event.hdr.version = OS_SYSCALL_ABI_VERSION;
+    event.type = OS_NET_EVENT_LINK_CHANGED;
+    event.status_flags =
+        (hardware_present ? OS_NET_STATUS_HARDWARE_PRESENT : 0U) |
+        (link_up ? OS_NET_STATUS_LINK_UP : 0U) |
+        (ipv6_configured ? OS_NET_STATUS_IPV6_CONFIGURED : 0U);
+    event.link_transitions = g_net_manager.link_transitions;
     net_manager_unlock();
+
+    if (event_port != 0) {
+        (void)message_port_send(event_port, &event, sizeof(event));
+        object_put(event_port);
+    }
 }
 
 bool net_manager_get_status(net_manager_status_t *status) {

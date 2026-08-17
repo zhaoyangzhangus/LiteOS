@@ -1716,6 +1716,42 @@ static int64_t sys_net_get_status(uint64_t arguments_pointer, uint64_t unused1,
                         &arguments, sizeof(arguments));
 }
 
+/*
+ * NET_SUBSCRIBE(message_port): bind the system network daemon's waitable
+ * message port to link-state changes. OS_INVALID_HANDLE unsubscribes.
+ */
+static int64_t sys_net_subscribe(uint64_t port_handle, uint64_t unused1,
+                                 uint64_t unused2, uint64_t unused3,
+                                 uint64_t unused4, uint64_t unused5) {
+    process_t *process = current_process();
+    void *object = 0;
+    kstatus_t status;
+
+    (void)unused1;
+    (void)unused2;
+    (void)unused3;
+    (void)unused4;
+    (void)unused5;
+
+    if (process == 0) return K_EPERM;
+    if (port_handle == OS_INVALID_HANDLE) return net_manager_subscribe(0);
+
+    status = handle_lookup(&process->handles,
+                           (handle_t)port_handle,
+                           MESSAGE_PORT_RIGHT_WRITE,
+                           &object);
+    if (status != K_OK) return status;
+
+    if (((message_port_t *)object)->object.type != KOBJECT_TYPE_MESSAGE_PORT) {
+        status = K_EINVAL;
+    } else {
+        status = net_manager_subscribe((message_port_t *)object);
+    }
+
+    object_put(object);
+    return status;
+}
+
 /* NET_SET_IPV4(args)：只有系统管理 capability 能修改地址和默认路由。 */
 static int64_t sys_net_set_ipv4(uint64_t arguments_pointer, uint64_t unused1,
                                 uint64_t unused2, uint64_t unused3,
@@ -2863,6 +2899,7 @@ static const syscall_handler_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [OS_SYS_SOCKET_SEND_ASYNC6] = sys_socket_send_async6,
     [OS_SYS_NET_GET_STATUS] = sys_net_get_status,
     [OS_SYS_NET_SET_IPV4] = sys_net_set_ipv4,
+    [OS_SYS_NET_SUBSCRIBE] = sys_net_subscribe,
     [OS_SYS_GPU_CREATE_CTX] = sys_gpu_create_context,
     [OS_SYS_GPU_ALLOC] = sys_gpu_alloc,
     [OS_SYS_GPU_MAP] = sys_gpu_map,

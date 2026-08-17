@@ -77,6 +77,7 @@ enum os_syscall_number {
 
     OS_SYS_NET_GET_STATUS    = 0x0B00,
     OS_SYS_NET_SET_IPV4     = 0x0B01,
+    OS_SYS_NET_SUBSCRIBE    = 0x0B02,
 
     OS_SYS_WINDOW_REGISTER_MANAGER = 0x0C00,
     OS_SYS_WINDOW_CREATE           = 0x0C01,

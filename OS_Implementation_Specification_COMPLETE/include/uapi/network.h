@@ -28,3 +28,12 @@ typedef struct os_net_set_ipv4_config {
     uint8_t prefix_length;
     uint8_t reserved[3];
 } os_net_set_ipv4_config_t;
+
+#define OS_NET_EVENT_LINK_CHANGED 1U
+
+typedef struct os_net_event {
+    os_versioned_header_t hdr;
+    uint32_t type;
+    uint32_t status_flags;
+    uint64_t link_transitions;
+} os_net_event_t;
