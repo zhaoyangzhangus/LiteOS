@@ -1199,7 +1199,10 @@ static bool handle_key(const os_window_event_t *event) {
         return false;
     }
     if (input->value == OS_INPUT_VALUE_RELEASE) return false;
-    if (g_ctrl && (input->code == 0x04U || input->code == (uint32_t)'A')) {
+    if (g_ctrl && (input->code == 0x14U || input->code == (uint32_t)'Q')) {
+        gshell_exit(0U);
+    } else if (g_ctrl &&
+               (input->code == 0x04U || input->code == (uint32_t)'A')) {
         g_command_cursor = 0U;
     } else if (g_ctrl && (input->code == 0x08U || input->code == (uint32_t)'E')) {
         g_command_cursor = g_command_length;

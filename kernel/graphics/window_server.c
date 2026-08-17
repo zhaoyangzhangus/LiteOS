@@ -1,5 +1,8 @@
 #include <kernel/window_server.h>
 #include <arch/x86_64/paging.h>
+#include <ascii_font.h>
+#include <kernel/elf_loader.h>
+#include <kernel/vfs.h>
 #include <kernel/display.h>
 #include <kernel/input.h>
 #include <kernel/kmem.h>
@@ -13,6 +16,26 @@
 #define WINDOW_CURSOR_HEIGHT 24U
 #define WINDOW_CURSOR_HOTSPOT_X 3U
 #define WINDOW_CURSOR_HOTSPOT_Y 1U
+
+/* LiteOS desktop shell: wallpaper, icons and launcher. */
+#define DESKTOP_TOPBAR_HEIGHT        34U
+#define DESKTOP_DOCK_HEIGHT          54U
+#define DESKTOP_DOCK_BOTTOM          12U
+#define DESKTOP_ICON_CELL_WIDTH      112U
+#define DESKTOP_ICON_CELL_HEIGHT     90U
+#define DESKTOP_ICON_START_X         24
+#define DESKTOP_ICON_START_Y         58
+#define DESKTOP_ICON_GAP_Y           12U
+#define DESKTOP_ICON_IMAGE_WIDTH     48U
+#define DESKTOP_ICON_IMAGE_HEIGHT    48U
+#define DESKTOP_PROGRAM_MAX_BYTES    (16ULL * 1024ULL * 1024ULL)
+
+enum {
+    DESKTOP_APP_NONE = 0U,
+    DESKTOP_APP_FILES = 1U,
+    DESKTOP_APP_TERMINAL = 2U,
+    DESKTOP_APP_NOTES = 3U,
+};
 #define WINDOW_RESIZE_GRAB 6U
 #define WINDOW_MIN_WIDTH 160U
 #define WINDOW_MIN_HEIGHT 96U
@@ -59,6 +82,11 @@ static struct {
     volatile uint32_t *composite_framebuffer;
     uint32_t pointer_x;
     uint32_t pointer_y;
+    uint32_t desktop_hovered_app;
+    uint32_t desktop_pending_launch;
+    uint32_t desktop_gui_mask;
+    bool desktop_tab_consumed;
+    bool desktop_focus_cycle_requested;
     uint32_t dragging_identifier;
     int32_t drag_offset_x;
     int32_t drag_offset_y;
@@ -125,6 +153,11 @@ bool window_server_init(void) {
         g_window_server.composite_framebuffer = 0;
         g_window_server.pointer_x = 0U;
         g_window_server.pointer_y = 0U;
+        g_window_server.desktop_hovered_app = DESKTOP_APP_NONE;
+        g_window_server.desktop_pending_launch = DESKTOP_APP_NONE;
+        g_window_server.desktop_gui_mask = 0U;
+        g_window_server.desktop_tab_consumed = false;
+        g_window_server.desktop_focus_cycle_requested = false;
         g_window_server.dragging_identifier = 0U;
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
@@ -519,6 +552,345 @@ static void compositor_fill_rounded_locked(int32_t x, int32_t y,
     }
 }
 
+
+typedef struct desktop_icon_entry {
+    uint32_t app;
+    int32_t x;
+    int32_t y;
+    const char *label;
+} desktop_icon_entry_t;
+
+static const desktop_icon_entry_t g_desktop_icons[] = {
+    { DESKTOP_APP_FILES,    DESKTOP_ICON_START_X, DESKTOP_ICON_START_Y, "Files" },
+    { DESKTOP_APP_TERMINAL, DESKTOP_ICON_START_X,
+      DESKTOP_ICON_START_Y + (int32_t)(DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y),
+      "Terminal" },
+    { DESKTOP_APP_NOTES,    DESKTOP_ICON_START_X,
+      DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 2U),
+      "Notes" },
+};
+
+static uint32_t desktop_text_length(const char *text) {
+    uint32_t length = 0U;
+    if (text == 0) return 0U;
+    while (text[length] != '\0') ++length;
+    return length;
+}
+
+static void desktop_put_pixel_locked(int32_t x, int32_t y, uint32_t color) {
+    if (g_window_server.composite_framebuffer == 0 ||
+        x < 0 || y < 0 ||
+        x >= (int32_t)g_window_server.display_width ||
+        y >= (int32_t)g_window_server.display_height ||
+        x < (int32_t)g_window_server.damage_left ||
+        y < (int32_t)g_window_server.damage_top ||
+        x >= (int32_t)g_window_server.damage_right ||
+        y >= (int32_t)g_window_server.damage_bottom) {
+        return;
+    }
+    g_window_server.composite_framebuffer[
+        (uint64_t)(uint32_t)y * g_window_server.display_stride +
+        (uint32_t)x] = color;
+}
+
+static void desktop_draw_small_glyph_locked(int32_t x, int32_t y,
+                                            char character, uint32_t color) {
+    const UINT8 *glyph = ascii_font_glyph((UINT8)character);
+    if (glyph == 0) return;
+    for (uint32_t row = 0U; row < 16U; ++row) {
+        uint32_t offset = row * 4U;
+        uint16_t bits =
+            (uint16_t)(((uint16_t)glyph[offset] << 8) | glyph[offset + 1U]);
+        bits |= (uint16_t)(((uint16_t)glyph[offset + 2U] << 8) |
+                           glyph[offset + 3U]);
+        for (uint32_t column = 0U; column < 8U; ++column) {
+            if ((bits & (uint16_t)(0xC000U >> (column * 2U))) != 0U) {
+                desktop_put_pixel_locked(x + (int32_t)column,
+                                         y + (int32_t)row, color);
+            }
+        }
+    }
+}
+
+static void desktop_draw_text_locked(int32_t x, int32_t y,
+                                     const char *text, uint32_t color) {
+    if (text == 0) return;
+    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+        desktop_draw_small_glyph_locked(
+            x + (int32_t)(index * 8U), y, text[index], color);
+    }
+}
+
+static uint32_t desktop_app_at_locked(uint32_t x, uint32_t y) {
+    for (uint32_t index = 0U;
+         index < sizeof(g_desktop_icons) / sizeof(g_desktop_icons[0]);
+         ++index) {
+        const desktop_icon_entry_t *icon = &g_desktop_icons[index];
+        int64_t right = (int64_t)icon->x + DESKTOP_ICON_CELL_WIDTH;
+        int64_t bottom = (int64_t)icon->y + DESKTOP_ICON_CELL_HEIGHT;
+        if ((int64_t)x >= icon->x && (int64_t)y >= icon->y &&
+            (int64_t)x < right && (int64_t)y < bottom) {
+            return icon->app;
+        }
+    }
+    return DESKTOP_APP_NONE;
+}
+
+static void desktop_mark_app_locked(uint32_t app) {
+    if (app == DESKTOP_APP_NONE) return;
+    for (uint32_t index = 0U;
+         index < sizeof(g_desktop_icons) / sizeof(g_desktop_icons[0]);
+         ++index) {
+        const desktop_icon_entry_t *icon = &g_desktop_icons[index];
+        if (icon->app != app) continue;
+        window_mark_rect_locked(icon->x, icon->y,
+                                DESKTOP_ICON_CELL_WIDTH,
+                                DESKTOP_ICON_CELL_HEIGHT);
+        return;
+    }
+}
+
+static void desktop_draw_folder_icon_locked(int32_t x, int32_t y) {
+    compositor_fill_rounded_locked(x + 2, y + 13, 44U, 31U,
+                                   WINDOW_CORNER_RADIUS, 0x00D99F36U);
+    compositor_fill_locked(x + 6, y + 8, 17U, 10U, 0x00F2C66DU);
+    compositor_fill_rounded_locked(x, y + 16, 48U, 30U,
+                                   WINDOW_CORNER_RADIUS, 0x00F0B84FU);
+    compositor_fill_locked(x + 4, y + 21, 40U, 3U, 0x00F7CF79U);
+}
+
+static void desktop_draw_terminal_icon_locked(int32_t x, int32_t y) {
+    compositor_fill_rounded_locked(x, y + 3, 48U, 42U,
+                                   WINDOW_CORNER_RADIUS, 0x000B1420U);
+    compositor_fill_locked(x + 4, y + 7, 40U, 4U, 0x002A526FU);
+    for (uint32_t step = 0U; step < 7U; ++step) {
+        compositor_fill_locked(x + 10 + (int32_t)step,
+                               y + 17 + (int32_t)step, 2U, 2U,
+                               0x007FE0AEU);
+        compositor_fill_locked(x + 10 + (int32_t)step,
+                               y + 29 - (int32_t)step, 2U, 2U,
+                               0x007FE0AEU);
+    }
+    compositor_fill_locked(x + 27, y + 31, 11U, 2U, 0x00C8E7F0U);
+}
+
+static void desktop_draw_notes_icon_locked(int32_t x, int32_t y) {
+    compositor_fill_rounded_locked(x + 5, y + 2, 38U, 44U,
+                                   WINDOW_CORNER_RADIUS, 0x00EAF2F6U);
+    compositor_fill_locked(x + 5, y + 2, 38U, 7U, 0x005DADE2U);
+    compositor_fill_locked(x + 12, y + 16, 24U, 2U, 0x006F8797U);
+    compositor_fill_locked(x + 12, y + 23, 24U, 2U, 0x006F8797U);
+    compositor_fill_locked(x + 12, y + 30, 20U, 2U, 0x006F8797U);
+    compositor_fill_locked(x + 12, y + 37, 16U, 2U, 0x006F8797U);
+}
+
+static void desktop_draw_icon_locked(const desktop_icon_entry_t *icon) {
+    uint32_t text_width;
+    int32_t image_x;
+    int32_t image_y;
+    int32_t text_x;
+
+    if (icon == 0) return;
+
+    if (g_window_server.desktop_hovered_app == icon->app) {
+        compositor_fill_rounded_locked(icon->x, icon->y,
+                                       DESKTOP_ICON_CELL_WIDTH,
+                                       DESKTOP_ICON_CELL_HEIGHT,
+                                       WINDOW_CORNER_RADIUS, 0x00213A52U);
+        compositor_fill_locked(icon->x + 8,
+                               icon->y + (int32_t)DESKTOP_ICON_CELL_HEIGHT - 2,
+                               DESKTOP_ICON_CELL_WIDTH - 16U, 1U,
+                               0x004C7794U);
+    }
+
+    image_x = icon->x +
+              (int32_t)(DESKTOP_ICON_CELL_WIDTH - DESKTOP_ICON_IMAGE_WIDTH) / 2;
+    image_y = icon->y + 7;
+
+    if (icon->app == DESKTOP_APP_FILES) {
+        desktop_draw_folder_icon_locked(image_x, image_y);
+    } else if (icon->app == DESKTOP_APP_TERMINAL) {
+        desktop_draw_terminal_icon_locked(image_x, image_y);
+    } else if (icon->app == DESKTOP_APP_NOTES) {
+        desktop_draw_notes_icon_locked(image_x, image_y);
+    }
+
+    text_width = desktop_text_length(icon->label) * 8U;
+    text_x = icon->x +
+             (int32_t)(DESKTOP_ICON_CELL_WIDTH -
+                       (text_width < DESKTOP_ICON_CELL_WIDTH ?
+                        text_width : DESKTOP_ICON_CELL_WIDTH)) / 2;
+    desktop_draw_text_locked(text_x, icon->y + 63, icon->label, 0x00E8F2F7U);
+}
+
+static void desktop_draw_wallpaper_locked(void) {
+    uint32_t height = g_window_server.display_height;
+    uint32_t width = g_window_server.display_width;
+    uint32_t left = g_window_server.damage_left;
+    uint32_t right = g_window_server.damage_right;
+    uint32_t top = g_window_server.damage_top;
+    uint32_t bottom = g_window_server.damage_bottom;
+
+    if (g_window_server.composite_framebuffer == 0 ||
+        left >= right || top >= bottom) {
+        return;
+    }
+
+    for (uint32_t row = top; row < bottom; ++row) {
+        uint32_t t = height > 1U ?
+            (uint32_t)(((uint64_t)row * 255U) / (height - 1U)) : 0U;
+        uint32_t red = 8U + (7U * t) / 255U;
+        uint32_t green = 20U + (23U * t) / 255U;
+        uint32_t blue = 36U + (31U * t) / 255U;
+        uint32_t color = (red << 16) | (green << 8) | blue;
+        volatile uint32_t *destination =
+            g_window_server.composite_framebuffer +
+            (uint64_t)row * g_window_server.display_stride + left;
+        for (uint32_t column = left; column < right; ++column) {
+            *destination++ = color;
+        }
+    }
+
+    compositor_fill_locked(0, 0, width, DESKTOP_TOPBAR_HEIGHT, 0x00101C2BU);
+    compositor_fill_locked(0, (int32_t)DESKTOP_TOPBAR_HEIGHT - 1,
+                           width, 1U, 0x00294B63U);
+    desktop_draw_text_locked(18, 9, "LiteOS", 0x00EDF7FAU);
+    if (width > 150U) {
+        desktop_draw_text_locked((int32_t)width - 76, 9,
+                                 "Desktop", 0x009FB7C7U);
+    }
+
+    if (height > DESKTOP_DOCK_HEIGHT + DESKTOP_DOCK_BOTTOM + 8U &&
+        width > 40U) {
+        uint32_t dock_width = width > 320U ? 320U : width - 24U;
+        int32_t dock_x = (int32_t)(width - dock_width) / 2;
+        int32_t dock_y = (int32_t)height -
+                         (int32_t)DESKTOP_DOCK_HEIGHT -
+                         (int32_t)DESKTOP_DOCK_BOTTOM;
+        uint32_t label_width =
+            desktop_text_length("Files   Terminal   Notes") * 8U;
+        compositor_fill_rounded_locked(dock_x, dock_y, dock_width,
+                                       DESKTOP_DOCK_HEIGHT,
+                                       WINDOW_CORNER_RADIUS, 0x00132232U);
+        compositor_fill_locked(dock_x + 12, dock_y + 5,
+                               dock_width > 24U ? dock_width - 24U : 0U,
+                               1U, 0x002C4A61U);
+        desktop_draw_text_locked(
+            dock_x + (int32_t)(dock_width -
+                               (label_width < dock_width ?
+                                label_width : dock_width)) / 2,
+            dock_y + 20, "Files   Terminal   Notes", 0x009EB9C8U);
+    }
+
+    for (uint32_t index = 0U;
+         index < sizeof(g_desktop_icons) / sizeof(g_desktop_icons[0]);
+         ++index) {
+        desktop_draw_icon_locked(&g_desktop_icons[index]);
+    }
+}
+
+
+static void desktop_cycle_window_focus(void) {
+    uint32_t first_identifier = 0U;
+    uint32_t next_identifier = 0U;
+    bool choose_next = false;
+
+    for (uint32_t index = 0U; ; ++index) {
+        window_server_snapshot_t snapshot;
+        kstatus_t status = window_server_snapshot(index, &snapshot);
+        if (status != K_OK) break;
+        if (!snapshot.visible || snapshot.identifier == 0U) continue;
+
+        if (first_identifier == 0U) {
+            first_identifier = snapshot.identifier;
+        }
+        if (choose_next) {
+            next_identifier = snapshot.identifier;
+            break;
+        }
+        if (snapshot.focused) {
+            choose_next = true;
+        }
+    }
+
+    if (next_identifier == 0U) next_identifier = first_identifier;
+    if (next_identifier != 0U) {
+        (void)window_server_focus(next_identifier);
+    }
+}
+
+static const char *desktop_program_path(uint32_t app) {
+    if (app == DESKTOP_APP_FILES) return "/sbin/fileman";
+    if (app == DESKTOP_APP_TERMINAL) return "/sbin/gshell";
+    if (app == DESKTOP_APP_NOTES) return "/sbin/notepad";
+    return 0;
+}
+
+static kstatus_t desktop_launch_program(uint32_t app) {
+    const char *path = desktop_program_path(app);
+    file_t *file = 0;
+    process_t *process = 0;
+    thread_t *thread = 0;
+    user_elf_image_info_t info;
+    vaddr_t stack_pointer = 0U;
+    uint8_t *image = 0;
+    uint64_t image_size;
+    uint64_t bytes = 0U;
+    kstatus_t status;
+
+    if (path == 0) return K_EINVAL;
+
+    status = vfs_open_kernel(path, VFS_OPEN_READ, &file);
+    if (status != K_OK) return status;
+    if (file->vnode == 0 || file->vnode->size == 0U ||
+        file->vnode->size > DESKTOP_PROGRAM_MAX_BYTES) {
+        vfs_close(file);
+        return K_EINVAL;
+    }
+
+    image_size = file->vnode->size;
+    image = (uint8_t *)kmalloc((size_t)image_size, 0);
+    if (image == 0) {
+        vfs_close(file);
+        return K_ENOMEM;
+    }
+
+    status = vfs_read_kernel(file, image, image_size, &bytes);
+    vfs_close(file);
+    file = 0;
+    if (status != K_OK || bytes != image_size) {
+        kfree(image);
+        return status == K_OK ? K_EIO : status;
+    }
+
+    status = process_create(0, &process);
+    if (status == K_OK) {
+        status = process_load_elf_image(process, image, (size_t)image_size,
+                                        &info, &stack_pointer);
+    }
+    kfree(image);
+
+    if (status == K_OK) {
+        status = thread_create_user_suspended(process, info.entry,
+                                              stack_pointer, 0U, 0U,
+                                              &thread);
+    }
+    if (status == K_OK) status = thread_start(thread);
+
+    if (status != K_OK) {
+        if (thread != 0) {
+            (void)thread_terminate(thread, status);
+            object_put(thread);
+        }
+        if (process != 0) object_put(process);
+        return status;
+    }
+
+    object_put(thread);
+    object_put(process);
+    return K_OK;
+}
+
 static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
     for (uint32_t index = g_window_server.count; index != 0U; --index) {
         window_server_window_t *window = g_window_server.windows[index - 1U];
@@ -761,16 +1133,14 @@ static void compositor_region_locked(void) {
     uint32_t damage_right = g_window_server.damage_right;
     uint32_t damage_bottom = g_window_server.damage_bottom;
     if (damage_left >= damage_right || damage_top >= damage_bottom) return;
-    compositor_fill_locked((int32_t)damage_left, (int32_t)damage_top,
-                           damage_right - damage_left,
-                           damage_bottom - damage_top, 0x00101928U);
+    desktop_draw_wallpaper_locked();
     for (uint32_t index = 0U; index < g_window_server.count; ++index) {
         window_server_window_t *window = g_window_server.windows[index];
         uint32_t frame_color;
         if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U ||
             !compositor_window_intersects_damage_locked(window)) continue;
         frame_color = window->identifier == g_window_server.focused_identifier ?
-                      0x005C99C6U : 0x002A3B4BU;
+                      0x005DADE2U : 0x0026384AU;
         compositor_fill_rounded_locked(window->x, window->y,
                                        window->width + WINDOW_FRAME_EXTRA,
                                        window->height + WINDOW_FRAME_EXTRA,
@@ -1363,6 +1733,33 @@ static void route_input_locked(const input_event_t *event) {
 
     if (event == 0) return;
 
+
+    if (event->type == INPUT_EVENT_KEY) {
+        if (event->code == 0xE3U || event->code == 0xE7U) {
+            uint32_t bit = event->code == 0xE3U ? 1U : 2U;
+            if (event->value == INPUT_VALUE_RELEASE) {
+                g_window_server.desktop_gui_mask &= ~bit;
+            } else {
+                g_window_server.desktop_gui_mask |= bit;
+            }
+            deliver_input = false;
+        } else if (event->code == 0x2BU) {
+            if (g_window_server.desktop_gui_mask != 0U) {
+                deliver_input = false;
+                g_window_server.desktop_tab_consumed = true;
+                if (event->value == INPUT_VALUE_PRESS) {
+                    g_window_server.desktop_focus_cycle_requested = true;
+                }
+            } else if (g_window_server.desktop_tab_consumed) {
+                deliver_input = false;
+            }
+
+            if (event->value == INPUT_VALUE_RELEASE) {
+                g_window_server.desktop_tab_consumed = false;
+            }
+        }
+    }
+
     if (event->type == INPUT_EVENT_RELATIVE) {
         uint32_t old_pointer_x = g_window_server.pointer_x;
         uint32_t old_pointer_y = g_window_server.pointer_y;
@@ -1384,6 +1781,21 @@ static void route_input_locked(const input_event_t *event) {
                        (int64_t)g_window_server.display_height - 1;
             }
             g_window_server.pointer_y = (uint32_t)next;
+        }
+
+        {
+            uint32_t hovered = DESKTOP_APP_NONE;
+            if (g_window_server.dragging_identifier == 0U &&
+                window_at_locked(g_window_server.pointer_x,
+                                 g_window_server.pointer_y) == 0) {
+                hovered = desktop_app_at_locked(g_window_server.pointer_x,
+                                                g_window_server.pointer_y);
+            }
+            if (hovered != g_window_server.desktop_hovered_app) {
+                desktop_mark_app_locked(g_window_server.desktop_hovered_app);
+                desktop_mark_app_locked(hovered);
+                g_window_server.desktop_hovered_app = hovered;
+            }
         }
 
         if (g_window_server.dragging_identifier != 0U) {
@@ -1430,6 +1842,19 @@ static void route_input_locked(const input_event_t *event) {
     } else if (event->type == INPUT_EVENT_BUTTON) {
         target = window_at_locked(g_window_server.pointer_x,
                                   g_window_server.pointer_y);
+
+        if (event->code == INPUT_BUTTON_LEFT &&
+            event->value == INPUT_VALUE_PRESS && target == 0) {
+            uint32_t app = desktop_app_at_locked(g_window_server.pointer_x,
+                                                 g_window_server.pointer_y);
+            if (app != DESKTOP_APP_NONE) {
+                if (g_window_server.desktop_pending_launch == DESKTOP_APP_NONE) {
+                    g_window_server.desktop_pending_launch = app;
+                }
+                desktop_mark_app_locked(app);
+                deliver_input = false;
+            }
+        }
 
         if (event->code == INPUT_BUTTON_LEFT &&
             event->value == INPUT_VALUE_PRESS && target != 0) {
@@ -1514,6 +1939,23 @@ void window_server_pump_input(void) {
         wake = true;
     }
     if (wake) (void)wake_all(&g_window_server.event_waitq);
+
+    for (;;) {
+        uint32_t app;
+        bool cycle_focus;
+
+        window_lock();
+        app = g_window_server.desktop_pending_launch;
+        g_window_server.desktop_pending_launch = DESKTOP_APP_NONE;
+        cycle_focus = g_window_server.desktop_focus_cycle_requested;
+        g_window_server.desktop_focus_cycle_requested = false;
+        window_unlock();
+
+        if (app == DESKTOP_APP_NONE && !cycle_focus) break;
+        if (cycle_focus) desktop_cycle_window_focus();
+        if (app != DESKTOP_APP_NONE) (void)desktop_launch_program(app);
+    }
+
     window_lock();
     compositor_locked();
     window_unlock();

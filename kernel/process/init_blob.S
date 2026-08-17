@@ -330,15 +330,11 @@ liteos_init_service:
 .Linit_service_shell_exec:
     cmpb $0, INIT_PERSISTENT
     je .Linit_service_exit
-    /* 图形 Shell 是独立 ELF，服务线程通过 exec 切换到它自己的地址空间。 */
-    movl $SYS_PROCESS_EXEC, %eax
-    movq $INIT_SHELL_PATH, %rdi
-    xorl %esi, %esi
-    xorl %edx, %edx
-    syscall
-    testq %rax, %rax
-    js .Linit_service_fail_direct
-    ud2
+    /*
+     * Ring0 desktop owns interactive application launch. Keep this service
+     * slot blocked so init's six-service accounting remains unchanged.
+     */
+    jmp .Linit_service_block
 
 .Linit_service_netmgr_exec:
     cmpb $0, INIT_PERSISTENT
