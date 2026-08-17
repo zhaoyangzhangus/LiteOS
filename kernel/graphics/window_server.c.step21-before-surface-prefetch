@@ -1794,41 +1794,6 @@ compositor_surface_cache_get(
  *
  * No VM lock, no backing-page list traversal.
  */
-
-/*
- * Sequential surface rendering normally crosses shared pages in ascending
- * order.  Once the next page already has a positive direct-page cache entry,
- * pull its first cache line toward L1 before the current page is exhausted.
- *
- * This is only a performance hint. Missing pages are never resolved or
- * allocated here.
- */
-static inline void compositor_prefetch_surface_page(
-    const compositor_surface_page_cache_t *cache,
-    uint64_t page_index) {
-
-    uint8_t *next;
-
-    if (cache == 0 ||
-        page_index + 1U >= cache->page_count) {
-        return;
-    }
-
-    next =
-        cache->pages[page_index + 1U];
-
-    if (next == 0) {
-        return;
-    }
-
-    __asm__ volatile (
-        "prefetcht0 (%0)"
-        :
-        : "r"(next)
-        : "memory");
-}
-
-
 static inline kstatus_t compositor_surface_page_direct(
     const compositor_window_view_t *view,
     vm_object_t *object,
@@ -1881,10 +1846,6 @@ static inline kstatus_t compositor_surface_page_direct(
             cache->pages[page_index];
 
         if (base != 0) {
-            compositor_prefetch_surface_page(
-                cache,
-                page_index);
-
             *out = base;
             return K_OK;
         }
@@ -1944,10 +1905,6 @@ static inline kstatus_t compositor_surface_page_direct(
 
         cache->pages[page_index] =
             *out;
-
-        compositor_prefetch_surface_page(
-            cache,
-            page_index);
     }
 
     return K_OK;

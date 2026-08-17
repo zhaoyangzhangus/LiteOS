@@ -1794,41 +1794,6 @@ compositor_surface_cache_get(
  *
  * No VM lock, no backing-page list traversal.
  */
-
-/*
- * Sequential surface rendering normally crosses shared pages in ascending
- * order.  Once the next page already has a positive direct-page cache entry,
- * pull its first cache line toward L1 before the current page is exhausted.
- *
- * This is only a performance hint. Missing pages are never resolved or
- * allocated here.
- */
-static inline void compositor_prefetch_surface_page(
-    const compositor_surface_page_cache_t *cache,
-    uint64_t page_index) {
-
-    uint8_t *next;
-
-    if (cache == 0 ||
-        page_index + 1U >= cache->page_count) {
-        return;
-    }
-
-    next =
-        cache->pages[page_index + 1U];
-
-    if (next == 0) {
-        return;
-    }
-
-    __asm__ volatile (
-        "prefetcht0 (%0)"
-        :
-        : "r"(next)
-        : "memory");
-}
-
-
 static inline kstatus_t compositor_surface_page_direct(
     const compositor_window_view_t *view,
     vm_object_t *object,
@@ -1881,10 +1846,6 @@ static inline kstatus_t compositor_surface_page_direct(
             cache->pages[page_index];
 
         if (base != 0) {
-            compositor_prefetch_surface_page(
-                cache,
-                page_index);
-
             *out = base;
             return K_OK;
         }
@@ -1944,10 +1905,6 @@ static inline kstatus_t compositor_surface_page_direct(
 
         cache->pages[page_index] =
             *out;
-
-        compositor_prefetch_surface_page(
-            cache,
-            page_index);
     }
 
     return K_OK;
@@ -2557,61 +2514,6 @@ static void compositor_cursor_locked(void) {
  *
  * A false result only loses an optimization; it never affects correctness.
  */
-
-/*
- * Return true only when the complete current damage rectangle lies in the
- * guaranteed opaque interior of the client surface.
- *
- * In that case drawing the window frame/background first is redundant:
- * compositor_surface_locked() will overwrite every damaged pixel.
- *
- * Keep a conservative WINDOW_CORNER_RADIUS margin so rounded corners and the
- * one-pixel frame can never enter this fast path.
- */
-static inline bool compositor_damage_inside_surface_interior(
-    const compositor_window_view_t *window) {
-
-    int64_t left;
-    int64_t top;
-    int64_t right;
-    int64_t bottom;
-
-    if (window == 0 ||
-        window->width <= WINDOW_CORNER_RADIUS * 2U ||
-        window->height <= WINDOW_CORNER_RADIUS * 2U) {
-        return false;
-    }
-
-    left =
-        (int64_t)window->x +
-        WINDOW_FRAME_BORDER +
-        WINDOW_CORNER_RADIUS;
-
-    top =
-        (int64_t)window->y +
-        WINDOW_FRAME_BORDER +
-        WINDOW_CORNER_RADIUS;
-
-    right =
-        (int64_t)window->x +
-        WINDOW_FRAME_BORDER +
-        (int64_t)window->width -
-        WINDOW_CORNER_RADIUS;
-
-    bottom =
-        (int64_t)window->y +
-        WINDOW_FRAME_BORDER +
-        (int64_t)window->height -
-        WINDOW_CORNER_RADIUS;
-
-    return
-        (int64_t)g_compositor_snapshot.damage_left >= left &&
-        (int64_t)g_compositor_snapshot.damage_top >= top &&
-        (int64_t)g_compositor_snapshot.damage_right <= right &&
-        (int64_t)g_compositor_snapshot.damage_bottom <= bottom;
-}
-
-
 static bool compositor_window_fully_covers_damage(
     const compositor_window_view_t *window) {
 
@@ -2778,20 +2680,18 @@ static void compositor_region_locked(void) {
             0x005DADE2U :
             0x0026384AU;
 
-        if (!compositor_damage_inside_surface_interior(window)) {
-            compositor_fill_rounded_locked(
-                        window->x,
-                        window->y,
+        compositor_fill_rounded_locked(
+            window->x,
+            window->y,
 
-                        window->width +
-                            WINDOW_FRAME_EXTRA,
+            window->width +
+                WINDOW_FRAME_EXTRA,
 
-                        window->height +
-                            WINDOW_FRAME_EXTRA,
+            window->height +
+                WINDOW_FRAME_EXTRA,
 
-                        WINDOW_CORNER_RADIUS,
-                        frame_color);
-        }
+            WINDOW_CORNER_RADIUS,
+            frame_color);
 
         compositor_surface_locked(window);
     }
@@ -2981,173 +2881,93 @@ static inline void compositor_wc_store64(volatile uint64_t *destination,
         : "memory");
 }
 
-/*
- * WB composite framebuffer -> GPR.
- *
- * x86-64 supports unaligned 64-bit loads, so this remains correct even for
- * an unusual framebuffer/base alignment.  In the normal case both buffers
- * are naturally aligned and this becomes one MOVQ.
- */
-static inline uint64_t compositor_wb_load64(
-    const volatile uint32_t *source) {
-
-    uint64_t value;
-
-    __asm__ volatile (
-        "movq %1, %0"
-        : "=r"(value)
-        : "m"(*(const volatile uint64_t *)(const void *)source)
-        : "memory");
-
-    return value;
-}
-
-
 
 static void compositor_copy_wc_scanline(
     volatile uint32_t *destination,
     const volatile uint32_t *source,
     uint32_t pixels) {
 
-    if (destination == 0 ||
-        source == 0 ||
-        pixels == 0U) {
+    if (destination == 0 || source == 0 || pixels == 0U) {
         return;
     }
 
     /*
-     * First obtain natural qword alignment.
-     *
-     * destination/source advance together, and both framebuffers use the
-     * same 32-bit pixel layout, so after this point pair loads/stores are
-     * naturally aligned whenever the starting parity differed.
+     * Bring the destination to an 8-byte boundary.  Framebuffer base and
+     * stride are naturally aligned in the normal display path; an odd damage
+     * left coordinate is the usual reason this is needed.
      */
-    if (((uintptr_t)destination & 7U) != 0U &&
-        pixels != 0U) {
+    if ((((uintptr_t)destination) & 7U) != 0U && pixels != 0U) {
         *destination++ = *source++;
         --pixels;
     }
 
     /*
-     * Align the WC destination to a 64-byte cache-line boundary before the
-     * main loop.  MOVNTI is still used here, so we do not introduce cached
-     * stores into the WC bulk path.
-     */
-    while (pixels >= 2U &&
-           ((uintptr_t)destination & 63U) != 0U) {
-
-        uint64_t value =
-            compositor_wb_load64(source);
-
-        compositor_wc_store64(
-            (volatile uint64_t *)(void *)destination,
-            value);
-
-        destination += 2;
-        source += 2;
-        pixels -= 2U;
-    }
-
-    /*
-     * Main 64-byte path:
+     * Main loop: eight XRGB pixels = 32 bytes per iteration.
      *
-     *     16 XRGB8888 pixels
-     *       = 64 bytes
-     *       = 8 MOVNTI qword stores
-     *
-     * One loop iteration now consumes one complete cache line.
+     * Build four qwords from uint32_t source loads instead of type-punning
+     * the source pointer, avoiding aliasing/alignment assumptions.
      */
-    while (pixels >= 16U) {
-        uint64_t v0 =
-            compositor_wb_load64(source + 0U);
+    while (pixels >= 8U) {
+        uint64_t value0 =
+            (uint64_t)source[0] |
+            ((uint64_t)source[1] << 32U);
 
-        uint64_t v1 =
-            compositor_wb_load64(source + 2U);
+        uint64_t value1 =
+            (uint64_t)source[2] |
+            ((uint64_t)source[3] << 32U);
 
-        uint64_t v2 =
-            compositor_wb_load64(source + 4U);
+        uint64_t value2 =
+            (uint64_t)source[4] |
+            ((uint64_t)source[5] << 32U);
 
-        uint64_t v3 =
-            compositor_wb_load64(source + 6U);
+        uint64_t value3 =
+            (uint64_t)source[6] |
+            ((uint64_t)source[7] << 32U);
 
-        uint64_t v4 =
-            compositor_wb_load64(source + 8U);
-
-        uint64_t v5 =
-            compositor_wb_load64(source + 10U);
-
-        uint64_t v6 =
-            compositor_wb_load64(source + 12U);
-
-        uint64_t v7 =
-            compositor_wb_load64(source + 14U);
-
-        volatile uint64_t *out =
+        volatile uint64_t *destination64 =
             (volatile uint64_t *)(void *)destination;
 
-        compositor_wc_store64(out + 0, v0);
-        compositor_wc_store64(out + 1, v1);
-        compositor_wc_store64(out + 2, v2);
-        compositor_wc_store64(out + 3, v3);
-        compositor_wc_store64(out + 4, v4);
-        compositor_wc_store64(out + 5, v5);
-        compositor_wc_store64(out + 6, v6);
-        compositor_wc_store64(out + 7, v7);
+        /*
+         * Four independent WC stores keep the write-combining path fed
+         * without requiring SIMD registers.
+         */
+        __asm__ volatile (
+            "movnti %1, 0(%0)\n\t"
+            "movnti %2, 8(%0)\n\t"
+            "movnti %3, 16(%0)\n\t"
+            "movnti %4, 24(%0)"
+            :
+            : "r"(destination64),
+              "r"(value0),
+              "r"(value1),
+              "r"(value2),
+              "r"(value3)
+            : "memory");
 
-        destination += 16;
-        source += 16;
-        pixels -= 16U;
-    }
-
-    /*
-     * 32-byte remainder.
-     */
-    if (pixels >= 8U) {
-        uint64_t v0 =
-            compositor_wb_load64(source + 0U);
-
-        uint64_t v1 =
-            compositor_wb_load64(source + 2U);
-
-        uint64_t v2 =
-            compositor_wb_load64(source + 4U);
-
-        uint64_t v3 =
-            compositor_wb_load64(source + 6U);
-
-        volatile uint64_t *out =
-            (volatile uint64_t *)(void *)destination;
-
-        compositor_wc_store64(out + 0, v0);
-        compositor_wc_store64(out + 1, v1);
-        compositor_wc_store64(out + 2, v2);
-        compositor_wc_store64(out + 3, v3);
-
-        destination += 8;
-        source += 8;
+        destination += 8U;
+        source += 8U;
         pixels -= 8U;
     }
 
     /*
-     * Remaining qwords.
+     * Handle remaining pairs with one 64-bit non-temporal store.
      */
     while (pixels >= 2U) {
         uint64_t value =
-            compositor_wb_load64(source);
+            (uint64_t)source[0] |
+            ((uint64_t)source[1] << 32U);
 
         compositor_wc_store64(
             (volatile uint64_t *)(void *)destination,
             value);
 
-        destination += 2;
-        source += 2;
+        destination += 2U;
+        source += 2U;
         pixels -= 2U;
     }
 
     /*
-     * At most one final XRGB8888 pixel remains.
-     *
-     * sfence deliberately remains at frame/commit level rather than here.
+     * At most one pixel remains.
      */
     if (pixels != 0U) {
         *destination = *source;
