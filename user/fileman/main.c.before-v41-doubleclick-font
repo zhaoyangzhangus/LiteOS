@@ -20,22 +20,15 @@
 #define FM4_GRID_MARGIN_Y           20U
 
 #define FM4_GRID_CARD_WIDTH        126U
-#define FM4_GRID_CARD_HEIGHT       136U
+#define FM4_GRID_CARD_HEIGHT       120U
 #define FM4_GRID_STEP_X            148U
-#define FM4_GRID_STEP_Y            150U
+#define FM4_GRID_STEP_Y            134U
 
 #define FM4_CONTEXT_WIDTH          180U
 #define FM4_CONTEXT_ROW_HEIGHT      34U
 
 #define FM4_HISTORY_CAPACITY        16U
-/*
- * input.timestamp currently contains raw x86 TSC ticks.
- *
- * Do not label this value as nanoseconds. 3 billion TSC ticks gives a
- * practical desktop double-click window on the current high-frequency
- * x86_64 environment.
- */
-#define FM4_DOUBLE_CLICK_TSC_TICKS 3000000000ULL
+#define FM4_DOUBLE_CLICK_NS  450000000ULL
 
 #define FM4_INDEX_NONE      0xFFFFFFFFU
 
@@ -430,33 +423,77 @@ static void fm4_round_rect(
 /*
  * Existing 5x7 Fileman glyphs rendered at 2x.
  */
+static void fm4_char(
+    uint32_t x,
+    uint32_t y,
+    char character,
+    uint32_t color) {
+
+    const uint8_t *glyph =
+        glyph_for(character);
+
+    if (glyph == 0) {
+        return;
+    }
+
+    for (uint32_t row = 0U;
+         row < 7U;
+         ++row) {
+
+        uint8_t bits =
+            glyph[row];
+
+        for (uint32_t column = 0U;
+             column < 5U;
+             ++column) {
+
+            if ((bits &
+                 (1U << (4U - column))) ==
+                0U) {
+
+                continue;
+            }
+
+            fill_rect(
+                x + column * 2U,
+                y + row * 2U,
+                2U,
+                2U,
+                color);
+        }
+    }
+}
+
+
 static void fm4_text(
     uint32_t x,
     uint32_t y,
     const char *text,
     uint32_t color) {
 
-    /*
-     * Same renderer as gshell:
-     *
-     *     font12x24_draw_glyph()
-     *
-     * Keep every Ring3 application on the same 12x24 text raster.
-     */
-    draw_text(
-        x,
-        y,
-        text,
-        color);
+    if (text == 0) {
+        return;
+    }
+
+    for (uint32_t index = 0U;
+         text[index] != '\0';
+         ++index) {
+
+        fm4_char(
+            x + index * 12U,
+            y,
+            text[index],
+            color);
+    }
 }
+
 
 static uint32_t fm4_text_width(
     const char *text) {
 
-    return
-        text_length(text) *
-        FONT12X24_WIDTH;
+    return text_length(text) * 12U;
 }
+
 
 static void fm4_center_text(
     uint32_t x,
@@ -1082,7 +1119,7 @@ static void fm4_item_label(
         fm4_center_text(
             x,
             FM4_GRID_CARD_WIDTH,
-            y + FONT12X24_HEIGHT,
+            y + 17U,
             second,
             color);
     }
@@ -1625,15 +1662,15 @@ static bool create_window(void) {
     /*
      * Medium centered desktop window instead of almost-fullscreen.
      */
-    /*
-     * Initial Fileman window:
-     * centered at 50% of the display width and height.
-     */
     width =
-        display.width / 2U;
+        display.width > 1280U ?
+        1180U :
+        display.width - 48U;
 
     height =
-        display.height / 2U;
+        display.height > 840U ?
+        760U :
+        display.height - 72U;
 
     request.hdr.size =
         sizeof(request);
@@ -2709,21 +2746,6 @@ static void handle_event(
                     g_pointer_x,
                     g_pointer_y);
 
-            /*
-             * A double-click must stay on the same item.
-             */
-            if (g_last_click_item !=
-                    FM4_INDEX_NONE &&
-                g_hover_item !=
-                    g_last_click_item) {
-
-                g_last_click_item =
-                    FM4_INDEX_NONE;
-
-                g_last_click_time =
-                    0U;
-            }
-
             if (old_item !=
                     g_hover_item ||
                 old_control !=
@@ -2995,7 +3017,7 @@ static void handle_event(
                 g_last_click_time &&
             event->input.timestamp -
                 g_last_click_time <=
-                FM4_DOUBLE_CLICK_TSC_TICKS) {
+                FM4_DOUBLE_CLICK_NS) {
 
             g_selected = item;
             g_selection_valid = true;
