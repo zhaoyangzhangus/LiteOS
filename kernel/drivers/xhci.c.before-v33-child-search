@@ -280,18 +280,6 @@ typedef struct xhci_slot_device {
     uint8_t hub_protocol;
 
 
-    /*
-     * Downstream device slots.
-     *
-     * Index:
-     *   port number - 1
-     *
-     * Value:
-     *   child Slot ID
-     */
-    uint8_t child_slots[16];
-
-
     xhci_device_context_t context;
 
 } xhci_slot_device_t;
@@ -2532,205 +2520,26 @@ static bool xhci_remove_device_subtree(xhci_state_t *state,
     return removed;
 }
 
-
-
-static bool xhci_find_hub_child(
-    xhci_state_t *state,
-    xhci_device_context_t *child,
-    uint8_t parent_slot,
-    uint8_t parent_port,
-    uint32_t *index,
-    bool *active)
-{
-
-    if(state == 0 ||
-       index == 0 ||
-       active == 0)
-    {
-        return false;
-    }
-
-
-    *index =
-        UINT32_MAX;
-
-    *active =
-        false;
-
-
-    /*
-     * V3.4.3 O(1) child lookup
-     *
-     * Hub topology is now maintained by:
-     *
-     * parent_slot
-     *       |
-     *       + child_slots[port]
-     *
-     * No global inventory scan.
-     */
-
-    if(parent_slot == 0U ||
-       parent_port == 0U ||
-       parent_port > 16U)
-    {
-        return false;
-    }
-
-
-    xhci_slot_device_t *parent =
-        &g_xhci_slot_devices[parent_slot];
-
-
-    if(!parent->used ||
-       !parent->is_hub)
-    {
-        return false;
-    }
-
-
-    uint8_t child_slot =
-        parent->child_slots[parent_port-1U];
-
-
-    if(child_slot == 0U)
-    {
-        return false;
-    }
-
-
-    xhci_slot_device_t *dev =
-        &g_xhci_slot_devices[child_slot];
-
-
-    if(!dev->used)
-    {
-        return false;
-    }
-
-
-    /*
-     * Keep old caller ABI:
-     * return inventory index.
-     */
-
-    for(uint32_t i=0U;
-        i<state->inventory_count;
-        ++i)
-    {
-        if(!state->inventory[i].valid)
-        {
-            continue;
-        }
-
-
-        if(state->inventory[i]
-            .context.device_slot ==
-           child_slot)
-        {
-            *index=i;
-
-            if(child)
-            {
-                *child =
-                    dev->context;
-            }
-
-
-            *active=true;
-
+static bool xhci_find_hub_child(const xhci_state_t *state,
+                                const xhci_device_context_t *saved_active,
+                                uint8_t hub_slot, uint8_t port,
+                                uint32_t *inventory_index, bool *active_child) {
+    if (state == 0 || saved_active == 0 || inventory_index == 0 ||
+        active_child == 0) return false;
+    *inventory_index = UINT32_MAX;
+    *active_child = saved_active->device_slot != 0U &&
+                    saved_active->parent_slot == hub_slot &&
+                    saved_active->parent_port == port;
+    for (uint32_t i = 0U; i < state->inventory_count; ++i) {
+        const xhci_inventory_entry_t *entry = &state->inventory[i];
+        if (entry->valid && entry->context.parent_slot == hub_slot &&
+            entry->context.parent_port == port) {
+            *inventory_index = i;
             return true;
         }
     }
-
-
-    /*
-     * Slot exists but inventory entry
-     * disappeared.
-     */
-    if(child)
-    {
-        *child =
-            dev->context;
-    }
-
-
-    *active=true;
-
-    return false;
+    return *active_child;
 }
-
-/*
- * V3.4.4 Slot tree removal
- *
- * Remove children before parent.
- *
- * Topology source:
- *
- *     parent slot
- *          |
- *     child_slots[]
- *
- */
-static void __attribute__((used))
-xhci_remove_slot_tree(
-    uint8_t slot)
-{
-    if(slot == 0U)
-    {
-        return;
-    }
-
-
-    xhci_slot_device_t *dev =
-        &g_xhci_slot_devices[slot];
-
-
-    if(!dev->used)
-    {
-        return;
-    }
-
-
-    /*
-     * Remove downstream devices first.
-     */
-    for(uint32_t port = 0U;
-        port < 16U;
-        ++port)
-    {
-        uint8_t child =
-            dev->child_slots[port];
-
-
-        if(child != 0U)
-        {
-            xhci_remove_slot_tree(
-                child);
-        }
-    }
-
-
-    /*
-     * Hardware slot disable is handled by
-     * the existing removal path.
-     *
-     * This function only maintains
-     * software topology.
-     */
-
-
-    /*
-     * Clear software topology node.
-     */
-    __builtin_memset(
-        dev,
-        0,
-        sizeof(*dev));
-}
-
-
-
 
 static bool xhci_reconcile_one_hub(xhci_state_t *state,
                               const xhci_device_context_t *hub,
@@ -3223,7 +3032,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     static const uint8_t get_device_descriptor[8] = {
         0x80U, XHCI_SETUP_GET_DESCRIPTOR, 0x00U, XHCI_DESCRIPTOR_DEVICE,
         0x00U, 0x00U, XHCI_DESCRIPTOR_DEVICE_LENGTH, 0x00U
-
+    
     /* V3.2 Slot Table mirror completed */
 };
     static const uint8_t get_configuration_descriptor[8] = {
@@ -3322,30 +3131,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         if (g_xhci_error == 0U) g_xhci_error = 59U;
         return false;
     }
-
-
-    /*
-     * V3.4.2 parent child link
-     *
-     * Build the hardware Slot topology in software.
-     */
-    if(parent_slot != 0U &&
-       parent_port != 0U &&
-       parent_port <= 16U)
-    {
-        xhci_slot_device_t *parent_dev =
-            &g_xhci_slot_devices[parent_slot];
-
-
-        if(parent_dev->used)
-        {
-            parent_dev->child_slots[parent_port-1U] =
-                slot;
-        }
-    }
-
-
-return true;
+    return true;
 }
 
 static bool xhci_initialize(xhci_state_t *state, const pci_device_t *pci) {

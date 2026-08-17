@@ -2672,8 +2672,7 @@ static bool xhci_find_hub_child(
  *     child_slots[]
  *
  */
-static void __attribute__((used))
-xhci_remove_slot_tree(
+static void xhci_remove_slot_tree(
     uint8_t slot)
 {
     if(slot == 0U)
@@ -2712,12 +2711,11 @@ xhci_remove_slot_tree(
 
 
     /*
-     * Hardware slot disable is handled by
-     * the existing removal path.
+     * Existing hardware disable path.
      *
-     * This function only maintains
-     * software topology.
+     * Do not replace current caller yet.
      */
+    xhci_disable_slot(slot);
 
 
     /*
