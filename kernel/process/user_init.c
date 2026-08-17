@@ -152,7 +152,7 @@ static bool init_make_image(uint8_t *image, bool persistent, size_t *image_size)
         image[INIT_DATA_OFFSET + INIT_SHELL_PATH_OFFSET + i] =
             (uint8_t)shell_path[i];
     }
-    static const char netmgr_path[] = "/sbin/netmgr";
+    static const char netmgr_path[] = "/sbin/netd";
     for (size_t i = 0; i < sizeof(netmgr_path); ++i) {
         image[INIT_DATA_OFFSET + INIT_NETMGR_PATH_OFFSET + i] =
             (uint8_t)netmgr_path[i];

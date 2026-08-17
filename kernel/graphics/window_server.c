@@ -35,6 +35,7 @@ enum {
     DESKTOP_APP_FILES = 1U,
     DESKTOP_APP_TERMINAL = 2U,
     DESKTOP_APP_NOTES = 3U,
+    DESKTOP_APP_NETWORK = 4U,
 };
 #define WINDOW_RESIZE_GRAB 6U
 #define WINDOW_MIN_WIDTH 160U
@@ -568,6 +569,9 @@ static const desktop_icon_entry_t g_desktop_icons[] = {
     { DESKTOP_APP_NOTES,    DESKTOP_ICON_START_X,
       DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 2U),
       "Notes" },
+    { DESKTOP_APP_NETWORK,  DESKTOP_ICON_START_X,
+      DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 3U),
+      "Network" },
 };
 
 static uint32_t desktop_text_length(const char *text) {
@@ -684,6 +688,20 @@ static void desktop_draw_notes_icon_locked(int32_t x, int32_t y) {
     compositor_fill_locked(x + 12, y + 37, 16U, 2U, 0x006F8797U);
 }
 
+
+static void desktop_draw_network_icon_locked(int32_t x, int32_t y) {
+    compositor_fill_rounded_locked(x + 4, y + 4, 40U, 40U,
+                                   WINDOW_CORNER_RADIUS, 0x00152A38U);
+    compositor_fill_locked(x + 22, y + 12, 4U, 20U, 0x007FD7E8U);
+    compositor_fill_locked(x + 14, y + 18, 20U, 4U, 0x007FD7E8U);
+    compositor_fill_rounded_locked(x + 8, y + 14, 12U, 12U,
+                                   WINDOW_CORNER_RADIUS, 0x005DADE2U);
+    compositor_fill_rounded_locked(x + 28, y + 14, 12U, 12U,
+                                   WINDOW_CORNER_RADIUS, 0x005DADE2U);
+    compositor_fill_rounded_locked(x + 18, y + 30, 12U, 12U,
+                                   WINDOW_CORNER_RADIUS, 0x007FE0AEU);
+}
+
 static void desktop_draw_icon_locked(const desktop_icon_entry_t *icon) {
     uint32_t text_width;
     int32_t image_x;
@@ -713,6 +731,8 @@ static void desktop_draw_icon_locked(const desktop_icon_entry_t *icon) {
         desktop_draw_terminal_icon_locked(image_x, image_y);
     } else if (icon->app == DESKTOP_APP_NOTES) {
         desktop_draw_notes_icon_locked(image_x, image_y);
+    } else if (icon->app == DESKTOP_APP_NETWORK) {
+        desktop_draw_network_icon_locked(image_x, image_y);
     }
 
     text_width = desktop_text_length(icon->label) * 8U;
@@ -762,13 +782,13 @@ static void desktop_draw_wallpaper_locked(void) {
 
     if (height > DESKTOP_DOCK_HEIGHT + DESKTOP_DOCK_BOTTOM + 8U &&
         width > 40U) {
-        uint32_t dock_width = width > 320U ? 320U : width - 24U;
+        uint32_t dock_width = width > 430U ? 430U : width - 24U;
         int32_t dock_x = (int32_t)(width - dock_width) / 2;
         int32_t dock_y = (int32_t)height -
                          (int32_t)DESKTOP_DOCK_HEIGHT -
                          (int32_t)DESKTOP_DOCK_BOTTOM;
         uint32_t label_width =
-            desktop_text_length("Files   Terminal   Notes") * 8U;
+            desktop_text_length("Files  Terminal  Notes  Network") * 8U;
         compositor_fill_rounded_locked(dock_x, dock_y, dock_width,
                                        DESKTOP_DOCK_HEIGHT,
                                        WINDOW_CORNER_RADIUS, 0x00132232U);
@@ -779,7 +799,7 @@ static void desktop_draw_wallpaper_locked(void) {
             dock_x + (int32_t)(dock_width -
                                (label_width < dock_width ?
                                 label_width : dock_width)) / 2,
-            dock_y + 20, "Files   Terminal   Notes", 0x009EB9C8U);
+            dock_y + 20, "Files  Terminal  Notes  Network", 0x009EB9C8U);
     }
 
     for (uint32_t index = 0U;
@@ -823,6 +843,7 @@ static const char *desktop_program_path(uint32_t app) {
     if (app == DESKTOP_APP_FILES) return "/sbin/fileman";
     if (app == DESKTOP_APP_TERMINAL) return "/sbin/gshell";
     if (app == DESKTOP_APP_NOTES) return "/sbin/notepad";
+    if (app == DESKTOP_APP_NETWORK) return "/sbin/netmgr";
     return 0;
 }
 

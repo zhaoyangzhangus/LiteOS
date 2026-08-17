@@ -203,7 +203,7 @@ int main(int argc, char **argv) {
     put_header(image, DATA_OFFSET + 0x1C0U, 48U);
     put_header(image, DATA_OFFSET + 0x400U, 48U);
     put_path(image, DATA_OFFSET + 0x480U, "/sbin/gshell");
-    put_path(image, DATA_OFFSET + 0x4C0U, "/sbin/netmgr");
+    put_path(image, DATA_OFFSET + 0x4C0U, "/sbin/netd");
 
     if (!write_image(argv[2], image)) {
         fprintf(stderr, "cannot write %s\n", argv[2]);

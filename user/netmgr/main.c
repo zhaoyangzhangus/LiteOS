@@ -3,15 +3,32 @@
 
 #include <uapi/all.h>
 
-#define NETMGR_DHCP_CLIENT_PORT 68U
-#define NETMGR_DHCP_SERVER_PORT 67U
-#define NETMGR_DHCP_BROADCAST  0xFFFFFFFFU
-#define NETMGR_DHCP_COOKIE     0x63825363U
-#define NETMGR_DHCP_PACKET_SIZE 576U
-#define NETMGR_DHCP_POLL_NS    250000000ULL
-#define NETMGR_DHCP_RECEIVE_ATTEMPTS 8U
-#define NETMGR_DHCP_RETRY_NS   2000000000ULL
-#define NETMGR_DHCP_OPTION_END 255U
+#include "../font12x24.h"
+
+#define NETMGR_MAP_BASE          0x0C000000ULL
+#define NETMGR_EVENT_TIMEOUT     100000000ULL
+#define NETMGR_REFRESH_TICKS     5U
+#define NETMGR_MIN_WIDTH         520U
+#define NETMGR_MIN_HEIGHT        320U
+
+typedef struct netmgr_window {
+    os_handle_t handle;
+    uint32_t identifier;
+    uint32_t width;
+    uint32_t height;
+    uint32_t *pixels;
+} netmgr_window_t;
+
+static netmgr_window_t g_window = {
+    OS_INVALID_HANDLE, 0U, 0U, 0U, 0
+};
+static os_net_status_t g_status;
+static bool g_status_valid;
+static bool g_ctrl;
+static uint32_t g_refresh_tick;
+
+void __main(void) {
+}
 
 static int64_t netmgr_syscall_one(uint64_t number, uint64_t arg0) {
     register uint64_t rax __asm__("rax") = number;
@@ -21,327 +38,455 @@ static int64_t netmgr_syscall_one(uint64_t number, uint64_t arg0) {
     return (int64_t)rax;
 }
 
-static int64_t netmgr_syscall_three(uint64_t number, uint64_t arg0,
-                                    uint64_t arg1, uint64_t arg2) {
-    register uint64_t rax __asm__("rax") = number;
-    register uint64_t rdi __asm__("rdi") = arg0;
-    register uint64_t rsi __asm__("rsi") = arg1;
-    register uint64_t rdx __asm__("rdx") = arg2;
-    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
-                      "+d"(rdx) : : "rcx", "r11", "memory");
-    return (int64_t)rax;
-}
-
-/* socket syscall 使用完整的 x86_64 原始六参数约定。 */
-static int64_t netmgr_syscall_six(uint64_t number, uint64_t arg0,
-                                  uint64_t arg1, uint64_t arg2,
-                                  uint64_t arg3, uint64_t arg4,
-                                  uint64_t arg5) {
-    register uint64_t rax __asm__("rax") = number;
-    register uint64_t rdi __asm__("rdi") = arg0;
-    register uint64_t rsi __asm__("rsi") = arg1;
-    register uint64_t rdx __asm__("rdx") = arg2;
-    register uint64_t r10 __asm__("r10") = arg3;
-    register uint64_t r8 __asm__("r8") = arg4;
-    register uint64_t r9 __asm__("r9") = arg5;
-    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
-                      "+d"(rdx), "+r"(r10), "+r"(r8), "+r"(r9) :
-                      : "rcx", "r11", "memory");
-    return (int64_t)rax;
-}
-
-static void netmgr_exit(uint64_t status) {
+__attribute__((noreturn)) static void netmgr_exit(uint64_t status) {
+    if (g_window.handle != OS_INVALID_HANDLE) {
+        (void)netmgr_syscall_one(OS_SYS_HANDLE_CLOSE, g_window.handle);
+        g_window.handle = OS_INVALID_HANDLE;
+    }
     (void)netmgr_syscall_one(OS_SYS_THREAD_EXIT, status);
     for (;;) __asm__ volatile ("pause");
 }
 
 static int64_t netmgr_get_status(os_net_status_t *status) {
     if (status == 0) return -22;
+    *status = (os_net_status_t){0};
     status->hdr.size = sizeof(*status);
     status->hdr.version = OS_SYSCALL_ABI_VERSION;
-    status->hdr.flags = 0U;
     return netmgr_syscall_one(OS_SYS_NET_GET_STATUS, (uint64_t)status);
 }
 
-static int64_t netmgr_set_ipv4(uint32_t address, uint8_t prefix_length,
-                               uint32_t gateway) {
-    os_net_set_ipv4_config_t config = {0};
-    config.hdr.size = sizeof(config);
-    config.hdr.version = OS_SYSCALL_ABI_VERSION;
-    config.hdr.flags = 0U;
-    config.address = address;
-    config.gateway = gateway;
-    config.prefix_length = prefix_length;
-    return netmgr_syscall_one(OS_SYS_NET_SET_IPV4, (uint64_t)&config);
+static uint32_t text_length(const char *text) {
+    uint32_t length = 0U;
+    if (text == 0) return 0U;
+    while (text[length] != '\0') ++length;
+    return length;
 }
 
-static void netmgr_delay(uint64_t timeout_ns) {
-    volatile uint32_t word = 0U;
-    (void)netmgr_syscall_three(OS_SYS_FUTEX_WAIT, (uint64_t)&word, 0U,
-                               timeout_ns);
+static void append_character(char *destination, uint32_t capacity, char value) {
+    uint32_t length;
+    if (destination == 0 || capacity == 0U) return;
+    length = text_length(destination);
+    if (length + 1U >= capacity) return;
+    destination[length] = value;
+    destination[length + 1U] = '\0';
 }
 
-static void put_be16(uint8_t *buffer, uint16_t value) {
-    buffer[0] = (uint8_t)(value >> 8U);
-    buffer[1] = (uint8_t)value;
-}
-
-static void put_be32(uint8_t *buffer, uint32_t value) {
-    buffer[0] = (uint8_t)(value >> 24U);
-    buffer[1] = (uint8_t)(value >> 16U);
-    buffer[2] = (uint8_t)(value >> 8U);
-    buffer[3] = (uint8_t)value;
-}
-
-static uint32_t get_be32(const uint8_t *buffer) {
-    return ((uint32_t)buffer[0] << 24U) | ((uint32_t)buffer[1] << 16U) |
-           ((uint32_t)buffer[2] << 8U) | buffer[3];
-}
-
-static void copy_bytes(uint8_t *destination, const uint8_t *source, size_t length) {
-    while (length-- != 0U) *destination++ = *source++;
-}
-
-static bool append_option(uint8_t *packet, size_t capacity, size_t *offset,
-                          uint8_t type, const void *value, uint8_t length) {
-    if (packet == 0 || offset == 0 || (value == 0 && length != 0U) ||
-        *offset > capacity || capacity - *offset < (size_t)length + 2U) {
-        return false;
+static void append_text(char *destination, uint32_t capacity, const char *source) {
+    uint32_t length;
+    uint32_t index = 0U;
+    if (destination == 0 || source == 0 || capacity == 0U) return;
+    length = text_length(destination);
+    while (length + 1U < capacity && source[index] != '\0') {
+        destination[length++] = source[index++];
     }
-    packet[(*offset)++] = type;
-    packet[(*offset)++] = length;
-    copy_bytes(packet + *offset, (const uint8_t *)value, length);
-    *offset += length;
-    return true;
+    destination[length] = '\0';
 }
 
-static bool append_byte_option(uint8_t *packet, size_t capacity, size_t *offset,
-                               uint8_t type, uint8_t value) {
-    return append_option(packet, capacity, offset, type, &value, 1U);
-}
-
-static bool append_u32_option(uint8_t *packet, size_t capacity, size_t *offset,
-                              uint8_t type, uint32_t value) {
-    uint8_t encoded[4];
-    put_be32(encoded, value);
-    return append_option(packet, capacity, offset, type, encoded, sizeof(encoded));
-}
-
-static bool build_dhcp_packet(uint8_t *packet, size_t capacity, uint32_t xid,
-                              const uint8_t mac[6], uint8_t message_type,
-                              uint32_t requested_address, uint32_t server_id,
-                              size_t *length) {
-    static const uint8_t parameter_request_list[] = {1U, 3U, 6U, 15U, 51U, 54U,
-                                                     58U, 59U};
-    uint8_t client_identifier[7] = {1U, 0U, 0U, 0U, 0U, 0U, 0U};
-    size_t offset = 240U;
-    if (packet == 0 || mac == 0 || length == 0 || capacity < offset + 1U ||
-        message_type == 0U) return false;
-    for (size_t index = 0U; index < capacity; ++index) packet[index] = 0U;
-    packet[0] = 1U;                 /* BOOTP request */
-    packet[1] = 1U;                 /* Ethernet */
-    packet[2] = 6U;                 /* MAC length */
-    put_be32(packet + 4U, xid);
-    put_be16(packet + 10U, 0x8000U); /* 广播接收 DHCP OFFER/ACK */
-    copy_bytes(packet + 28U, mac, 6U);
-    copy_bytes(client_identifier + 1U, mac, 6U);
-    put_be32(packet + 236U, NETMGR_DHCP_COOKIE);
-    if (!append_byte_option(packet, capacity, &offset, 53U, message_type) ||
-        !append_option(packet, capacity, &offset, 55U, parameter_request_list,
-                       (uint8_t)sizeof(parameter_request_list)) ||
-        !append_option(packet, capacity, &offset, 61U,
-                       client_identifier, (uint8_t)sizeof(client_identifier))) {
-        return false;
+static void append_decimal(char *destination, uint32_t capacity, uint64_t value) {
+    char digits[24];
+    uint32_t count = 0U;
+    do {
+        digits[count++] = (char)('0' + value % 10U);
+        value /= 10U;
+    } while (value != 0U && count < sizeof(digits));
+    while (count != 0U) {
+        append_character(destination, capacity, digits[--count]);
     }
-    if (requested_address != 0U &&
-        !append_u32_option(packet, capacity, &offset, 50U, requested_address)) {
-        return false;
-    }
-    if (server_id != 0U &&
-        !append_u32_option(packet, capacity, &offset, 54U, server_id)) {
-        return false;
-    }
-    if (offset >= capacity) return false;
-    packet[offset++] = NETMGR_DHCP_OPTION_END;
-    *length = offset;
-    return true;
 }
 
-typedef struct dhcp_offer {
-    uint32_t address;
-    uint32_t subnet_mask;
-    uint32_t gateway;
-    uint32_t server_id;
-    uint8_t message_type;
-    bool has_subnet_mask;
-    bool has_server_id;
-} dhcp_offer_t;
+static char hex_digit(uint8_t value) {
+    value &= 0x0FU;
+    return value < 10U ? (char)('0' + value) :
+                         (char)('A' + value - 10U);
+}
 
-static bool parse_dhcp_packet(const uint8_t *packet, size_t length, uint32_t xid,
-                              dhcp_offer_t *offer) {
-    size_t offset = 240U;
-    if (packet == 0 || offer == 0 || length < offset || packet[0] != 2U ||
-        packet[1] != 1U || packet[2] != 6U || get_be32(packet + 4U) != xid ||
-        get_be32(packet + 236U) != NETMGR_DHCP_COOKIE) return false;
-    offer->address = get_be32(packet + 16U);
-    offer->subnet_mask = 0U;
-    offer->gateway = 0U;
-    offer->server_id = 0U;
-    offer->message_type = 0U;
-    offer->has_subnet_mask = false;
-    offer->has_server_id = false;
-    while (offset < length) {
-        uint8_t type = packet[offset++];
-        uint8_t option_length;
-        if (type == 0U) continue;
-        if (type == NETMGR_DHCP_OPTION_END) break;
-        if (offset >= length) return false;
-        option_length = packet[offset++];
-        if (option_length > length - offset) return false;
-        if (type == 53U && option_length == 1U) {
-            offer->message_type = packet[offset];
-        } else if (type == 1U && option_length == 4U) {
-            offer->subnet_mask = get_be32(packet + offset);
-            offer->has_subnet_mask = true;
-        } else if (type == 3U && option_length >= 4U) {
-            offer->gateway = get_be32(packet + offset);
-        } else if (type == 54U && option_length == 4U) {
-            offer->server_id = get_be32(packet + offset);
-            offer->has_server_id = true;
+static void append_hex_byte(char *destination, uint32_t capacity, uint8_t value) {
+    append_character(destination, capacity, hex_digit((uint8_t)(value >> 4U)));
+    append_character(destination, capacity, hex_digit(value));
+}
+
+static void format_ipv4(char *output, uint32_t capacity, uint32_t address) {
+    if (output == 0 || capacity == 0U) return;
+    output[0] = '\0';
+    if (address == 0U) {
+        append_text(output, capacity, "Not configured");
+        return;
+    }
+    append_decimal(output, capacity, (address >> 24U) & 0xFFU);
+    append_character(output, capacity, '.');
+    append_decimal(output, capacity, (address >> 16U) & 0xFFU);
+    append_character(output, capacity, '.');
+    append_decimal(output, capacity, (address >> 8U) & 0xFFU);
+    append_character(output, capacity, '.');
+    append_decimal(output, capacity, address & 0xFFU);
+}
+
+static void format_ipv4_prefix(char *output, uint32_t capacity,
+                               uint32_t address, uint8_t prefix) {
+    format_ipv4(output, capacity, address);
+    if (address != 0U) {
+        append_character(output, capacity, '/');
+        append_decimal(output, capacity, prefix);
+    }
+}
+
+static void format_mac(char *output, uint32_t capacity, const uint8_t mac[6]) {
+    if (output == 0 || capacity == 0U || mac == 0) return;
+    output[0] = '\0';
+    for (uint32_t index = 0U; index < 6U; ++index) {
+        if (index != 0U) append_character(output, capacity, ':');
+        append_hex_byte(output, capacity, mac[index]);
+    }
+}
+
+static void format_ipv6(char *output, uint32_t capacity,
+                        const uint8_t address[16], bool configured) {
+    if (output == 0 || capacity == 0U) return;
+    output[0] = '\0';
+    if (!configured) {
+        append_text(output, capacity, "Not configured");
+        return;
+    }
+    for (uint32_t group = 0U; group < 8U; ++group) {
+        if (group != 0U) append_character(output, capacity, ':');
+        append_hex_byte(output, capacity, address[group * 2U]);
+        append_hex_byte(output, capacity, address[group * 2U + 1U]);
+    }
+}
+
+static void fill_rect(uint32_t x, uint32_t y,
+                      uint32_t width, uint32_t height, uint32_t color) {
+    if (g_window.pixels == 0 || x >= g_window.width || y >= g_window.height) {
+        return;
+    }
+    if (width > g_window.width - x) width = g_window.width - x;
+    if (height > g_window.height - y) height = g_window.height - y;
+    for (uint32_t row = 0U; row < height; ++row) {
+        for (uint32_t column = 0U; column < width; ++column) {
+            g_window.pixels[
+                (uint64_t)(y + row) * g_window.width + x + column] = color;
         }
-        offset += option_length;
     }
-    return offer->message_type != 0U && offer->address != 0U;
 }
 
-static bool prefix_from_mask(uint32_t mask, uint8_t *prefix) {
-    bool saw_zero = false;
-    uint8_t count = 0U;
-    if (prefix == 0) return false;
-    for (int32_t bit = 31; bit >= 0; --bit) {
-        if ((mask & (1U << (uint32_t)bit)) != 0U) {
-            if (saw_zero) return false;
-            ++count;
+static void draw_text(uint32_t x, uint32_t y,
+                      const char *text, uint32_t color) {
+    if (text == 0) return;
+    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+        font12x24_draw_glyph(
+            g_window.pixels, g_window.width,
+            g_window.width, g_window.height,
+            (int32_t)(x + index * FONT12X24_WIDTH),
+            (int32_t)y, text[index], color);
+    }
+}
+
+static void draw_card(uint32_t x, uint32_t y,
+                      uint32_t width, uint32_t height) {
+    fill_rect(x, y, width, height, 0x001B2A36U);
+    if (width > 2U && height > 2U) {
+        fill_rect(x, y, width, 1U, 0x00334E60U);
+        fill_rect(x, y + height - 1U, width, 1U, 0x000E1820U);
+        fill_rect(x, y, 1U, height, 0x00334E60U);
+        fill_rect(x + width - 1U, y, 1U, height, 0x000E1820U);
+    }
+}
+
+static void update_window(void) {
+    os_window_update_t request = {0};
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.identifier = g_window.identifier;
+    request.width = g_window.width;
+    request.height = g_window.height;
+    (void)netmgr_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+}
+
+static void render(void) {
+    char value[96];
+    char line[128];
+    uint32_t content_width;
+    uint32_t left_width;
+    uint32_t right_x;
+    uint32_t right_width;
+    bool hardware;
+    bool link_up;
+    bool ipv6;
+
+    if (g_window.pixels == 0 || g_window.width == 0U ||
+        g_window.height == 0U) return;
+
+    hardware = g_status_valid &&
+        (g_status.flags & OS_NET_STATUS_HARDWARE_PRESENT) != 0U;
+    link_up = g_status_valid &&
+        (g_status.flags & OS_NET_STATUS_LINK_UP) != 0U;
+    ipv6 = g_status_valid &&
+        (g_status.flags & OS_NET_STATUS_IPV6_CONFIGURED) != 0U;
+
+    fill_rect(0U, 0U, g_window.width, g_window.height, 0x00121D26U);
+
+    fill_rect(0U, 0U, g_window.width, 52U, 0x001D3444U);
+    fill_rect(0U, 51U, g_window.width, 1U, 0x003E667CU);
+    draw_text(18U, 8U, "LITEOS NETWORK", 0x00E9F4F7U);
+    draw_text(18U, 29U, "Network status and configuration",
+              0x008FAEBDU);
+
+    content_width = g_window.width > 36U ? g_window.width - 36U :
+                                           g_window.width;
+
+    if (content_width >= 640U) {
+        left_width = (content_width - 16U) / 2U;
+        right_x = 18U + left_width + 16U;
+        right_width = content_width - left_width - 16U;
+    } else {
+        left_width = content_width;
+        right_x = 18U;
+        right_width = content_width;
+    }
+
+    draw_card(18U, 68U, left_width, 86U);
+    draw_text(34U, 82U, "CONNECTION", 0x008FD6C4U);
+    draw_text(34U, 110U,
+              !g_status_valid ? "Status unavailable" :
+              !hardware ? "No network hardware" :
+              link_up ? "Connected" : "Disconnected",
+              link_up ? 0x007FE0AEU : 0x00E7A36AU);
+    draw_text(34U, 132U, "DHCP service: netd", 0x008FAEBDU);
+
+    draw_card(18U, 166U, left_width, 138U);
+    draw_text(34U, 180U, "IP CONFIGURATION", 0x008FD6C4U);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "IPv4   ");
+    if (g_status_valid) {
+        format_ipv4_prefix(value, sizeof(value),
+                           g_status.ipv4_address,
+                           g_status.ipv4_prefix_length);
+    } else {
+        value[0] = '\0';
+        append_text(value, sizeof(value), "Unavailable");
+    }
+    append_text(line, sizeof(line), value);
+    draw_text(34U, 208U, line, 0x00D8E8EEU);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "Gateway ");
+    if (g_status_valid) {
+        format_ipv4(value, sizeof(value), g_status.ipv4_gateway);
+    } else {
+        value[0] = '\0';
+        append_text(value, sizeof(value), "Unavailable");
+    }
+    append_text(line, sizeof(line), value);
+    draw_text(34U, 234U, line, 0x00D8E8EEU);
+
+    line[0] = '\0';
+    append_text(line, sizeof(line), "IPv6   ");
+    if (g_status_valid) {
+        format_ipv6(value, sizeof(value), g_status.ipv6_address, ipv6);
+    } else {
+        value[0] = '\0';
+        append_text(value, sizeof(value), "Unavailable");
+    }
+    append_text(line, sizeof(line), value);
+    draw_text(34U, 260U, line, 0x00D8E8EEU);
+
+    if (content_width >= 640U) {
+        draw_card(right_x, 68U, right_width, 236U);
+        draw_text(right_x + 16U, 82U, "ADAPTER", 0x008FD6C4U);
+
+        line[0] = '\0';
+        append_text(line, sizeof(line), "MAC ");
+        if (g_status_valid) {
+            format_mac(value, sizeof(value), g_status.mac);
         } else {
-            saw_zero = true;
+            value[0] = '\0';
+            append_text(value, sizeof(value), "--:--:--:--:--:--");
         }
+        append_text(line, sizeof(line), value);
+        draw_text(right_x + 16U, 112U, line, 0x00D8E8EEU);
+
+        line[0] = '\0';
+        append_text(line, sizeof(line), "Link changes ");
+        append_decimal(line, sizeof(line),
+                       g_status_valid ? g_status.link_transitions : 0U);
+        draw_text(right_x + 16U, 142U, line, 0x00D8E8EEU);
+
+        line[0] = '\0';
+        append_text(line, sizeof(line), "Reset count  ");
+        append_decimal(line, sizeof(line),
+                       g_status_valid ? g_status.reset_count : 0U);
+        draw_text(right_x + 16U, 172U, line, 0x00D8E8EEU);
+
+        draw_text(right_x + 16U, 218U,
+                  "R        Refresh now", 0x009FB8C5U);
+        draw_text(right_x + 16U, 244U,
+                  "Ctrl+Q   Close", 0x009FB8C5U);
+        draw_text(right_x + 16U, 270U,
+                  "Auto refresh: 500 ms", 0x006F8F9FU);
+    } else if (g_window.height >= 390U) {
+        draw_card(18U, 316U, left_width, 62U);
+        draw_text(34U, 330U, "R Refresh    Ctrl+Q Close",
+                  0x009FB8C5U);
     }
-    *prefix = count;
+
+    if (g_window.height > 42U) {
+        fill_rect(0U, g_window.height - 34U,
+                  g_window.width, 34U, 0x000D171EU);
+        draw_text(18U, g_window.height - 29U,
+                  g_status_valid ?
+                  "Live kernel network status" :
+                  "Network status read failed",
+                  g_status_valid ? 0x007FAFC3U : 0x00DE8C75U);
+    }
+
+    update_window();
+}
+
+static bool refresh_status(void) {
+    os_net_status_t status;
+    if (netmgr_get_status(&status) < 0) {
+        g_status_valid = false;
+        render();
+        return false;
+    }
+    g_status = status;
+    g_status_valid = true;
+    render();
     return true;
 }
 
-static int64_t socket_create(os_handle_t *handle) {
-    if (handle == 0) return -22;
-    *handle = OS_INVALID_HANDLE;
-    return netmgr_syscall_six(OS_SYS_SOCKET_CREATE, OS_AF_INET4, OS_SOCK_DGRAM,
-                              0U, (uint64_t)handle, 0U, 0U);
-}
+static bool create_window(void) {
+    os_display_info_t display = {0};
+    os_window_create_t request = {0};
 
-static int64_t socket_bind(os_handle_t handle, uint32_t address, uint16_t port) {
-    return netmgr_syscall_three(OS_SYS_SOCKET_BIND, handle, address, port);
-}
-
-static int64_t socket_send(os_handle_t handle, const uint8_t *packet, size_t length,
-                           uint32_t address, uint16_t port) {
-    return netmgr_syscall_six(OS_SYS_SOCKET_SEND, handle, (uint64_t)packet, length,
-                              address, port, 0U);
-}
-
-static int64_t socket_receive(os_handle_t handle, uint8_t *packet, size_t capacity,
-                              uint64_t timeout_ns) {
-    uint32_t source_address = 0U;
-    uint16_t source_port = 0U;
-    return netmgr_syscall_six(OS_SYS_SOCKET_RECV, handle, (uint64_t)packet, capacity,
-                              (uint64_t)&source_address, (uint64_t)&source_port,
-                              timeout_ns);
-}
-
-/*
- * 网卡轮询是延迟工作，旧事务的 DHCP 包可能在当前事务之后才进入 socket
- * 队列。这里在一个接收窗口内持续读取，只接受匹配 xid 和消息类型的包。
- */
-static bool receive_dhcp_message(os_handle_t socket, uint8_t *packet, size_t capacity,
-                                 uint32_t xid, uint8_t message_type,
-                                 dhcp_offer_t *offer) {
-    for (uint32_t attempt = 0U; attempt < NETMGR_DHCP_RECEIVE_ATTEMPTS; ++attempt) {
-        int64_t received = socket_receive(socket, packet, capacity,
-                                          NETMGR_DHCP_POLL_NS);
-        if (received <= 0 || !parse_dhcp_packet(packet, (size_t)received, xid, offer) ||
-            offer->message_type != message_type) continue;
-        return true;
+    display.hdr.size = sizeof(display);
+    display.hdr.version = OS_SYSCALL_ABI_VERSION;
+    if (netmgr_syscall_one(OS_SYS_DISPLAY_GET_INFO,
+                           (uint64_t)&display) < 0 ||
+        display.width < 320U || display.height < 240U) {
+        return false;
     }
-    return false;
+
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.width = display.width > 760U ? 720U :
+                    (display.width > 48U ? display.width - 48U :
+                                           display.width);
+    request.height = display.height > 500U ? 430U :
+                     (display.height > 70U ? display.height - 70U :
+                                             display.height);
+    if (request.width < NETMGR_MIN_WIDTH &&
+        display.width >= NETMGR_MIN_WIDTH) {
+        request.width = NETMGR_MIN_WIDTH;
+    }
+    if (request.height < NETMGR_MIN_HEIGHT &&
+        display.height >= NETMGR_MIN_HEIGHT) {
+        request.height = NETMGR_MIN_HEIGHT;
+    }
+    request.x = display.width > request.width ?
+        (int32_t)((display.width - request.width) / 2U) : 0;
+    request.y = display.height > request.height ?
+        (int32_t)((display.height - request.height) / 2U) : 0;
+    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
+    request.background = 0x00121D26U;
+    request.title[0] = 'N';
+    request.title[1] = 'E';
+    request.title[2] = 'T';
+    request.title[3] = 'W';
+    request.title[4] = 'O';
+    request.title[5] = 'R';
+    request.title[6] = 'K';
+    request.title[7] = '\0';
+    request.address = NETMGR_MAP_BASE;
+
+    if (netmgr_syscall_one(OS_SYS_WINDOW_CREATE,
+                           (uint64_t)&request) != 0 ||
+        request.window == OS_INVALID_HANDLE ||
+        request.identifier == 0U ||
+        request.address == 0U) {
+        return false;
+    }
+
+    g_window.handle = request.window;
+    g_window.identifier = request.identifier;
+    g_window.width = request.width;
+    g_window.height = request.height;
+    g_window.pixels = (uint32_t *)(uintptr_t)request.address;
+    return true;
 }
 
-static bool dhcp_exchange(os_handle_t socket, const os_net_status_t *status,
-                          uint32_t xid, uint32_t *address, uint8_t *prefix,
-                          uint32_t *gateway) {
-    uint8_t packet[NETMGR_DHCP_PACKET_SIZE];
-    uint8_t reply[NETMGR_DHCP_PACKET_SIZE];
-    dhcp_offer_t offer;
-    size_t packet_length = 0U;
-    if (status == 0 || address == 0 || prefix == 0 || gateway == 0 ||
-        !build_dhcp_packet(packet, sizeof(packet), xid, status->mac, 1U, 0U, 0U,
-                           &packet_length) ||
-        socket_send(socket, packet, packet_length, NETMGR_DHCP_BROADCAST,
-                    NETMGR_DHCP_SERVER_PORT) < 0) return false;
-    if (!receive_dhcp_message(socket, reply, sizeof(reply), xid, 2U, &offer) ||
-        !offer.has_subnet_mask || !offer.has_server_id ||
-        !prefix_from_mask(offer.subnet_mask, prefix)) return false;
-    if (!build_dhcp_packet(packet, sizeof(packet), xid, status->mac, 3U,
-                           offer.address, offer.server_id, &packet_length) ||
-        socket_send(socket, packet, packet_length, NETMGR_DHCP_BROADCAST,
-                    NETMGR_DHCP_SERVER_PORT) < 0) return false;
-    if (!receive_dhcp_message(socket, reply, sizeof(reply), xid, 5U, &offer) ||
-        !offer.has_subnet_mask || !prefix_from_mask(offer.subnet_mask, prefix)) return false;
-    *address = offer.address;
-    *gateway = offer.gateway;
-    return *address != 0U;
+static void handle_key(const os_window_event_t *event) {
+    const os_input_event_t *input;
+
+    if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT) return;
+    input = &event->input;
+    if (input->type != OS_INPUT_EVENT_KEY) return;
+
+    if (input->code == 0xE0U || input->code == 0xE4U) {
+        g_ctrl = input->value != OS_INPUT_VALUE_RELEASE;
+        return;
+    }
+    if (input->value == OS_INPUT_VALUE_RELEASE) return;
+
+    if (g_ctrl &&
+        (input->code == 0x14U || input->code == (uint32_t)'Q')) {
+        netmgr_exit(0U);
+    }
+    if (input->code == 0x15U || input->code == (uint32_t)'R') {
+        g_refresh_tick = 0U;
+        (void)refresh_status();
+    }
+}
+
+static void handle_event(const os_window_event_t *event) {
+    uint64_t pixels;
+
+    if (event == 0) return;
+    if (event->type == OS_WINDOW_EVENT_RESIZE) {
+        if (event->resize.width == 0U ||
+            event->resize.height == 0U) return;
+        pixels = (uint64_t)event->resize.width *
+                 event->resize.height;
+        if (pixels >
+            event->resize.buffer_size / sizeof(uint32_t)) return;
+        g_window.width = event->resize.width;
+        g_window.height = event->resize.height;
+        render();
+        return;
+    }
+    handle_key(event);
+}
+
+static int netmgr_main(void) {
+    if (!create_window()) return 1;
+    (void)refresh_status();
+
+    for (;;) {
+        os_window_event_read_t request = {0};
+        int64_t status;
+
+        request.hdr.size = sizeof(request);
+        request.hdr.version = OS_SYSCALL_ABI_VERSION;
+        request.identifier = g_window.identifier;
+        request.timeout_ns = NETMGR_EVENT_TIMEOUT;
+
+        status = netmgr_syscall_one(OS_SYS_WINDOW_EVENT_READ,
+                                    (uint64_t)&request);
+        if (status == 0) {
+            handle_event(&request.event);
+        } else if (status != -11 && status != -110) {
+            __asm__ volatile ("pause");
+        }
+
+        if (++g_refresh_tick >= NETMGR_REFRESH_TICKS) {
+            g_refresh_tick = 0U;
+            (void)refresh_status();
+        }
+    }
 }
 
 __attribute__((noreturn)) void netmgr_entry(void) {
-    os_net_status_t status = {0};
-    os_handle_t socket = OS_INVALID_HANDLE;
-    uint32_t transaction = 0x4C544F53U;
-    if (netmgr_get_status(&status) < 0) netmgr_exit(1U);
-    for (;;) {
-        uint32_t address;
-        uint32_t gateway;
-        uint8_t prefix;
-        bool link_up;
-        if (netmgr_get_status(&status) < 0) netmgr_exit(1U);
-        link_up = (status.flags & OS_NET_STATUS_LINK_UP) != 0U;
-        if (!link_up) {
-            if (socket != OS_INVALID_HANDLE) {
-                (void)netmgr_syscall_one(OS_SYS_HANDLE_CLOSE, socket);
-                socket = OS_INVALID_HANDLE;
-            }
-            if (status.ipv4_address != 0U) (void)netmgr_set_ipv4(0U, 0U, 0U);
-            netmgr_delay(NETMGR_DHCP_RETRY_NS);
-            continue;
-        }
-        if (status.ipv4_address != 0U && status.ipv4_prefix_length != 0U) {
-            netmgr_delay(100000000ULL);
-            continue;
-        }
-        if (socket == OS_INVALID_HANDLE &&
-            (socket_create(&socket) < 0 || socket == OS_INVALID_HANDLE ||
-             socket_bind(socket, 0U, NETMGR_DHCP_CLIENT_PORT) < 0)) {
-            if (socket != OS_INVALID_HANDLE) {
-                (void)netmgr_syscall_one(OS_SYS_HANDLE_CLOSE, socket);
-                socket = OS_INVALID_HANDLE;
-            }
-            netmgr_delay(NETMGR_DHCP_RETRY_NS);
-            continue;
-        }
-        ++transaction;
-        if (dhcp_exchange(socket, &status, transaction, &address, &prefix, &gateway) &&
-            netmgr_set_ipv4(address, prefix, gateway) == 0) {
-            (void)netmgr_syscall_one(OS_SYS_HANDLE_CLOSE, socket);
-            socket = OS_INVALID_HANDLE;
-            netmgr_delay(100000000ULL);
-        } else {
-            netmgr_delay(NETMGR_DHCP_RETRY_NS);
-        }
-    }
+    int status = netmgr_main();
+    netmgr_exit(status == 0 ? 0U : 1U);
 }

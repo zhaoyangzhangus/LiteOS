@@ -63,6 +63,11 @@ USER_NETMGR_ELF = $(BUILD)/user/netmgr.elf
 USER_NETMGR_LDFLAGS = -nostdlib -Wl,--entry,netmgr_entry -Wl,--subsystem,0 \
                       -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                       -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
+USER_NETD_PE = $(BUILD)/user/netd.pe
+USER_NETD_ELF = $(BUILD)/user/netd.elf
+USER_NETD_LDFLAGS = -nostdlib -Wl,--entry,netd_entry -Wl,--subsystem,0 \
+                    -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
+                    -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
 .PHONY: all clean esp loader kernel test header-sanity abi-sanity rsa-test bluetooth-test firmware-test audiod-test release-metadata \
         $(BUILD)/build-id.exe $(BUILD)/sha256-test.exe $(BUILD)/buddy-test.exe \
@@ -174,7 +179,7 @@ $(BUILD)/kernel/fileman-blob.o: $(USER_FILEMAN_ELF) | $(BUILD)/kernel
 		--redefine-sym _binary_$(call binary_input_symbol,$(USER_FILEMAN_ELF))_start=liteos_fileman_blob_start \
 		--redefine-sym _binary_$(call binary_input_symbol,$(USER_FILEMAN_ELF))_end=liteos_fileman_blob_end $< $@
 
-$(BUILD)/user/netmgr.o: user/netmgr/main.c | $(BUILD)/user
+$(BUILD)/user/netmgr.o: user/netmgr/main.c $(FONT_HEADER) | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_NETMGR_PE): $(BUILD)/user/netmgr.o | $(BUILD)/user
@@ -187,6 +192,15 @@ $(BUILD)/kernel/netmgr-blob.o: $(USER_NETMGR_ELF) | $(BUILD)/kernel
 	$(OBJCOPY) -I binary -O pe-x86-64 -B i386:x86-64 \
 		--redefine-sym _binary_$(call binary_input_symbol,$(USER_NETMGR_ELF))_start=liteos_netmgr_blob_start \
 		--redefine-sym _binary_$(call binary_input_symbol,$(USER_NETMGR_ELF))_end=liteos_netmgr_blob_end $< $@
+
+$(BUILD)/user/netd.o: user/netd/main.c | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(USER_NETD_PE): $(BUILD)/user/netd.o | $(BUILD)/user
+	$(LD) $(USER_NETD_LDFLAGS) $^ -o $@
+
+$(USER_NETD_ELF): $(USER_NETD_PE) | $(BUILD)/user
+	$(OBJCOPY) -O elf64-x86-64 $< $@
 
 $(BUILD)/kernel/entry.o: kernel/kernel_entry.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -642,6 +656,9 @@ $(BUILD)/esp/sbin/audiod: $(USER_AUDIOD_ELF) | $(BUILD)/esp/sbin
 $(BUILD)/esp/sbin/netmgr: $(USER_NETMGR_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
+$(BUILD)/esp/sbin/netd: $(USER_NETD_ELF) | $(BUILD)/esp/sbin
+	cp $< $@
+
 esp: $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI $(KERNEL_ELF) \
      $(BUILD)/esp/EFI/LITEOS/loader.conf $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS) \
      $(BUILD)/esp/init $(BUILD)/esp/init-runtime \
@@ -650,7 +667,7 @@ esp: $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI $(KERNEL_ELF) \
      $(BUILD)/esp/sbin/crashd $(BUILD)/esp/sbin/gshell \
      $(BUILD)/esp/sbin/notepad $(BUILD)/esp/sbin/fileman \
      $(BUILD)/esp/sbin/fm $(BUILD)/esp/sbin/audiod \
-     $(BUILD)/esp/sbin/netmgr
+     $(BUILD)/esp/sbin/netmgr $(BUILD)/esp/sbin/netd
 	@echo ESP image prepared at $(BUILD)/esp
 
 release-metadata: $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS)
