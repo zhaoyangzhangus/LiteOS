@@ -505,40 +505,6 @@ static kstatus_t anon_page_get(vm_object_t *object, uint64_t index, bool create,
 }
 
 /* 在不创建页面的情况下查询私有 shadow，调用者必须持有地址空间锁。 */
-
-kstatus_t vm_object_shared_page_direct(vm_object_t *object,
-                                       uint64_t offset,
-                                       bool create,
-                                       uint8_t **out) {
-    page_t *page = 0;
-    void *direct;
-    uint64_t page_offset;
-    uint64_t index;
-    kstatus_t status;
-
-    if (object == 0 || out == 0 ||
-        object->type != VM_OBJECT_SHARED ||
-        offset >= object->size) {
-        return K_EINVAL;
-    }
-
-    page_offset = offset & ~(uint64_t)(PAGE_SIZE - 1U);
-    index = page_offset >> PAGE_SHIFT;
-
-    status = anon_page_get(object, index, create, &page);
-    if (status != K_OK) {
-        return status;
-    }
-
-    direct = phys_to_direct(page_to_phys(page));
-    if (direct == 0) {
-        return K_EIO;
-    }
-
-    *out = (uint8_t *)direct;
-    return K_OK;
-}
-
 static page_t *anon_page_lookup(vm_object_t *object, uint64_t index) {
     if (object == 0 || object->type != VM_OBJECT_ANON ||
         object->u.anon.anon_root == 0) return 0;

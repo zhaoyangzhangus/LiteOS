@@ -1122,67 +1122,39 @@ static void focus_locked(window_server_window_t *window) {
     window_mark_window_locked(window);
 }
 
-static bool window_source_pixel_locked(
-    const window_server_window_t *window,
-    uint64_t surface_offset,
-    uint32_t *pixel,
-    uint64_t *cached_page,
-    uint8_t **cached_base) {
-
-    vm_object_t *object;
-    uint64_t page_offset;
-
-    if (window == 0 ||
-        pixel == 0 ||
-        cached_page == 0 ||
-        cached_base == 0 ||
-        window->section == 0 ||
-        window->section->vm_object == 0 ||
-        window->owner_address == 0U ||
-        surface_offset >= window->buffer_size) {
-        return false;
-    }
-
-    object = window->section->vm_object;
-
-    if (object->type != VM_OBJECT_SHARED) {
-        return false;
-    }
-
-    page_offset =
-        surface_offset & ~(uint64_t)(PAGE_SIZE - 1U);
-
-    if (*cached_page != page_offset) {
-        /*
-         * Resolve the shared backing object directly.
-         *
-         * The old compositor translated window->owner_address through the
-         * client process page tables. That made composition depend on a live
-         * user vm_space and could even run vm_handle_fault() in the rendering
-         * hot path.
-         *
-         * Both Ring3 and Ring0 now address exactly the same shared page, but
-         * Ring0 reaches it through the physical direct map.
-         */
-        if (vm_object_shared_page_direct(
-                object,
-                page_offset,
-                true,
-                cached_base) != K_OK) {
-            return false;
+static bool window_source_pixel_locked(const window_server_window_t *window,
+                                       uint64_t virtual_address,
+                                       uint32_t *pixel,
+                                       uint64_t *cached_page,
+                                       uint8_t **cached_base) {
+    paddr_t physical;
+    uint64_t page = virtual_address & ~(uint64_t)(PAGE_SIZE - 1U);
+    if (window == 0 || pixel == 0 || cached_page == 0 || cached_base == 0 ||
+        window->owner == 0 || window->owner->vm == 0 ||
+        window->owner_address == 0U) return false;
+    if (*cached_page != page) {
+        /* x86_translate_page 返回的物理地址包含传入地址的页内偏移。
+         * 这里缓存的是整页基址，因此必须翻译页首地址，避免后面
+         * 再加一次 offset 后跨页读取错误内容。 */
+        if (x86_translate_page(window->owner->vm->root_table,
+                               (vaddr_t)page, &physical, 0) != K_OK) {
+            vm_fault_info_t fault = {
+                .address = (vaddr_t)page,
+                .access = VM_PROT_READ,
+                .cpu_error = 0U,
+            };
+            if (vm_handle_fault(window->owner->vm, &fault) != K_OK ||
+                x86_translate_page(window->owner->vm->root_table,
+                                   (vaddr_t)page, &physical, 0) != K_OK) {
+                return false;
+            }
         }
-
-        *cached_page = page_offset;
+        *cached_page = page;
+        *cached_base = (uint8_t *)phys_to_direct(physical);
     }
-
-    if (*cached_base == 0) {
-        return false;
-    }
-
-    *pixel = *(const uint32_t *)(const void *)(
-        *cached_base +
-        (surface_offset & (PAGE_SIZE - 1U)));
-
+    if (*cached_base == 0) return false;
+    *pixel = *(const uint32_t *)(const void *)(*cached_base +
+                                               (virtual_address & (PAGE_SIZE - 1U)));
     return true;
 }
 
@@ -1240,7 +1212,7 @@ static void compositor_surface_locked(const window_server_window_t *window) {
             (uint32_t)(surface_x + first_column);
         for (int64_t column = first_column; column < last_column; ++column) {
             uint64_t index;
-            uint64_t source_offset;
+            uint64_t source;
             uint32_t pixel = window->background;
 
             if (window->resize_pending) {
@@ -1249,14 +1221,9 @@ static void compositor_surface_locked(const window_server_window_t *window) {
             }
 
             index = (uint64_t)row * window->width + column;
-            source_offset = index * sizeof(uint32_t);
-
-            if (window_source_pixel_locked(
-                    window,
-                    source_offset,
-                    &pixel,
-                    &cached_page,
-                    &cached_base)) {
+            source = window->owner_address + index * sizeof(uint32_t);
+            if (window_source_pixel_locked(window, source, &pixel,
+                                           &cached_page, &cached_base)) {
                 *destination++ = pixel;
             } else {
                 *destination++ = window->background;

@@ -12,19 +12,4 @@ kstatus_t vm_object_create_device(paddr_t phys, uint64_t length,
                                   vm_object_t **out);
 void vm_object_get(vm_object_t *object);
 void vm_object_put(vm_object_t *object);
-
-/*
- * Resolve one page of a VM_OBJECT_SHARED into the kernel physical direct map.
- *
- * offset may point anywhere inside the requested page. When create is true,
- * a missing shared page is allocated zero-filled just like a user mapping's
- * first page fault.
- *
- * The returned address is the beginning of the requested 4K object page.
- * Its lifetime is owned by the vm_object; callers must keep the object alive.
- */
-kstatus_t vm_object_shared_page_direct(vm_object_t *object,
-                                       uint64_t offset,
-                                       bool create,
-                                       uint8_t **out);
 kstatus_t vm_space_clone_cow(vm_space_t *source, vm_space_t **out);
