@@ -2643,18 +2643,120 @@ static bool xhci_inventory_has_root_port(
     return false;
 }
 
-
 /*
- * V3.10.6B6A LAST PUBLISHED ACTIVATOR REMOVED
+ * V3.9.3 SLOT ACTIVATION
  *
- * xhci_activate_next_slot_device() removed.
+ * Runtime working-context selection is now Slot Table based.
  *
- * Published devices are permanently addressed through
- * g_xhci_slot_devices[slot].context.
- *
- * state->device is not a runtime device-selection mechanism.
+ * inventory[] is not consulted.
  */
+static bool xhci_activate_next_slot_device(
+    xhci_state_t *state)
+{
+    if(state == 0 ||
+       state->device.device_slot != 0U)
+    {
+        return false;
+    }
 
+
+    uint32_t limit =
+        state->max_slots;
+
+
+    if(limit >=
+       XHCI_MAX_SLOT_TABLE)
+    {
+        limit =
+            XHCI_MAX_SLOT_TABLE -
+            1U;
+    }
+
+
+    /*
+     * Preserve the previous policy:
+     *
+     *   pass 0: ordinary functional devices
+     *   pass 1: Hubs
+     *
+     * Hub is used as the working context only if there is no
+     * normal functional device available.
+     */
+    for(uint32_t pass = 0U;
+        pass < 2U;
+        ++pass)
+    {
+        for(uint32_t slot = 1U;
+            slot <= limit;
+            ++slot)
+        {
+            xhci_slot_device_t *slot_dev =
+                &g_xhci_slot_devices[
+                    slot];
+
+
+            if(!slot_dev->used ||
+               slot_dev->context.device_slot !=
+                   (uint8_t)slot)
+            {
+                continue;
+            }
+
+
+            uint8_t kind =
+                xhci_context_kind(
+                    &slot_dev->context);
+
+
+            if(kind == 0U)
+            {
+                continue;
+            }
+
+
+            if(pass == 0U &&
+               kind == 4U)
+            {
+                continue;
+            }
+
+
+            if(pass == 1U &&
+               kind != 4U)
+            {
+                continue;
+            }
+
+
+            /*
+             * Slot.context remains canonical.
+             *
+             * state->device is only the legacy working copy used by
+             * helpers that have not yet been converted to accept a
+             * device context explicitly.
+             */
+            xhci_copy_device_context(
+                &state->device,
+                &slot_dev->context);
+
+
+            xhci_set_device_kind(
+                kind);
+
+
+            xhci_recompute_topology(
+                state);
+
+
+            return true;
+        }
+    }
+
+
+    xhci_clear_device_flags();
+
+    return false;
+}
 
 /*
  * V3.9.2 ROOT PORT DIRECT SLOT REMOVE
@@ -2746,13 +2848,12 @@ static bool xhci_remove_root_port_devices(
      *
      * The next V3.9 step removes this activation dependency too.
      */
-
-    /*
-     * V3.10.6B6A
-     *
-     * No published Slot is activated into state->device.
-     */
-
+    if(state->device.device_slot ==
+       0U)
+    {
+        (void)xhci_activate_next_slot_device(
+            state);
+    }
 
 
     xhci_recompute_topology(
@@ -4777,88 +4878,40 @@ xhci_remove_slot_tree(
 
 
 
-/*
- * V3.10.6B5 CANONICAL HUB RECONCILE
- *
- * Published Hub control state belongs permanently to Slot.context.
- *
- * Hub port control:
- *
- *     Slot.context -> hub
- *
- * New downstream child enumeration:
- *
- *     state->device -> enumerate -> publish Slot.context
- *
- * The two ownership domains never overlap.
- */
-static bool xhci_reconcile_one_hub(
-    xhci_state_t *state,
-    xhci_device_context_t *hub,
-    xhci_device_context_t *saved_active,
-    uint8_t *saved_kind)
-{
-    bool changed =
-        false;
-
-    if(state == 0 ||
-       hub == 0 ||
-       saved_active == 0 ||
-       saved_kind == 0 ||
-       hub->device_slot == 0U ||
-       hub->hub_port_count == 0U)
-    {
-        return false;
-    }
-
-    for(uint32_t port = 1U;
-        port <= hub->hub_port_count;
-        ++port)
-    {
-        uint32_t status =
-            0U;
-
-        uint8_t child_slot =
-            0U;
-
-        bool child_present =
-            false;
-
+static bool xhci_reconcile_one_hub(xhci_state_t *state,
+                              const xhci_device_context_t *hub,
+                              xhci_device_context_t *saved_active,
+                              uint8_t *saved_kind) {
+    bool changed = false;
+    if (state == 0 || hub == 0 || saved_active == 0 || saved_kind == 0 ||
+        hub->device_slot == 0U || hub->hub_port_count == 0U) return false;
+    for (uint32_t port = 1U; port <= hub->hub_port_count; ++port) {
+        uint32_t status = 0U;
+        uint8_t child_slot = 0U;
+        bool child_present = false;
         bool connected;
-
-        /*
-         * Published Hub EP0/control state is used directly.
-         *
-         * Control transfers may advance EP0 enqueue/cycle state,
-         * so this must be the canonical Slot.context rather than
-         * a temporary copy.
-         */
-        if(!xhci_hub_get_port_status_device(
-               state,
-               hub,
-               (uint8_t)port,
-               &status))
-        {
+        xhci_copy_device_context(&state->device, hub);
+        xhci_set_device_kind(4U);
+        if (!xhci_hub_get_port_status_device(state, &state->device,  (uint8_t)port, &status)) {
+            xhci_zero_device_context(&state->device);
+            xhci_clear_device_flags();
             continue;
         }
-
-        connected =
-            (status & 1U) != 0U;
-
-        child_present =
+        connected = (status & 1U) != 0U;
+                child_present =
             xhci_find_hub_child(
                 hub->device_slot,
                 (uint8_t)port,
                 &child_slot);
 
-        /*
-         * Disconnect:
-         *
-         * remove only the published child subtree.
-         * The Hub itself remains canonical in Slot.context.
-         */
         if(!connected)
         {
+            xhci_zero_device_context(
+                &state->device);
+
+            xhci_clear_device_flags();
+
+
             if(child_present &&
                child_slot != 0U &&
                xhci_remove_device_subtree(
@@ -4874,160 +4927,69 @@ static bool xhci_reconcile_one_hub(
             continue;
         }
 
+
         /*
-         * Already represented by a published child Slot.
+         * Port is connected and Slot Table already owns a child.
+         * Nothing to enumerate.
          */
         if(child_present)
         {
-            continue;
-        }
-
-        /*
-         * Newly connected downstream device.
-         *
-         * Power/reset/status transactions still belong to the
-         * published Hub context.
-         */
-        (void)xhci_hub_set_port_feature_device(
-            state,
-            hub,
-            (uint8_t)port,
-            USB_HUB_FEATURE_PORT_POWER);
-
-        (void)xhci_hub_set_port_feature_device(
-            state,
-            hub,
-            (uint8_t)port,
-            USB_HUB_FEATURE_PORT_RESET);
-
-        bool enabled =
-            false;
-
-        for(uint32_t spin = 0U;
-            spin < 10000U;
-            ++spin)
-        {
-            if(xhci_hub_get_port_status_device(
-                   state,
-                   hub,
-                   (uint8_t)port,
-                   &status) &&
-               (status & 1U) != 0U &&
-               (status & 2U) != 0U)
-            {
-                enabled =
-                    true;
-
-                break;
-            }
-
-            __asm__ volatile (
-                "pause");
-        }
-
-        uint32_t route =
-            0U;
-
-        if(!enabled ||
-           !xhci_child_route(
-               hub,
-               (uint8_t)port,
-               &route))
-        {
-            continue;
-        }
-
-        uint8_t speed =
-            xhci_hub_port_speed(
-                status);
-
-        uint8_t slot =
-            0U;
-
-        /*
-         * V3.10.6B5 CHILD ENUMERATION BOUNDARY
-         *
-         * Everything above this point operates on the published
-         * Hub context.
-         *
-         * Everything below that creates/configures the new child
-         * uses state->device as unpublished working storage.
-         */
-        xhci_zero_device_context(
-            &state->device);
-
-        xhci_clear_device_flags();
-
-        if(!xhci_submit_command(
-               state,
-               XHCI_COMMAND_RING_TYPE,
-               0U,
-               0U,
-               &slot) ||
-           slot == 0U ||
-           !xhci_enumerate_device(
-               state,
-               slot,
-               (uint8_t)port,
-               speed,
-               hub->root_port,
-               hub->device_slot,
-               (uint8_t)port,
-               route))
-        {
-            if(slot != 0U)
-            {
-                (void)xhci_submit_command(
-                    state,
-                    XHCI_DISABLE_SLOT_TYPE,
-                    slot,
-                    0U,
-                    0);
-            }
-
-            (void)xhci_free_device_resources(
-                state);
+            xhci_zero_device_context(
+                &state->device);
 
             xhci_clear_device_flags();
 
             continue;
         }
 
-        uint8_t kind =
-            xhci_current_device_kind();
-
-        if(kind != 0U &&
-           xhci_save_active_device(
-               state,
-               kind))
-        {
-            changed =
-                true;
+        /* 新连接设备需要由 Hub 供电并复位，随后才能取得可用速度。 */
+        (void)xhci_hub_set_port_feature_device(state, &state->device,  (uint8_t)port,
+                                        USB_HUB_FEATURE_PORT_POWER);
+        (void)xhci_hub_set_port_feature_device(state, &state->device,  (uint8_t)port,
+                                        USB_HUB_FEATURE_PORT_RESET);
+        bool enabled = false;
+        for (uint32_t spin = 0U; spin < 10000U; ++spin) {
+            if (xhci_hub_get_port_status_device(state, &state->device,  (uint8_t)port, &status) &&
+                (status & 1U) != 0U && (status & 2U) != 0U) {
+                enabled = true;
+                break;
+            }
+            __asm__ volatile ("pause");
         }
-        else
-        {
-            (void)xhci_submit_command(
-                state,
-                XHCI_DISABLE_SLOT_TYPE,
-                slot,
-                0U,
-                0);
-
-            (void)xhci_free_device_resources(
-                state);
-
+        uint32_t route = 0U;
+        if (!enabled || !xhci_child_route(hub, (uint8_t)port, &route)) {
+            xhci_zero_device_context(&state->device);
+            xhci_clear_device_flags();
+            continue;
+        }
+        uint8_t speed = xhci_hub_port_speed(status);
+        uint8_t slot = 0U;
+        /* Hub context 的 DMA 所有权由局部副本持有，子设备从空 context 分配。 */
+        xhci_zero_device_context(&state->device);
+        if (!xhci_submit_command(state, XHCI_COMMAND_RING_TYPE, 0U, 0U, &slot) ||
+            slot == 0U || !xhci_enumerate_device(
+                state, slot, (uint8_t)port, speed, hub->root_port,
+                hub->device_slot, (uint8_t)port, route)) {
+            if (slot != 0U) {
+                (void)xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
+                                           slot, 0U, 0);
+            }
+            (void)xhci_free_device_resources(state);
+            xhci_clear_device_flags();
+            continue;
+        }
+        uint8_t kind = xhci_current_device_kind();
+        if (kind != 0U && xhci_save_active_device(state, kind)) {
+            changed = true;
+        } else {
+            (void)xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
+                                       slot, 0U, 0);
+            (void)xhci_free_device_resources(state);
             xhci_clear_device_flags();
         }
     }
-
-    /*
-     * No unpublished child context may escape reconciliation.
-     */
-    xhci_zero_device_context(
-        &state->device);
-
+    xhci_zero_device_context(&state->device);
     xhci_clear_device_flags();
-
     return changed;
 }
 
@@ -5161,24 +5123,20 @@ static bool xhci_reconcile_hub_topology(
                 true;
 
 
-            /*
-             * V3.10.6B5 CANONICAL HUB OWNER
-             *
-             * Do not snapshot Hub DMA/control state.
-             *
-             * EP0 enqueue/cycle changes made by Hub control
-             * transfers must remain in Slot.context.
-             */
-            xhci_device_context_t *hub =
-                &slot_dev->context;
+            xhci_device_context_t hub;
+
+            xhci_copy_device_context(
+                &hub,
+                &slot_dev->context);
+
 
             /*
              * Slot Table corruption/stale context must not route
              * control transfers to another hardware Slot.
              */
-            if(hub->device_slot !=
+            if(hub.device_slot !=
                    (uint8_t)slot ||
-               hub->hub_port_count ==
+               hub.hub_port_count ==
                    0U)
             {
                 continue;
@@ -5187,7 +5145,7 @@ static bool xhci_reconcile_hub_topology(
 
             if(xhci_reconcile_one_hub(
                     state,
-                    hub,
+                    &hub,
                     &saved_active,
                     &saved_kind))
             {
@@ -5215,13 +5173,16 @@ static bool xhci_reconcile_hub_topology(
             &saved_active,
             saved_kind);
     }
-    else
-    /*
-     * V3.10.6B6A
-     *
-     * No published Slot is activated into state->device.
-     */
-
+    else if(state->device.device_slot ==
+            0U)
+    {
+        /*
+         * Compatibility path while inventory storage still exists.
+         * Device discovery itself no longer depends on inventory.
+         */
+        (void)xhci_activate_next_slot_device(
+            state);
+    }
 
 
     xhci_recompute_topology(

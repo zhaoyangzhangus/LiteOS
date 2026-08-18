@@ -2643,18 +2643,120 @@ static bool xhci_inventory_has_root_port(
     return false;
 }
 
-
 /*
- * V3.10.6B6A LAST PUBLISHED ACTIVATOR REMOVED
+ * V3.9.3 SLOT ACTIVATION
  *
- * xhci_activate_next_slot_device() removed.
+ * Runtime working-context selection is now Slot Table based.
  *
- * Published devices are permanently addressed through
- * g_xhci_slot_devices[slot].context.
- *
- * state->device is not a runtime device-selection mechanism.
+ * inventory[] is not consulted.
  */
+static bool xhci_activate_next_slot_device(
+    xhci_state_t *state)
+{
+    if(state == 0 ||
+       state->device.device_slot != 0U)
+    {
+        return false;
+    }
 
+
+    uint32_t limit =
+        state->max_slots;
+
+
+    if(limit >=
+       XHCI_MAX_SLOT_TABLE)
+    {
+        limit =
+            XHCI_MAX_SLOT_TABLE -
+            1U;
+    }
+
+
+    /*
+     * Preserve the previous policy:
+     *
+     *   pass 0: ordinary functional devices
+     *   pass 1: Hubs
+     *
+     * Hub is used as the working context only if there is no
+     * normal functional device available.
+     */
+    for(uint32_t pass = 0U;
+        pass < 2U;
+        ++pass)
+    {
+        for(uint32_t slot = 1U;
+            slot <= limit;
+            ++slot)
+        {
+            xhci_slot_device_t *slot_dev =
+                &g_xhci_slot_devices[
+                    slot];
+
+
+            if(!slot_dev->used ||
+               slot_dev->context.device_slot !=
+                   (uint8_t)slot)
+            {
+                continue;
+            }
+
+
+            uint8_t kind =
+                xhci_context_kind(
+                    &slot_dev->context);
+
+
+            if(kind == 0U)
+            {
+                continue;
+            }
+
+
+            if(pass == 0U &&
+               kind == 4U)
+            {
+                continue;
+            }
+
+
+            if(pass == 1U &&
+               kind != 4U)
+            {
+                continue;
+            }
+
+
+            /*
+             * Slot.context remains canonical.
+             *
+             * state->device is only the legacy working copy used by
+             * helpers that have not yet been converted to accept a
+             * device context explicitly.
+             */
+            xhci_copy_device_context(
+                &state->device,
+                &slot_dev->context);
+
+
+            xhci_set_device_kind(
+                kind);
+
+
+            xhci_recompute_topology(
+                state);
+
+
+            return true;
+        }
+    }
+
+
+    xhci_clear_device_flags();
+
+    return false;
+}
 
 /*
  * V3.9.2 ROOT PORT DIRECT SLOT REMOVE
@@ -2746,13 +2848,12 @@ static bool xhci_remove_root_port_devices(
      *
      * The next V3.9 step removes this activation dependency too.
      */
-
-    /*
-     * V3.10.6B6A
-     *
-     * No published Slot is activated into state->device.
-     */
-
+    if(state->device.device_slot ==
+       0U)
+    {
+        (void)xhci_activate_next_slot_device(
+            state);
+    }
 
 
     xhci_recompute_topology(
@@ -5215,13 +5316,16 @@ static bool xhci_reconcile_hub_topology(
             &saved_active,
             saved_kind);
     }
-    else
-    /*
-     * V3.10.6B6A
-     *
-     * No published Slot is activated into state->device.
-     */
-
+    else if(state->device.device_slot ==
+            0U)
+    {
+        /*
+         * Compatibility path while inventory storage still exists.
+         * Device discovery itself no longer depends on inventory.
+         */
+        (void)xhci_activate_next_slot_device(
+            state);
+    }
 
 
     xhci_recompute_topology(
