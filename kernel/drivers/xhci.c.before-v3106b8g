@@ -421,17 +421,56 @@ typedef struct xhci_state {
  * state->device is only a fallback for a Slot that is currently
  * being enumerated and has not yet been committed to Slot.context.
  */
-/*
- * V3.10.6B8G
- *
- * xhci_slot_context_owner() removed.
- *
- * Published runtime paths address Slot.context directly.
- *
- * The only pre-publication Transfer Event exception is HID, whose
- * enumeration fallback now lives locally in xhci_find_hid_context().
- */
+static xhci_device_context_t *
+xhci_slot_context_owner(
+    xhci_state_t *state,
+    uint8_t slot)
+{
+    if(state == 0 ||
+       slot == 0U)
+    {
+        return 0;
+    }
 
+
+    xhci_slot_device_t *slot_dev =
+        &g_xhci_slot_devices[
+            slot];
+
+
+    /*
+     * Canonical published runtime owner.
+     *
+     * Do this BEFORE checking state->device.
+     *
+     * A published Slot must never have HID/Hub/BT/Audio producer
+     * state updated in a temporary working copy.
+     */
+    if(slot_dev->used &&
+       slot_dev->context.device_slot ==
+           slot)
+    {
+        return
+            &slot_dev->context;
+    }
+
+
+    /*
+     * Unpublished enumeration-time fallback.
+     *
+     * xhci_enumerate_device() can receive EP0 events before the
+     * finished context has been committed into Slot Table.
+     */
+    if(state->device.device_slot ==
+       slot)
+    {
+        return
+            &state->device;
+    }
+
+
+    return 0;
+}
 
 
 
@@ -3146,68 +3185,16 @@ static bool xhci_handle_hub_transfer_event(
  *
  * Slot ID is the only device identity.
  */
-/*
- * V3.10.6B8G HID-ONLY WORKING CONTEXT FALLBACK
- *
- * HID is the one Transfer Event path that may legitimately see an
- * interrupt completion before enumeration has published state->device
- * into Slot.context.
- *
- * Ownership order is intentionally:
- *
- *     published Slot.context
- *              |
- *              v
- *     enumeration state->device fallback
- *
- * Never reverse this order: a published HID must always mutate the
- * permanent Slot.context.
- */
 static xhci_device_context_t *
 xhci_find_hid_context(
     xhci_state_t *state,
     uint8_t slot,
     uint32_t endpoint_id)
 {
-    if(state == 0 ||
-       slot == 0U)
-    {
-        return 0;
-    }
-
-
     xhci_device_context_t *device =
-        0;
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    /*
-     * Published HID always wins.
-     *
-     * This preserves the V3.9.6 mouse regression fix.
-     */
-    if(slot_dev->used &&
-       slot_dev->context.device_slot ==
-           slot)
-    {
-        device =
-            &slot_dev->context;
-    }
-    else if(state->device.device_slot ==
-            slot)
-    {
-        /*
-         * Enumeration-only fallback.
-         *
-         * HID configuration posts its first interrupt-IN before
-         * the completed working context is published.
-         */
-        device =
-            &state->device;
-    }
+        xhci_slot_context_owner(
+            state,
+            slot);
 
 
     if(device == 0 ||
@@ -6603,16 +6590,6 @@ bool xhci_usb_bluetooth_configured(void) {
  * calls are therefore O(1).  A Slot Table scan is used only when
  * the cache is empty or stale.
  */
-/*
- * V3.10.6B8G DIRECT AUDIO SLOT CONTEXT
- *
- * Runtime Audio ownership is always:
- *
- *     g_xhci_audio_slot -> Slot.context
- *
- * The Slot cache provides the O(1) steady-state path. A Slot Table
- * scan is used only when the cache is empty or stale.
- */
 static xhci_device_context_t *
 xhci_audio_context(
     xhci_state_t *state)
@@ -6629,19 +6606,18 @@ xhci_audio_context(
      */
     if(g_xhci_audio_slot != 0U)
     {
-        xhci_slot_device_t *slot_dev =
-            &g_xhci_slot_devices[
-                g_xhci_audio_slot];
+        xhci_device_context_t *device =
+            xhci_slot_context_owner(
+                state,
+                g_xhci_audio_slot);
 
 
-        if(slot_dev->used &&
-           slot_dev->context.device_slot ==
+        if(device != 0 &&
+           device->device_slot ==
                g_xhci_audio_slot &&
-           slot_dev->context.audio_endpoint !=
-               0U)
+           device->audio_endpoint != 0U)
         {
-            return
-                &slot_dev->context;
+            return device;
         }
 
 
@@ -6654,7 +6630,21 @@ xhci_audio_context(
 
 
     /*
-     * Slow discovery path.
+     * Active device can be tested without a Slot Table scan.
+     */
+    /*
+     * V3.10.6B8E
+     *
+     * Audio UAPI never exposes state->device.
+     *
+     * state->device is unpublished enumeration working storage;
+     * runtime Audio state must already exist in Slot.context.
+     */
+
+
+
+    /*
+     * Slow discovery path.  Runs only when the cache is empty.
      */
     uint32_t limit =
         state->max_slots;
@@ -6688,12 +6678,24 @@ xhci_audio_context(
         }
 
 
+        xhci_device_context_t *device =
+            xhci_slot_context_owner(
+                state,
+                (uint8_t)slot);
+
+
+        if(device == 0 ||
+           device->audio_endpoint == 0U)
+        {
+            continue;
+        }
+
+
         g_xhci_audio_slot =
             (uint8_t)slot;
 
 
-        return
-            &slot_dev->context;
+        return device;
     }
 
 
