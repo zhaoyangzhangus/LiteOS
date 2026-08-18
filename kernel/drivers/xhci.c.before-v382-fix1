@@ -395,6 +395,7 @@ typedef struct xhci_state {
  *
  * Callers must therefore stop knowing where the context lives.
  */
+static xhci_device_context_t *
 /*
  * V3.8.1 / V3.8.2 SLOT CONTEXT OWNER
  *
@@ -3031,31 +3032,16 @@ return true;
  * Slot Table context remains a mirror.  Ring/DMA producer state
  * is modified only in the actual owning context.
  */
-/*
- * V3.8.5 AUDIO CANONICAL SLOT EVENT
- *
- * Audio completion ownership:
- *
- *      Transfer Event Slot ID
- *                |
- *                v
- *       xhci_slot_context_owner()
- *                |
- *          +-----+-----+
- *          |           |
- *       active     Slot.context
- *
- * inventory[].context is no longer an Audio event owner.
- */
 static bool xhci_handle_audio_transfer_event(
     xhci_state_t *state,
     const xhci_trb_t *event)
 {
-    xhci_device_context_t saved_active;
-
-    xhci_device_context_t *owner;
+    xhci_inventory_entry_t *entry =
+        0;
 
     xhci_slot_device_t *slot_dev;
+
+    xhci_device_context_t saved_active;
 
     uint8_t slot;
 
@@ -3103,19 +3089,70 @@ static bool xhci_handle_audio_transfer_event(
 
 
     /*
-     * Slot ID selects the real mutable Audio context.
+     * Fast path:
+     * Audio device is already the active context.
      */
-    owner =
-        xhci_slot_context_owner(
-            state,
-            slot);
+    active =
+        state->device.device_slot ==
+            slot &&
+        state->audio_endpoint !=
+            0U;
 
 
-    if(owner == 0 ||
-       owner->device_slot != slot ||
-       owner->audio_endpoint == 0U)
+    if(!active)
     {
-        return false;
+        uint32_t index;
+
+
+        if(!slot_dev->
+               runtime_in_inventory)
+        {
+            return false;
+        }
+
+
+        index =
+            slot_dev->
+                inventory_index;
+
+
+        if(index >=
+           state->inventory_count)
+        {
+            return false;
+        }
+
+
+        entry =
+            &state->inventory[
+                index];
+
+
+        /*
+         * Protect against stale Slot reuse / cached index.
+         */
+        if(!entry->valid ||
+           entry->context.device_slot !=
+               slot ||
+           entry->context.audio_endpoint ==
+               0U)
+        {
+            return false;
+        }
+
+
+        /*
+         * Existing Audio transport helpers operate on
+         * state->audio_* fields, therefore temporarily install
+         * exactly the context selected by Slot ID.
+         */
+        xhci_copy_device_context(
+            &saved_active,
+            &state->device);
+
+        xhci_copy_device_context(
+            &state->device,
+            &entry->context);
     }
 
 
@@ -3127,39 +3164,31 @@ static bool xhci_handle_audio_transfer_event(
 
     expected_endpoint_id =
         (uint32_t)
-            owner->audio_endpoint *
+            state->audio_endpoint *
             2U +
-        (owner->audio_endpoint_in ?
+        (state->audio_endpoint_in ?
              1U :
              0U);
 
 
-    if(endpoint_id !=
-       expected_endpoint_id)
-    {
-        return false;
-    }
-
-
-    active =
-        owner ==
-        &state->device;
-
-
     /*
-     * Existing Audio queue helpers still use state->audio_*.
-     * Install canonical Slot context temporarily when inactive.
+     * Event belongs to this Slot, but not to its Audio endpoint.
      */
-    if(!active)
+    if(state->audio_endpoint == 0U ||
+       endpoint_id !=
+           expected_endpoint_id)
     {
-        xhci_copy_device_context(
-            &saved_active,
-            &state->device);
+        if(!active)
+        {
+            xhci_zero_device_context(
+                &state->device);
 
+            xhci_copy_device_context(
+                &state->device,
+                &saved_active);
+        }
 
-        xhci_copy_device_context(
-            &state->device,
-            owner);
+        return false;
     }
 
 
@@ -3208,7 +3237,8 @@ static bool xhci_handle_audio_transfer_event(
 
 
             /*
-             * Audio UAPI owns COMPLETE acknowledgement.
+             * COMPLETE is acknowledged by the Audio UAPI owner.
+             * xHCI only releases backend hardware occupancy.
              */
             state->audio_stream_queued =
                 false;
@@ -3217,10 +3247,9 @@ static bool xhci_handle_audio_transfer_event(
                     audio_stream_bound)
         {
             /*
-             * Legacy autonomous path.
+             * Legacy autonomous stream path.
              *
-             * Re-arm while this exact Slot occupies state->device
-             * so the doorbell uses the correct Slot ID.
+             * Re-arm while the owning Slot context is installed.
              */
             (void)xhci_queue_audio_transfer(
                 state);
@@ -3231,56 +3260,29 @@ static bool xhci_handle_audio_transfer_event(
         state->audio_stream_queued =
             false;
 
-
         g_xhci_error =
             64U +
             completion;
     }
 
 
+    /*
+     * Synchronize the permanent Slot mirror after pending,
+     * enqueue, cycle or completion counters may have changed.
+     */
+    slot_dev->context =
+        state->device;
+
+
     if(!active)
     {
         /*
-         * Commit mutable Audio ring/UAPI state directly into the
-         * canonical Slot context.
+         * Commit modified transport state back to its actual
+         * storage before restoring the previous active device.
          */
         xhci_copy_device_context(
-            owner,
+            &entry->context,
             &state->device);
-
-
-        /*
-         * Compatibility shadow only.
-         *
-         * This is write-only for Audio after V3.8.5 and will be
-         * deleted together with inventory.context.
-         */
-        if(slot_dev->
-               runtime_in_inventory)
-        {
-            uint32_t index =
-                slot_dev->
-                    inventory_index;
-
-
-            if(index <
-               state->inventory_count)
-            {
-                xhci_inventory_entry_t *entry =
-                    &state->inventory[
-                        index];
-
-
-                if(entry->valid &&
-                   entry->slot_id ==
-                       slot)
-                {
-                    xhci_copy_device_context(
-                        &entry->context,
-                        owner);
-                }
-            }
-        }
 
 
         xhci_zero_device_context(
@@ -3291,17 +3293,14 @@ static bool xhci_handle_audio_transfer_event(
             &state->device,
             &saved_active);
     }
-    else
-    {
-        xhci_slot_context_sync(
-            state,
-            slot);
-    }
 
 
+    /*
+     * The Transfer Event was recognized even if the hardware
+     * completion code reported an error.
+     */
     return true;
 }
-
 
 
 static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {

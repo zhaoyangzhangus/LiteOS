@@ -322,26 +322,10 @@ g_xhci_slot_devices[
 
 
 
-/*
- * V3.8.2 INVENTORY SLOT INDEX
- *
- * inventory[] is no longer the authoritative device context store.
- *
- * slot_id identifies the real object:
- *
- *     g_xhci_slot_devices[slot_id]
- *
- * context remains temporarily as a compatibility shadow for the
- * Hub/BT/Audio migration.  It will be removed in a later V3.8 step.
- */
 typedef struct xhci_inventory_entry {
-    uint8_t slot_id;
-
-    uint8_t kind;
-
-    bool valid;
-
     xhci_device_context_t context;
+    uint8_t kind;
+    bool valid;
 } xhci_inventory_entry_t;
 
 typedef struct xhci_state {
@@ -378,175 +362,9 @@ typedef struct xhci_state {
     bool initialized;
 } xhci_state_t;
 
-/*
- * V3.8.1 SLOT CONTEXT OWNER
- *
- * All runtime code must resolve a device by Slot ID.
- *
- * Today the actual mutable context can still live in:
- *
- *      state->device
- *
- * or:
- *
- *      inventory[index].context
- *
- * Later V3.8 removes inventory context storage completely.
- *
- * Callers must therefore stop knowing where the context lives.
- */
-/*
- * V3.8.1 / V3.8.2 SLOT CONTEXT OWNER
- *
- * Slot Table is now the canonical context for inactive devices.
- *
- * state->device remains a temporary active/working context until
- * the final active-device migration is completed.
- */
-static xhci_device_context_t *
-xhci_slot_context_owner(
-    xhci_state_t *state,
-    uint8_t slot)
-{
-    if(state == 0 ||
-       slot == 0U)
-    {
-        return 0;
-    }
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used)
-    {
-        return 0;
-    }
-
-
-    /*
-     * Active working copy.
-     */
-    if(state->device.device_slot ==
-       slot)
-    {
-        return
-            &state->device;
-    }
-
-
-    /*
-     * Inactive device:
-     *
-     * inventory[] proves that this Slot is parked, but the actual
-     * mutable context is now Slot Table context.
-     */
-    if(slot_dev->
-           runtime_in_inventory)
-    {
-        uint32_t index =
-            slot_dev->
-                inventory_index;
-
-
-        if(index >=
-           state->inventory_count)
-        {
-            return 0;
-        }
-
-
-        xhci_inventory_entry_t *entry =
-            &state->inventory[
-                index];
-
-
-        if(!entry->valid ||
-           entry->slot_id != slot)
-        {
-            return 0;
-        }
-
-
-        if(slot_dev->
-               context.device_slot !=
-           slot)
-        {
-            return 0;
-        }
-
-
-        return
-            &slot_dev->context;
-    }
-
-
-    return 0;
-}
-
-
-
-/*
- * Synchronize the Slot Table mirror after the real owner changes.
- *
- * Later, when Slot Table itself becomes the owner, this function
- * becomes unnecessary and can be removed.
- */
-static void
-xhci_slot_context_sync(
-    xhci_state_t *state,
-    uint8_t slot)
-{
-    if(slot == 0U)
-    {
-        return;
-    }
-
-
-    xhci_device_context_t *owner =
-        xhci_slot_context_owner(
-            state,
-            slot);
-
-
-    if(owner == 0 ||
-       owner->device_slot !=
-           slot)
-    {
-        return;
-    }
-
-
-    g_xhci_slot_devices[
-        slot].context =
-            *owner;
-}
-
-
 #undef XHCI_DEVICE_FIELDS
 
 static xhci_state_t g_xhci;
-
-/*
- * V3.7.7 BT SLOT TRANSPORT
- *
- * Bluetooth Core callbacks must identify a USB device by its
- * permanent xHCI Slot ID, never by whichever context happens
- * to be installed in state->device.
- */
-typedef struct xhci_bt_transport {
-    xhci_state_t *state;
-    uint8_t slot;
-} xhci_bt_transport_t;
-
-
-static xhci_bt_transport_t
-g_xhci_bt_transports[
-    XHCI_MAX_SLOT_TABLE];
-
-
 static uint32_t g_xhci_error;
 /* HID recovery diagnostics: counters only, never printed from IRQ/deferred
  * context.  A nonzero failure stage is retained for debugger inspection. */
@@ -1329,17 +1147,7 @@ static void xhci_unpublish_slot_device(
     usb_release_device(
         slot);
 
-        /*
-     * bt_controller_disconnect/destroy runs before unpublish.
-     * The callback binding can now be invalidated safely.
-     */
     __builtin_memset(
-        &g_xhci_bt_transports[slot],
-        0,
-        sizeof(g_xhci_bt_transports[slot]));
-
-
-__builtin_memset(
         &g_xhci_slot_devices[slot],
         0,
         sizeof(g_xhci_slot_devices[slot]));
@@ -1386,426 +1194,237 @@ static bool xhci_release_active_device(xhci_state_t *state) {
     return released;
 }
 
-static bool xhci_release_inventory_entry(
-    xhci_state_t *state,
-    uint32_t index)
-{
-    if(state == 0 ||
-       state->device.device_slot != 0U ||
-       index >=
-           state->inventory_count)
-    {
-        return false;
-    }
-
-
-    xhci_inventory_entry_t *entry =
-        &state->inventory[
-            index];
-
-
-    if(!entry->valid ||
-       entry->slot_id == 0U)
-    {
-        return false;
-    }
-
-
-    uint8_t slot =
-        entry->slot_id;
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot)
-    {
-        return false;
-    }
-
-
-    uint8_t kind =
-        entry->kind;
-
-
-    /*
-     * Activate canonical Slot context only for hardware teardown.
-     */
+static bool xhci_release_inventory_entry(xhci_state_t *state, uint32_t index) {
+    xhci_inventory_entry_t *entry;
+    uint8_t kind;
+    bool released;
+    if (state == 0 || state->device.device_slot != 0U ||
+        index >= state->inventory_count) return false;
+    entry = &state->inventory[index];
+    if (!entry->valid || entry->context.device_slot == 0U) return false;
+    kind = entry->kind;
     xhci_copy_device_context(
         &state->device,
-        &slot_dev->context);
-
-
-    slot_dev->
-        runtime_in_inventory =
-            false;
-
-    slot_dev->
-        inventory_index =
-            UINT32_MAX;
-
-
-    entry->valid =
-        false;
-
-    entry->slot_id =
-        0U;
-
-    entry->kind =
-        0U;
-
-
-    xhci_zero_device_context(
         &entry->context);
 
-
-    xhci_set_device_kind(
-        kind);
-
-
-    bool released =
-        xhci_release_active_device(
-            state);
-
-
-    xhci_zero_device_context(
-        &state->device);
-
-    xhci_clear_device_flags();
-
-    xhci_recompute_topology(
-        state);
-
-
-    return released;
-}
-
-
-static bool xhci_save_active_device(
-    xhci_state_t *state,
-    uint8_t kind)
-{
-    if(state == 0 ||
-       state->device.device_slot == 0U ||
-       state->inventory_count >=
-           XHCI_MAX_USB_INVENTORY ||
-       kind == 0U)
+    if(state->device.device_slot != 0U)
     {
-        return false;
-    }
-
-
-    uint8_t slot =
-        state->device.device_slot;
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used)
-    {
-        return false;
-    }
-
-
-    uint32_t index =
-        state->inventory_count++;
-
-
-    xhci_inventory_entry_t *entry =
-        &state->inventory[
-            index];
-
-
-    /*
-     * Slot Table becomes canonical before the active working
-     * context is cleared.
-     */
-    slot_dev->context =
-        state->device;
-
-
-    slot_dev->
-        runtime_in_inventory =
-            true;
-
-    slot_dev->
-        inventory_index =
-            index;
-
-
-    entry->slot_id =
-        slot;
-
-    entry->kind =
-        kind;
-
-    entry->valid =
-        true;
-
-
-    /*
-     * Temporary compatibility shadow.
-     *
-     * Hub/BT/Audio will be migrated away from this field next.
-     */
-    xhci_copy_device_context(
-        &entry->context,
-        &slot_dev->context);
-
-
-    if(kind == 4U)
-    {
-        g_xhci_usb_hub_present =
-            true;
-
-        g_xhci_usb_hub_inventory_ports =
-            slot_dev->
-                context.hub_port_count;
-    }
-
-
-    xhci_zero_device_context(
-        &state->device);
-
-    xhci_clear_device_flags();
-
-    xhci_recompute_topology(
-        state);
-
-
-    return true;
-}
-
-
-static bool xhci_load_inventory_device(
-    xhci_state_t *state,
-    uint32_t index)
-{
-    if(state == 0 ||
-       state->device.device_slot != 0U ||
-       index >=
-           state->inventory_count)
-    {
-        return false;
-    }
-
-
-    xhci_inventory_entry_t *entry =
-        &state->inventory[
-            index];
-
-
-    if(!entry->valid ||
-       entry->slot_id == 0U)
-    {
-        return false;
-    }
-
-
-    uint8_t slot =
-        entry->slot_id;
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot)
-    {
-        return false;
-    }
-
-
-    /*
-     * Canonical Slot context becomes active working context.
-     */
-    xhci_copy_device_context(
-        &state->device,
-        &slot_dev->context);
-
-
-    slot_dev->
-        runtime_in_inventory =
-            false;
-
-    slot_dev->
-        inventory_index =
-            UINT32_MAX;
-
-
-    uint8_t kind =
-        entry->kind;
-
-
-    entry->valid =
-        false;
-
-    entry->slot_id =
-        0U;
-
-    entry->kind =
-        0U;
-
-
-    xhci_zero_device_context(
-        &entry->context);
-
-
-    xhci_set_device_kind(
-        kind);
-
-
-    xhci_recompute_topology(
-        state);
-
-
-    return true;
-}
-
-
-static bool xhci_free_inventory_resources(
-    xhci_state_t *state)
-{
-    bool released =
-        true;
-
-
-    if(state == 0)
-    {
-        return false;
-    }
-
-
-    for(uint32_t i = 0U;
-        i < state->inventory_count;
-        ++i)
-    {
-        xhci_inventory_entry_t *entry =
-            &state->inventory[i];
-
-
-        if(!entry->valid ||
-           entry->slot_id == 0U)
-        {
-            continue;
-        }
-
-
-        uint8_t slot =
-            entry->slot_id;
-
-
         xhci_slot_device_t *slot_dev =
             &g_xhci_slot_devices[
-                slot];
+                state->device.device_slot];
 
-
-        if(!slot_dev->used ||
-           slot_dev->context.device_slot !=
-               slot)
-        {
-            entry->valid =
-                false;
-
-            entry->slot_id =
-                0U;
-
-            xhci_zero_device_context(
-                &entry->context);
-
-            released =
-                false;
-
-            continue;
-        }
-
-
-        /*
-         * Canonical Slot context -> teardown working context.
-         */
-        xhci_copy_device_context(
-            &state->device,
-            &slot_dev->context);
-
-
-        uint8_t parent_slot =
-            state->device.parent_slot;
-
-        uint8_t parent_port =
-            state->device.parent_port;
-
-
-        if(!xhci_stop_pending_endpoints(
-                state))
-        {
-            released =
-                false;
-        }
-
-
-        if(!xhci_submit_command(
-                state,
-                XHCI_DISABLE_SLOT_TYPE,
-                slot,
-                0U,
-                0))
-        {
-            released =
-                false;
-        }
-
-
-        if(!xhci_free_device_resources(
-                state))
-        {
-            released =
-                false;
-        }
-
-
-        /*
-         * Hardware/DMA lifetime ended; now remove software identity.
-         */
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-
-
-        entry->valid =
+        slot_dev->runtime_in_inventory =
             false;
 
-        entry->slot_id =
-            0U;
+        slot_dev->inventory_index =
+            UINT32_MAX;
 
-        entry->kind =
-            0U;
-
-
-        xhci_zero_device_context(
-            &entry->context);
-
-
-        xhci_zero_device_context(
-            &state->device);
-
-        xhci_clear_device_flags();
+        slot_dev->context =
+            state->device;
     }
-
-
+    xhci_zero_device_context(&entry->context);
+    entry->valid = false;
+    xhci_set_device_kind(kind);
+    released = xhci_release_active_device(state);
+    xhci_zero_device_context(&state->device);
+    xhci_clear_device_flags();
+    xhci_recompute_topology(state);
     return released;
 }
 
+static bool xhci_save_active_device(xhci_state_t *state, uint8_t kind) {
+    xhci_inventory_entry_t *entry;
+    uint32_t inventory_index;
+    if (state == 0 || state->device.device_slot == 0U ||
+        state->inventory_count >= XHCI_MAX_USB_INVENTORY || kind == 0U) {
+        return false;
+    }
+    /*
+     * V3.6.5 FINALIZE SLOT DEVICE
+     *
+     * Enumeration is complete here.  state->device owns the final
+     * endpoint/DMA/Hub information, so this is the correct point to
+     * publish the permanent Slot Table copy.
+     */
+    {
+        uint8_t slot =
+            state->device.device_slot;
+
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[slot];
+
+        slot_dev->used =
+            true;
+
+        slot_dev->slot_id =
+            slot;
+
+        slot_dev->speed =
+            state->device.device_speed;
+
+        slot_dev->parent_slot =
+            state->device.parent_slot;
+
+        slot_dev->parent_port =
+            state->device.parent_port;
+
+        slot_dev->root_port =
+            state->device.root_port;
+
+        slot_dev->route_string =
+            state->device.route_string;
+
+        /*
+         * Keep the complete per-device context available by Slot ID.
+         */
+        slot_dev->context =
+            state->device;
+
+        slot_dev->is_hub =
+            kind == 4U;
+
+        if(slot_dev->is_hub)
+        {
+            slot_dev->hub_port_count =
+                state->device.hub_port_count;
+
+            /*
+             * Hub descriptor has already been read at this point,
+             * therefore publish the real bNbrPorts to USB Core.
+             */
+            (void)usb_hub_init(
+                slot,
+                state->device.hub_port_count);
+
+            usb_device_t *usb_dev =
+                usb_get_device(slot);
+
+            if(usb_dev != 0)
+            {
+                usb_dev->device_class =
+                    USB_CLASS_HUB;
+            }
+        }
+
+        /*
+         * Mirror the physical parent/port relation into USB Hub Core.
+         */
+        if(state->device.parent_slot != 0U &&
+           state->device.parent_port != 0U)
+        {
+            usb_hub_port_connect(
+                state->device.parent_slot,
+                state->device.parent_port,
+                slot);
+
+            /*
+             * Keep xHCI Slot topology synchronized as well.
+             */
+            if(state->device.parent_port <= 16U)
+            {
+                xhci_slot_device_t *parent =
+                    &g_xhci_slot_devices[
+                        state->device.parent_slot];
+
+                if(parent->used)
+                {
+                    parent->child_slots[
+                        state->device.parent_port - 1U] =
+                        slot;
+                }
+            }
+        }
+    }
+
+    inventory_index =
+        state->inventory_count++;
+
+    entry =
+        &state->inventory[
+            inventory_index];
+    xhci_copy_device_context(
+        &entry->context,
+        &state->device);
+
+    if(state->device.device_slot != 0U)
+    {
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[
+                state->device.device_slot];
+
+        slot_dev->runtime_in_inventory =
+            true;
+
+        slot_dev->inventory_index =
+            inventory_index;
+
+        /*
+         * Keep Slot Table context synchronized with
+         * the context that owns the DMA resources.
+         */
+        slot_dev->context =
+            state->device;
+    }
+    entry->kind = kind;
+    entry->valid = true;
+    if (kind == 4U) {
+        g_xhci_usb_hub_present = true;
+        g_xhci_usb_hub_inventory_ports = state->device.hub_port_count;
+    }
+    xhci_zero_device_context(&state->device);
+    xhci_clear_device_flags();
+    xhci_recompute_topology(state);
+    return true;
+}
+
+static bool xhci_load_inventory_device(xhci_state_t *state, uint32_t index) {
+    xhci_inventory_entry_t *entry;
+    if (state == 0 || state->device.device_slot != 0U ||
+        index >= state->inventory_count) return false;
+    entry = &state->inventory[index];
+    if (!entry->valid) return false;
+    xhci_copy_device_context(
+        &state->device,
+        &entry->context);
+
+    if(state->device.device_slot != 0U)
+    {
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[
+                state->device.device_slot];
+
+        slot_dev->runtime_in_inventory =
+            false;
+
+        slot_dev->inventory_index =
+            UINT32_MAX;
+
+        slot_dev->context =
+            state->device;
+    }
+    xhci_zero_device_context(&entry->context);
+    entry->valid = false;
+    xhci_set_device_kind(entry->kind);
+    xhci_recompute_topology(state);
+    return true;
+}
+
+static bool xhci_free_inventory_resources(xhci_state_t *state) {
+    bool released = true;
+    if (state == 0) return false;
+    for (uint32_t i = 0U; i < state->inventory_count; ++i) {
+        xhci_inventory_entry_t *entry = &state->inventory[i];
+        if (!entry->valid) continue;
+        xhci_copy_device_context(&state->device, &entry->context);
+        if (!xhci_stop_pending_endpoints(state)) released = false;
+        if (!xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
+                                 state->device_slot, 0U, 0)) released = false;
+        if (!xhci_free_device_resources(state)) released = false;
+        xhci_zero_device_context(&entry->context);
+        entry->valid = false;
+    }
+    return released;
+}
 
 static bool xhci_reset(xhci_state_t *state) {
     uint32_t command = xhci_read32(state, state->operational_offset + XHCI_USBCMD);
@@ -2575,7 +2194,6 @@ static bool xhci_probe_connected_ports(xhci_state_t *state,
     state->inventory_count = 0U;
     for (uint32_t i = 0U; i < XHCI_MAX_USB_INVENTORY; ++i) {
         state->inventory[i].valid = false;
-        state->inventory[i].slot_id = 0U;
         state->inventory[i].kind = 0U;
         xhci_zero_device_context(&state->inventory[i].context);
     }
@@ -2889,66 +2507,27 @@ static bool xhci_handle_hub_transfer_event(
 }
 
 
-/*
- * V3.7.5 HID SLOT EVENT LOOKUP
- *
- * Transfer Event already contains the xHCI Slot ID.
- *
- * Resolve:
- *
- *     Slot ID
- *        |
- *        v
- *   Slot Table
- *        |
- *        +-- active ------------> state->device
- *        |
- *        +-- inventory_index ---> inventory[index].context
- *
- * No inventory scan.
- *
- * Important:
- * Slot Table context is only a mirror.  HID transfer state
- * (enqueue/cycle/pending/DMA ownership) must be modified in the
- * actual owning context.
- */
-/*
- * HID context lookup is now independent of context storage.
- *
- * Slot ID is the only device identity.
- */
-static xhci_device_context_t *
-xhci_find_hid_context(
-    xhci_state_t *state,
-    uint8_t slot,
-    uint32_t endpoint_id)
-{
-    xhci_device_context_t *device =
-        xhci_slot_context_owner(
-            state,
-            slot);
-
-
-    if(device == 0 ||
-       device->hid_endpoint == 0U)
-    {
-        return 0;
+static xhci_device_context_t *xhci_find_hid_context(xhci_state_t *state,
+                                                     uint8_t slot,
+                                                     uint32_t endpoint_id) {
+    xhci_device_context_t *device;
+    if (state == 0 || slot == 0U) return 0;
+    device = &state->device;
+    if (device->device_slot == slot && device->hid_endpoint != 0U &&
+        endpoint_id == (uint32_t)device->hid_endpoint * 2U + 1U) {
+        return device;
     }
-
-
-    if(endpoint_id !=
-       (uint32_t)
-           device->hid_endpoint *
-           2U + 1U)
-    {
-        return 0;
+    for (uint32_t i = 0U; i < state->inventory_count; ++i) {
+        xhci_inventory_entry_t *entry = &state->inventory[i];
+        device = &entry->context;
+        if (entry->valid && device->device_slot == slot &&
+            device->hid_endpoint != 0U &&
+            endpoint_id == (uint32_t)device->hid_endpoint * 2U + 1U) {
+            return device;
+        }
     }
-
-
-    return device;
+    return 0;
 }
-
-
 
 static bool xhci_handle_hid_transfer_event(xhci_state_t *state,
                                            const xhci_trb_t *event) {
@@ -2992,317 +2571,8 @@ static bool xhci_handle_hid_transfer_event(xhci_state_t *state,
             g_xhci_error = 0U;
         }
     }
-        /*
-     * Keep Slot Table mirror synchronized with the actual
-     * context after producer index/cycle/pending state changes.
-     */
-    if(slot != 0U &&
-       g_xhci_slot_devices[slot].used)
-    {
-        g_xhci_slot_devices[slot].context =
-            *device;
-    }
-
-    xhci_slot_context_sync(
-        state,
-        slot);
-
-return true;
-}
-
-
-/*
- * V3.7.8 AUDIO SLOT EVENT DISPATCH
- *
- * Resolve Audio Transfer Events by the hardware Slot ID carried
- * by the xHCI Transfer Event.
- *
- *      Transfer Event
- *           |
- *         Slot ID
- *           |
- *           v
- *      Slot Table
- *           |
- *           +-- active ----------> state->device
- *           |
- *           +-- inventory_index -> inventory[index].context
- *
- * Slot Table context remains a mirror.  Ring/DMA producer state
- * is modified only in the actual owning context.
- */
-/*
- * V3.8.5 AUDIO CANONICAL SLOT EVENT
- *
- * Audio completion ownership:
- *
- *      Transfer Event Slot ID
- *                |
- *                v
- *       xhci_slot_context_owner()
- *                |
- *          +-----+-----+
- *          |           |
- *       active     Slot.context
- *
- * inventory[].context is no longer an Audio event owner.
- */
-static bool xhci_handle_audio_transfer_event(
-    xhci_state_t *state,
-    const xhci_trb_t *event)
-{
-    xhci_device_context_t saved_active;
-
-    xhci_device_context_t *owner;
-
-    xhci_slot_device_t *slot_dev;
-
-    uint8_t slot;
-
-    uint32_t endpoint_id;
-
-    uint32_t expected_endpoint_id;
-
-    uint32_t completion;
-
-    bool active;
-
-
-    if(state == 0 ||
-       event == 0 ||
-       ((event->control >>
-         XHCI_TRB_TYPE_SHIFT) &
-        0x3FU) !=
-           XHCI_TRANSFER_EVENT_TYPE)
-    {
-        return false;
-    }
-
-
-    slot =
-        (uint8_t)(
-            event->control >>
-            XHCI_TRB_SLOT_SHIFT);
-
-
-    if(slot == 0U)
-    {
-        return false;
-    }
-
-
-    slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used)
-    {
-        return false;
-    }
-
-
-    /*
-     * Slot ID selects the real mutable Audio context.
-     */
-    owner =
-        xhci_slot_context_owner(
-            state,
-            slot);
-
-
-    if(owner == 0 ||
-       owner->device_slot != slot ||
-       owner->audio_endpoint == 0U)
-    {
-        return false;
-    }
-
-
-    endpoint_id =
-        (event->control >>
-         XHCI_TRB_ENDPOINT_SHIFT) &
-        0x1FU;
-
-
-    expected_endpoint_id =
-        (uint32_t)
-            owner->audio_endpoint *
-            2U +
-        (owner->audio_endpoint_in ?
-             1U :
-             0U);
-
-
-    if(endpoint_id !=
-       expected_endpoint_id)
-    {
-        return false;
-    }
-
-
-    active =
-        owner ==
-        &state->device;
-
-
-    /*
-     * Existing Audio queue helpers still use state->audio_*.
-     * Install canonical Slot context temporarily when inactive.
-     */
-    if(!active)
-    {
-        xhci_copy_device_context(
-            &saved_active,
-            &state->device);
-
-
-        xhci_copy_device_context(
-            &state->device,
-            owner);
-    }
-
-
-    completion =
-        event->status >>
-        XHCI_COMPLETION_SHIFT;
-
-
-    state->audio_transfer_pending =
-        false;
-
-
-    if(completion ==
-       XHCI_COMPLETION_SUCCESS)
-    {
-        dma_sync_for_cpu(
-            &state->
-                audio_buffer.mapping);
-
-
-        ++state->audio_completed;
-
-
-        if(state->audio_stream != 0)
-        {
-            if(state->audio_endpoint_in &&
-               state->audio_stream_queued)
-            {
-                uint64_t bytes =
-                    audio_stream_bytes_for_frames(
-                        state->audio_stream,
-                        state->audio_frames);
-
-
-                if(bytes != 0U &&
-                   bytes <= PAGE_SIZE)
-                {
-                    (void)audio_stream_period_write(
-                        state->audio_stream,
-                        state->audio_period,
-                        state->
-                            audio_buffer.cpu,
-                        bytes);
-                }
-            }
-
-
-            /*
-             * Audio UAPI owns COMPLETE acknowledgement.
-             */
-            state->audio_stream_queued =
-                false;
-        }
-        else if(!state->
-                    audio_stream_bound)
-        {
-            /*
-             * Legacy autonomous path.
-             *
-             * Re-arm while this exact Slot occupies state->device
-             * so the doorbell uses the correct Slot ID.
-             */
-            (void)xhci_queue_audio_transfer(
-                state);
-        }
-    }
-    else if(completion != 0U)
-    {
-        state->audio_stream_queued =
-            false;
-
-
-        g_xhci_error =
-            64U +
-            completion;
-    }
-
-
-    if(!active)
-    {
-        /*
-         * Commit mutable Audio ring/UAPI state directly into the
-         * canonical Slot context.
-         */
-        xhci_copy_device_context(
-            owner,
-            &state->device);
-
-
-        /*
-         * Compatibility shadow only.
-         *
-         * This is write-only for Audio after V3.8.5 and will be
-         * deleted together with inventory.context.
-         */
-        if(slot_dev->
-               runtime_in_inventory)
-        {
-            uint32_t index =
-                slot_dev->
-                    inventory_index;
-
-
-            if(index <
-               state->inventory_count)
-            {
-                xhci_inventory_entry_t *entry =
-                    &state->inventory[
-                        index];
-
-
-                if(entry->valid &&
-                   entry->slot_id ==
-                       slot)
-                {
-                    xhci_copy_device_context(
-                        &entry->context,
-                        owner);
-                }
-            }
-        }
-
-
-        xhci_zero_device_context(
-            &state->device);
-
-
-        xhci_copy_device_context(
-            &state->device,
-            &saved_active);
-    }
-    else
-    {
-        xhci_slot_context_sync(
-            state,
-            slot);
-    }
-
-
     return true;
 }
-
-
 
 static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {
     bool consumed = false;
@@ -3332,13 +2602,37 @@ static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {
         } else if (type == XHCI_TRANSFER_EVENT_TYPE &&
                    xhci_handle_hid_transfer_event(state, &event)) {
             consumed = true;
-        } else if(type == XHCI_TRANSFER_EVENT_TYPE &&
-                   xhci_handle_audio_transfer_event(
-                       state,
-                       &event))
-        {
-            consumed =
-                true;
+        } else if (type == XHCI_TRANSFER_EVENT_TYPE && state->audio_endpoint != 0U &&
+                   (uint8_t)(event.control >> XHCI_TRB_SLOT_SHIFT) == state->device_slot &&
+                   ((event.control >> XHCI_TRB_ENDPOINT_SHIFT) & 0x1FU) ==
+                       (uint32_t)state->audio_endpoint * 2U +
+                           (state->audio_endpoint_in ? 1U : 0U)) {
+            uint32_t completion = event.status >> XHCI_COMPLETION_SHIFT;
+            state->audio_transfer_pending = false;
+            if (completion == XHCI_COMPLETION_SUCCESS) {
+                dma_sync_for_cpu(&state->audio_buffer.mapping);
+                ++state->audio_completed;
+                if (state->audio_stream != 0) {
+                    if (state->audio_endpoint_in && state->audio_stream_queued) {
+                        uint64_t bytes = audio_stream_bytes_for_frames(
+                            state->audio_stream, state->audio_frames);
+                        if (bytes != 0U && bytes <= PAGE_SIZE) {
+                            (void)audio_stream_period_write(
+                                state->audio_stream, state->audio_period,
+                                state->audio_buffer.cpu, bytes);
+                        }
+                    }
+                    /* COMPLETE 由音频 UAPI 的拥有者确认；这里仅释放后端
+                       的硬件占用，避免内核与用户同时消费同一周期。 */
+                    state->audio_stream_queued = false;
+                } else if (!state->audio_stream_bound) {
+                    (void)xhci_queue_audio_transfer(state);
+                }
+                consumed = true;
+            } else if (completion != 0U) {
+                state->audio_stream_queued = false;
+                g_xhci_error = 64U + completion;
+            }
         }
     }
     /* Hub status is reconciled only as a consequence of an xHCI event.  It
@@ -3843,278 +3137,83 @@ static bool xhci_probe_hub_downstream(xhci_state_t *state) {
     return true;
 }
 
-/*
- * V3.7.4 SLOT TABLE SUBTREE REMOVE
- *
- * Device-tree removal is driven only by:
- *
- *     Slot
- *       |
- *       +-- child_slots[]
- *
- * inventory[] is still temporary context storage, but is no
- * longer searched to discover descendants or locate a Slot.
- *
- * Removal order:
- *
- *     deepest child
- *          ->
- *     intermediate Hub
- *          ->
- *     parent Hub
- *
- * This matters because unpublishing a parent clears its
- * child_slots[] table.
- */
-static bool xhci_remove_device_subtree(
-    xhci_state_t *state,
-    xhci_device_context_t *saved_active,
-    uint8_t *saved_kind,
-    uint8_t slot)
-{
-    bool removed =
-        false;
-
-
-    if(state == 0 ||
-       saved_active == 0 ||
-       saved_kind == 0 ||
-       slot == 0U)
-    {
+static bool xhci_remove_device_subtree(xhci_state_t *state,
+                                       xhci_device_context_t *saved_active,
+                                       uint8_t *saved_kind, uint8_t slot) {
+    bool removed = false;
+    if (state == 0 || saved_active == 0 || saved_kind == 0 || slot == 0U) {
         return false;
     }
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used)
-    {
-        return false;
-    }
-
-
-    /*
-     * Snapshot children first.
-     *
-     * Recursive child removal will unlink itself from this
-     * parent's child_slots[], so walking the live array directly
-     * would mutate the structure while it is being traversed.
-     */
-    uint8_t children[16];
-
-
-    for(uint32_t port = 0U;
-        port < 16U;
-        ++port)
-    {
-        children[port] =
-            slot_dev->
-                child_slots[port];
-    }
-
-
-    /*
-     * Children before parent.
-     *
-     * This naturally supports:
-     *
-     * Hub
-     *  +- Hub
-     *      +- Hub
-     *          +- device
-     */
-    for(uint32_t port = 0U;
-        port < 16U;
-        ++port)
-    {
-        uint8_t child =
-            children[port];
-
-
-        if(child == 0U ||
-           child == slot)
-        {
-            continue;
-        }
-
-
-        if(xhci_remove_device_subtree(
-                state,
-                saved_active,
-                saved_kind,
-                child))
-        {
-            removed =
-                true;
-        }
-    }
-
-
-    /*
-     * The externally saved active device is not stored in
-     * inventory while topology reconciliation is running.
-     */
-    if(saved_active->device_slot ==
-       slot)
-    {
-        uint8_t kind =
-            *saved_kind;
-
-
-        xhci_copy_device_context(
-            &state->device,
-            saved_active);
-
-        xhci_zero_device_context(
-            saved_active);
-
-
-        xhci_set_device_kind(
-            kind != 0U ?
-                kind :
-                xhci_context_kind(
-                    &state->device));
-
-
-        if(xhci_release_active_device(
-                state))
-        {
-            removed =
-                true;
-        }
-
-
-        xhci_zero_device_context(
-            &state->device);
-
+    if (saved_active->device_slot == slot) {
+        xhci_copy_device_context(&state->device, saved_active);
+        xhci_zero_device_context(saved_active);
+        xhci_set_device_kind(*saved_kind);
+        (void)xhci_release_active_device(state);
+        xhci_zero_device_context(&state->device);
         xhci_clear_device_flags();
-
-
-        *saved_kind =
-            0U;
-
-
-        return removed;
+        *saved_kind = 0U;
+        removed = true;
     }
-
-
-    /*
-     * Handle a directly active context as well.
-     *
-     * Normally reconcile keeps state->device empty here, but
-     * this makes the subtree primitive safe for other callers.
-     */
-    if(state->device.device_slot ==
-       slot)
-    {
-        uint8_t kind =
-            xhci_context_kind(
-                &state->device);
-
-
-        xhci_set_device_kind(
-            kind);
-
-
-        if(xhci_release_active_device(
-                state))
-        {
-            removed =
-                true;
-        }
-
-
-        return removed;
+    for (uint32_t i = 0U; i < state->inventory_count; ++i) {
+        if (!state->inventory[i].valid ||
+            state->inventory[i].context.device_slot != slot) continue;
+        (void)xhci_release_inventory_entry(state, i);
+        removed = true;
+        break;
     }
-
-
-    /*
-     * V3.6.7 records the exact inventory location by Slot ID.
-     *
-     * No:
-     *
-     *     for (i = 0; i < inventory_count; ++i)
-     *
-     * is required anymore.
-     */
-    if(slot_dev->
-           runtime_in_inventory)
-    {
-        uint32_t index =
-            slot_dev->
-                inventory_index;
-
-
-        if(index <
-           state->inventory_count)
-        {
-            xhci_inventory_entry_t *entry =
-                &state->inventory[
-                    index];
-
-
-            /*
-             * Validate cached location against Slot ID before
-             * destroying anything.
-             */
-            if(entry->valid &&
-               entry->context.device_slot ==
-                   slot)
-            {
-                if(state->device.device_slot ==
-                   0U)
-                {
-                    if(xhci_release_inventory_entry(
-                            state,
-                            index))
-                    {
-                        removed =
-                            true;
-                    }
-                }
-            }
-        }
+    /* 先移除直接子节点，再递归清理更深层 Hub 下游。 */
+    for (uint32_t i = 0U; i < state->inventory_count; ++i) {
+        if (!state->inventory[i].valid ||
+            state->inventory[i].context.parent_slot != slot) continue;
+        uint8_t child_slot = state->inventory[i].context.device_slot;
+        if (xhci_remove_device_subtree(state, saved_active, saved_kind,
+                                       child_slot)) removed = true;
     }
-
-
+    if (saved_active->device_slot != 0U && saved_active->parent_slot == slot) {
+        uint8_t child_slot = saved_active->device_slot;
+        if (xhci_remove_device_subtree(state, saved_active, saved_kind,
+                                       child_slot)) removed = true;
+    }
     return removed;
 }
 
 
 
-
-/*
- * V3.7.3 PURE SLOT CHILD LOOKUP
- *
- * Topology lookup is now:
- *
- *      parent Slot
- *          |
- *      child_slots[port - 1]
- *          |
- *       child Slot
- *
- * No active-context comparison.
- * No inventory scan.
- * No context copying.
- */
 static bool xhci_find_hub_child(
+    xhci_state_t *state,
+    xhci_device_context_t *child,
     uint8_t parent_slot,
     uint8_t parent_port,
-    uint8_t *child_slot)
+    uint32_t *index,
+    bool *active)
 {
-    if(child_slot == 0)
+
+    if(state == 0 ||
+       index == 0 ||
+       active == 0)
     {
         return false;
     }
 
 
-    *child_slot =
-        0U;
+    *index =
+        UINT32_MAX;
 
+    *active =
+        false;
+
+
+    /*
+     * V3.4.3 O(1) child lookup
+     *
+     * Hub topology is now maintained by:
+     *
+     * parent_slot
+     *       |
+     *       + child_slots[port]
+     *
+     * No global inventory scan.
+     */
 
     if(parent_slot == 0U ||
        parent_port == 0U ||
@@ -4125,8 +3224,7 @@ static bool xhci_find_hub_child(
 
 
     xhci_slot_device_t *parent =
-        &g_xhci_slot_devices[
-            parent_slot];
+        &g_xhci_slot_devices[parent_slot];
 
 
     if(!parent->used ||
@@ -4136,70 +3234,76 @@ static bool xhci_find_hub_child(
     }
 
 
-    uint8_t slot =
-        parent->child_slots[
-            parent_port - 1U];
+    uint8_t child_slot =
+        parent->child_slots[parent_port-1U];
 
 
-    if(slot == 0U)
+    if(child_slot == 0U)
     {
         return false;
     }
 
 
-    xhci_slot_device_t *child =
-        &g_xhci_slot_devices[
-            slot];
+    xhci_slot_device_t *dev =
+        &g_xhci_slot_devices[child_slot];
 
 
-    if(!child->used)
+    if(!dev->used)
     {
-        /*
-         * Repair stale parent topology while we are here.
-         */
-        parent->child_slots[
-            parent_port - 1U] =
-            0U;
-
         return false;
     }
 
 
     /*
-     * Verify the reverse topology relation too.
-     *
-     * Slot reuse must never make an old child_slots[] entry
-     * point at an unrelated device.
+     * Keep old caller ABI:
+     * return inventory index.
      */
-    if(child->parent_slot !=
-           parent_slot ||
-       child->parent_port !=
-           parent_port)
-    {
-        parent->child_slots[
-            parent_port - 1U] =
-            0U;
 
-        return false;
+    for(uint32_t i=0U;
+        i<state->inventory_count;
+        ++i)
+    {
+        if(!state->inventory[i].valid)
+        {
+            continue;
+        }
+
+
+        if(state->inventory[i]
+            .context.device_slot ==
+           child_slot)
+        {
+            *index=i;
+
+            if(child)
+            {
+                *child =
+                    dev->context;
+            }
+
+
+            *active=true;
+
+            return true;
+        }
     }
 
 
     /*
-     * Only fully published devices count.
+     * Slot exists but inventory entry
+     * disappeared.
      */
-    if(child->context.device_slot !=
-       slot)
+    if(child)
     {
-        return false;
+        *child =
+            dev->context;
     }
 
 
-    *child_slot =
-        slot;
+    *active=true;
 
-    return true;
+    return false;
 }
-
 
 /*
  * V3.4.4 Slot tree removal
@@ -4282,8 +3386,8 @@ static bool xhci_reconcile_one_hub(xhci_state_t *state,
         hub->device_slot == 0U || hub->hub_port_count == 0U) return false;
     for (uint32_t port = 1U; port <= hub->hub_port_count; ++port) {
         uint32_t status = 0U;
-        uint8_t child_slot = 0U;
-        bool child_present = false;
+        uint32_t child_index = UINT32_MAX;
+        bool active_child = false;
         bool connected;
         xhci_copy_device_context(&state->device, hub);
         xhci_set_device_kind(4U);
@@ -4293,47 +3397,26 @@ static bool xhci_reconcile_one_hub(xhci_state_t *state,
             continue;
         }
         connected = (status & 1U) != 0U;
-                child_present =
-            xhci_find_hub_child(
-                hub->device_slot,
-                (uint8_t)port,
-                &child_slot);
-
-        if(!connected)
-        {
-            xhci_zero_device_context(
-                &state->device);
-
-            xhci_clear_device_flags();
-
-
-            if(child_present &&
-               child_slot != 0U &&
-               xhci_remove_device_subtree(
-                   state,
-                   saved_active,
-                   saved_kind,
-                   child_slot))
-            {
-                changed =
-                    true;
+        (void)xhci_find_hub_child(state, saved_active, hub->device_slot,
+                                  (uint8_t)port, &child_index, &active_child);
+        if (!connected) {
+            uint8_t child_slot = 0U;
+            if (active_child) child_slot = saved_active->device_slot;
+            else if (child_index != UINT32_MAX) {
+                child_slot = state->inventory[child_index].context.device_slot;
             }
-
+            xhci_zero_device_context(&state->device);
+            xhci_clear_device_flags();
+            if (child_slot != 0U &&
+                xhci_remove_device_subtree(state, saved_active, saved_kind,
+                                            child_slot)) {
+                changed = true;
+            }
             continue;
         }
-
-
-        /*
-         * Port is connected and Slot Table already owns a child.
-         * Nothing to enumerate.
-         */
-        if(child_present)
-        {
-            xhci_zero_device_context(
-                &state->device);
-
+        if (active_child || child_index != UINT32_MAX) {
+            xhci_zero_device_context(&state->device);
             xhci_clear_device_flags();
-
             continue;
         }
 
@@ -4730,293 +3813,29 @@ static bool xhci_queue_bt_acl_out(xhci_state_t *state, size_t length) {
     return true;
 }
 
-/*
- * Send using the context currently installed in state->device.
- *
- * The public Bluetooth callback below resolves Slot ID first and
- * temporarily installs the owning context when necessary.
- */
-static kstatus_t xhci_bt_send_current(
-    xhci_state_t *state,
-    const uint8_t *packet,
-    size_t length)
-{
-    uint8_t setup[8] = {
-        0x20U,
-        0x00U,
-        0x00U,
-        0x00U,
-        0x00U,
-        0x00U,
-        0x00U,
-        0x00U
-    };
-
-
-    if(state == 0 ||
-       packet == 0 ||
-       length < 4U ||
-       length - 1U > PAGE_SIZE)
-    {
+static kstatus_t xhci_bt_send(void *context, const uint8_t *packet, size_t length) {
+    xhci_state_t *state = (xhci_state_t *)context;
+    uint8_t setup[8] = {0x20U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
+    if (state == 0 || packet == 0 || length < 4U || length - 1U > PAGE_SIZE) {
         return K_EINVAL;
     }
-
-
-    /*
-     * HCI ACL packet.
-     */
-    if(packet[0] == 0x02U)
-    {
-        if(state->bt_acl_out_endpoint == 0U ||
-           state->bt_acl_out_transfer_pending ||
-           state->bt_acl_out_buffer.cpu == 0 ||
-           length - 1U > PAGE_SIZE)
-        {
-            return K_EBUSY;
+    if (packet[0] == 0x02U) {
+        if (state->bt_acl_out_endpoint == 0U || state->bt_acl_out_transfer_pending ||
+            state->bt_acl_out_buffer.cpu == 0 || length - 1U > PAGE_SIZE) return K_EBUSY;
+        for (size_t i = 1U; i < length; ++i) {
+            ((uint8_t *)state->bt_acl_out_buffer.cpu)[i - 1U] = packet[i];
         }
-
-
-        for(size_t i = 1U;
-            i < length;
-            ++i)
-        {
-            ((uint8_t *)
-                state->
-                    bt_acl_out_buffer.cpu)
-                [i - 1U] =
-                    packet[i];
-        }
-
-
-        return
-            xhci_queue_bt_acl_out(
-                state,
-                length - 1U)
-            ? K_OK
-            : K_EIO;
+        return xhci_queue_bt_acl_out(state, length - 1U) ? K_OK : K_EIO;
     }
-
-
-    /*
-     * HCI Command packet.
-     */
-    if(packet[0] != 0x01U ||
-       state->descriptor_buffer.cpu == 0)
-    {
-        return K_EINVAL;
-    }
-
-
-    /*
-     * USB Bluetooth control transfer carries the HCI command
-     * without the packet-type byte.
-     */
-    for(size_t i = 1U;
-        i < length;
-        ++i)
-    {
-        ((uint8_t *)
-            state->
-                descriptor_buffer.cpu)
-            [i - 1U] =
-                packet[i];
-    }
-
-
-    setup[6] =
-        (uint8_t)(
-            (length - 1U) &
-            0xFFU);
-
-    setup[7] =
-        (uint8_t)(
-            (length - 1U) >>
-            8);
-
-
-    dma_sync_for_device(
-        &state->
-            descriptor_buffer.mapping);
-
-
-    return
-        xhci_submit_control_transfer(
-            state,
-            setup,
-            (uint32_t)(
-                length - 1U),
-            false)
-        ? K_OK
-        : K_EIO;
+    if (packet[0] != 0x01U || state->descriptor_buffer.cpu == 0) return K_EINVAL;
+    /* USB Bluetooth 的 control pipe 传输 opcode/length/parameters，不含 HCI 类型字节。 */
+    for (size_t i = 1U; i < length; ++i) ((uint8_t *)state->descriptor_buffer.cpu)[i - 1U] = packet[i];
+    setup[6] = (uint8_t)((length - 1U) & 0xFFU);
+    setup[7] = (uint8_t)((length - 1U) >> 8);
+    dma_sync_for_device(&state->descriptor_buffer.mapping);
+    return xhci_submit_control_transfer(state, setup, (uint32_t)(length - 1U), false) ?
+           K_OK : K_EIO;
 }
-
-
-/*
- * V3.7.7 BT SLOT TRANSPORT
- *
- * Bluetooth Core -> xHCI transmission is now routed by the Slot ID
- * permanently bound when bt_controller is created.
- */
-static kstatus_t xhci_bt_send(
-    void *context,
-    const uint8_t *packet,
-    size_t length)
-{
-    xhci_bt_transport_t *transport =
-        (xhci_bt_transport_t *)context;
-
-
-    if(transport == 0 ||
-       transport->state == 0 ||
-       transport->slot == 0U)
-    {
-        return K_EINVAL;
-    }
-
-
-    xhci_state_t *state =
-        transport->state;
-
-    uint8_t slot =
-        transport->slot;
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot)
-    {
-        return K_EIO;
-    }
-
-
-    /*
-     * Fast path:
-     *
-     * Bluetooth device is already the active xHCI context.
-     */
-    if(state->device.device_slot ==
-       slot)
-    {
-        kstatus_t status =
-            xhci_bt_send_current(
-                state,
-                packet,
-                length);
-
-
-        slot_dev->context =
-            state->device;
-
-
-        return status;
-    }
-
-
-    /*
-     * Inactive Bluetooth devices are currently stored in the
-     * compatibility inventory, but Slot Table knows the exact
-     * location.
-     */
-    if(!slot_dev->
-           runtime_in_inventory)
-    {
-        /*
-         * The device may temporarily be owned by topology
-         * reconciliation.  Do not accidentally send through
-         * another active Slot.
-         */
-        return K_EBUSY;
-    }
-
-
-    uint32_t index =
-        slot_dev->
-            inventory_index;
-
-
-    if(index >=
-       state->inventory_count)
-    {
-        return K_EIO;
-    }
-
-
-    xhci_inventory_entry_t *entry =
-        &state->inventory[
-            index];
-
-
-    if(!entry->valid ||
-       entry->context.device_slot !=
-           slot ||
-       entry->context.bt_controller ==
-           0)
-    {
-        return K_EIO;
-    }
-
-
-    /*
-     * Existing control-transfer/doorbell helpers use state->device.
-     *
-     * Temporarily install only the context identified by this
-     * Bluetooth controller's permanent Slot binding.
-     */
-    xhci_device_context_t saved_active;
-
-
-    xhci_copy_device_context(
-        &saved_active,
-        &state->device);
-
-
-    xhci_copy_device_context(
-        &state->device,
-        &entry->context);
-
-
-    kstatus_t status =
-        xhci_bt_send_current(
-            state,
-            packet,
-            length);
-
-
-    /*
-     * Producer state may have changed:
-     *
-     *     enqueue
-     *     cycle
-     *     transfer_pending
-     *
-     * Commit it back to its real owner.
-     */
-    slot_dev->context =
-        state->device;
-
-
-    xhci_copy_device_context(
-        &entry->context,
-        &state->device);
-
-
-    xhci_zero_device_context(
-        &state->device);
-
-
-    xhci_copy_device_context(
-        &state->device,
-        &saved_active);
-
-
-    return status;
-}
-
 
 static bool xhci_configure_bt_endpoints(xhci_state_t *state) {
     uint32_t event_id;
@@ -5075,388 +3894,64 @@ static bool xhci_configure_bt_endpoints(xhci_state_t *state) {
             (uint32_t *)((uint8_t *)input + state->context_size * (acl_out_id + 1U)),
             0U, 2U, state->bt_acl_out_max_packet, &state->bt_acl_out_ring.mapping);
     }
-    /*
-     * Bind this Bluetooth controller permanently to its hardware
-     * Slot before Bluetooth Core receives the callback pointer.
-     */
-    if(state->device_slot == 0U)
-    {
-        return false;
-    }
-
-
-    xhci_bt_transport_t *transport =
-        &g_xhci_bt_transports[
-            state->device_slot];
-
-
-    transport->state =
-        state;
-
-    transport->slot =
-        state->device_slot;
-
-
-    dma_sync_for_device(
-        &state->input_context.mapping);
+    dma_sync_for_device(&state->input_context.mapping);
     if (!xhci_submit_command(state, XHCI_CONFIGURE_ENDPOINT_TYPE,
                              state->device_slot,
                              xhci_dma_address(&state->input_context.mapping), 0) ||
-        bt_controller_create(
-            xhci_bt_send,
-            transport,
-            &state->bt_controller) != K_OK ||
+        bt_controller_create(xhci_bt_send, state, &state->bt_controller) != K_OK ||
         bt_controller_start(state->bt_controller) != K_OK ||
         !xhci_queue_bt_event(state) ||
         (acl_in_id != 0U && !xhci_queue_bt_acl_in(state))) return false;
     return true;
 }
 
-/*
- * V3.7.6 BT SLOT EVENT DISPATCH
- *
- * xHCI Transfer Event already provides Slot ID.
- *
- * Resolve the actual Bluetooth context directly:
- *
- *      Slot ID
- *         |
- *         v
- *    Slot Table
- *         |
- *         +-- active ----------> state->device
- *         |
- *         +-- inventory_index -> inventory[index]
- *
- * No inventory scan.
- *
- * Existing Bluetooth helpers still operate through state->device,
- * so an inactive Bluetooth context is temporarily installed there
- * while its event is processed.
- */
-static bool xhci_handle_bt_transfer_event(
-    xhci_state_t *state,
-    const xhci_trb_t *event)
-{
-    xhci_inventory_entry_t *entry =
-        0;
-
-    xhci_slot_device_t *slot_dev;
-
-    xhci_device_context_t saved_active;
-
-    uint8_t slot;
-
+static bool xhci_handle_bt_transfer_event(xhci_state_t *state,
+                                          const xhci_trb_t *event) {
     uint32_t endpoint_id;
-
     uint32_t completion;
-
     uint32_t residual;
-
     size_t length;
-
-    bool active;
-
-    bool handled =
-        false;
-
-
-    if(state == 0 ||
-       event == 0 ||
-       ((event->control >>
-         XHCI_TRB_TYPE_SHIFT) &
-        0x3FU) !=
-           XHCI_TRANSFER_EVENT_TYPE)
-    {
-        return false;
-    }
-
-
-    slot =
-        (uint8_t)(
-            event->control >>
-            XHCI_TRB_SLOT_SHIFT);
-
-
-    if(slot == 0U)
-    {
-        return false;
-    }
-
-
-    /*
-     * Hardware Slot ID is the primary identity.
-     */
-    slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used)
-    {
-        return false;
-    }
-
-
-    /*
-     * Is this Bluetooth device currently occupying the
-     * controller's active context?
-     */
-    active =
-        state->device.device_slot ==
-            slot &&
-        state->bt_controller !=
-            0;
-
-
-    if(!active)
-    {
-        uint32_t index;
-
-
-        if(!slot_dev->
-               runtime_in_inventory)
-        {
-            return false;
+    if (state == 0 || event == 0 || state->bt_controller == 0 ||
+        (uint8_t)(event->control >> XHCI_TRB_SLOT_SHIFT) != state->device_slot ||
+        (event->control >> XHCI_TRB_TYPE_SHIFT & 0x3FU) != XHCI_TRANSFER_EVENT_TYPE) return false;
+    endpoint_id = (event->control >> XHCI_TRB_ENDPOINT_SHIFT) & 0x1FU;
+    completion = event->status >> XHCI_COMPLETION_SHIFT;
+    residual = event->status & 0x00FFFFFFU;
+    if (endpoint_id == (uint32_t)state->bt_event_endpoint * 2U + 1U) {
+        state->bt_event_transfer_pending = false;
+        if (completion == XHCI_COMPLETION_SUCCESS && residual <= state->bt_event_max_packet) {
+            length = state->bt_event_max_packet - residual;
+            dma_sync_for_cpu(&state->bt_event_buffer.mapping);
+            if (length != 0U) (void)bt_hci_receive_event(state->bt_controller,
+                state->bt_event_buffer.cpu, length);
+            (void)xhci_queue_bt_event(state);
+        } else {
+            g_xhci_error = 70U + completion;
         }
-
-
-        index =
-            slot_dev->
-                inventory_index;
-
-
-        if(index >=
-           state->inventory_count)
-        {
-            return false;
-        }
-
-
-        entry =
-            &state->inventory[
-                index];
-
-
-        /*
-         * Protect against stale inventory index / Slot reuse.
-         */
-        if(!entry->valid ||
-           entry->context.device_slot !=
-               slot ||
-           entry->context.bt_controller ==
-               0)
-        {
-            return false;
-        }
-
-
-        /*
-         * Existing xHCI Bluetooth transport code accesses
-         * state->bt_* directly.
-         *
-         * Temporarily activate exactly the context identified
-         * by the Transfer Event Slot ID.
-         */
-        xhci_copy_device_context(
-            &saved_active,
-            &state->device);
-
-        xhci_copy_device_context(
-            &state->device,
-            &entry->context);
+        return true;
     }
-
-
-    endpoint_id =
-        (event->control >>
-         XHCI_TRB_ENDPOINT_SHIFT) &
-        0x1FU;
-
-
-    completion =
-        event->status >>
-        XHCI_COMPLETION_SHIFT;
-
-
-    residual =
-        event->status &
-        0x00FFFFFFU;
-
-
-    /*
-     * Bluetooth HCI Event endpoint.
-     */
-    if(state->bt_event_endpoint != 0U &&
-       endpoint_id ==
-           (uint32_t)
-               state->bt_event_endpoint *
-                   2U + 1U)
-    {
-        state->bt_event_transfer_pending =
-            false;
-
-
-        if(completion ==
-               XHCI_COMPLETION_SUCCESS &&
-           residual <=
-               state->bt_event_max_packet)
-        {
-            length =
-                state->bt_event_max_packet -
-                residual;
-
-
-            dma_sync_for_cpu(
-                &state->
-                    bt_event_buffer.mapping);
-
-
-            if(length != 0U)
-            {
-                (void)bt_hci_receive_event(
-                    state->bt_controller,
-                    state->
-                        bt_event_buffer.cpu,
-                    length);
-            }
-
-
-            /*
-             * Re-arm the interrupt endpoint while the owning
-             * Bluetooth context is still installed.
-             */
-            (void)xhci_queue_bt_event(
-                state);
+    if (state->bt_acl_in_endpoint != 0U &&
+        endpoint_id == (uint32_t)state->bt_acl_in_endpoint * 2U + 1U) {
+        state->bt_acl_in_transfer_pending = false;
+        if (completion == XHCI_COMPLETION_SUCCESS && residual <= PAGE_SIZE) {
+            length = PAGE_SIZE - residual;
+            dma_sync_for_cpu(&state->bt_acl_in_buffer.mapping);
+            if (length != 0U) (void)bt_acl_receive(state->bt_controller,
+                state->bt_acl_in_buffer.cpu, length);
+            (void)xhci_queue_bt_acl_in(state);
+        } else {
+            g_xhci_error = 71U + completion;
         }
-        else
-        {
-            g_xhci_error =
-                70U +
-                completion;
-        }
-
-
-        handled =
-            true;
+        return true;
     }
-
-
-    /*
-     * Bluetooth ACL IN endpoint.
-     */
-    else if(state->bt_acl_in_endpoint !=
-                0U &&
-            endpoint_id ==
-                (uint32_t)
-                    state->
-                        bt_acl_in_endpoint *
-                    2U + 1U)
-    {
-        state->bt_acl_in_transfer_pending =
-            false;
-
-
-        if(completion ==
-               XHCI_COMPLETION_SUCCESS &&
-           residual <=
-               PAGE_SIZE)
-        {
-            length =
-                PAGE_SIZE -
-                residual;
-
-
-            dma_sync_for_cpu(
-                &state->
-                    bt_acl_in_buffer.mapping);
-
-
-            if(length != 0U)
-            {
-                (void)bt_acl_receive(
-                    state->bt_controller,
-                    state->
-                        bt_acl_in_buffer.cpu,
-                    length);
-            }
-
-
-            (void)xhci_queue_bt_acl_in(
-                state);
-        }
-        else
-        {
-            g_xhci_error =
-                71U +
-                completion;
-        }
-
-
-        handled =
-            true;
+    if (state->bt_acl_out_endpoint != 0U &&
+        endpoint_id == (uint32_t)state->bt_acl_out_endpoint * 2U) {
+        state->bt_acl_out_transfer_pending = false;
+        if (completion != XHCI_COMPLETION_SUCCESS) g_xhci_error = 72U + completion;
+        return true;
     }
-
-
-    /*
-     * Bluetooth ACL OUT endpoint.
-     */
-    else if(state->bt_acl_out_endpoint !=
-                0U &&
-            endpoint_id ==
-                (uint32_t)
-                    state->
-                        bt_acl_out_endpoint *
-                    2U)
-    {
-        state->bt_acl_out_transfer_pending =
-            false;
-
-
-        if(completion !=
-           XHCI_COMPLETION_SUCCESS)
-        {
-            g_xhci_error =
-                72U +
-                completion;
-        }
-
-
-        handled =
-            true;
-    }
-
-
-    /*
-     * Keep Slot Table mirror synchronized with the real owner
-     * after pending/enqueue/cycle fields may have changed.
-     */
-    slot_dev->context =
-        state->device;
-
-
-    if(!active)
-    {
-        /*
-         * Return updated DMA/ring ownership to its inventory
-         * storage before restoring the previous active device.
-         */
-        xhci_copy_device_context(
-            &entry->context,
-            &state->device);
-
-        xhci_zero_device_context(
-            &state->device);
-
-        xhci_copy_device_context(
-            &state->device,
-            &saved_active);
-    }
-
-
-    return handled;
+    return false;
 }
-
 
 static bool xhci_configure_hid_endpoint(xhci_state_t *state) {
     uint32_t endpoint_id;
@@ -5515,17 +4010,6 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
                                   uint8_t port, uint8_t speed,
                                   uint8_t root_port, uint8_t parent_slot,
                                   uint8_t parent_port, uint32_t route_string) {
-    /*
-     * V3.7.2 ENUMERATION FAILURE ROLLBACK
-     *
-     * Slot Table and USB Core objects can be created before
-     * hardware enumeration has fully succeeded.
-     *
-     * Every failure exit must remove those tentative software
-     * objects.  Hardware Disable Slot and DMA teardown remain
-     * owned by the existing caller.
-     */
-
 
     /*
      * V3.5.2 USB CORE BIND
@@ -5644,94 +4128,46 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         !xhci_submit_command(state, XHCI_ADDRESS_DEVICE_TYPE, slot,
                              xhci_dma_address(&state->input_context.mapping), 0)) {
         if (g_xhci_error == 0U) g_xhci_error = 55U;
-        do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
         return false;
-    } while (0);
     }
     if (!xhci_submit_control_transfer(state, get_device_descriptor,
                                       XHCI_DESCRIPTOR_DEVICE_LENGTH, true)) {
-        do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
         return false;
-    } while (0);
     }
     uint8_t *descriptor = (uint8_t *)state->descriptor_buffer.cpu;
     if (descriptor[0] < XHCI_DESCRIPTOR_DEVICE_LENGTH ||
         descriptor[1] != XHCI_DESCRIPTOR_DEVICE) {
         g_xhci_error = 56U;
-        do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
         return false;
-    } while (0);
     }
     g_xhci_usb_enumerated = true;
     if (!xhci_submit_control_transfer(state, get_configuration_descriptor,
                                       0xFFU, true) ||
         !xhci_parse_configuration(state)) {
         g_xhci_error = 57U;
-        do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
         return false;
-    } while (0);
     }
     set_configuration[0] = 0x00U;
     set_configuration[1] = XHCI_SETUP_SET_CONFIGURATION;
     set_configuration[2] = state->configuration_value;
     if (!xhci_submit_control_transfer(state, set_configuration, 0U, false)) {
         g_xhci_error = 58U;
-        do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
         return false;
-    } while (0);
     }
     /* Hub 第一阶段只完成类识别和 Hub 描述符读取；下游端口的
      * route string、slot/context 隔离以及端口事件处理在后续阶段接入。 */
     if (state->hub_interface_present) {
-        if (!xhci_read_hub_descriptor(state)) do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+        if (!xhci_read_hub_descriptor(state)) return false;
         if (state->hub_endpoint != 0U && !xhci_configure_hub_endpoint(state)) {
             if (g_xhci_error == 0U) g_xhci_error = 68U;
-            do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+            return false;
         }
         g_xhci_usb_hub = true;
         g_xhci_usb_hub_ports = state->hub_port_count;
     } else if (state->bt_event_endpoint != 0U) {
         if (!xhci_configure_bt_endpoints(state)) {
             if (g_xhci_error == 0U) g_xhci_error = 65U;
-            do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+            return false;
         }
         g_xhci_usb_bluetooth = true;
     } else if (state->audio_endpoint != 0U) {
@@ -5743,13 +4179,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         set_interface[4] = state->audio_interface;
         if (!xhci_submit_control_transfer(state, set_interface, 0U, false)) {
             g_xhci_error = 59U;
-            do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+            return false;
         }
     }
     if (state->hid_endpoint != 0U) {
@@ -5761,36 +4191,18 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
          * Select Boot protocol before arming its fixed-format interrupt TRB. */
         if (!xhci_submit_control_transfer(state, set_protocol, 0U, false)) {
             g_xhci_error = 59U;
-            do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+            return false;
         }
         if (!xhci_configure_hid_endpoint(state)) {
             if (g_xhci_error == 0U) g_xhci_error = 59U;
-            do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+            return false;
         }
         g_xhci_usb_hid = true;
         if (state->hid_protocol == USB_HID_PROTOCOL_MOUSE) g_xhci_usb_mouse = true;
     } else if (state->audio_endpoint != 0U) {
         if (!xhci_configure_audio_endpoint(state)) {
             if (g_xhci_error == 0U) g_xhci_error = 63U;
-            do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-        return false;
-    } while (0);
+            return false;
         }
         g_xhci_usb_audio = true;
     } else if (state->bt_event_endpoint != 0U) {
@@ -5799,13 +4211,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         /* Hub 第一阶段没有供内核数据面使用的普通数据端点。 */
     } else {
         if (g_xhci_error == 0U) g_xhci_error = 59U;
-        do {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
         return false;
-    } while (0);
     }
 
 
