@@ -722,28 +722,6 @@ static bool xhci_free_rings(xhci_state_t *state) {
  *
  * DMA/resource lifetime belongs to an explicit device context.
  */
-/*
- * V3.10.6B9E-DIAG2 RESOURCE FREE STAGES
- *
- * Temporary diagnostics:
- *
- *   681 descriptor_buffer
- *   682 hid_report
- *   683 hid_ring
- *   684 audio_buffer
- *   685 audio_ring
- *   686 bt_acl_out_ring
- *   687 bt_acl_out_buffer
- *   688 bt_acl_in_buffer
- *   689 bt_acl_in_ring
- *   690 bt_event_buffer
- *   691 bt_event_ring
- *   692 hub_report
- *   693 hub_ring
- *   694 ep0_ring
- *   695 input_context
- *   696 output_context
- */
 static bool xhci_free_device_resources_device(
     xhci_device_context_t *device) {
     bool released = true;
@@ -762,246 +740,22 @@ static bool xhci_free_device_resources_device(
         bt_controller_destroy(device->bt_controller);
         device->bt_controller = 0;
     }
-    if(!xhci_free_page(
-           &device->descriptor_buffer))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                681U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->hid_report))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                682U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->hid_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                683U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->audio_buffer))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                684U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->audio_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                685U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->bt_acl_out_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                686U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->bt_acl_out_buffer))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                687U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->bt_acl_in_buffer))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                688U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->bt_acl_in_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                689U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->bt_event_buffer))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                690U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->bt_event_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                691U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->hub_report))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                692U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->hub_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                693U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->ep0_ring))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                694U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->input_context))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                695U;
-        }
-
-        released =
-            false;
-    }
-    if(!xhci_free_page(
-           &device->output_context))
-    {
-        /*
-         * Keep the FIRST resource-free failure.
-         */
-        if(released)
-        {
-            g_xhci_error =
-                696U;
-        }
-
-        released =
-            false;
-    }
+    if (!xhci_free_page(&device->descriptor_buffer)) released = false;
+    if (!xhci_free_page(&device->hid_report)) released = false;
+    if (!xhci_free_page(&device->hid_ring)) released = false;
+    if (!xhci_free_page(&device->audio_buffer)) released = false;
+    if (!xhci_free_page(&device->audio_ring)) released = false;
+    if (!xhci_free_page(&device->bt_acl_out_ring)) released = false;
+    if (!xhci_free_page(&device->bt_acl_out_buffer)) released = false;
+    if (!xhci_free_page(&device->bt_acl_in_buffer)) released = false;
+    if (!xhci_free_page(&device->bt_acl_in_ring)) released = false;
+    if (!xhci_free_page(&device->bt_event_buffer)) released = false;
+    if (!xhci_free_page(&device->bt_event_ring)) released = false;
+    if (!xhci_free_page(&device->hub_report)) released = false;
+    if (!xhci_free_page(&device->hub_ring)) released = false;
+    if (!xhci_free_page(&device->ep0_ring)) released = false;
+    if (!xhci_free_page(&device->input_context)) released = false;
+    if (!xhci_free_page(&device->output_context)) released = false;
     if (!released) return false;
     device->device_slot = 0;
     device->device_port = 0;
@@ -2821,15 +2575,6 @@ static bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
  *          v
  *     publish Slot.context
  */
-/*
- * V3.10.6B9E-DIAG1 REENUM FAILURE STAGES
- *
- * 661 = invalid root port
- * 662 = supplied Slot.context is not canonical
- * 663 = state->device unexpectedly occupied
- * 664 = published subtree teardown failed
- * 665 = physical root port lost CCS after teardown
- */
 static bool xhci_reenumerate_self_test(
     xhci_state_t *state,
     xhci_device_context_t *device)
@@ -2869,7 +2614,7 @@ static bool xhci_reenumerate_self_test(
        port > state->max_ports)
     {
         g_xhci_error =
-            661U;
+            66U;
 
         return false;
     }
@@ -2897,7 +2642,7 @@ static bool xhci_reenumerate_self_test(
            old_slot)
     {
         g_xhci_error =
-            662U;
+            66U;
 
         return false;
     }
@@ -2910,7 +2655,7 @@ static bool xhci_reenumerate_self_test(
     if(state->device.device_slot != 0U)
     {
         g_xhci_error =
-            663U;
+            66U;
 
         return false;
     }
@@ -2925,15 +2670,8 @@ static bool xhci_reenumerate_self_test(
            state,
            old_slot))
     {
-        /*
-         * Preserve DIAG2's exact DMA/resource failure.
-         */
-        if(g_xhci_error < 681U ||
-           g_xhci_error > 696U)
-        {
-            g_xhci_error =
-                664U;
-        }
+        g_xhci_error =
+            66U;
 
         return false;
     }
@@ -2949,7 +2687,7 @@ static bool xhci_reenumerate_self_test(
        (portsc & XHCI_PORTSC_CCS) == 0U)
     {
         g_xhci_error =
-            665U;
+            66U;
 
         return false;
     }
@@ -6507,164 +6245,27 @@ static bool xhci_initialize(xhci_state_t *state, const pci_device_t *pci) {
     return true;
 }
 
-/*
- * V3.10.6B9E-FIX2 DESTROY ORDER
- *
- * xHCI commands require the controller command ring to be running.
- *
- * Therefore the teardown order is:
- *
- *     stop/disable/free every device Slot
- *                  |
- *                  v
- *             halt controller
- *                  |
- *                  v
- *             release rings/MMIO
- *
- * Never halt the controller before Disable Slot.
- *
- * If destroy() is cleaning up an earlier failure, preserve that
- * original diagnostic instead of replacing it with a cleanup error.
- */
-static bool xhci_destroy(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-
-    uint32_t original_error =
-        g_xhci_error;
-
-    bool released =
-        true;
-
-
-    g_xhci_runtime_ready =
-        false;
-
-    g_xhci_runtime_event_batches =
-        0U;
-
-
-    /*
-     * Runtime IRQ delivery is no longer needed.
-     *
-     * Synchronous xHCI commands below consume Command Completion
-     * Events directly from the Event Ring.
-     */
-    xhci_unbind_msix(
-        state);
-
-
-    /*
-     * DEVICE/SLOT TEARDOWN FIRST.
-     *
-     * Stop Endpoint and Disable Slot are xHCI commands and cannot
-     * complete after USBCMD.RUN has been cleared.
-     */
-    if(!xhci_free_slot_resources(
-           state))
-    {
-        released =
-            false;
-    }
-
-
-    /*
-     * All device DMA ownership has ended.
-     * The controller can now be halted safely.
-     */
-    if(state->mmio != 0)
-    {
-        if(!xhci_write32(
-               state,
-               state->operational_offset +
-                   XHCI_USBCMD,
-               0U))
-        {
-            released =
-                false;
-        }
-        else
-        {
-            bool halted =
-                false;
-
-
-            for(uint32_t spin = 0U;
-                spin < 10000U;
-                ++spin)
-            {
-                if((xhci_read32(
-                        state,
-                        state->operational_offset +
-                            XHCI_USBSTS) &
-                    XHCI_USBSTS_HCH) != 0U)
-                {
-                    halted =
-                        true;
-
-                    break;
-                }
-
-
-                __asm__ volatile (
-                    "pause");
-            }
-
-
-            if(!halted)
-            {
-                released =
-                    false;
-            }
+static bool xhci_destroy(xhci_state_t *state) {
+    if (state == 0) return false;
+    g_xhci_runtime_ready = false;
+    g_xhci_runtime_event_batches = 0U;
+    xhci_unbind_msix(state);
+    if (state->mmio != 0) {
+        (void)xhci_write32(state, state->operational_offset + XHCI_USBCMD, 0U);
+        for (uint32_t spin = 0; spin < 10000U; ++spin) {
+            if ((xhci_read32(state, state->operational_offset + XHCI_USBSTS) &
+                 XHCI_USBSTS_HCH) != 0) break;
+            __asm__ volatile ("pause");
         }
     }
-
-
-    if(!xhci_free_rings(
-           state))
-    {
-        released =
-            false;
-    }
-
-
-    xhci_zero_device_context(
-        &state->device);
-
+    if (!xhci_free_slot_resources(state) ||
+        !xhci_free_rings(state)) return false;
+    xhci_zero_device_context(&state->device);
     xhci_clear_device_flags();
-
-
-    xhci_unmap_mmio(
-        state);
-
-
-    state->initialized =
-        false;
-
-    state->pci =
-        0;
-
-
-    /*
-     * Cleanup commands normally set g_xhci_error back to zero.
-     *
-     * If destroy() was entered because something else had already
-     * failed, that first error is the useful diagnostic.
-     */
-    if(original_error != 0U)
-    {
-        g_xhci_error =
-            original_error;
-    }
-
-
-    return released;
+    xhci_unmap_mmio(state);
+    state->initialized = false;
+    state->pci = 0;
+    return true;
 }
 
 bool xhci_hardware_present(void) {
