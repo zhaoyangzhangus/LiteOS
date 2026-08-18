@@ -899,113 +899,16 @@ static bool xhci_restore_active_device(xhci_state_t *state,
     return true;
 }
 
-
-/*
- * V3.6.6 SLOT UNPUBLISH
- *
- * Hardware teardown is still owned by xHCI.
- *
- * Once Disable Slot has been issued, remove the same device from:
- *
- *   xHCI Slot Table
- *   parent Hub child map
- *   USB Hub Core
- *   USB Device Core
- */
-static void xhci_unpublish_slot_device(
-    uint8_t slot,
-    uint8_t parent_slot,
-    uint8_t parent_port)
-{
-    if(slot == 0U)
-    {
-        return;
-    }
-
-    /*
-     * Detach from parent first.
-     */
-    if(parent_slot != 0U &&
-       parent_port != 0U)
-    {
-        usb_hub_port_disconnect(
-            parent_slot,
-            parent_port,
-            slot);
-
-        /*
-         * Current xHCI fast child map contains 16 entries.
-         */
-        if(parent_port <= 16U)
-        {
-            xhci_slot_device_t *parent =
-                &g_xhci_slot_devices[
-                    parent_slot];
-
-            if(parent->used &&
-               parent->child_slots[
-                   parent_port - 1U] ==
-                   slot)
-            {
-                parent->child_slots[
-                    parent_port - 1U] =
-                    0U;
-            }
-        }
-    }
-
-    /*
-     * Safe for non-Hub devices too:
-     * usb_hub_remove() simply clears the corresponding class slot.
-     */
-    usb_hub_remove(
-        slot);
-
-    usb_release_device(
-        slot);
-
-    __builtin_memset(
-        &g_xhci_slot_devices[slot],
-        0,
-        sizeof(g_xhci_slot_devices[slot]));
-}
-
-
 static bool xhci_release_active_device(xhci_state_t *state) {
     bool released;
     if (state == 0 || state->device.device_slot == 0U) return true;
-
-    /*
-     * xhci_free_device_resources() clears these fields,
-     * therefore preserve topology identity before releasing DMA.
-     */
-    uint8_t released_slot =
-        state->device.device_slot;
-
-    uint8_t released_parent_slot =
-        state->device.parent_slot;
-
-    uint8_t released_parent_port =
-        state->device.parent_port;
     if (!xhci_stop_pending_endpoints(state)) g_xhci_error = 60U;
     if (!xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
                              state->device_slot, 0U, 0)) {
         /* 设备已断开时 Disable Slot 可能没有完成事件，但 DMA 仍必须释放。 */
         g_xhci_error = 61U;
     }
-    released =
-        xhci_free_device_resources(
-            state);
-
-    /*
-     * Hardware Slot lifetime has ended.
-     * Publish the removal to every software topology layer.
-     */
-    xhci_unpublish_slot_device(
-        released_slot,
-        released_parent_slot,
-        released_parent_port);
-
+    released = xhci_free_device_resources(state);
     xhci_clear_device_flags();
     xhci_recompute_topology(state);
     return released;
@@ -1037,103 +940,6 @@ static bool xhci_save_active_device(xhci_state_t *state, uint8_t kind) {
         state->inventory_count >= XHCI_MAX_USB_INVENTORY || kind == 0U) {
         return false;
     }
-    /*
-     * V3.6.5 FINALIZE SLOT DEVICE
-     *
-     * Enumeration is complete here.  state->device owns the final
-     * endpoint/DMA/Hub information, so this is the correct point to
-     * publish the permanent Slot Table copy.
-     */
-    {
-        uint8_t slot =
-            state->device.device_slot;
-
-        xhci_slot_device_t *slot_dev =
-            &g_xhci_slot_devices[slot];
-
-        slot_dev->used =
-            true;
-
-        slot_dev->slot_id =
-            slot;
-
-        slot_dev->speed =
-            state->device.device_speed;
-
-        slot_dev->parent_slot =
-            state->device.parent_slot;
-
-        slot_dev->parent_port =
-            state->device.parent_port;
-
-        slot_dev->root_port =
-            state->device.root_port;
-
-        slot_dev->route_string =
-            state->device.route_string;
-
-        /*
-         * Keep the complete per-device context available by Slot ID.
-         */
-        slot_dev->context =
-            state->device;
-
-        slot_dev->is_hub =
-            kind == 4U;
-
-        if(slot_dev->is_hub)
-        {
-            slot_dev->hub_port_count =
-                state->device.hub_port_count;
-
-            /*
-             * Hub descriptor has already been read at this point,
-             * therefore publish the real bNbrPorts to USB Core.
-             */
-            (void)usb_hub_init(
-                slot,
-                state->device.hub_port_count);
-
-            usb_device_t *usb_dev =
-                usb_get_device(slot);
-
-            if(usb_dev != 0)
-            {
-                usb_dev->device_class =
-                    USB_CLASS_HUB;
-            }
-        }
-
-        /*
-         * Mirror the physical parent/port relation into USB Hub Core.
-         */
-        if(state->device.parent_slot != 0U &&
-           state->device.parent_port != 0U)
-        {
-            usb_hub_port_connect(
-                state->device.parent_slot,
-                state->device.parent_port,
-                slot);
-
-            /*
-             * Keep xHCI Slot topology synchronized as well.
-             */
-            if(state->device.parent_port <= 16U)
-            {
-                xhci_slot_device_t *parent =
-                    &g_xhci_slot_devices[
-                        state->device.parent_slot];
-
-                if(parent->used)
-                {
-                    parent->child_slots[
-                        state->device.parent_port - 1U] =
-                        slot;
-                }
-            }
-        }
-    }
-
     entry = &state->inventory[state->inventory_count++];
     xhci_copy_device_context(&entry->context, &state->device);
     entry->kind = kind;

@@ -75,10 +75,4 @@ usb_alloc_device(
 
 
 
-
-void
-usb_release_device(
-    uint8_t slot);
-
-
 #endif

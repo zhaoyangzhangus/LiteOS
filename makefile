@@ -478,6 +478,9 @@ $(BUILD)/kernel/xhci.o: kernel/drivers/xhci.c | $(BUILD)/kernel
 $(BUILD)/kernel/usb-core.o: kernel/drivers/usb/core.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD)/kernel/usb-hub.o: kernel/drivers/usb/hub.c | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD)/kernel/vfs.o: kernel/fs/vfs.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -588,7 +591,7 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/ascii_font.o \
                                     $(BUILD)/kernel/nvme.o $(BUILD)/kernel/nvme-core.o \
                                     $(BUILD)/kernel/e1000.o \
                                     $(BUILD)/kernel/security.o $(BUILD)/kernel/gpu.o \
-                                    $(BUILD)/kernel/usb.o $(BUILD)/kernel/usb-core.o $(BUILD)/kernel/xhci.o \
+                                    $(BUILD)/kernel/usb.o $(BUILD)/kernel/usb-core.o $(BUILD)/kernel/usb-hub.o $(BUILD)/kernel/xhci.o \
                                     $(BUILD)/kernel/vfs.o $(BUILD)/kernel/block.o \
                                     $(BUILD)/kernel/block-core.o \
                                     $(BUILD)/kernel/fat32.o $(BUILD)/kernel/cache.o \

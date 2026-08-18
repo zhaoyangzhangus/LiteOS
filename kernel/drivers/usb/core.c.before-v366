@@ -62,19 +62,3 @@ usb_alloc_device(
 
     return dev;
 }
-
-
-void
-usb_release_device(
-    uint8_t slot)
-{
-    if(slot == 0U)
-    {
-        return;
-    }
-
-    __builtin_memset(
-        &usb_devices[slot],
-        0,
-        sizeof(usb_devices[slot]));
-}

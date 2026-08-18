@@ -1,0 +1,68 @@
+#ifndef LITEOS_USB_HUB_H
+#define LITEOS_USB_HUB_H
+
+
+#include <stdint.h>
+#include <stdbool.h>
+
+
+#define USB_HUB_MAX_PORTS 32
+
+
+typedef struct usb_hub
+{
+    bool used;
+
+
+    uint8_t slot_id;
+
+
+    uint8_t port_count;
+
+
+    uint8_t protocol;
+
+
+    uint8_t child_slots[
+        USB_HUB_MAX_PORTS];
+
+
+} usb_hub_t;
+
+
+
+usb_hub_t *
+usb_hub_get(
+    uint8_t slot);
+
+
+
+bool
+usb_hub_init(
+    uint8_t slot,
+    uint8_t ports);
+
+
+
+void
+usb_hub_port_connect(
+    uint8_t hub_slot,
+    uint8_t port,
+    uint8_t child_slot);
+
+
+
+
+void
+usb_hub_port_disconnect(
+    uint8_t hub_slot,
+    uint8_t port,
+    uint8_t child_slot);
+
+
+void
+usb_hub_remove(
+    uint8_t slot);
+
+
+#endif
