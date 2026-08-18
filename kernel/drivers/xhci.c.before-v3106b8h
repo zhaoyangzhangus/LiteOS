@@ -526,6 +526,7 @@ static bool xhci_find_hub_child(
     uint8_t parent_slot,
     uint8_t parent_port,
     uint8_t *child_slot);
+static uint8_t xhci_current_device_kind(void);
 static bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
                                         uint32_t portsc);
 static bool xhci_reconcile_hub_topology(xhci_state_t *state);
@@ -1492,8 +1493,14 @@ static bool xhci_release_slot_device(
     if(had_active)
     {
         saved_kind =
-            xhci_context_kind(
-                &state->device);
+            xhci_current_device_kind();
+
+        if(saved_kind == 0U)
+        {
+            saved_kind =
+                xhci_context_kind(
+                    &state->device);
+        }
     }
 
     uint8_t release_kind =
@@ -2774,15 +2781,9 @@ static bool xhci_reenumerate_self_test(xhci_state_t *state,
     return true;
 }
 
-/*
- * V3.10.6B8H EXPLICIT WORKING DEVICE KIND
- *
- * xhci_current_device_kind() removed.
- *
- * Device classification is always performed on the explicit
- * context whose ownership is known at the call site.
- */
-
+static uint8_t xhci_current_device_kind(void) {
+    return xhci_context_kind(&g_xhci.device);
+}
 
 /*
  * V3.10.6B8C INVENTORY REMOVED
@@ -4341,8 +4342,7 @@ static bool xhci_probe_hub_downstream(
 
 
                 uint8_t kind =
-                    xhci_context_kind(
-                        &state->device);
+                    xhci_current_device_kind();
 
 
                 if(kind != 0U &&
@@ -4985,8 +4985,7 @@ static bool xhci_reconcile_one_hub(
         }
 
         uint8_t kind =
-            xhci_context_kind(
-                &state->device);
+            xhci_current_device_kind();
 
         if(kind != 0U &&
            xhci_publish_working_device(
