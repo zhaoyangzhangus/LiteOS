@@ -560,7 +560,6 @@ static uint32_t g_xhci_usb_device_count;
 static bool g_xhci_usb_hid;
 static bool g_xhci_usb_mouse;
 static bool g_xhci_usb_audio;
-static uint8_t g_xhci_audio_slot;
 static bool g_xhci_usb_hub;
 static uint8_t g_xhci_usb_hub_ports;
 static bool g_xhci_usb_hub_present;
@@ -6030,867 +6029,169 @@ bool xhci_usb_bluetooth_configured(void) {
     return g_xhci_usb_bluetooth;
 }
 
-/*
- * V3.8.6 AUDIO UAPI SLOT OWNER
- *
- * Audio UAPI never assumes that the Audio device occupies
- * g_xhci.device.
- *
- * The Slot ID is cached after first resolution.  Normal UAPI
- * calls are therefore O(1).  A Slot Table scan is used only when
- * the cache is empty or stale.
- */
-static xhci_device_context_t *
-xhci_audio_context(
-    xhci_state_t *state)
-{
-    if(state == 0 ||
-       !state->initialized)
-    {
-        return 0;
-    }
-
-
-    /*
-     * O(1) steady-state path.
-     */
-    if(g_xhci_audio_slot != 0U)
-    {
-        xhci_device_context_t *device =
-            xhci_slot_context_owner(
-                state,
-                g_xhci_audio_slot);
-
-
-        if(device != 0 &&
-           device->device_slot ==
-               g_xhci_audio_slot &&
-           device->audio_endpoint != 0U)
-        {
-            return device;
-        }
-
-
-        /*
-         * Device was unplugged or Slot was reused.
-         */
-        g_xhci_audio_slot =
-            0U;
-    }
-
-
-    /*
-     * Active device can be tested without a Slot Table scan.
-     */
-    if(state->device.device_slot != 0U &&
-       state->device.audio_endpoint != 0U)
-    {
-        g_xhci_audio_slot =
-            state->device.device_slot;
-
-        return
-            &state->device;
-    }
-
-
-    /*
-     * Slow discovery path.  Runs only when the cache is empty.
-     */
-    uint32_t limit =
-        state->max_slots;
-
-
-    if(limit >=
-       XHCI_MAX_SLOT_TABLE)
-    {
-        limit =
-            XHCI_MAX_SLOT_TABLE -
-            1U;
-    }
-
-
-    for(uint32_t slot = 1U;
-        slot <= limit;
-        ++slot)
-    {
-        xhci_slot_device_t *slot_dev =
-            &g_xhci_slot_devices[
-                slot];
-
-
-        if(!slot_dev->used ||
-           slot_dev->context.device_slot !=
-               (uint8_t)slot ||
-           slot_dev->context.audio_endpoint ==
-               0U)
-        {
-            continue;
-        }
-
-
-        xhci_device_context_t *device =
-            xhci_slot_context_owner(
-                state,
-                (uint8_t)slot);
-
-
-        if(device == 0 ||
-           device->audio_endpoint == 0U)
-        {
-            continue;
-        }
-
-
-        g_xhci_audio_slot =
-            (uint8_t)slot;
-
-
-        return device;
-    }
-
-
-    return 0;
+uint32_t xhci_usb_audio_completed(void) {
+    return g_xhci.audio_completed;
 }
 
+struct device *xhci_audio_device(void) {
+    return g_xhci.initialized && g_xhci_usb_audio && g_xhci.pci != 0 ?
+           (struct device *)&g_xhci.pci->device : 0;
+}
 
-/*
- * Keep transitional inventory shadow synchronized.
- *
- * Slot.context is already the real owner for parked devices.
- * inventory.context will be removed after all remaining legacy
- * inventory readers have been migrated.
- */
-static void
-xhci_audio_context_commit(
-    xhci_state_t *state,
-    xhci_device_context_t *device)
-{
-    if(state == 0 ||
-       device == 0 ||
-       device->device_slot == 0U)
-    {
-        return;
-    }
-
-
-    uint8_t slot =
-        device->device_slot;
-
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-
-    if(!slot_dev->used)
-    {
-        return;
-    }
-
-
-    if(device ==
-       &state->device)
-    {
-        xhci_slot_context_sync(
-            state,
-            slot);
-    }
-
-
-    /*
-     * Compatibility shadow only.
-     */
-    if(slot_dev->
-           runtime_in_inventory)
-    {
-        uint32_t index =
-            slot_dev->
-                inventory_index;
-
-
-        if(index <
-           state->inventory_count)
-        {
-            xhci_inventory_entry_t *entry =
-                &state->inventory[
-                    index];
-
-
-            if(entry->valid &&
-               entry->slot_id ==
-                   slot)
-            {
-                xhci_copy_device_context(
-                    &entry->context,
-                    device);
-            }
-        }
+static void xhci_audio_lock(void) {
+    while (atomic_exchange_explicit(&g_xhci.event_lock.state, 1U,
+                                    memory_order_acquire) != 0U) {
+        __asm__ volatile ("pause");
     }
 }
 
-
-/*
- * xhci_queue_audio_transfer() still consumes state->audio_*.
- *
- * Adapt an inactive canonical Slot context to that old ABI only
- * for the duration of the doorbell operation.
- */
-static bool
-xhci_queue_audio_owner(
-    xhci_state_t *state,
-    xhci_device_context_t *device)
-{
-    if(state == 0 ||
-       device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
-    if(device ==
-       &state->device)
-    {
-        return
-            xhci_queue_audio_transfer(
-                state);
-    }
-
-
-    xhci_device_context_t saved_active;
-
-
-    xhci_copy_device_context(
-        &saved_active,
-        &state->device);
-
-
-    xhci_copy_device_context(
-        &state->device,
-        device);
-
-
-    bool success =
-        xhci_queue_audio_transfer(
-            state);
-
-
-    /*
-     * Queue operation updates enqueue/cycle/pending state.
-     */
-    xhci_copy_device_context(
-        device,
-        &state->device);
-
-
-    xhci_zero_device_context(
-        &state->device);
-
-
-    xhci_copy_device_context(
-        &state->device,
-        &saved_active);
-
-
-    return success;
+static void xhci_audio_unlock(void) {
+    atomic_store_explicit(&g_xhci.event_lock.state, 0U, memory_order_release);
 }
 
-
-uint32_t
-xhci_usb_audio_completed(void)
-{
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio)
-    {
-        return 0U;
-    }
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    return
-        device != 0
-        ? device->audio_completed
-        : 0U;
-}
-
-
-struct device *
-xhci_audio_device(void)
-{
-    return
-        g_xhci.initialized &&
-        g_xhci_usb_audio &&
-        g_xhci.pci != 0
-        ? (struct device *)
-            &g_xhci.pci->device
-        : 0;
-}
-
-
-static void
-xhci_audio_lock(void)
-{
-    while(atomic_exchange_explicit(
-              &g_xhci.event_lock.state,
-              1U,
-              memory_order_acquire) !=
-          0U)
-    {
-        __asm__ volatile(
-            "pause");
-    }
-}
-
-
-static void
-xhci_audio_unlock(void)
-{
-    atomic_store_explicit(
-        &g_xhci.event_lock.state,
-        0U,
-        memory_order_release);
-}
-
-
-static bool
-xhci_audio_format_supported(
-    const xhci_device_context_t *device,
-    const audio_format_t *format)
-{
+static bool xhci_audio_format_supported(const audio_format_t *format) {
     uint32_t sample_bits;
-
-
-    if(device == 0 ||
-       format == 0 ||
-       format->channels !=
-           device->audio_channels ||
-       format->sample_rate !=
-           device->audio_sample_rate)
-    {
-        return false;
+    if (format == 0 || format->channels != g_xhci.audio_channels ||
+        format->sample_rate != g_xhci.audio_sample_rate) return false;
+    switch (format->sample_format) {
+        case AUDIO_SAMPLE_S16_LE: sample_bits = 16U; break;
+        case AUDIO_SAMPLE_S24_LE: sample_bits = 24U; break;
+        case AUDIO_SAMPLE_S32_LE: sample_bits = 32U; break;
+        default: return false;
     }
-
-
-    switch(format->sample_format)
-    {
-        case AUDIO_SAMPLE_S16_LE:
-            sample_bits = 16U;
-            break;
-
-        case AUDIO_SAMPLE_S24_LE:
-            sample_bits = 24U;
-            break;
-
-        case AUDIO_SAMPLE_S32_LE:
-            sample_bits = 32U;
-            break;
-
-        default:
-            return false;
-    }
-
-
-    return
-        sample_bits ==
-        device->
-            audio_bit_resolution;
+    return sample_bits == g_xhci.audio_bit_resolution;
 }
 
-
-kstatus_t
-xhci_audio_stream_configure(
-    struct audio_stream *stream)
-{
-    audio_stream_t *audio =
-        (audio_stream_t *)stream;
-
+kstatus_t xhci_audio_stream_configure(struct audio_stream *stream) {
+    audio_stream_t *audio = (audio_stream_t *)stream;
     audio_format_t format;
-
-
-    if(audio == 0)
-    {
-        return K_EINVAL;
-    }
-
-
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio ||
-       audio_stream_device(audio) !=
-           xhci_audio_device())
-    {
-        return K_ENOENT;
-    }
-
-
-    audio_stream_get_format(
-        audio,
-        &format);
-
-
+    if (audio == 0 || !g_xhci.initialized || !g_xhci_usb_audio ||
+        audio_stream_device(audio) != xhci_audio_device()) return K_ENOENT;
+    audio_stream_get_format(audio, &format);
+    if (audio_stream_direction(audio) !=
+            (g_xhci.audio_endpoint_in ? AUDIO_CAPTURE : AUDIO_PLAYBACK) ||
+        !xhci_audio_format_supported(&format) ||
+        audio_stream_period_bytes(audio) > PAGE_SIZE) return K_EINVAL;
     xhci_audio_lock();
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    if(device == 0)
-    {
-        xhci_audio_unlock();
-        return K_ENOENT;
-    }
-
-
-    if(audio_stream_direction(audio) !=
-           (device->audio_endpoint_in
-                ? AUDIO_CAPTURE
-                : AUDIO_PLAYBACK) ||
-       !xhci_audio_format_supported(
-           device,
-           &format) ||
-       audio_stream_period_bytes(audio) >
-           PAGE_SIZE)
-    {
-        xhci_audio_unlock();
-        return K_EINVAL;
-    }
-
-
-    if(device->audio_stream != 0 &&
-       device->audio_stream != audio)
-    {
+    if (g_xhci.audio_stream != 0 && g_xhci.audio_stream != audio) {
         xhci_audio_unlock();
         return K_EBUSY;
     }
-
-
-    device->audio_stream =
-        audio;
-
-    device->audio_stream_bound =
-        true;
-
-    device->audio_stream_running =
-        false;
-
-    device->audio_stream_queued =
-        false;
-
-    device->audio_period =
-        0U;
-
-    device->audio_frames =
-        0U;
-
-
-    xhci_audio_context_commit(
-        &g_xhci,
-        device);
-
-
+    g_xhci.audio_stream = audio;
+    g_xhci.audio_stream_bound = true;
+    g_xhci.audio_stream_running = false;
+    g_xhci.audio_stream_queued = false;
+    g_xhci.audio_period = 0U;
+    g_xhci.audio_frames = 0U;
     xhci_audio_unlock();
-
     return K_OK;
 }
 
-
-kstatus_t
-xhci_audio_stream_start(
-    struct audio_stream *stream)
-{
-    audio_stream_t *audio =
-        (audio_stream_t *)stream;
-
-    bool success =
-        true;
-
-
-    if(audio == 0)
-    {
-        return K_EINVAL;
-    }
-
-
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio)
-    {
-        return K_ENOENT;
-    }
-
-
+kstatus_t xhci_audio_stream_start(struct audio_stream *stream) {
+    audio_stream_t *audio = (audio_stream_t *)stream;
+    bool success = true;
+    if (audio == 0 || !g_xhci.initialized || !g_xhci_usb_audio ||
+        g_xhci.audio_stream != audio) return K_ENOENT;
     xhci_audio_lock();
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    if(device == 0 ||
-       device->audio_stream != audio ||
-       !device->audio_stream_bound)
-    {
+    if (g_xhci.audio_stream != audio || !g_xhci.audio_stream_bound) {
         xhci_audio_unlock();
         return K_ENOENT;
     }
-
-
-    device->audio_stream_running =
-        true;
-
-
-    if(device->audio_stream_queued &&
-       !device->audio_transfer_pending)
-    {
-        success =
-            xhci_queue_audio_owner(
-                &g_xhci,
-                device);
-
-
-        if(!success)
-        {
-            device->
-                audio_stream_running =
-                    false;
-        }
+    g_xhci.audio_stream_running = true;
+    if (g_xhci.audio_stream_queued && !g_xhci.audio_transfer_pending) {
+        success = xhci_queue_audio_transfer(&g_xhci);
+        if (!success) g_xhci.audio_stream_running = false;
     }
-
-
-    xhci_audio_context_commit(
-        &g_xhci,
-        device);
-
-
     xhci_audio_unlock();
-
-
-    return
-        success
-        ? K_OK
-        : K_EIO;
+    return success ? K_OK : K_EIO;
 }
 
-
-kstatus_t
-xhci_audio_stream_stop(
-    struct audio_stream *stream)
-{
-    audio_stream_t *audio =
-        (audio_stream_t *)stream;
-
-
-    if(audio == 0)
-    {
-        return K_EINVAL;
-    }
-
-
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio)
-    {
-        return K_ENOENT;
-    }
-
-
+kstatus_t xhci_audio_stream_stop(struct audio_stream *stream) {
+    audio_stream_t *audio = (audio_stream_t *)stream;
+    if (audio == 0) return K_EINVAL;
+    if (!g_xhci.initialized || !g_xhci_usb_audio) return K_ENOENT;
     xhci_audio_lock();
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    if(device == 0 ||
-       device->audio_stream != audio ||
-       !device->audio_stream_bound)
-    {
+    if (g_xhci.audio_stream != audio || !g_xhci.audio_stream_bound) {
         xhci_audio_unlock();
         return K_ENOENT;
     }
-
-
-    device->audio_stream_running =
-        false;
-
-
-    if(!device->
-           audio_transfer_pending)
-    {
-        device->audio_stream_queued =
-            false;
-    }
-
-
-    xhci_audio_context_commit(
-        &g_xhci,
-        device);
-
-
+    g_xhci.audio_stream_running = false;
+    if (!g_xhci.audio_transfer_pending) g_xhci.audio_stream_queued = false;
     xhci_audio_unlock();
-
     return K_OK;
 }
 
-
-kstatus_t
-xhci_audio_stream_queue(
-    struct audio_stream *stream,
-    uint32_t period,
-    uint32_t frames)
-{
-    audio_stream_t *audio =
-        (audio_stream_t *)stream;
-
+kstatus_t xhci_audio_stream_queue(struct audio_stream *stream, uint32_t period,
+                                  uint32_t frames) {
+    audio_stream_t *audio = (audio_stream_t *)stream;
     audio_format_t format;
-
-    bool success =
-        true;
-
-
-    if(audio == 0 ||
-       frames == 0U)
-    {
-        return K_EINVAL;
-    }
-
-
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio)
-    {
-        return K_ENOENT;
-    }
-
-
-    audio_stream_get_format(
-        audio,
-        &format);
-
-
+    bool success = true;
+    if (audio == 0 || frames == 0U) return K_EINVAL;
+    if (!g_xhci.initialized || !g_xhci_usb_audio) return K_ENOENT;
+    audio_stream_get_format(audio, &format);
     xhci_audio_lock();
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    if(device == 0 ||
-       device->audio_stream != audio ||
-       !device->audio_stream_bound)
-    {
+    if (g_xhci.audio_stream != audio || !g_xhci.audio_stream_bound) {
         xhci_audio_unlock();
         return K_ENOENT;
     }
-
-
-    if(device->audio_stream_queued ||
-       device->audio_transfer_pending)
-    {
+    if (g_xhci.audio_stream_queued || g_xhci.audio_transfer_pending) {
         xhci_audio_unlock();
         return K_EBUSY;
     }
-
-
-    if(period >=
-           format.period_count ||
-       frames >
-           format.period_frames)
-    {
+    if (period >= format.period_count || frames > format.period_frames) {
         xhci_audio_unlock();
         return K_EINVAL;
     }
-
-
-    uint64_t bytes =
-        audio_stream_bytes_for_frames(
-            audio,
-            frames);
-
-
-    if(bytes == 0U ||
-       bytes > PAGE_SIZE)
-    {
+    if (audio_stream_bytes_for_frames(audio, frames) == 0U ||
+        audio_stream_bytes_for_frames(audio, frames) > PAGE_SIZE) {
         xhci_audio_unlock();
         return K_EINVAL;
     }
-
-
-    device->audio_period =
-        period;
-
-    device->audio_frames =
-        frames;
-
-    device->audio_stream_queued =
-        true;
-
-
-    if(device->audio_stream_running)
-    {
-        success =
-            xhci_queue_audio_owner(
-                &g_xhci,
-                device);
-
-
-        if(!success)
-        {
-            device->
-                audio_stream_queued =
-                    false;
-        }
+    g_xhci.audio_period = period;
+    g_xhci.audio_frames = frames;
+    g_xhci.audio_stream_queued = true;
+    if (g_xhci.audio_stream_running) {
+        success = xhci_queue_audio_transfer(&g_xhci);
+        if (!success) g_xhci.audio_stream_queued = false;
     }
-
-
-    xhci_audio_context_commit(
-        &g_xhci,
-        device);
-
-
     xhci_audio_unlock();
-
-
-    return
-        success
-        ? K_OK
-        : K_EIO;
+    return success ? K_OK : K_EIO;
 }
 
-
-kstatus_t
-xhci_audio_stream_reset(
-    struct audio_stream *stream)
-{
-    audio_stream_t *audio =
-        (audio_stream_t *)stream;
-
-
-    if(audio == 0)
-    {
-        return K_EINVAL;
-    }
-
-
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio)
-    {
-        return K_ENOENT;
-    }
-
-
+kstatus_t xhci_audio_stream_reset(struct audio_stream *stream) {
+    audio_stream_t *audio = (audio_stream_t *)stream;
+    if (audio == 0) return K_EINVAL;
+    if (!g_xhci.initialized || !g_xhci_usb_audio) return K_ENOENT;
     xhci_audio_lock();
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    if(device == 0 ||
-       device->audio_stream != audio ||
-       !device->audio_stream_bound)
-    {
+    if (g_xhci.audio_stream != audio || !g_xhci.audio_stream_bound) {
         xhci_audio_unlock();
         return K_ENOENT;
     }
-
-
-    device->audio_stream_running =
-        false;
-
-    device->audio_stream_queued =
-        false;
-
-    device->audio_period =
-        0U;
-
-    device->audio_frames =
-        0U;
-
-
-    xhci_audio_context_commit(
-        &g_xhci,
-        device);
-
-
+    g_xhci.audio_stream_running = false;
+    g_xhci.audio_stream_queued = false;
+    g_xhci.audio_period = 0U;
+    g_xhci.audio_frames = 0U;
     xhci_audio_unlock();
-
     return K_OK;
 }
 
-
-kstatus_t
-xhci_audio_stream_disconnect(
-    struct audio_stream *stream)
-{
-    audio_stream_t *audio =
-        (audio_stream_t *)stream;
-
-
-    if(audio == 0)
-    {
-        return K_EINVAL;
-    }
-
-
-    if(!g_xhci.initialized ||
-       !g_xhci_usb_audio)
-    {
-        return K_ENOENT;
-    }
-
-
+kstatus_t xhci_audio_stream_disconnect(struct audio_stream *stream) {
+    audio_stream_t *audio = (audio_stream_t *)stream;
+    if (audio == 0) return K_EINVAL;
+    if (!g_xhci.initialized || !g_xhci_usb_audio) return K_ENOENT;
     xhci_audio_lock();
-
-
-    xhci_device_context_t *device =
-        xhci_audio_context(
-            &g_xhci);
-
-
-    if(device == 0 ||
-       device->audio_stream != audio)
-    {
+    if (g_xhci.audio_stream != audio) {
         xhci_audio_unlock();
         return K_ENOENT;
     }
-
-
-    device->audio_stream =
-        0;
-
-    device->audio_stream_running =
-        false;
-
-    device->audio_stream_queued =
-        false;
-
-
-    /*
-     * Keep bound set until any already posted Transfer Event has
-     * been consumed.  This preserves the previous behavior and
-     * prevents the autonomous self-test queue from restarting.
-     */
-    device->audio_stream_bound =
-        true;
-
-
-    xhci_audio_context_commit(
-        &g_xhci,
-        device);
-
-
+    g_xhci.audio_stream = 0;
+    g_xhci.audio_stream_running = false;
+    g_xhci.audio_stream_queued = false;
+    /* 保持 bound 标志，防止尚未回收的 transfer event 重新启动自测队列。 */
+    g_xhci.audio_stream_bound = true;
     xhci_audio_unlock();
-
     return K_OK;
 }
-
 
 bool xhci_process_events(uint32_t budget) {
     bool consumed;
