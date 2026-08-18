@@ -36,17 +36,6 @@ typedef struct dma_mapping {
 kstatus_t dma_map_pages(struct device *dev, page_t **pages, uint32_t page_count,
                         enum dma_direction dir, dma_mapping_t *out);
 /* 尝试解除映射；失败时映射仍归调用者所有，不能释放后备页。 */
-/*
- * Move a live DMA mapping to another dma_mapping_t object without
- * changing its IOVA, page pins, IOMMU mapping or device reference.
- *
- * dma_mapping_t has address identity while registered in DMA Core;
- * callers must use this primitive instead of copying a live mapping.
- */
-kstatus_t dma_mapping_move(
-    dma_mapping_t *destination,
-    dma_mapping_t *source);
-
 kstatus_t dma_unmap_checked(dma_mapping_t *mapping);
 void dma_unmap(dma_mapping_t *mapping);
 void dma_sync_for_device(dma_mapping_t *mapping);

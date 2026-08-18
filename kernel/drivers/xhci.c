@@ -2672,6 +2672,205 @@ static bool xhci_remove_root_port_devices(
  * No publication path uses a secondary device store or leaves a
  * published device installed in state->device.
  */
+/*
+ * V3.10.6B9E-FIX2 DMA MAPPING OWNERSHIP MOVE
+ *
+ * xhci_device_context_t contains embedded dma_mapping_t objects.
+ *
+ * A published device therefore cannot be transferred with a raw
+ * structure copy alone: DMA Core registers the address of each
+ * dma_mapping_t.
+ *
+ * Copy ordinary device state first, hide the destination from Slot
+ * lookup with device_slot == 0, then move all DMA mapping identities
+ * to their permanent Slot.context addresses.
+ */
+static bool xhci_move_device_context(
+    xhci_device_context_t *destination,
+    xhci_device_context_t *source)
+{
+    if(destination == 0 ||
+       source == 0 ||
+       destination == source ||
+       source->device_slot == 0U)
+    {
+        return false;
+    }
+
+    dma_mapping_t *destination_mappings[] = {
+        &destination->input_context.mapping,
+        &destination->output_context.mapping,
+        &destination->ep0_ring.mapping,
+        &destination->descriptor_buffer.mapping,
+        &destination->hid_ring.mapping,
+        &destination->hid_report.mapping,
+        &destination->audio_ring.mapping,
+        &destination->audio_buffer.mapping,
+        &destination->bt_event_ring.mapping,
+        &destination->bt_event_buffer.mapping,
+        &destination->bt_acl_in_ring.mapping,
+        &destination->bt_acl_in_buffer.mapping,
+        &destination->bt_acl_out_ring.mapping,
+        &destination->bt_acl_out_buffer.mapping,
+        &destination->hub_ring.mapping,
+        &destination->hub_report.mapping,
+    };
+
+    dma_mapping_t *source_mappings[] = {
+        &source->input_context.mapping,
+        &source->output_context.mapping,
+        &source->ep0_ring.mapping,
+        &source->descriptor_buffer.mapping,
+        &source->hid_ring.mapping,
+        &source->hid_report.mapping,
+        &source->audio_ring.mapping,
+        &source->audio_buffer.mapping,
+        &source->bt_event_ring.mapping,
+        &source->bt_event_buffer.mapping,
+        &source->bt_acl_in_ring.mapping,
+        &source->bt_acl_in_buffer.mapping,
+        &source->bt_acl_out_ring.mapping,
+        &source->bt_acl_out_buffer.mapping,
+        &source->hub_ring.mapping,
+        &source->hub_report.mapping,
+    };
+
+    uint32_t mapping_count =
+        (uint32_t)(
+            sizeof(destination_mappings) /
+            sizeof(destination_mappings[0]));
+
+    /*
+     * A tentative Slot must not already own a published context.
+     */
+    if(destination->device_slot != 0U)
+    {
+        g_xhci_error =
+            697U;
+
+        return false;
+    }
+
+    /*
+     * Never overwrite an existing DMA owner.
+     */
+    for(uint32_t i = 0U;
+        i < mapping_count;
+        ++i)
+    {
+        dma_mapping_t *mapping =
+            destination_mappings[i];
+
+        if(mapping->device != 0 ||
+           mapping->pages != 0 ||
+           mapping->page_count != 0U ||
+           mapping->segments != 0 ||
+           mapping->segment_count != 0U ||
+           mapping->mapped_length != 0U ||
+           mapping->flags != 0U)
+        {
+            g_xhci_error =
+                697U;
+
+            return false;
+        }
+    }
+
+    uint8_t slot =
+        source->device_slot;
+
+    /*
+     * Ordinary fields are movable by value.
+     *
+     * DMA mappings below are immediately replaced by real ownership
+     * moves before the destination becomes visible as published.
+     */
+    *destination =
+        *source;
+
+    destination->device_slot =
+        0U;
+
+    /*
+     * Remove the shallow mapping copies before dma_mapping_move().
+     */
+    for(uint32_t i = 0U;
+        i < mapping_count;
+        ++i)
+    {
+        *destination_mappings[i] =
+            (dma_mapping_t){0};
+    }
+
+    uint32_t moved =
+        0U;
+
+    for(;
+        moved < mapping_count;
+        ++moved)
+    {
+        if(dma_mapping_move(
+               destination_mappings[moved],
+               source_mappings[moved]) !=
+           K_OK)
+        {
+            /*
+             * Publication has not happened yet.  Restore every
+             * mapping already moved so state->device remains the
+             * sole working owner on an ordinary failure.
+             */
+            uint32_t rollback =
+                moved;
+
+            while(rollback != 0U)
+            {
+                --rollback;
+
+                if(dma_mapping_move(
+                       source_mappings[rollback],
+                       destination_mappings[rollback]) !=
+                   K_OK)
+                {
+                    /*
+                     * This indicates DMA registry corruption rather
+                     * than an xHCI enumeration failure.  Keep both
+                     * contexts intact for diagnosis.
+                     */
+                    g_xhci_error =
+                        698U;
+
+                    return false;
+                }
+            }
+
+            xhci_zero_device_context(
+                destination);
+
+            g_xhci_error =
+                697U;
+
+            return false;
+        }
+    }
+
+    /*
+     * DMA ownership is now permanently registered against
+     * Slot.context.  Publish identity last.
+     */
+    destination->device_slot =
+        slot;
+
+    /*
+     * Source mappings were zeroed by dma_mapping_move(); clear the
+     * remaining moved non-DMA state without touching the new owner.
+     */
+    xhci_zero_device_context(
+        source);
+
+    return true;
+}
+
+
 static bool xhci_publish_working_device(
     xhci_state_t *state)
 {
@@ -2693,16 +2892,19 @@ static bool xhci_publish_working_device(
         return false;
     }
 
-    slot_dev->context =
-        state->device;
+    if(!xhci_move_device_context(
+           &slot_dev->context,
+           &state->device))
+    {
+        return false;
+    }
 
     /*
      * Published devices require no secondary context locator.
      */
 
 
-    xhci_zero_device_context(
-        &state->device);
+
 
     xhci_clear_device_flags();
 
