@@ -12,7 +12,6 @@ build_dir="${BUILD:-build}"
 debug=0
 no_build=0
 headless=0
-usb_nested=0
 keep_open=0
 no_kvm=0
 seconds=10
@@ -28,7 +27,6 @@ usage() {
   --debug             启动 GDB stub，监听 127.0.0.1:1234
   --gdb-port N        修改 GDB 端口
   --headless          不显示图形窗口
-  --usb-nested        测试 xHCI -> Hub -> Hub -> Mouse
   --keep-open         普通运行模式下持续运行，Ctrl-C 退出
   --seconds N         普通运行模式最多运行 N 秒（默认 10）
   --no-build          使用现有 build/esp，不重新编译
@@ -48,7 +46,6 @@ while (($# > 0)); do
             (($# >= 2)) || { echo "--gdb-port 需要参数" >&2; exit 2; }
             gdb_port="$2"; shift 2 ;;
         --headless) headless=1; shift ;;
-        --usb-nested) usb_nested=1; shift ;;
         --keep-open) keep_open=1; shift ;;
         --seconds)
             (($# >= 2)) || { echo "--seconds 需要参数" >&2; exit 2; }
@@ -71,11 +68,6 @@ while (($# > 0)); do
         *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
     esac
 done
-
-if ((usb_nested && headless)); then
-    echo "--usb-nested 需要图形窗口以产生鼠标输入" >&2
-    exit 2
-fi
 
 [[ -n "$qemu_path" && -x "$qemu_path" ]] || {
     echo "找不到 Linux QEMU，请安装 qemu-system-x86 或使用 --qemu PATH" >&2
@@ -130,40 +122,7 @@ if ((headless)); then
     qemu_args+=( -display none )
 else
     qemu_args+=( -display gtk,zoom-to-fit=off,grab-on-hover=on )
-
-    if ((usb_nested)); then
-        #
-        # B10B-2 NESTED USB HUB TOPOLOGY
-        #
-        # Physical topology:
-        #
-        #   xHCI root port 1
-        #        |
-        #        +-- Hub #1
-        #              |
-        #              +-- port 1: Hub #2
-        #                          |
-        #                          +-- port 1: Mouse
-        #
-        # xHCI route strings expected by LiteOS:
-        #
-        #   Hub #1 : 0x00000
-        #   Hub #2 : 0x00001
-        #   Mouse  : 0x00011
-        #
-        qemu_args+=(
-            -device "qemu-xhci,id=liteos-xhci,msix=on"
-            -device "usb-hub,id=liteos-hub1,bus=liteos-xhci.0,port=1"
-            -device "usb-hub,id=liteos-hub2,bus=liteos-xhci.0,port=1.1"
-            -device "usb-mouse,id=liteos-nested-mouse,bus=liteos-xhci.0,port=1.1.1"
-        )
-    else
-        qemu_args+=(
-            -device "qemu-xhci,id=liteos-xhci,msix=on"
-            -device "usb-kbd,bus=liteos-xhci.0"
-            -device "usb-mouse,bus=liteos-xhci.0"
-        )
-    fi
+    qemu_args+=( -device qemu-xhci,id=liteos-xhci,msix=on -device usb-kbd,bus=liteos-xhci.0 -device usb-mouse,bus=liteos-xhci.0 )
 fi
 if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" ); fi
 
