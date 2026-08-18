@@ -862,131 +862,108 @@ static bool xhci_free_rings(xhci_state_t *state) {
     return erst && event_ring && command_ring && dcbaa;
 }
 
-/*
- * V3.10.6B6C EXPLICIT DEVICE RESOURCE TEARDOWN
- *
- * DMA/resource lifetime belongs to an explicit device context.
- */
-static bool xhci_free_device_resources_device(
-    xhci_device_context_t *device) {
+static bool xhci_free_device_resources(xhci_state_t *state) {
     bool released = true;
-    if (device == 0) return false;
-    if (device->audio_stream != 0) {
+    if (state == 0) return false;
+    if (state->audio_stream != 0) {
         /* 热拔出先让统一音频对象进入 DISCONNECTED，再释放其端点 DMA。 */
-        audio_stream_t *stream = device->audio_stream;
-        device->audio_stream = 0;
-        device->audio_stream_running = false;
-        device->audio_stream_queued = false;
-        device->audio_stream_bound = false;
+        audio_stream_t *stream = state->audio_stream;
+        state->audio_stream = 0;
+        state->audio_stream_running = false;
+        state->audio_stream_queued = false;
+        state->audio_stream_bound = false;
         (void)audio_stream_disconnect(stream);
     }
-    if (device->bt_controller != 0) {
-        (void)bt_controller_disconnect(device->bt_controller);
-        bt_controller_destroy(device->bt_controller);
-        device->bt_controller = 0;
+    if (state->bt_controller != 0) {
+        (void)bt_controller_disconnect(state->bt_controller);
+        bt_controller_destroy(state->bt_controller);
+        state->bt_controller = 0;
     }
-    if (!xhci_free_page(&device->descriptor_buffer)) released = false;
-    if (!xhci_free_page(&device->hid_report)) released = false;
-    if (!xhci_free_page(&device->hid_ring)) released = false;
-    if (!xhci_free_page(&device->audio_buffer)) released = false;
-    if (!xhci_free_page(&device->audio_ring)) released = false;
-    if (!xhci_free_page(&device->bt_acl_out_ring)) released = false;
-    if (!xhci_free_page(&device->bt_acl_out_buffer)) released = false;
-    if (!xhci_free_page(&device->bt_acl_in_buffer)) released = false;
-    if (!xhci_free_page(&device->bt_acl_in_ring)) released = false;
-    if (!xhci_free_page(&device->bt_event_buffer)) released = false;
-    if (!xhci_free_page(&device->bt_event_ring)) released = false;
-    if (!xhci_free_page(&device->hub_report)) released = false;
-    if (!xhci_free_page(&device->hub_ring)) released = false;
-    if (!xhci_free_page(&device->ep0_ring)) released = false;
-    if (!xhci_free_page(&device->input_context)) released = false;
-    if (!xhci_free_page(&device->output_context)) released = false;
+    if (!xhci_free_page(&state->descriptor_buffer)) released = false;
+    if (!xhci_free_page(&state->hid_report)) released = false;
+    if (!xhci_free_page(&state->hid_ring)) released = false;
+    if (!xhci_free_page(&state->audio_buffer)) released = false;
+    if (!xhci_free_page(&state->audio_ring)) released = false;
+    if (!xhci_free_page(&state->bt_acl_out_ring)) released = false;
+    if (!xhci_free_page(&state->bt_acl_out_buffer)) released = false;
+    if (!xhci_free_page(&state->bt_acl_in_buffer)) released = false;
+    if (!xhci_free_page(&state->bt_acl_in_ring)) released = false;
+    if (!xhci_free_page(&state->bt_event_buffer)) released = false;
+    if (!xhci_free_page(&state->bt_event_ring)) released = false;
+    if (!xhci_free_page(&state->hub_report)) released = false;
+    if (!xhci_free_page(&state->hub_ring)) released = false;
+    if (!xhci_free_page(&state->ep0_ring)) released = false;
+    if (!xhci_free_page(&state->input_context)) released = false;
+    if (!xhci_free_page(&state->output_context)) released = false;
     if (!released) return false;
-    device->device_slot = 0;
-    device->device_port = 0;
-    device->device_speed = 0;
-    device->root_port = 0U;
-    device->parent_slot = 0U;
-    device->parent_port = 0U;
-    device->route_string = 0U;
-    device->ep0_enqueue = 0;
-    device->configuration_value = 0;
-    device->hid_interface = 0U;
-    device->hid_protocol = 0U;
-    device->hid_endpoint = 0;
-    device->hid_max_packet = 0;
-    device->hid_interval = 0;
-    device->hid_enqueue = 0;
-    device->hid_cycle = 1U;
-    device->hid_transfer_pending = false;
-    device->hid_previous_modifier = 0U;
-    for (uint32_t i = 0; i < 6U; ++i) device->hid_previous_keys[i] = 0U;
-    device->hid_previous_buttons = 0U;
-    device->audio_interface = 0U;
-    device->audio_alt_setting = 0U;
-    device->audio_endpoint = 0U;
-    device->audio_interval = 0U;
-    device->audio_max_packet = 0U;
-    device->audio_channels = 0U;
-    device->audio_bit_resolution = 0U;
-    device->audio_sample_rate = 0U;
-    device->audio_endpoint_in = false;
-    device->audio_enqueue = 0U;
-    device->audio_cycle = 1U;
-    device->audio_transfer_pending = false;
-    device->audio_completed = 0U;
-    device->audio_stream = 0;
-    device->audio_period = 0U;
-    device->audio_frames = 0U;
-    device->audio_stream_running = false;
-    device->audio_stream_queued = false;
-    device->audio_stream_bound = false;
-    device->hub_interface = 0U;
-    device->hub_interface_present = false;
-    device->hub_port_count = 0U;
-    device->hub_configured = false;
-    device->hub_endpoint = 0U;
-    device->hub_max_packet = 0U;
-    device->hub_interval = 0U;
-    device->hub_enqueue = 0U;
-    device->hub_cycle = 1U;
-    device->hub_transfer_pending = false;
-    device->hub_change_bitmap = 0U;
-    device->bt_event_endpoint = 0U;
-    device->bt_acl_in_endpoint = 0U;
-    device->bt_acl_out_endpoint = 0U;
-    device->bt_event_interval = 0U;
-    device->bt_event_max_packet = 0U;
-    device->bt_acl_in_max_packet = 0U;
-    device->bt_acl_out_max_packet = 0U;
-    device->bt_event_enqueue = 0U;
-    device->bt_event_cycle = 1U;
-    device->bt_event_transfer_pending = false;
-    device->bt_acl_in_enqueue = 0U;
-    device->bt_acl_in_cycle = 1U;
-    device->bt_acl_in_transfer_pending = false;
-    device->bt_acl_out_enqueue = 0U;
-    device->bt_acl_out_cycle = 1U;
-    device->bt_acl_out_transfer_pending = false;
+    state->device_slot = 0;
+    state->device_port = 0;
+    state->device_speed = 0;
+    state->root_port = 0U;
+    state->parent_slot = 0U;
+    state->parent_port = 0U;
+    state->route_string = 0U;
+    state->ep0_enqueue = 0;
+    state->configuration_value = 0;
+    state->hid_interface = 0U;
+    state->hid_protocol = 0U;
+    state->hid_endpoint = 0;
+    state->hid_max_packet = 0;
+    state->hid_interval = 0;
+    state->hid_enqueue = 0;
+    state->hid_cycle = 1U;
+    state->hid_transfer_pending = false;
+    state->hid_previous_modifier = 0U;
+    for (uint32_t i = 0; i < 6U; ++i) state->hid_previous_keys[i] = 0U;
+    state->hid_previous_buttons = 0U;
+    state->audio_interface = 0U;
+    state->audio_alt_setting = 0U;
+    state->audio_endpoint = 0U;
+    state->audio_interval = 0U;
+    state->audio_max_packet = 0U;
+    state->audio_channels = 0U;
+    state->audio_bit_resolution = 0U;
+    state->audio_sample_rate = 0U;
+    state->audio_endpoint_in = false;
+    state->audio_enqueue = 0U;
+    state->audio_cycle = 1U;
+    state->audio_transfer_pending = false;
+    state->audio_completed = 0U;
+    state->audio_stream = 0;
+    state->audio_period = 0U;
+    state->audio_frames = 0U;
+    state->audio_stream_running = false;
+    state->audio_stream_queued = false;
+    state->audio_stream_bound = false;
+    state->hub_interface = 0U;
+    state->hub_interface_present = false;
+    state->hub_port_count = 0U;
+    state->hub_configured = false;
+    state->hub_endpoint = 0U;
+    state->hub_max_packet = 0U;
+    state->hub_interval = 0U;
+    state->hub_enqueue = 0U;
+    state->hub_cycle = 1U;
+    state->hub_transfer_pending = false;
+    state->hub_change_bitmap = 0U;
+    state->bt_event_endpoint = 0U;
+    state->bt_acl_in_endpoint = 0U;
+    state->bt_acl_out_endpoint = 0U;
+    state->bt_event_interval = 0U;
+    state->bt_event_max_packet = 0U;
+    state->bt_acl_in_max_packet = 0U;
+    state->bt_acl_out_max_packet = 0U;
+    state->bt_event_enqueue = 0U;
+    state->bt_event_cycle = 1U;
+    state->bt_event_transfer_pending = false;
+    state->bt_acl_in_enqueue = 0U;
+    state->bt_acl_in_cycle = 1U;
+    state->bt_acl_in_transfer_pending = false;
+    state->bt_acl_out_enqueue = 0U;
+    state->bt_acl_out_cycle = 1U;
+    state->bt_acl_out_transfer_pending = false;
     return true;
 }
-
-/*
- * Compatibility wrapper for unpublished/new-device enumeration.
- */
-static bool xhci_free_device_resources(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_free_device_resources_device(
-            &state->device);
-}
-
 
 static uint8_t xhci_context_kind(const xhci_device_context_t *context) {
     if (context == 0) return 0U;
@@ -1003,36 +980,29 @@ static uint8_t xhci_context_kind(const xhci_device_context_t *context) {
  * 生命周期边界前移；即使设备已突然拔出，命令失败也只影响诊断，
  * 后续仍会执行最小化的资源回收。
  */
-/*
- * V3.10.6B6C EXPLICIT ENDPOINT STOP
- */
-static bool xhci_stop_pending_endpoints_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device) {
+static bool xhci_stop_pending_endpoints(xhci_state_t *state) {
     uint8_t endpoints[6];
     uint32_t count = 0U;
     bool stopped = true;
-    if (state == 0 ||
-        device == 0 ||
-        device->device_slot == 0U) return true;
-    if (device->hid_transfer_pending && device->hid_endpoint != 0U) {
-        endpoints[count++] = (uint8_t)(device->hid_endpoint * 2U + 1U);
+    if (state == 0 || state->device_slot == 0U) return true;
+    if (state->hid_transfer_pending && state->hid_endpoint != 0U) {
+        endpoints[count++] = (uint8_t)(state->hid_endpoint * 2U + 1U);
     }
-    if (device->audio_transfer_pending && device->audio_endpoint != 0U) {
-        endpoints[count++] = (uint8_t)(device->audio_endpoint * 2U +
-                                       (device->audio_endpoint_in ? 1U : 0U));
+    if (state->audio_transfer_pending && state->audio_endpoint != 0U) {
+        endpoints[count++] = (uint8_t)(state->audio_endpoint * 2U +
+                                       (state->audio_endpoint_in ? 1U : 0U));
     }
-    if (device->hub_transfer_pending && device->hub_endpoint != 0U) {
-        endpoints[count++] = (uint8_t)(device->hub_endpoint * 2U + 1U);
+    if (state->hub_transfer_pending && state->hub_endpoint != 0U) {
+        endpoints[count++] = (uint8_t)(state->hub_endpoint * 2U + 1U);
     }
-    if (device->bt_event_transfer_pending && device->bt_event_endpoint != 0U) {
-        endpoints[count++] = (uint8_t)(device->bt_event_endpoint * 2U + 1U);
+    if (state->bt_event_transfer_pending && state->bt_event_endpoint != 0U) {
+        endpoints[count++] = (uint8_t)(state->bt_event_endpoint * 2U + 1U);
     }
-    if (device->bt_acl_in_transfer_pending && device->bt_acl_in_endpoint != 0U) {
-        endpoints[count++] = (uint8_t)(device->bt_acl_in_endpoint * 2U + 1U);
+    if (state->bt_acl_in_transfer_pending && state->bt_acl_in_endpoint != 0U) {
+        endpoints[count++] = (uint8_t)(state->bt_acl_in_endpoint * 2U + 1U);
     }
-    if (device->bt_acl_out_transfer_pending && device->bt_acl_out_endpoint != 0U) {
-        endpoints[count++] = (uint8_t)(device->bt_acl_out_endpoint * 2U);
+    if (state->bt_acl_out_transfer_pending && state->bt_acl_out_endpoint != 0U) {
+        endpoints[count++] = (uint8_t)(state->bt_acl_out_endpoint * 2U);
     }
     for (uint32_t i = 0U; i < count; ++i) {
         bool duplicate = false;
@@ -1041,30 +1011,12 @@ static bool xhci_stop_pending_endpoints_device(
         }
         if (duplicate || endpoints[i] > 31U) continue;
         if (!xhci_submit_command_ex(state, XHCI_STOP_ENDPOINT_TYPE,
-                                    device->device_slot, endpoints[i], 0U, 0)) {
+                                    state->device_slot, endpoints[i], 0U, 0)) {
             stopped = false;
         }
     }
     return stopped;
 }
-
-/*
- * Compatibility wrapper for the unpublished working context.
- */
-static bool xhci_stop_pending_endpoints(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return true;
-    }
-
-    return
-        xhci_stop_pending_endpoints_device(
-            state,
-            &state->device);
-}
-
 
 /* 设备可以在 active context 和 inventory 之间移动，拓扑标记必须随之重算。 */
 /*
@@ -1437,80 +1389,6 @@ static bool xhci_release_active_device(xhci_state_t *state) {
 }
 
 /*
- * V3.10.6B6C EXPLICIT DEVICE TEARDOWN
- *
- * Destroy one device context without installing it in state->device.
- *
- * The caller owns current-device kind/flag bookkeeping.
- */
-static bool xhci_release_device_context(
-    xhci_state_t *state,
-    xhci_device_context_t *device)
-{
-    if(state == 0 ||
-       device == 0 ||
-       device->device_slot == 0U)
-    {
-        return true;
-    }
-
-    /*
-     * Resource teardown clears identity fields, therefore preserve
-     * software topology identity first.
-     */
-    uint8_t released_slot =
-        device->device_slot;
-
-    uint8_t released_parent_slot =
-        device->parent_slot;
-
-    uint8_t released_parent_port =
-        device->parent_port;
-
-    if(!xhci_stop_pending_endpoints_device(
-           state,
-           device))
-    {
-        g_xhci_error =
-            60U;
-    }
-
-    if(!xhci_submit_command(
-           state,
-           XHCI_DISABLE_SLOT_TYPE,
-           device->device_slot,
-           0U,
-           0))
-    {
-        /*
-         * A disconnected device may no longer produce a Disable
-         * Slot completion, but its software/DMA ownership still
-         * has to be released.
-         */
-        g_xhci_error =
-            61U;
-    }
-
-    bool released =
-        xhci_free_device_resources_device(
-            device);
-
-    /*
-     * Hardware Slot lifetime has ended.
-     */
-    xhci_unpublish_slot_device(
-        released_slot,
-        released_parent_slot,
-        released_parent_port);
-
-    xhci_recompute_topology(
-        state);
-
-    return released;
-}
-
-
-/*
  * V3.9.2 DIRECT SLOT RELEASE
  *
  * Hardware/device lifetime is now terminated directly by Slot ID.
@@ -1524,12 +1402,6 @@ static bool xhci_release_device_context(
  * is needed to stop endpoints, Disable Slot, release DMA or
  * unpublish topology.
  */
-/*
- * V3.10.6B6C CANONICAL SLOT TEARDOWN
- *
- * Published Slot.context is destroyed in place.
- * state->device remains untouched unless it is itself the target.
- */
 static bool xhci_release_slot_device(
     xhci_state_t *state,
     uint8_t slot)
@@ -1540,17 +1412,21 @@ static bool xhci_release_slot_device(
         return false;
     }
 
+
     xhci_slot_device_t *slot_dev =
         &g_xhci_slot_devices[
             slot];
+
 
     if(!slot_dev->used)
     {
         return false;
     }
 
+
     /*
-     * Unpublished/legacy working-context fast path.
+     * Fast path:
+     * target is already installed as the active working context.
      */
     if(state->device.device_slot ==
        slot)
@@ -1560,8 +1436,9 @@ static bool xhci_release_slot_device(
                 state);
     }
 
+
     /*
-     * Published device must have a valid canonical context.
+     * Parked Slot must own a valid canonical context.
      */
     if(slot_dev->context.device_slot !=
        slot)
@@ -1569,22 +1446,25 @@ static bool xhci_release_slot_device(
         return false;
     }
 
-    /*
-     * Current-device global flags are independent from the device
-     * context itself. Preserve their meaning if another unpublished
-     * working device happens to exist.
-     */
-    bool had_active =
-        state->device.device_slot !=
-        0U;
+
+    xhci_device_context_t saved_active;
 
     uint8_t saved_kind =
         0U;
 
+    bool had_active =
+        state->device.device_slot !=
+        0U;
+
+
+    /*
+     * Preserve an unrelated active functional device.
+     */
     if(had_active)
     {
         saved_kind =
             xhci_current_device_kind();
+
 
         if(saved_kind == 0U)
         {
@@ -1592,32 +1472,79 @@ static bool xhci_release_slot_device(
                 xhci_context_kind(
                     &state->device);
         }
+
+
+        xhci_copy_device_context(
+            &saved_active,
+            &state->device);
+
+
+        xhci_zero_device_context(
+            &state->device);
+
+
+        xhci_clear_device_flags();
     }
 
-    uint8_t release_kind =
-        xhci_context_kind(
-            &slot_dev->context);
-
-    xhci_set_device_kind(
-        release_kind);
-
-    bool released =
-        xhci_release_device_context(
-            state,
-            &slot_dev->context);
 
     /*
-     * release_device_context() deliberately does not own global
-     * current-kind state.
+     * Install exactly the canonical context belonging to Slot ID.
+     *
+     * Existing Stop Endpoint / Disable Slot / resource free helpers
+     * can therefore remain unchanged.
      */
-    xhci_clear_device_flags();
+    xhci_copy_device_context(
+        &state->device,
+        &slot_dev->context);
 
-    if(had_active &&
-       saved_kind != 0U)
+
+    uint8_t kind =
+        xhci_context_kind(
+            &state->device);
+
+
+    xhci_set_device_kind(
+        kind);
+
+
+    bool released =
+        xhci_release_active_device(
+            state);
+
+
+    /*
+     * release_active_device() has already:
+     *
+     *   stopped endpoints
+     *   disabled hardware Slot
+     *   released DMA pages
+     *   removed USB/Hub objects
+     *   cleared Slot Table entry
+     */
+
+
+    if(had_active)
     {
-        xhci_set_device_kind(
+        /*
+         * Restore the unrelated working device.
+         */
+        xhci_zero_device_context(
+            &state->device);
+
+
+        (void)xhci_restore_active_device(
+            state,
+            &saved_active,
             saved_kind);
     }
+    else
+    {
+        xhci_zero_device_context(
+            &state->device);
+
+        xhci_clear_device_flags();
+    }
+
 
     return released;
 }
@@ -4597,42 +4524,43 @@ static bool xhci_remove_device_subtree(
     if(saved_active->device_slot ==
        slot)
     {
-        /*
-         * V3.10.6B6C SAVED CONTEXT TEARDOWN
-         *
-         * Reconciliation parked this exact working context in
-         * saved_active. Destroy it there; never reinstall it into
-         * state->device.
-         */
         uint8_t kind =
             *saved_kind;
+
+
+        xhci_copy_device_context(
+            &state->device,
+            saved_active);
+
+
+        xhci_zero_device_context(
+            saved_active);
+
 
         xhci_set_device_kind(
             kind != 0U
                 ? kind
                 : xhci_context_kind(
-                    saved_active));
+                    &state->device));
 
-        if(xhci_release_device_context(
-               state,
-               saved_active))
+
+        if(xhci_release_active_device(
+               state))
         {
             removed =
                 true;
         }
 
-        /*
-         * xhci_free_device_resources_device() normally clears the
-         * context. Force the shadow empty even if a partial DMA free
-         * reported failure.
-         */
+
         xhci_zero_device_context(
-            saved_active);
+            &state->device);
 
         xhci_clear_device_flags();
 
+
         *saved_kind =
             0U;
+
 
         return removed;
     }
