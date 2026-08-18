@@ -236,11 +236,10 @@ typedef struct xhci_device_context {
 } xhci_device_context_t;
 
 /*
- * Canonical xHCI Slot Table.
+ * xHCI V3 Slot Table.
  *
- * A published Slot owns its permanent xhci_device_context_t.
- * Topology, runtime event routing and teardown all begin from
- * hardware Slot ID.
+ * Only introduce the storage here.
+ * Migration happens in later steps.
  */
 
 #define XHCI_MAX_SLOT_TABLE 256U
@@ -318,21 +317,29 @@ g_xhci_slot_devices[
     XHCI_MAX_SLOT_TABLE]
     __attribute__((used));
 
+
+
+
 /*
- * V3.10.6B8B INVENTORY CONTEXT SHADOW REMOVED
+ * V3.10.6B8B METADATA-ONLY STARTUP INVENTORY
+ *
+ * inventory[] is not a device store.
+ *
+ * Each entry contains only enough information to select a
+ * canonical Slot during initialization/self-test:
+ *
+ *     slot_id -> Slot.context
+ *     kind
+ *     valid
+ */
+
+/*
  * V3.10.6B8C INVENTORY REMOVED
  *
- * Slot Table is the sole directory for published USB devices.
- * No secondary device directory or context store exists.
+ * Slot Table is the only published-device directory.
  */
 
 
-/*
- * V3.10.6B8I COMMENT BASELINE
- *
- * state->device is enumeration working storage.
- * g_xhci_slot_devices[slot].context is published runtime state.
- */
 typedef struct xhci_state {
     const pci_device_t *pci;
     volatile uint8_t *mmio;
@@ -366,20 +373,84 @@ typedef struct xhci_state {
 } xhci_state_t;
 
 /*
- * V3.10.6B8D SLOT CONTEXT MIRROR REMOVED
- * V3.10.6B8G HID-ONLY WORKING CONTEXT FALLBACK
+ * V3.8.1 SLOT CONTEXT OWNER
  *
- * Ownership invariant:
+ * All runtime code must resolve a device by Slot ID.
  *
- *   published device
- *       -> g_xhci_slot_devices[slot].context
+ * Today the actual mutable context can still live in:
  *
- *   unpublished enumeration transaction
- *       -> state->device
+ *      state->device
  *
- * HID alone may resolve state->device for a pre-publication
- * interrupt completion. Published Slot.context always wins.
+ * or:
+ *
+ *      inventory[index].context
+ *
+ * Later V3.8 removes inventory context storage completely.
+ *
+ * Callers must therefore stop knowing where the context lives.
  */
+/*
+ * V3.8.1 / V3.8.2 SLOT CONTEXT OWNER
+ *
+ * Slot Table is now the canonical context for inactive devices.
+ *
+ * state->device remains a temporary active/working context until
+ * the final active-device migration is completed.
+ */
+/*
+ * V3.9.6 HID REGRESSION FIX
+ *
+ * Slot ID is the permanent runtime device identity.
+ *
+ * state->device is only a temporary mutable working copy.
+ * Otherwise Slot.context is the canonical device context.
+ *
+ * No inventory locator is required on the event fast path.
+ */
+/*
+ * V3.10.3A CANONICAL EVENT OWNER
+ *
+ * Hardware Transfer Event Slot ID identifies the permanent device.
+ *
+ * Published device:
+ *
+ *     Slot ID -> Slot.context
+ *
+ * always wins.
+ *
+ * state->device is only a fallback for a Slot that is currently
+ * being enumerated and has not yet been committed to Slot.context.
+ */
+/*
+ * V3.10.6B8G
+ *
+ * xhci_slot_context_owner() removed.
+ *
+ * Published runtime paths address Slot.context directly.
+ *
+ * The only pre-publication Transfer Event exception is HID, whose
+ * enumeration fallback now lives locally in xhci_find_hid_context().
+ */
+
+
+
+
+/*
+ * Synchronize the Slot Table mirror after the real owner changes.
+ *
+ * Later, when Slot Table itself becomes the owner, this function
+ * becomes unnecessary and can be removed.
+ */
+/*
+ * V3.10.6B8D SLOT CONTEXT MIRROR REMOVED
+ *
+ * xhci_slot_context_sync() removed.
+ *
+ * Published mutable state already lives directly in Slot.context.
+ * Unpublished enumeration state remains in state->device until
+ * xhci_publish_working_device().
+ */
+
 
 
 #undef XHCI_DEVICE_FIELDS
@@ -1387,7 +1458,7 @@ static bool xhci_release_slot_device(
     }
 
     /*
-     * Unpublished working-context fast path.
+     * Unpublished/legacy working-context fast path.
      */
     if(state->device.device_slot ==
        slot)
@@ -1407,7 +1478,7 @@ static bool xhci_release_slot_device(
     }
 
     /*
-     * Working-context global flags are independent from the device
+     * Current-device global flags are independent from the device
      * context itself. Preserve their meaning if another unpublished
      * working device happens to exist.
      */
@@ -2502,7 +2573,11 @@ static bool xhci_remove_root_port_devices(
     }
 
 
-
+    /*
+     * Compatibility while startup inventory still exists.
+     *
+     * The next V3.9 step removes this activation dependency too.
+     */
 
     /*
      * V3.10.6B6A
@@ -2553,7 +2628,7 @@ static bool xhci_publish_working_device(
         state->device;
 
     /*
-     * Published devices require no secondary context locator.
+     * Runtime publication has no inventory locator.
      */
 
 
@@ -3042,7 +3117,29 @@ static bool xhci_handle_hub_transfer_event(
 }
 
 
-
+/*
+ * V3.7.5 HID SLOT EVENT LOOKUP
+ *
+ * Transfer Event already contains the xHCI Slot ID.
+ *
+ * Resolve:
+ *
+ *     Slot ID
+ *        |
+ *        v
+ *   Slot Table
+ *        |
+ *        +-- active ------------> state->device
+ *        |
+ *        +-- inventory_index ---> inventory[index].context
+ *
+ * No inventory scan.
+ *
+ * Important:
+ * Slot Table context is only a mirror.  HID transfer state
+ * (enqueue/cycle/pending/DMA ownership) must be modified in the
+ * actual owning context.
+ */
 /*
  * HID context lookup is now independent of context storage.
  *
@@ -3188,7 +3285,26 @@ return true;
 }
 
 
-
+/*
+ * V3.7.8 AUDIO SLOT EVENT DISPATCH
+ *
+ * Resolve Audio Transfer Events by the hardware Slot ID carried
+ * by the xHCI Transfer Event.
+ *
+ *      Transfer Event
+ *           |
+ *         Slot ID
+ *           |
+ *           v
+ *      Slot Table
+ *           |
+ *           +-- active ----------> state->device
+ *           |
+ *           +-- inventory_index -> inventory[index].context
+ *
+ * Slot Table context remains a mirror.  Ring/DMA producer state
+ * is modified only in the actual owning context.
+ */
 /*
  * V3.8.5 AUDIO CANONICAL SLOT EVENT
  *
@@ -4278,7 +4394,29 @@ static bool xhci_probe_hub_downstream(
     return true;
 }
 
-
+/*
+ * V3.7.4 SLOT TABLE SUBTREE REMOVE
+ *
+ * Device-tree removal is driven only by:
+ *
+ *     Slot
+ *       |
+ *       +-- child_slots[]
+ *
+ * inventory[] is still temporary context storage, but is no
+ * longer searched to discover descendants or locate a Slot.
+ *
+ * Removal order:
+ *
+ *     deepest child
+ *          ->
+ *     intermediate Hub
+ *          ->
+ *     parent Hub
+ *
+ * This matters because unpublishing a parent clears its
+ * child_slots[] table.
+ */
 /*
  * V3.9.2 DIRECT SLOT SUBTREE REMOVE
  *
@@ -4884,7 +5022,25 @@ static bool xhci_reconcile_one_hub(
     return changed;
 }
 
-
+/*
+ * V3.7 SLOT TABLE HUB WALK
+ *
+ * Hub topology enumeration is now driven exclusively by Slot ID.
+ *
+ * inventory[] may still own a device context during the migration,
+ * but it is no longer searched to discover Hub devices.
+ *
+ * A small processed bitmap also allows a newly discovered downstream
+ * Hub to be processed during the same reconciliation pass:
+ *
+ *      Root Hub
+ *          |
+ *        Hub A
+ *          |
+ *        Hub B
+ *          |
+ *       device
+ */
 static bool xhci_reconcile_hub_topology(
     xhci_state_t *state)
 {
@@ -5572,7 +5728,28 @@ static bool xhci_configure_bt_endpoints(xhci_state_t *state) {
     return true;
 }
 
-
+/*
+ * V3.7.6 BT SLOT EVENT DISPATCH
+ *
+ * xHCI Transfer Event already provides Slot ID.
+ *
+ * Resolve the actual Bluetooth context directly:
+ *
+ *      Slot ID
+ *         |
+ *         v
+ *    Slot Table
+ *         |
+ *         +-- active ----------> state->device
+ *         |
+ *         +-- inventory_index -> inventory[index]
+ *
+ * No inventory scan.
+ *
+ * Existing Bluetooth helpers still operate through state->device,
+ * so an inactive Bluetooth context is temporarily installed there
+ * while its event is processed.
+ */
 /*
  * V3.10.6B7C CANONICAL BT TRANSFER EVENT
  *
@@ -6525,7 +6702,13 @@ xhci_audio_context(
 }
 
 
-
+/*
+ * Keep transitional inventory shadow synchronized.
+ *
+ * Slot.context is already the real owner for parked devices.
+ * inventory.context will be removed after all remaining legacy
+ * inventory readers have been migrated.
+ */
 /*
  * V3.10.6B8E AUDIO CANONICAL UAPI
  *
