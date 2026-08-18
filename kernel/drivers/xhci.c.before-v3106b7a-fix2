@@ -2505,16 +2505,27 @@ static bool xhci_queue_audio_transfer_device(
     return true;
 }
 
-
 /*
- * V3.10.6B7A-FIX2 AUDIO WRAPPER REMOVED
+ * Compatibility wrapper.
  *
- * xhci_queue_audio_transfer() removed.
- *
- * Unpublished setup paths configure Audio directly, while published
- * runtime Audio uses xhci_queue_audio_transfer_device(state, device).
+ * V3.10.4A intentionally preserves every existing caller.
+ * Later Audio patches migrate callers to canonical Slot.context
+ * individually.
  */
+static bool xhci_queue_audio_transfer(
+    xhci_state_t *state)
+{
+    if(state == 0)
+    {
+        return false;
+    }
 
+
+    return
+        xhci_queue_audio_transfer_device(
+            state,
+            &state->device);
+}
 
 
 static bool xhci_configure_audio_endpoint(xhci_state_t *state) {

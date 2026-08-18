@@ -2505,16 +2505,27 @@ static bool xhci_queue_audio_transfer_device(
     return true;
 }
 
-
 /*
- * V3.10.6B7A-FIX2 AUDIO WRAPPER REMOVED
+ * Compatibility wrapper.
  *
- * xhci_queue_audio_transfer() removed.
- *
- * Unpublished setup paths configure Audio directly, while published
- * runtime Audio uses xhci_queue_audio_transfer_device(state, device).
+ * V3.10.4A intentionally preserves every existing caller.
+ * Later Audio patches migrate callers to canonical Slot.context
+ * individually.
  */
+static bool xhci_queue_audio_transfer(
+    xhci_state_t *state)
+{
+    if(state == 0)
+    {
+        return false;
+    }
 
+
+    return
+        xhci_queue_audio_transfer_device(
+            state,
+            &state->device);
+}
 
 
 static bool xhci_configure_audio_endpoint(xhci_state_t *state) {
@@ -3278,25 +3289,27 @@ return true;
  *
  * inventory[].context is no longer an Audio event owner.
  */
-/*
- * V3.10.6B7A CANONICAL AUDIO TRANSFER EVENT
- *
- * Transfer Event Slot ID is the permanent Audio device identity.
- *
- *     Transfer Event Slot ID
- *              |
- *              v
- *         Slot.context
- *              |
- *       completion/re-arm
- *
- * Published Audio state is never installed into state->device.
- * inventory[] is not part of Audio runtime routing.
- */
 static bool xhci_handle_audio_transfer_event(
     xhci_state_t *state,
     const xhci_trb_t *event)
 {
+    xhci_device_context_t saved_active;
+
+    xhci_device_context_t *owner;
+
+    xhci_slot_device_t *slot_dev;
+
+    uint8_t slot;
+
+    uint32_t endpoint_id;
+
+    uint32_t expected_endpoint_id;
+
+    uint32_t completion;
+
+    bool active;
+
+
     if(state == 0 ||
        event == 0 ||
        ((event->control >>
@@ -3307,44 +3320,61 @@ static bool xhci_handle_audio_transfer_event(
         return false;
     }
 
-    uint8_t slot =
+
+    slot =
         (uint8_t)(
             event->control >>
             XHCI_TRB_SLOT_SHIFT);
+
 
     if(slot == 0U)
     {
         return false;
     }
 
-    xhci_slot_device_t *slot_dev =
+
+    slot_dev =
         &g_xhci_slot_devices[
             slot];
 
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot ||
-       slot_dev->context.audio_endpoint ==
-           0U)
+
+    if(!slot_dev->used)
     {
         return false;
     }
 
-    xhci_device_context_t *device =
-        &slot_dev->context;
 
-    uint32_t endpoint_id =
+    /*
+     * Slot ID selects the real mutable Audio context.
+     */
+    owner =
+        xhci_slot_context_owner(
+            state,
+            slot);
+
+
+    if(owner == 0 ||
+       owner->device_slot != slot ||
+       owner->audio_endpoint == 0U)
+    {
+        return false;
+    }
+
+
+    endpoint_id =
         (event->control >>
          XHCI_TRB_ENDPOINT_SHIFT) &
         0x1FU;
 
-    uint32_t expected_endpoint_id =
+
+    expected_endpoint_id =
         (uint32_t)
-            device->audio_endpoint *
+            owner->audio_endpoint *
             2U +
-        (device->audio_endpoint_in
-             ? 1U
-             : 0U);
+        (owner->audio_endpoint_in ?
+             1U :
+             0U);
+
 
     if(endpoint_id !=
        expected_endpoint_id)
@@ -3352,71 +3382,164 @@ static bool xhci_handle_audio_transfer_event(
         return false;
     }
 
-    uint32_t completion =
+
+    active =
+        owner ==
+        &state->device;
+
+
+    /*
+     * Existing Audio queue helpers still use state->audio_*.
+     * Install canonical Slot context temporarily when inactive.
+     */
+    if(!active)
+    {
+        xhci_copy_device_context(
+            &saved_active,
+            &state->device);
+
+
+        xhci_copy_device_context(
+            &state->device,
+            owner);
+    }
+
+
+    completion =
         event->status >>
         XHCI_COMPLETION_SHIFT;
 
-    device->audio_transfer_pending =
+
+    state->audio_transfer_pending =
         false;
+
 
     if(completion ==
        XHCI_COMPLETION_SUCCESS)
     {
         dma_sync_for_cpu(
-            &device->
+            &state->
                 audio_buffer.mapping);
 
-        ++device->
-            audio_completed;
 
-        if(device->audio_stream != 0)
+        ++state->audio_completed;
+
+
+        if(state->audio_stream != 0)
         {
-            if(device->audio_endpoint_in &&
-               device->audio_stream_queued)
+            if(state->audio_endpoint_in &&
+               state->audio_stream_queued)
             {
                 uint64_t bytes =
                     audio_stream_bytes_for_frames(
-                        device->audio_stream,
-                        device->audio_frames);
+                        state->audio_stream,
+                        state->audio_frames);
+
 
                 if(bytes != 0U &&
                    bytes <= PAGE_SIZE)
                 {
-                    (void)
-                        audio_stream_period_write(
-                            device->audio_stream,
-                            device->audio_period,
-                            device->
-                                audio_buffer.cpu,
-                            bytes);
+                    (void)audio_stream_period_write(
+                        state->audio_stream,
+                        state->audio_period,
+                        state->
+                            audio_buffer.cpu,
+                        bytes);
                 }
             }
 
-            device->audio_stream_queued =
+
+            /*
+             * Audio UAPI owns COMPLETE acknowledgement.
+             */
+            state->audio_stream_queued =
                 false;
         }
-        else if(!device->
+        else if(!state->
                     audio_stream_bound)
         {
             /*
-             * Legacy autonomous mode:
-             * explicit queue uses device->device_slot for doorbell.
+             * Legacy autonomous path.
+             *
+             * Re-arm while this exact Slot occupies state->device
+             * so the doorbell uses the correct Slot ID.
              */
-            (void)
-                xhci_queue_audio_transfer_device(
-                    state,
-                    device);
+            (void)xhci_queue_audio_transfer(
+                state);
         }
     }
     else if(completion != 0U)
     {
-        device->audio_stream_queued =
+        state->audio_stream_queued =
             false;
+
 
         g_xhci_error =
             64U +
             completion;
     }
+
+
+    if(!active)
+    {
+        /*
+         * Commit mutable Audio ring/UAPI state directly into the
+         * canonical Slot context.
+         */
+        xhci_copy_device_context(
+            owner,
+            &state->device);
+
+
+        /*
+         * Compatibility shadow only.
+         *
+         * This is write-only for Audio after V3.8.5 and will be
+         * deleted together with inventory.context.
+         */
+        if(slot_dev->
+               runtime_in_inventory)
+        {
+            uint32_t index =
+                slot_dev->
+                    inventory_index;
+
+
+            if(index <
+               state->inventory_count)
+            {
+                xhci_inventory_entry_t *entry =
+                    &state->inventory[
+                        index];
+
+
+                if(entry->valid &&
+                   entry->slot_id ==
+                       slot)
+                {
+                    xhci_copy_device_context(
+                        &entry->context,
+                        owner);
+                }
+            }
+        }
+
+
+        xhci_zero_device_context(
+            &state->device);
+
+
+        xhci_copy_device_context(
+            &state->device,
+            &saved_active);
+    }
+    else
+    {
+        xhci_slot_context_sync(
+            state,
+            slot);
+    }
+
 
     return true;
 }
