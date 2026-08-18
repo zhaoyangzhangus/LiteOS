@@ -906,13 +906,19 @@ static bool xhci_stop_pending_endpoints_device(
 /*
  * Compatibility wrapper for the unpublished working context.
  */
-/*
- * V3.10.6B9E-FIX1 STOP ENDPOINT WRAPPER REMOVED
- *
- * Endpoint teardown always receives an explicit
- * xhci_device_context_t *.
- */
+static bool xhci_stop_pending_endpoints(
+    xhci_state_t *state)
+{
+    if(state == 0)
+    {
+        return true;
+    }
 
+    return
+        xhci_stop_pending_endpoints_device(
+            state,
+            &state->device);
+}
 
 
 /* 设备可以在 active context 和 inventory 之间移动，拓扑标记必须随之重算。 */

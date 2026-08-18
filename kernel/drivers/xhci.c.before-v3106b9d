@@ -906,13 +906,19 @@ static bool xhci_stop_pending_endpoints_device(
 /*
  * Compatibility wrapper for the unpublished working context.
  */
-/*
- * V3.10.6B9E-FIX1 STOP ENDPOINT WRAPPER REMOVED
- *
- * Endpoint teardown always receives an explicit
- * xhci_device_context_t *.
- */
+static bool xhci_stop_pending_endpoints(
+    xhci_state_t *state)
+{
+    if(state == 0)
+    {
+        return true;
+    }
 
+    return
+        xhci_stop_pending_endpoints_device(
+            state,
+            &state->device);
+}
 
 
 /* 设备可以在 active context 和 inventory 之间移动，拓扑标记必须随之重算。 */
@@ -1217,32 +1223,44 @@ __builtin_memset(
 }
 
 
-static bool xhci_release_device_context(
-    xhci_state_t *state,
-    xhci_device_context_t *device);
+static bool xhci_release_active_device(xhci_state_t *state) {
+    bool released;
+    if (state == 0 || state->device.device_slot == 0U) return true;
 
-/*
- * V3.10.6B9D UNIFIED EXPLICIT TEARDOWN
- *
- * state->device is unpublished enumeration working storage.
- *
- * Its resource lifetime uses the same explicit device-context
- * teardown core as a published Slot.context.
- */
-static bool xhci_release_working_device(
-    xhci_state_t *state)
-{
-    if(state == 0 ||
-       state->device.device_slot == 0U)
-    {
-        return true;
+    /*
+     * xhci_free_device_resources() clears these fields,
+     * therefore preserve topology identity before releasing DMA.
+     */
+    uint8_t released_slot =
+        state->device.device_slot;
+
+    uint8_t released_parent_slot =
+        state->device.parent_slot;
+
+    uint8_t released_parent_port =
+        state->device.parent_port;
+    if (!xhci_stop_pending_endpoints(state)) g_xhci_error = 60U;
+    if (!xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
+                             state->device_slot, 0U, 0)) {
+        /* 设备已断开时 Disable Slot 可能没有完成事件，但 DMA 仍必须释放。 */
+        g_xhci_error = 61U;
     }
+    released =
+        xhci_free_device_resources(
+            state);
 
+    /*
+     * Hardware Slot lifetime has ended.
+     * Publish the removal to every software topology layer.
+     */
+    xhci_unpublish_slot_device(
+        released_slot,
+        released_parent_slot,
+        released_parent_port);
 
-    return
-        xhci_release_device_context(
-            state,
-            &state->device);
+    xhci_clear_device_flags();
+    xhci_recompute_topology(state);
+    return released;
 }
 
 /*
@@ -1471,7 +1489,7 @@ static bool xhci_free_slot_resources(
          *
          * Therefore state->device always owns its own teardown path.
          */
-        if(!xhci_release_working_device(
+        if(!xhci_release_active_device(
                state))
         {
             released =
@@ -2185,15 +2203,19 @@ static bool xhci_configure_audio_endpoint(xhci_state_t *state) {
     return true;
 }
 
-/*
- * V3.10.6B9E
- *
- * xhci_detach_device() removed.
- *
- * Working and published device lifetimes now use the explicit
- * teardown architecture directly.
- */
-
+static void xhci_detach_device(xhci_state_t *state) {
+    uint8_t slot;
+    if (state == 0 || state->device_slot == 0U) return;
+    slot = state->device_slot;
+    if (!xhci_stop_pending_endpoints(state)) g_xhci_error = 60U;
+    if (!xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE, slot, 0U, 0)) {
+        /* 设备已离线时，控制器可能不会再产生 Disable Slot 完成事件；
+           无论如何都要先释放 DMA 资源，避免拔出后使用悬空地址。 */
+        g_xhci_error = 61U;
+    }
+    xhci_free_device_resources(state);
+    xhci_clear_device_flags();
+}
 
 static bool xhci_prepare_connected_port(xhci_state_t *state, uint8_t port,
                                         uint8_t *speed_out) {
@@ -2520,7 +2542,7 @@ static bool xhci_attach_root_runtime_device(
     {
         if(state->device.device_slot != 0U)
         {
-            (void)xhci_release_working_device(
+            (void)xhci_release_active_device(
                 state);
         }
 
@@ -2556,226 +2578,44 @@ static bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
     return changed || (portsc & XHCI_PORTSC_CCS) != 0U;
 }
 
-/*
- * V3.10.6B9E CANONICAL REENUMERATION SELF TEST
- *
- * The self-test receives a published Slot.context explicitly.
- *
- * Re-enumeration therefore follows the same ownership transitions
- * as a real runtime root-device replacement:
- *
- *     Slot.context
- *          |
- *          v
- *     remove Slot subtree
- *          |
- *          v
- *     state->device enumeration
- *          |
- *          v
- *     publish Slot.context
- */
-static bool xhci_reenumerate_self_test(
-    xhci_state_t *state,
-    xhci_device_context_t *device)
-{
+static bool xhci_reenumerate_self_test(xhci_state_t *state,
+    xhci_device_context_t *device) {
+    /*
+     * V3.10.6B2 CANONICAL SELF TEST CONTEXT
+     *
+     * Published self-test devices stay in Slot.context.
+     */
     if(state == 0 ||
        device == 0 ||
-       device->device_slot == 0U ||
-       device->device_port == 0U)
+       device->device_slot == 0U)
     {
         return false;
     }
 
 
-    /*
-     * The self-test only re-enumerates a root device.
-     *
-     * A downstream device is already covered by the Hub topology
-     * enumeration path and must not be detached independently from
-     * its parent.
-     */
-    if(device->parent_slot != 0U)
-    {
+    uint8_t port;
+    uint32_t offset;
+    uint32_t portsc;
+    if (state == 0 || state->device_slot == 0U || state->device_port == 0U ||
+        state->parent_slot != 0U) {
         return true;
     }
+    port = state->root_port != 0U ? state->root_port : state->device_port;
+    offset = state->operational_offset + XHCI_PORT_REGISTER_BASE +
+             (uint32_t)(port - 1U) * XHCI_PORT_REGISTER_STRIDE;
 
-
-    uint8_t old_slot =
-        device->device_slot;
-
-    uint8_t port =
-        device->root_port != 0U
-        ? device->root_port
-        : device->device_port;
-
-
-    if(port == 0U ||
-       port > state->max_ports)
-    {
-        g_xhci_error =
-            66U;
-
+    /* 先走与真实拔出相同的 slot 禁用、端点停止和 DMA 释放路径。 */
+    xhci_detach_device(state);
+    portsc = xhci_read32(state, offset);
+    if (portsc == UINT32_MAX || (portsc & XHCI_PORTSC_CCS) == 0U) {
+        g_xhci_error = 66U;
         return false;
     }
-
-
-    uint32_t offset =
-        state->operational_offset +
-        XHCI_PORT_REGISTER_BASE +
-        (uint32_t)(port - 1U) *
-            XHCI_PORT_REGISTER_STRIDE;
-
-
-    /*
-     * Published context must actually belong to the supplied Slot.
-     */
-    xhci_slot_device_t *old_slot_dev =
-        &g_xhci_slot_devices[
-            old_slot];
-
-
-    if(!old_slot_dev->used ||
-       &old_slot_dev->context !=
-           device ||
-       old_slot_dev->context.device_slot !=
-           old_slot)
-    {
-        g_xhci_error =
-            66U;
-
+    xhci_attach_device(state, port);
+    if (state->device_slot == 0U || !g_xhci_usb_enumerated) {
+        if (g_xhci_error == 0U) g_xhci_error = 67U;
         return false;
     }
-
-
-    /*
-     * state->device must be free before beginning another
-     * enumeration transaction.
-     */
-    if(state->device.device_slot != 0U)
-    {
-        g_xhci_error =
-            66U;
-
-        return false;
-    }
-
-
-    /*
-     * Real published teardown:
-     *
-     * Hub roots also lose their downstream subtree here.
-     */
-    if(!xhci_remove_device_subtree(
-           state,
-           old_slot))
-    {
-        g_xhci_error =
-            66U;
-
-        return false;
-    }
-
-
-    uint32_t portsc =
-        xhci_read32(
-            state,
-            offset);
-
-
-    if(portsc == UINT32_MAX ||
-       (portsc & XHCI_PORTSC_CCS) == 0U)
-    {
-        g_xhci_error =
-            66U;
-
-        return false;
-    }
-
-
-    /*
-     * Re-enumerate into unpublished working storage.
-     */
-    xhci_attach_device(
-        state,
-        port);
-
-
-    if(state->device.device_slot == 0U)
-    {
-        if(g_xhci_error == 0U)
-        {
-            g_xhci_error =
-                67U;
-        }
-
-        return false;
-    }
-
-
-    uint8_t kind =
-        xhci_context_kind(
-            &state->device);
-
-
-    if(kind == 0U ||
-       !xhci_publish_working_device(
-           state))
-    {
-        if(state->device.device_slot != 0U)
-        {
-            (void)
-                xhci_release_working_device(
-                    state);
-        }
-
-        if(g_xhci_error == 0U)
-        {
-            g_xhci_error =
-                67U;
-        }
-
-        return false;
-    }
-
-
-    /*
-     * A Hub root may have lost its complete downstream tree during
-     * removal. Rebuild all visible Hub descendants before declaring
-     * the controller ready for runtime.
-     */
-    if(!xhci_probe_hub_downstream(
-           state))
-    {
-        if(g_xhci_error == 0U)
-        {
-            g_xhci_error =
-                67U;
-        }
-
-        return false;
-    }
-
-
-    xhci_recompute_topology(
-        state);
-
-
-    /*
-     * Publication empties working storage.
-     */
-    if(state->device.device_slot != 0U ||
-       !xhci_slot_has_root_port(
-           state,
-           port))
-    {
-        g_xhci_error =
-            67U;
-
-        return false;
-    }
-
-
     return true;
 }
 
