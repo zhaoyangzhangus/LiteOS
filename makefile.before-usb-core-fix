@@ -472,10 +472,9 @@ $(BUILD)/kernel/gpu.o: kernel/drivers/gpu.c | $(BUILD)/kernel
 $(BUILD)/kernel/usb.o: kernel/drivers/usb.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/xhci.o: kernel/drivers/xhci.c | $(BUILD)/kernel
-	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
-
-$(BUILD)/kernel/usb-core.o: kernel/drivers/usb/core.c | $(BUILD)/kernel
+$(BUILD)/kernel/xhci.o: 
+kernel/drivers/xhci.c \
+    kernel/drivers/usb/core.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/vfs.o: kernel/fs/vfs.c | $(BUILD)/kernel
@@ -747,6 +746,6 @@ test: $(BUILD)/sha256-test.exe $(BUILD)/buddy-test.exe $(BUILD)/memory-map-test.
 clean:
 	rm -rf $(BUILD)
 
-# 让头文件修改自动使相关 Loader/Kernel 对象失效，避免 ABI 结构体错位。
+# 让头文件修改自动使相关 Loader/Kernel 对象失效，避免 ABI 结构体错位。 
 -include $(wildcard $(BUILD)/loader/*.d) $(wildcard $(BUILD)/kernel/*.d) \
          $(wildcard $(BUILD)/user/*.d)

@@ -1,6 +1,4 @@
 #include <arch/x86_64/paging.h>
-#include <usb/device.h>
-
 #include <arch/x86_64/cpu.h>
 #include <kernel/dma.h>
 #include <kernel/kmem.h>
@@ -3186,30 +3184,6 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
                                   uint8_t port, uint8_t speed,
                                   uint8_t root_port, uint8_t parent_slot,
                                   uint8_t parent_port, uint32_t route_string) {
-
-    /*
-     * V3.5.2 USB CORE BIND
-     *
-     * Bind xHCI Slot ID to USB Core device.
-     */
-
-    usb_device_t *usb_dev =
-        usb_alloc_device(slot);
-
-
-    if(usb_dev != 0)
-    {
-        usb_dev->speed =
-            speed;
-
-        usb_dev->parent_slot =
-            parent_slot;
-
-        usb_dev->parent_port =
-            parent_port;
-    }
-
-
 
     /*
      * V3.2 Slot Table mirror
