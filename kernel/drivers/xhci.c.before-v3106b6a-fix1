@@ -5215,15 +5215,12 @@ static bool xhci_reconcile_hub_topology(
             &saved_active,
             saved_kind);
     }
-
-
+    else
     /*
-     * V3.10.6B6A FIX DANGLING ELSE
+     * V3.10.6B6A
      *
-     * No published Slot is activated when no saved working
-     * context exists. Topology recomputation remains unconditional.
+     * No published Slot is activated into state->device.
      */
-
 
 
 
