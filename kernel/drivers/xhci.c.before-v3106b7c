@@ -5699,29 +5699,33 @@ static bool xhci_configure_bt_endpoints(xhci_state_t *state) {
  * so an inactive Bluetooth context is temporarily installed there
  * while its event is processed.
  */
-/*
- * V3.10.6B7C CANONICAL BT TRANSFER EVENT
- *
- * Transfer Event Slot ID is the permanent Bluetooth identity.
- *
- *     Transfer Event
- *          |
- *        Slot ID
- *          |
- *          v
- *     Slot.context
- *          |
- *     +----+----+
- *     |         |
- * completion  re-arm
- *
- * Published Bluetooth runtime state never enters state->device.
- * inventory[] is not involved in BT event routing.
- */
 static bool xhci_handle_bt_transfer_event(
     xhci_state_t *state,
     const xhci_trb_t *event)
 {
+    xhci_inventory_entry_t *entry =
+        0;
+
+    xhci_slot_device_t *slot_dev;
+
+    xhci_device_context_t saved_active;
+
+    uint8_t slot;
+
+    uint32_t endpoint_id;
+
+    uint32_t completion;
+
+    uint32_t residual;
+
+    size_t length;
+
+    bool active;
+
+    bool handled =
+        false;
+
+
     if(state == 0 ||
        event == 0 ||
        ((event->control >>
@@ -5733,7 +5737,7 @@ static bool xhci_handle_bt_transfer_event(
     }
 
 
-    uint8_t slot =
+    slot =
         (uint8_t)(
             event->control >>
             XHCI_TRB_SLOT_SHIFT);
@@ -5745,90 +5749,150 @@ static bool xhci_handle_bt_transfer_event(
     }
 
 
-    xhci_slot_device_t *slot_dev =
+    /*
+     * Hardware Slot ID is the primary identity.
+     */
+    slot_dev =
         &g_xhci_slot_devices[
             slot];
 
 
-    /*
-     * Only a fully published canonical Bluetooth context owns
-     * runtime Transfer Events.
-     */
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot ||
-       slot_dev->context.bt_controller ==
-           0)
+    if(!slot_dev->used)
     {
         return false;
     }
 
 
-    xhci_device_context_t *device =
-        &slot_dev->context;
+    /*
+     * Is this Bluetooth device currently occupying the
+     * controller's active context?
+     */
+    active =
+        state->device.device_slot ==
+            slot &&
+        state->bt_controller !=
+            0;
 
 
-    uint32_t endpoint_id =
+    if(!active)
+    {
+        uint32_t index;
+
+
+        if(!slot_dev->
+               runtime_in_inventory)
+        {
+            return false;
+        }
+
+
+        index =
+            slot_dev->
+                inventory_index;
+
+
+        if(index >=
+           state->inventory_count)
+        {
+            return false;
+        }
+
+
+        entry =
+            &state->inventory[
+                index];
+
+
+        /*
+         * Protect against stale inventory index / Slot reuse.
+         */
+        if(!entry->valid ||
+           entry->context.device_slot !=
+               slot ||
+           entry->context.bt_controller ==
+               0)
+        {
+            return false;
+        }
+
+
+        /*
+         * Existing xHCI Bluetooth transport code accesses
+         * state->bt_* directly.
+         *
+         * Temporarily activate exactly the context identified
+         * by the Transfer Event Slot ID.
+         */
+        xhci_copy_device_context(
+            &saved_active,
+            &state->device);
+
+        xhci_copy_device_context(
+            &state->device,
+            &entry->context);
+    }
+
+
+    endpoint_id =
         (event->control >>
          XHCI_TRB_ENDPOINT_SHIFT) &
         0x1FU;
 
 
-    uint32_t completion =
+    completion =
         event->status >>
         XHCI_COMPLETION_SHIFT;
 
 
-    uint32_t residual =
+    residual =
         event->status &
         0x00FFFFFFU;
 
 
     /*
-     * HCI Event interrupt-IN.
+     * Bluetooth HCI Event endpoint.
      */
-    if(device->bt_event_endpoint !=
-           0U &&
+    if(state->bt_event_endpoint != 0U &&
        endpoint_id ==
            (uint32_t)
-               device->
-                   bt_event_endpoint *
-               2U + 1U)
+               state->bt_event_endpoint *
+                   2U + 1U)
     {
-        device->bt_event_transfer_pending =
+        state->bt_event_transfer_pending =
             false;
 
 
         if(completion ==
                XHCI_COMPLETION_SUCCESS &&
            residual <=
-               device->
-                   bt_event_max_packet)
+               state->bt_event_max_packet)
         {
-            size_t length =
-                device->
-                    bt_event_max_packet -
+            length =
+                state->bt_event_max_packet -
                 residual;
 
 
             dma_sync_for_cpu(
-                &device->
+                &state->
                     bt_event_buffer.mapping);
 
 
             if(length != 0U)
             {
                 (void)bt_hci_receive_event(
-                    device->bt_controller,
-                    device->
+                    state->bt_controller,
+                    state->
                         bt_event_buffer.cpu,
                     length);
             }
 
 
-            (void)xhci_queue_bt_event_device(
-                state,
-                device);
+            /*
+             * Re-arm the interrupt endpoint while the owning
+             * Bluetooth context is still installed.
+             */
+            (void)xhci_queue_bt_event(
+                state);
         }
         else
         {
@@ -5838,22 +5902,23 @@ static bool xhci_handle_bt_transfer_event(
         }
 
 
-        return true;
+        handled =
+            true;
     }
 
 
     /*
-     * ACL bulk-IN.
+     * Bluetooth ACL IN endpoint.
      */
-    if(device->bt_acl_in_endpoint !=
-           0U &&
-       endpoint_id ==
-           (uint32_t)
-               device->
-                   bt_acl_in_endpoint *
-               2U + 1U)
+    else if(state->bt_acl_in_endpoint !=
+                0U &&
+            endpoint_id ==
+                (uint32_t)
+                    state->
+                        bt_acl_in_endpoint *
+                    2U + 1U)
     {
-        device->bt_acl_in_transfer_pending =
+        state->bt_acl_in_transfer_pending =
             false;
 
 
@@ -5862,29 +5927,28 @@ static bool xhci_handle_bt_transfer_event(
            residual <=
                PAGE_SIZE)
         {
-            size_t length =
+            length =
                 PAGE_SIZE -
                 residual;
 
 
             dma_sync_for_cpu(
-                &device->
+                &state->
                     bt_acl_in_buffer.mapping);
 
 
             if(length != 0U)
             {
                 (void)bt_acl_receive(
-                    device->bt_controller,
-                    device->
+                    state->bt_controller,
+                    state->
                         bt_acl_in_buffer.cpu,
                     length);
             }
 
 
-            (void)xhci_queue_bt_acl_in_device(
-                state,
-                device);
+            (void)xhci_queue_bt_acl_in(
+                state);
         }
         else
         {
@@ -5894,22 +5958,23 @@ static bool xhci_handle_bt_transfer_event(
         }
 
 
-        return true;
+        handled =
+            true;
     }
 
 
     /*
-     * ACL bulk-OUT completion.
+     * Bluetooth ACL OUT endpoint.
      */
-    if(device->bt_acl_out_endpoint !=
-           0U &&
-       endpoint_id ==
-           (uint32_t)
-               device->
-                   bt_acl_out_endpoint *
-               2U)
+    else if(state->bt_acl_out_endpoint !=
+                0U &&
+            endpoint_id ==
+                (uint32_t)
+                    state->
+                        bt_acl_out_endpoint *
+                    2U)
     {
-        device->bt_acl_out_transfer_pending =
+        state->bt_acl_out_transfer_pending =
             false;
 
 
@@ -5922,11 +5987,39 @@ static bool xhci_handle_bt_transfer_event(
         }
 
 
-        return true;
+        handled =
+            true;
     }
 
 
-    return false;
+    /*
+     * Keep Slot Table mirror synchronized with the real owner
+     * after pending/enqueue/cycle fields may have changed.
+     */
+    slot_dev->context =
+        state->device;
+
+
+    if(!active)
+    {
+        /*
+         * Return updated DMA/ring ownership to its inventory
+         * storage before restoring the previous active device.
+         */
+        xhci_copy_device_context(
+            &entry->context,
+            &state->device);
+
+        xhci_zero_device_context(
+            &state->device);
+
+        xhci_copy_device_context(
+            &state->device,
+            &saved_active);
+    }
+
+
+    return handled;
 }
 
 
