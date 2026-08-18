@@ -860,46 +860,8 @@ bool user_elf_runtime_self_test(void) {
         if ((int64_t)(x86_read_tsc() - runtime_deadline) >= 0) break;
         __asm__ volatile ("pause");
     }
-    /*
-     * USER RUNTIME VM REAPER DRAIN
-     *
-     * PROCESS_DEAD only means process exit has been published.
-     * The execution reference may still keep process->vm alive
-     * until sched_finish_switch() completes on the execution CPU.
-     *
-     * This is the same teardown window handled by user_init.
-     */
-    __asm__ volatile ("sti" : : : "memory");
-
-    for (uint32_t attempt = 0;
-         attempt < 4U && process->vm != 0;
-         ++attempt)
-    {
-        sched_finish_switch();
-
-        if(process->vm == 0)
-        {
-            break;
-        }
-
-        schedule();
-    }
-
-    /*
-     * Safe idempotent completion in case exit occurred while
-     * interrupts were disabled.
-     */
+    /* execution ref 的回收由执行线程所在 CPU 的 sched_finish_switch 完成。 */
     thread_release_execution_ref(thread);
-
-    /*
-     * One final finish-switch pass handles an execution reference
-     * released by the call above.
-     */
-    if(process->vm != 0)
-    {
-        sched_finish_switch();
-    }
-
     thread_t *current = sched_current_thread();
     g_user_runtime_thread_count = process->thread_count;
     for (list_head_t *node = process->threads.next;

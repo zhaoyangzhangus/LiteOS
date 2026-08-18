@@ -2250,70 +2250,45 @@ static bool xhci_restart_hid_endpoint(xhci_state_t *state,
 /* 向 USB Audio 等时端点提交一个周期。统一音频对象的周期页通过一页
    受控 staging buffer 送入 xHCI，避免让端点直接依赖可变的用户请求。 */
 /* Hub 状态端点返回一个位图：bit0 是 Hub 自身，bit1 开始对应下游端口。 */
-
-/*
- * V3.10.6B4 EXPLICIT HUB STATUS QUEUE
- *
- * Hub interrupt-IN state belongs to an explicit device context.
- */
-static bool xhci_queue_hub_status_device(xhci_state_t *state,
-    xhci_device_context_t *device) {
+static bool xhci_queue_hub_status(xhci_state_t *state) {
     xhci_trb_t *ring;
     uint32_t index;
     uint32_t endpoint_id;
-    if (state == 0 || !state->initialized || device->hub_ring.cpu == 0 ||
-        device->hub_report.cpu == 0 || device->hub_endpoint == 0U ||
-        device->hub_max_packet == 0U || device->hub_transfer_pending) return false;
-    if (device->hub_max_packet > PAGE_SIZE) return false;
-    index = device->hub_enqueue;
+    if (state == 0 || !state->initialized || state->hub_ring.cpu == 0 ||
+        state->hub_report.cpu == 0 || state->hub_endpoint == 0U ||
+        state->hub_max_packet == 0U || state->hub_transfer_pending) return false;
+    if (state->hub_max_packet > PAGE_SIZE) return false;
+    index = state->hub_enqueue;
     if (index >= XHCI_RING_TRB_COUNT - 1U) return false;
-    endpoint_id = (uint32_t)device->hub_endpoint * 2U + 1U;
+    endpoint_id = (uint32_t)state->hub_endpoint * 2U + 1U;
     if (endpoint_id > 31U) return false;
-    for (uint32_t i = 0U; i < device->hub_max_packet; ++i) {
-        ((uint8_t *)device->hub_report.cpu)[i] = 0U;
+    for (uint32_t i = 0U; i < state->hub_max_packet; ++i) {
+        ((uint8_t *)state->hub_report.cpu)[i] = 0U;
     }
-    ring = (xhci_trb_t *)device->hub_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->hub_report.mapping);
-    ring[index].status = device->hub_max_packet;
+    ring = (xhci_trb_t *)state->hub_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->hub_report.mapping);
+    ring[index].status = state->hub_max_packet;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->hub_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->hub_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->hub_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->hub_enqueue = 0U;
-        device->hub_cycle ^= 1U;
+            state->hub_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->hub_enqueue = 0U;
+        state->hub_cycle ^= 1U;
     } else {
-        device->hub_enqueue = index;
+        state->hub_enqueue = index;
     }
-    device->hub_transfer_pending = true;
-    dma_sync_for_device(&device->hub_ring.mapping);
-    dma_sync_for_device(&device->hub_report.mapping);
+    state->hub_transfer_pending = true;
+    dma_sync_for_device(&state->hub_ring.mapping);
+    dma_sync_for_device(&state->hub_report.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
 }
-
-/*
- * Compatibility wrapper for unpublished enumeration/setup paths.
- * Published Hub runtime events never use this wrapper.
- */
-static bool xhci_queue_hub_status(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return xhci_queue_hub_status_device(
-        state,
-        &state->device);
-}
-
 
 static bool xhci_configure_hub_endpoint(xhci_state_t *state) {
     uint32_t endpoint_id;
@@ -3008,27 +2983,26 @@ static bool xhci_probe_connected_ports(xhci_state_t *state,
     return found;
 }
 
-/*
- * V3.10.6B4 CANONICAL HUB TRANSFER EVENT
- *
- * Transfer Event Slot ID is the permanent hardware identity.
- *
- *     Transfer Event Slot ID
- *              |
- *              v
- *         Slot.context
- *              |
- *              +--> completion state
- *              +--> status bitmap
- *              +--> interrupt-IN re-arm
- *
- * Published Hub state is never installed into state->device.
- * Inventory metadata is not part of runtime event routing.
- */
 static bool xhci_handle_hub_transfer_event(
     xhci_state_t *state,
     const xhci_trb_t *event)
 {
+    xhci_inventory_entry_t *entry =
+        0;
+
+    xhci_slot_device_t *slot_dev;
+
+    xhci_device_context_t saved_active;
+
+    uint8_t slot;
+
+    uint32_t endpoint_id;
+
+    uint32_t completion;
+
+    bool active;
+
+
     if(state == 0 ||
        event == 0 ||
        ((event->control >>
@@ -3039,7 +3013,14 @@ static bool xhci_handle_hub_transfer_event(
         return false;
     }
 
-    uint8_t slot =
+
+    /*
+     * Transfer Event gives Slot ID directly.
+     *
+     * This is the hardware identity and therefore the
+     * primary lookup key.
+     */
+    slot =
         (uint8_t)(
             event->control >>
             XHCI_TRB_SLOT_SHIFT);
@@ -3049,60 +3030,137 @@ static bool xhci_handle_hub_transfer_event(
         return false;
     }
 
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[slot];
+
+    slot_dev =
+        &g_xhci_slot_devices[
+            slot];
+
 
     /*
-     * Runtime Hub events are accepted only for a published,
-     * internally consistent Hub Slot.
+     * V3.6.7:
+     *
+     * No inventory scan.
      */
     if(!slot_dev->used ||
-       !slot_dev->is_hub ||
-       slot_dev->context.device_slot != slot ||
-       slot_dev->context.hub_endpoint == 0U)
+       !slot_dev->is_hub)
     {
         return false;
     }
 
-    xhci_device_context_t *device =
-        &slot_dev->context;
 
-    uint32_t endpoint_id =
+    endpoint_id =
         (event->control >>
          XHCI_TRB_ENDPOINT_SHIFT) &
         0x1FU;
 
+
+    active =
+        state->device_slot ==
+            slot &&
+        state->hub_endpoint != 0U;
+
+
+    if(!active)
+    {
+        uint32_t index;
+
+        if(!slot_dev->
+               runtime_in_inventory)
+        {
+            return false;
+        }
+
+
+        index =
+            slot_dev->
+                inventory_index;
+
+
+        if(index >=
+           state->inventory_count)
+        {
+            return false;
+        }
+
+
+        entry =
+            &state->inventory[
+                index];
+
+
+        /*
+         * Validate cached index so a stale mapping can
+         * never route an event to another device.
+         */
+        if(!entry->valid ||
+           entry->context.device_slot !=
+               slot ||
+           entry->context.hub_endpoint ==
+               0U)
+        {
+            return false;
+        }
+    }
+
+
     if(endpoint_id !=
-       (uint32_t)device->hub_endpoint *
-           2U + 1U)
+       (uint32_t)(
+           active ?
+               state->hub_endpoint :
+               entry->context.hub_endpoint)
+           * 2U + 1U)
     {
         return false;
     }
 
-    uint32_t completion =
+
+    /*
+     * Existing Hub helpers operate on state->device.
+     *
+     * Inventory still owns DMA storage for inactive
+     * devices during this migration, so temporarily
+     * activate exactly the context selected by Slot ID.
+     */
+    if(!active)
+    {
+        xhci_copy_device_context(
+            &saved_active,
+            &state->device);
+
+        xhci_copy_device_context(
+            &state->device,
+            &entry->context);
+    }
+
+
+    completion =
         event->status >>
         XHCI_COMPLETION_SHIFT;
 
-    device->hub_transfer_pending =
+
+    state->hub_transfer_pending =
         false;
+
 
     if(completion ==
        XHCI_COMPLETION_SUCCESS)
     {
         uint32_t bytes =
-            (device->hub_port_count +
+            (state->hub_port_count +
              8U) /
             8U;
 
         uint32_t bitmap =
             0U;
 
+
         if(bytes >
-           device->hub_max_packet)
+           state->hub_max_packet)
         {
             bytes =
-                device->hub_max_packet;
+                state->hub_max_packet;
         }
+
 
         if(bytes >
            PAGE_SIZE)
@@ -3111,12 +3169,15 @@ static bool xhci_handle_hub_transfer_event(
                 PAGE_SIZE;
         }
 
+
         dma_sync_for_cpu(
-            &device->hub_report.mapping);
+            &state->
+                hub_report.mapping);
+
 
         for(uint32_t port = 1U;
             port <=
-                device->hub_port_count;
+                state->hub_port_count;
             ++port)
         {
             uint32_t byte =
@@ -3125,9 +3186,11 @@ static bool xhci_handle_hub_transfer_event(
             uint32_t bit =
                 port % 8U;
 
+
             if(byte < bytes &&
                (((const uint8_t *)
-                    device->hub_report.cpu)
+                    state->
+                        hub_report.cpu)
                     [byte] &
                  (1U << bit)) != 0U)
             {
@@ -3137,23 +3200,48 @@ static bool xhci_handle_hub_transfer_event(
             }
         }
 
-        device->hub_change_bitmap |=
+
+        state->hub_change_bitmap |=
             bitmap;
 
-        (void)xhci_queue_hub_status_device(
-            state,
-            device);
+
+        (void)xhci_queue_hub_status(
+            state);
     }
     else if(completion != 0U)
     {
         /*
-         * Disconnect may stop/cancel interrupt-IN.
-         * Topology reconciliation performs final removal.
+         * Disconnect may stop/cancel the interrupt-IN
+         * endpoint.  Topology reconciliation performs
+         * final removal.
          */
         g_xhci_error =
             73U +
             completion;
     }
+
+
+    /*
+     * Always update the Slot Table mirror.
+     */
+    slot_dev->context =
+        state->device;
+
+
+    if(!active)
+    {
+        xhci_copy_device_context(
+            &entry->context,
+            &state->device);
+
+        xhci_zero_device_context(
+            &state->device);
+
+        xhci_copy_device_context(
+            &state->device,
+            &saved_active);
+    }
+
 
     return true;
 }
