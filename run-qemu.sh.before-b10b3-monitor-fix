@@ -13,7 +13,6 @@ debug=0
 no_build=0
 headless=0
 usb_nested=0
-monitor_socket=""
 keep_open=0
 no_kvm=0
 seconds=10
@@ -30,7 +29,6 @@ usage() {
   --gdb-port N        修改 GDB 端口
   --headless          不显示图形窗口
   --usb-nested        测试 xHCI -> Hub -> Hub -> Mouse
-  --monitor-socket P  在 Unix socket P 开启 HMP monitor
   --keep-open         普通运行模式下持续运行，Ctrl-C 退出
   --seconds N         普通运行模式最多运行 N 秒（默认 10）
   --no-build          使用现有 build/esp，不重新编译
@@ -51,15 +49,6 @@ while (($# > 0)); do
             gdb_port="$2"; shift 2 ;;
         --headless) headless=1; shift ;;
         --usb-nested) usb_nested=1; shift ;;
-        --monitor-socket)
-            (($# >= 2)) || {
-                echo "--monitor-socket 需要参数" >&2
-                exit 2
-            }
-            monitor_socket="$2"
-            shift 2
-            ;;
-
         --keep-open) keep_open=1; shift ;;
         --seconds)
             (($# >= 2)) || { echo "--seconds 需要参数" >&2; exit 2; }
@@ -82,12 +71,6 @@ while (($# > 0)); do
         *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
     esac
 done
-
-# B10B-3 HMP HOTPLUG MONITOR
-if [[ -n "$monitor_socket" &&
-      "$monitor_socket" != /* ]]; then
-    monitor_socket="$script_dir/$monitor_socket"
-fi
 
 if ((usb_nested && headless)); then
     echo "--usb-nested 需要图形窗口以产生鼠标输入" >&2
@@ -127,28 +110,13 @@ qemu_args=(
     -drive "if=none,id=liteos-nvme0,format=raw,file=fat:rw:$build_dir/esp"
     -device "nvme,drive=liteos-nvme0,serial=liteos-system,bootindex=1"
     -boot order=c
+    -monitor none
     -serial "file:$build_dir/qemu-serial.log"
     -no-reboot
     -no-shutdown
     -d guest_errors
     -D "$build_dir/qemu.log"
 )
-
-if [[ -n "$monitor_socket" ]]; then
-    mkdir -p "$(dirname -- "$monitor_socket")"
-    rm -f "$monitor_socket"
-
-    qemu_args+=(
-        -monitor
-        "unix:$monitor_socket,server=on,wait=off"
-    )
-else
-    qemu_args+=(
-        -monitor
-        none
-    )
-fi
-
 
 if ((no_kvm == 0)) && [[ -r /dev/kvm && -w /dev/kvm ]]; then
     qemu_args+=( -accel kvm )

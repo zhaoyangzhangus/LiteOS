@@ -120,26 +120,6 @@
 #define USB_HUB_FEATURE_PORT_RESET 4U
 #define USB_HUB_FEATURE_PORT_POWER 8U
 
-/*
- * V3.10.6B10B2-FIX3 SLOT HUB AND TT SEMANTICS
- *
- * xHCI Slot Context:
- *
- * DW0 bit 25  = MTT
- * DW0 bit 26  = Hub
- * DW1 31:24   = Number of Ports
- * DW2  7:0    = TT Hub Slot ID
- * DW2 15:8    = TT Port Number
- * DW2 17:16   = TT Think Time
- */
-#define XHCI_SLOT_MTT                 (1U << 25)
-#define XHCI_SLOT_HUB                 (1U << 26)
-#define XHCI_SLOT_MAX_PORTS_SHIFT     24U
-#define XHCI_SLOT_TT_PORT_SHIFT       8U
-#define XHCI_SLOT_TT_THINK_SHIFT      16U
-
-#define USB_HUB_PROTOCOL_MULTI_TT     2U
-
 
 #define XHCI_DEFERRED_EVENT_COUNT 32U
 
@@ -225,8 +205,6 @@ typedef struct xhci_dma_page {
     uint8_t hub_interface; \
     bool hub_interface_present; \
     uint8_t hub_port_count; \
-    uint8_t hub_protocol; \
-    uint8_t hub_tt_think_time; \
     bool hub_configured; \
     uint8_t hub_endpoint; \
     uint16_t hub_max_packet; \
@@ -902,8 +880,6 @@ static bool xhci_free_device_resources_device(
     device->hub_interface = 0U;
     device->hub_interface_present = false;
     device->hub_port_count = 0U;
-    device->hub_protocol = 0U;
-    device->hub_tt_think_time = 0U;
     device->hub_configured = false;
     device->hub_endpoint = 0U;
     device->hub_max_packet = 0U;
@@ -2130,64 +2106,8 @@ static bool xhci_configure_hub_endpoint(xhci_state_t *state) {
     output_slot = (uint32_t *)state->output_context.cpu;
     endpoint = (uint32_t *)((uint8_t *)input +
                             state->context_size * (endpoint_id + 1U));
-    for (uint32_t i = 0U;
-         i < 4U;
-         ++i)
-    {
-        input_slot[i] =
-            output_slot[i];
-    }
-
-    /*
-     * Tell the xHC that this Slot is a Hub.
-     */
-    input_slot[0] |=
-        XHCI_SLOT_HUB;
-
-    /*
-     * MTT is valid only for a High-Speed multi-TT Hub.
-     */
-    input_slot[0] &=
-        ~XHCI_SLOT_MTT;
-
-    if(state->device_speed == 3U &&
-       state->hub_protocol ==
-           USB_HUB_PROTOCOL_MULTI_TT)
-    {
-        input_slot[0] |=
-            XHCI_SLOT_MTT;
-    }
-
-    /*
-     * Number of downstream ports.
-     */
-    input_slot[1] &=
-        ~(0xFFU <<
-          XHCI_SLOT_MAX_PORTS_SHIFT);
-
-    input_slot[1] |=
-        (uint32_t)state->hub_port_count <<
-        XHCI_SLOT_MAX_PORTS_SHIFT;
-
-    /*
-     * TT Think Time applies to High-Speed USB2 Hubs.
-     * Full-Speed Hub Slot Context must leave it zero.
-     */
-    input_slot[2] &=
-        ~(0x03U <<
-          XHCI_SLOT_TT_THINK_SHIFT);
-
-    if(state->device_speed == 3U)
-    {
-        input_slot[2] |=
-            ((uint32_t)
-                 state->hub_tt_think_time &
-             0x03U) <<
-            XHCI_SLOT_TT_THINK_SHIFT;
-    }
-
-    input_slot[0] &=
-        ~(0x1FU << 27);
+    for (uint32_t i = 0U; i < 4U; ++i) input_slot[i] = output_slot[i];
+    input_slot[0] &= ~(0x1FU << 27);
     input_slot[0] |= endpoint_id << 27;
     control[0] = 0U;
     control[1] = 1U | (1U << endpoint_id);
@@ -2857,11 +2777,6 @@ static bool xhci_publish_working_device(
             ? slot_dev->context.hub_port_count
             : 0U;
 
-    slot_dev->hub_protocol =
-        slot_dev->is_hub
-            ? slot_dev->context.hub_protocol
-            : 0U;
-
 
     /*
      * Published devices require no secondary context locator.
@@ -3405,37 +3320,6 @@ static bool xhci_handle_hub_transfer_event(
     xhci_state_t *state,
     const xhci_trb_t *event)
 {
-    /*
-     * V3.10.6B10B3-DIAG1 HUB HOTPLUG PATH
-     *
-     * Print only when this Transfer Event belongs to a published
-     * Hub Slot, so normal HID Transfer Events cannot spam serial.
-     */
-    if(event != 0)
-    {
-        uint8_t diag_slot =
-            (uint8_t)(
-                event->control >>
-                XHCI_TRB_SLOT_SHIFT);
-
-        if(diag_slot != 0U)
-        {
-            xhci_slot_device_t *diag_dev =
-                &g_xhci_slot_devices[
-                    diag_slot];
-
-            if(diag_dev->used &&
-               diag_dev->is_hub &&
-               diag_dev->context.device_slot ==
-                   diag_slot)
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_TRANSFER_EVENT\r\n");
-            }
-        }
-    }
-
-
     if(state == 0 ||
        event == 0 ||
        ((event->control >>
@@ -3989,109 +3873,10 @@ static bool xhci_submit_command(xhci_state_t *state, uint32_t type,
     return xhci_submit_command_ex(state, type, slot, 0U, parameter, result_slot);
 }
 
-/*
- * V3.10.6B10B2-FIX3 EXTERNAL TT RESOLUTION
- *
- * Software topology uses parent_slot/parent_port.
- * Hardware Slot Context DW2 uses TT Hub Slot/TT Port instead.
- */
-static bool xhci_resolve_tt(
-    uint8_t child_speed,
-    uint8_t parent_slot,
-    uint8_t parent_port,
-    uint8_t *tt_slot,
-    uint8_t *tt_port,
-    bool *tt_multi)
-{
-    if(tt_slot == 0 ||
-       tt_port == 0 ||
-       tt_multi == 0)
-    {
-        return false;
-    }
-
-    *tt_slot =
-        0U;
-
-    *tt_port =
-        0U;
-
-    *tt_multi =
-        false;
-
-    /*
-     * Only Low/Full-Speed devices use an external USB2 TT.
-     */
-    if(child_speed > 2U ||
-       parent_slot == 0U)
-    {
-        return true;
-    }
-
-    if(parent_port == 0U)
-    {
-        return false;
-    }
-
-    xhci_slot_device_t *parent =
-        &g_xhci_slot_devices[
-            parent_slot];
-
-    if(!parent->used ||
-       !parent->is_hub ||
-       parent->context.device_slot !=
-           parent_slot)
-    {
-        return false;
-    }
-
-    /*
-     * Directly below a High-Speed Hub:
-     * that Hub owns the split transaction.
-     */
-    if(parent->context.device_speed == 3U)
-    {
-        *tt_slot =
-            parent_slot;
-
-        *tt_port =
-            parent_port;
-
-        *tt_multi =
-            parent->hub_protocol ==
-                USB_HUB_PROTOCOL_MULTI_TT;
-
-        return true;
-    }
-
-    /*
-     * A Full/Low-Speed Hub may itself be behind a High-Speed TT.
-     * All of its Full/Low-Speed descendants remain in that same
-     * upstream TT domain.
-     */
-    if(parent->tt_slot != 0U)
-    {
-        *tt_slot =
-            parent->tt_slot;
-
-        *tt_port =
-            parent->tt_port;
-
-        *tt_multi =
-            parent->tt_multi;
-    }
-
-    return true;
-}
-
-
 static bool xhci_prepare_device_resources(xhci_state_t *state, uint8_t slot,
                                           uint8_t port, uint8_t speed,
                                           uint8_t root_port, uint8_t parent_slot,
                                           uint8_t parent_port,
-                                          uint8_t tt_slot,
-                                          uint8_t tt_port,
-                                          bool tt_multi,
                                           uint32_t route_string) {
     if (state == 0 || slot == 0U || port == 0U || speed == 0U ||
         root_port == 0U) return false;
@@ -4112,32 +3897,10 @@ static bool xhci_prepare_device_resources(xhci_state_t *state, uint8_t slot,
     uint32_t *ep0_context = (uint32_t *)(input + state->context_size * 2U);
     control[0] = 0U;
     control[1] = 0x3U;
-    slot_context[0] =
-        ((uint32_t)(
-            speed &
-            XHCI_PORTSC_SPEED_MASK) <<
-         20) |
-        (route_string &
-         0x000FFFFFU) |
-        (1U << 27) |
-        (tt_multi
-             ? XHCI_SLOT_MTT
-             : 0U);
-
-    slot_context[1] =
-        (uint32_t)root_port <<
-        16;
-
-    /*
-     * DW2 is NOT software parent identity.
-     *
-     * It is the external High-Speed Transaction Translator that
-     * services this Low/Full-Speed device.
-     */
-    slot_context[2] =
-        (uint32_t)tt_slot |
-        ((uint32_t)tt_port <<
-         XHCI_SLOT_TT_PORT_SHIFT);
+    slot_context[0] = ((uint32_t)(speed & XHCI_PORTSC_SPEED_MASK) << 20) |
+                      (route_string & 0x000FFFFFU) | (1U << 27);
+    slot_context[1] = (uint32_t)root_port << 16;
+    slot_context[2] = (uint32_t)parent_slot | ((uint32_t)parent_port << 8);
     slot_context[3] = 0U;
     uint32_t max_packet = speed >= 3U ? 64U : 8U;
     if (speed >= 4U) max_packet = 512U;
@@ -4290,20 +4053,8 @@ static bool xhci_read_hub_descriptor(xhci_state_t *state) {
         g_xhci_error = 68U;
         return false;
     }
-    state->hub_port_count =
-        descriptor[2];
-
-    uint16_t hub_characteristics =
-        (uint16_t)descriptor[3] |
-        ((uint16_t)descriptor[4] << 8);
-
-    state->hub_tt_think_time =
-        (uint8_t)(
-            (hub_characteristics >> 5) &
-            0x03U);
-
-    state->hub_configured =
-        true;
+    state->hub_port_count = descriptor[2];
+    state->hub_configured = true;
     return true;
 }
 
@@ -4338,8 +4089,6 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
     state->hub_interface = 0U;
     state->hub_interface_present = false;
     state->hub_port_count = 0U;
-    state->hub_protocol = 0U;
-    state->hub_tt_think_time = 0U;
     state->hub_configured = false;
     state->hub_endpoint = 0U;
     state->hub_max_packet = 0U;
@@ -4378,9 +4127,7 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
             audio_interface = interface_class == USB_CLASS_AUDIO &&
                               interface_subclass == USB_AUDIO_SUBCLASS_STREAM &&
                               alternate != 0U;
-            hub_interface =
-                interface_class == USB_CLASS_HUB &&
-                alternate == 0U;
+            hub_interface = interface_class == USB_CLASS_HUB;
             bt_interface = interface_class == USB_CLASS_WIRELESS &&
                            interface_subclass == USB_BT_SUBCLASS &&
                            descriptor[offset + 7U] == USB_BT_PROTOCOL;
@@ -4391,7 +4138,6 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
             if (hub_interface) {
                 state->hub_interface = descriptor[offset + 2U];
                 state->hub_interface_present = true;
-                state->hub_protocol = interface_protocol;
             }
         } else if (type == XHCI_DESCRIPTOR_CS_INTERFACE && length >= 8U &&
                    audio_interface && descriptor[offset + 2U] == 0x02U) {
@@ -5323,22 +5069,6 @@ static bool xhci_reconcile_one_hub(
          */
         if(!connected)
         {
-            liteos_serial_write(
-                "LITEOS_DIAG_HUB_DISCONNECT\r\n");
-
-            if(child_present &&
-               child_slot != 0U)
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_CHILD_FOUND\r\n");
-            }
-            else
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_CHILD_MISSING\r\n");
-            }
-
-
             if(child_present &&
                child_slot != 0U &&
                xhci_remove_device_subtree(
@@ -5513,10 +5243,6 @@ static bool xhci_reconcile_one_hub(
 static bool xhci_reconcile_hub_topology(
     xhci_state_t *state)
 {
-    liteos_serial_write(
-        "LITEOS_DIAG_HUB_RECONCILE\r\n");
-
-
 
 
     bool changed =
@@ -6704,28 +6430,6 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     slot_dev->route_string =
         route_string;
 
-    /*
-     * parent_slot/parent_port remain software topology.
-     *
-     * tt_slot/tt_port describe the hardware split-transaction
-     * domain required by xHCI Slot Context DW2.
-     */
-    if(!xhci_resolve_tt(
-           speed,
-           parent_slot,
-           parent_port,
-           &slot_dev->tt_slot,
-           &slot_dev->tt_port,
-           &slot_dev->tt_multi))
-    {
-        xhci_unpublish_slot_device(
-            slot,
-            parent_slot,
-            parent_port);
-
-        return false;
-    }
-
 
     static const uint8_t get_device_descriptor[8] = {
         0x80U, XHCI_SETUP_GET_DESCRIPTOR, 0x00U, XHCI_DESCRIPTOR_DEVICE,
@@ -6740,11 +6444,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     uint8_t set_configuration[8] = {0};
     uint8_t set_interface[8] = {0};
     if (!xhci_prepare_device_resources(state, slot, port, speed, root_port,
-                                        parent_slot, parent_port,
-                                        slot_dev->tt_slot,
-                                        slot_dev->tt_port,
-                                        slot_dev->tt_multi,
-                                        route_string) ||
+                                        parent_slot, parent_port, route_string) ||
         !xhci_submit_command(state, XHCI_ADDRESS_DEVICE_TYPE, slot,
                              xhci_dma_address(&state->input_context.mapping), 0)) {
         if (g_xhci_error == 0U) g_xhci_error = 55U;

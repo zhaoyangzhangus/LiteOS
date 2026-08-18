@@ -3405,37 +3405,6 @@ static bool xhci_handle_hub_transfer_event(
     xhci_state_t *state,
     const xhci_trb_t *event)
 {
-    /*
-     * V3.10.6B10B3-DIAG1 HUB HOTPLUG PATH
-     *
-     * Print only when this Transfer Event belongs to a published
-     * Hub Slot, so normal HID Transfer Events cannot spam serial.
-     */
-    if(event != 0)
-    {
-        uint8_t diag_slot =
-            (uint8_t)(
-                event->control >>
-                XHCI_TRB_SLOT_SHIFT);
-
-        if(diag_slot != 0U)
-        {
-            xhci_slot_device_t *diag_dev =
-                &g_xhci_slot_devices[
-                    diag_slot];
-
-            if(diag_dev->used &&
-               diag_dev->is_hub &&
-               diag_dev->context.device_slot ==
-                   diag_slot)
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_TRANSFER_EVENT\r\n");
-            }
-        }
-    }
-
-
     if(state == 0 ||
        event == 0 ||
        ((event->control >>
@@ -5323,22 +5292,6 @@ static bool xhci_reconcile_one_hub(
          */
         if(!connected)
         {
-            liteos_serial_write(
-                "LITEOS_DIAG_HUB_DISCONNECT\r\n");
-
-            if(child_present &&
-               child_slot != 0U)
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_CHILD_FOUND\r\n");
-            }
-            else
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_CHILD_MISSING\r\n");
-            }
-
-
             if(child_present &&
                child_slot != 0U &&
                xhci_remove_device_subtree(
@@ -5513,10 +5466,6 @@ static bool xhci_reconcile_one_hub(
 static bool xhci_reconcile_hub_topology(
     xhci_state_t *state)
 {
-    liteos_serial_write(
-        "LITEOS_DIAG_HUB_RECONCILE\r\n");
-
-
 
 
     bool changed =
