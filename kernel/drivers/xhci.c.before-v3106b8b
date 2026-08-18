@@ -121,6 +121,7 @@
 #define USB_HUB_FEATURE_PORT_POWER 8U
 
 
+#define XHCI_MAX_USB_INVENTORY    16U
 #define XHCI_DEFERRED_EVENT_COUNT 32U
 
 typedef struct __attribute__((packed)) xhci_trb {
@@ -321,24 +322,26 @@ g_xhci_slot_devices[
 
 
 /*
- * V3.10.6B8B METADATA-ONLY STARTUP INVENTORY
+ * V3.8.2 INVENTORY SLOT INDEX
  *
- * inventory[] is not a device store.
+ * inventory[] is no longer the authoritative device context store.
  *
- * Each entry contains only enough information to select a
- * canonical Slot during initialization/self-test:
+ * slot_id identifies the real object:
  *
- *     slot_id -> Slot.context
- *     kind
- *     valid
+ *     g_xhci_slot_devices[slot_id]
+ *
+ * context remains temporarily as a compatibility shadow for the
+ * Hub/BT/Audio migration.  It will be removed in a later V3.8 step.
  */
+typedef struct xhci_inventory_entry {
+    uint8_t slot_id;
 
-/*
- * V3.10.6B8C INVENTORY REMOVED
- *
- * Slot Table is the only published-device directory.
- */
+    uint8_t kind;
 
+    bool valid;
+
+    xhci_device_context_t context;
+} xhci_inventory_entry_t;
 
 typedef struct xhci_state {
     const pci_device_t *pci;
@@ -362,6 +365,8 @@ typedef struct xhci_state {
         xhci_device_context_t device;
         struct { XHCI_DEVICE_FIELDS };
     };
+    xhci_inventory_entry_t inventory[XHCI_MAX_USB_INVENTORY];
+    uint32_t inventory_count;
     /* 同步控制传输期间到达的异步事件暂存于此，避免被等待循环丢弃。 */
     xhci_trb_t deferred_events[XHCI_DEFERRED_EVENT_COUNT];
     uint32_t deferred_event_head;
@@ -697,14 +702,13 @@ static void xhci_zero_device_context(xhci_device_context_t *context) {
     }
 }
 
-
-/*
- * V3.10.6B8B
- *
- * xhci_copy_device_context() removed.
- * No published device context is copied between ownership stores.
- */
-
+static void xhci_copy_device_context(xhci_device_context_t *destination,
+                                     const xhci_device_context_t *source) {
+    if (destination == 0 || source == 0) return;
+    for (size_t i = 0; i < sizeof(*destination); ++i) {
+        ((uint8_t *)destination)[i] = ((const uint8_t *)source)[i];
+    }
+}
 
 static void xhci_clear_device_flags(void) {
     g_xhci_usb_enumerated = false;
@@ -1596,14 +1600,55 @@ static bool xhci_release_slot_device(
  * Initial enumeration still uses inventory metadata, but hardware
  * teardown itself is now purely Slot-based.
  */
+static bool __attribute__((unused))
+xhci_release_inventory_entry(
+    xhci_state_t *state,
+    uint32_t index)
+{
+    if(state == 0 ||
+       index >= state->inventory_count)
+    {
+        return false;
+    }
 
-/*
- * V3.10.6B8C
- *
- * xhci_release_inventory_entry() removed.
- * Teardown is Slot-ID based.
- */
 
+    xhci_inventory_entry_t *entry =
+        &state->inventory[
+            index];
+
+
+    if(!entry->valid ||
+       entry->slot_id == 0U)
+    {
+        return false;
+    }
+
+
+    uint8_t slot =
+        entry->slot_id;
+
+
+    /*
+     * Remove metadata first.
+     *
+     * Even if hardware disappeared before Disable Slot completes,
+     * this inventory entry must never reactivate the dead Slot.
+     */
+    entry->valid =
+        false;
+
+    entry->slot_id =
+        0U;
+
+    entry->kind =
+        0U;
+
+
+    return
+        xhci_release_slot_device(
+            state,
+            slot);
+}
 
 
 
@@ -1612,16 +1657,106 @@ static bool xhci_release_slot_device(
  *
  * Slot Table is the permanent device store.
  *
-
-*/
-
-/*
- * V3.10.6B8C
- *
- * xhci_save_active_device() removed.
- * Publication is Slot.context-only.
+ * inventory[] is no longer populated.
  */
+/*
+ * V3.9.6 FIX2 KEEP INVENTORY METADATA
+ *
+ * Slot.context remains the real device owner.
+ *
+ * inventory[] temporarily remains a metadata-only publication list
+ * until the last consumer is identified and migrated.
+ *
+ * No device context is stored in inventory.
+ */
+static bool xhci_save_active_device(
+    xhci_state_t *state,
+    uint8_t kind)
+{
+    if(state == 0 ||
+       state->device.device_slot == 0U ||
+       state->inventory_count >=
+           XHCI_MAX_USB_INVENTORY ||
+       kind == 0U)
+    {
+        return false;
+    }
 
+
+    uint8_t slot =
+        state->device.device_slot;
+
+
+    xhci_slot_device_t *slot_dev =
+        &g_xhci_slot_devices[
+            slot];
+
+
+    if(!slot_dev->used)
+    {
+        return false;
+    }
+
+
+    uint32_t index =
+        state->inventory_count++;
+
+
+    xhci_inventory_entry_t *entry =
+        &state->inventory[
+            index];
+
+
+    /*
+     * Slot Table becomes canonical before the active working
+     * context is cleared.
+     */
+    slot_dev->context =
+        state->device;
+
+
+    entry->slot_id =
+        slot;
+
+    entry->kind =
+        kind;
+
+    entry->valid =
+        true;
+
+
+    /*
+     * Temporary compatibility shadow.
+     *
+     * Hub/BT/Audio will be migrated away from this field next.
+     */
+    xhci_copy_device_context(
+        &entry->context,
+        &slot_dev->context);
+
+
+    if(kind == 4U)
+    {
+        g_xhci_usb_hub_present =
+            true;
+
+        g_xhci_usb_hub_inventory_ports =
+            slot_dev->
+                context.hub_port_count;
+    }
+
+
+    xhci_zero_device_context(
+        &state->device);
+
+    xhci_clear_device_flags();
+
+    xhci_recompute_topology(
+        state);
+
+
+    return true;
+}
 
 
 
@@ -2661,15 +2796,15 @@ static bool xhci_remove_root_port_devices(
 }
 
 /*
- * V3.10.6B8C CANONICAL WORKING-CONTEXT PUBLICATION
+ * V3.10.6B7D-FIX1 NO RUNTIME ACTIVE DEVICE
  *
- * Publish a newly enumerated device directly into its
+ * Publish a newly enumerated runtime device directly into its
  * canonical Slot.context.
  *
- * No publication path uses a secondary device store or leaves a
+ * Runtime hotplug never enters inventory[] and never leaves a
  * published device installed in state->device.
  */
-static bool xhci_publish_working_device(
+static bool xhci_publish_runtime_working_device(
     xhci_state_t *state)
 {
     if(state == 0 ||
@@ -2758,7 +2893,7 @@ static bool xhci_attach_root_runtime_device(
             &state->device);
 
     if(kind == 0U ||
-       !xhci_publish_working_device(
+       !xhci_publish_runtime_working_device(
            state))
     {
         if(state->device.device_slot != 0U)
@@ -2844,186 +2979,56 @@ static uint8_t xhci_current_device_kind(void) {
     return xhci_context_kind(&g_xhci.device);
 }
 
-/*
- * V3.10.6B8C INVENTORY REMOVED
- *
- * Successful enumeration publishes directly to Slot.context.
- * Self-test selection scans the Slot Table directly.
- */
-static bool xhci_probe_connected_ports(
-    xhci_state_t *state,
-    uint8_t *selected_slot)
-{
-    if(state == 0 ||
-       selected_slot == 0)
-    {
-        return false;
-    }
+static bool xhci_probe_connected_ports(xhci_state_t *state,
+                                       uint32_t *active_index) {
+    bool found = false;
+    if (state == 0 || active_index == 0) return false;
+    state->inventory_count = 0U;
 
-    *selected_slot =
-        0U;
-
-
-    for(uint32_t port = 1U;
-        port <= state->max_ports;
-        ++port)
-    {
-        uint32_t offset =
-            state->operational_offset +
-            XHCI_PORT_REGISTER_BASE +
-            (port - 1U) *
-                XHCI_PORT_REGISTER_STRIDE;
-
-        uint32_t portsc =
-            xhci_read32(
-                state,
-                offset);
-
-        uint8_t speed =
-            0U;
-
-        uint8_t slot =
-            0U;
-
-
-        if(portsc == UINT32_MAX ||
-           (portsc & XHCI_PORTSC_CCS) == 0U ||
-           !xhci_prepare_connected_port(
-               state,
-               (uint8_t)port,
-               &speed) ||
-           !xhci_submit_command(
-               state,
-               XHCI_COMMAND_RING_TYPE,
-               0U,
-               0U,
-               &slot) ||
-           slot == 0U)
-        {
+    for (uint32_t port = 1U; port <= state->max_ports; ++port) {
+        uint32_t offset = state->operational_offset + XHCI_PORT_REGISTER_BASE +
+                          (port - 1U) * XHCI_PORT_REGISTER_STRIDE;
+        uint32_t portsc = xhci_read32(state, offset);
+        uint8_t speed = 0U;
+        uint8_t slot = 0U;
+        uint8_t kind;
+        bool save_failed = false;
+        if (portsc == UINT32_MAX || (portsc & XHCI_PORTSC_CCS) == 0U ||
+            !xhci_prepare_connected_port(state, (uint8_t)port, &speed) ||
+            !xhci_submit_command(state, XHCI_COMMAND_RING_TYPE, 0U, 0U, &slot) ||
+            slot == 0U) {
             continue;
         }
-
-
-        if(xhci_enumerate_device(
-               state,
-               slot,
-               (uint8_t)port,
-               speed,
-               (uint8_t)port,
-               0U,
-               0U,
-               0U))
-        {
-            uint8_t kind =
-                xhci_context_kind(
-                    &state->device);
-
-            if(kind != 0U &&
-               xhci_publish_working_device(
-                   state))
-            {
+        if (xhci_enumerate_device(state, slot, (uint8_t)port, speed,
+                                  (uint8_t)port, 0U, 0U, 0U)) {
+            kind = xhci_current_device_kind();
+            if (kind != 0U && xhci_save_active_device(state, kind)) {
+                ++g_xhci_usb_device_count;
                 continue;
             }
+            if (kind != 0U) save_failed = true;
         }
-
-
-        if(slot != 0U)
-        {
-            (void)xhci_submit_command(
-                state,
-                XHCI_DISABLE_SLOT_TYPE,
-                slot,
-                0U,
-                0);
-        }
-
-        (void)xhci_free_device_resources(
-            state);
-
-        xhci_zero_device_context(
-            &state->device);
-
+        if (slot != 0U) (void)xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE, slot, 0U, 0);
+        (void)xhci_free_device_resources(state);
         xhci_clear_device_flags();
-
-        g_xhci_error =
-            70U;
-
-        return false;
-    }
-
-
-    if(!xhci_probe_hub_downstream(
-           state))
-    {
-        return false;
-    }
-
-
-    xhci_recompute_topology(
-        state);
-
-
-    uint32_t limit =
-        state->max_slots;
-
-    if(limit >=
-       XHCI_MAX_SLOT_TABLE)
-    {
-        limit =
-            XHCI_MAX_SLOT_TABLE -
-            1U;
-    }
-
-
-    /*
-     * Preserve previous self-test preference:
-     *
-     * pass 0 -> non-Hub device
-     * pass 1 -> Hub fallback
-     */
-    for(uint32_t pass = 0U;
-        pass < 2U;
-        ++pass)
-    {
-        for(uint32_t slot = 1U;
-            slot <= limit;
-            ++slot)
-        {
-            xhci_slot_device_t *slot_dev =
-                &g_xhci_slot_devices[
-                    slot];
-
-            if(!slot_dev->used ||
-               slot_dev->context.device_slot !=
-                   (uint8_t)slot)
-            {
-                continue;
-            }
-
-            uint8_t kind =
-                xhci_context_kind(
-                    &slot_dev->context);
-
-            if(kind == 0U)
-            {
-                continue;
-            }
-
-            if(pass == 0U &&
-               kind == 4U)
-            {
-                continue;
-            }
-
-            *selected_slot =
-                (uint8_t)slot;
-
-            return true;
+        if (save_failed) {
+            g_xhci_error = 70U;
+            return false;
         }
     }
-
-
-    return false;
+    if (!xhci_probe_hub_downstream(state)) return false;
+    /* 优先把普通功能设备保留为活动设备，Hub 仅在没有其他可用设备
+     * 时成为活动设备，避免改变现有输入/音频路径。 */
+    for (uint32_t pass = 0U; pass < 2U && !found; ++pass) {
+        for (uint32_t i = 0U; i < state->inventory_count; ++i) {
+            const xhci_inventory_entry_t *entry = &state->inventory[i];
+            if (!entry->valid || (pass == 0U && entry->kind == 4U)) continue;
+            *active_index = i;
+            found = true;
+            break;
+        }
+    }
+    return found;
 }
 
 /*
@@ -4359,9 +4364,11 @@ static bool xhci_probe_hub_downstream(
 
 
                 if(kind != 0U &&
-                   xhci_publish_working_device(
-                       state))
+                   xhci_save_active_device(
+                       state,
+                       kind))
                 {
+                    ++g_xhci_usb_device_count;
 
                     g_xhci_usb_hub_downstream =
                         true;
@@ -5001,7 +5008,7 @@ static bool xhci_reconcile_one_hub(
             xhci_current_device_kind();
 
         if(kind != 0U &&
-           xhci_publish_working_device(
+           xhci_publish_runtime_working_device(
                state))
         {
             changed =
@@ -6432,6 +6439,7 @@ static bool xhci_destroy(xhci_state_t *state) {
     if (!xhci_free_slot_resources(state) ||
         !xhci_free_rings(state)) return false;
     xhci_zero_device_context(&state->device);
+    state->inventory_count = 0U;
     xhci_clear_device_flags();
     xhci_unmap_mmio(state);
     state->initialized = false;
@@ -6469,11 +6477,8 @@ bool xhci_hardware_self_test(void) {
     if (pci == 0) return true;
     g_xhci_error = 0;
     if (!xhci_initialize(&g_xhci, pci)) return false;
-    uint8_t selected_slot = 0U;
-    bool has_device =
-        xhci_probe_connected_ports(
-            &g_xhci,
-            &selected_slot);
+    uint32_t active_index = 0U;
+    bool has_device = xhci_probe_connected_ports(&g_xhci, &active_index);
     if (!has_device && g_xhci_error != 0U) {
         xhci_destroy(&g_xhci);
         return false;
@@ -6482,43 +6487,64 @@ bool xhci_hardware_self_test(void) {
     xhci_device_context_t *self_test_device = 0;
     bool keep_controller = false;
     bool success;
-    if(has_device)
-    {
-        success =
-            false;
+    if (has_device) {
+        success = false;
 
-        if(selected_slot != 0U)
+        if(active_index < g_xhci.inventory_count)
         {
-            xhci_slot_device_t *slot_dev =
-                &g_xhci_slot_devices[
-                    selected_slot];
+            xhci_inventory_entry_t *entry =
+                &g_xhci.inventory[active_index];
 
-            if(slot_dev->used &&
-               slot_dev->context.device_slot ==
-                   selected_slot)
+            if(entry->valid &&
+               entry->slot_id != 0U)
             {
-                /*
-                 * V3.10.6B8C DIRECT SELF-TEST SLOT
-                 *
-                 * selected_slot already names the permanent
-                 * canonical context.
-                 */
-                self_test_device =
-                    &slot_dev->context;
+                uint8_t selected_slot =
+                    entry->slot_id;
 
-                xhci_recompute_topology(
-                    &g_xhci);
+                xhci_slot_device_t *slot_dev =
+                    &g_xhci_slot_devices[selected_slot];
 
-                success =
-                    true;
+                if(slot_dev->used &&
+                   slot_dev->context.device_slot ==
+                       selected_slot)
+                {
+                    uint8_t kind =
+                        entry->kind;
+
+                    /*
+                     * V3.10.6B2 CANONICAL SELF TEST CONTEXT
+                     *
+                     * Consume the initialization inventory
+                     * metadata without activating Slot.context
+                     * into g_xhci.device.
+                     */
+                    entry->valid = false;
+                    entry->slot_id = 0U;
+                    entry->kind = 0U;
+
+                    self_test_device =
+                        &slot_dev->context;
+
+                    xhci_set_device_kind(kind);
+                    xhci_recompute_topology(&g_xhci);
+
+                    success = true;
+                }
+                else
+                {
+                    /*
+                     * Preserve the old lazy stale-inventory
+                     * repair behavior.
+                     */
+                    entry->valid = false;
+                    entry->slot_id = 0U;
+                    entry->kind = 0U;
+                }
             }
         }
 
-        if(!success)
-        {
-            g_xhci_error =
-                69U;
-        }
+        if (!success)
+            g_xhci_error = 69U;
     } else {
         success = xhci_submit_command(&g_xhci, XHCI_COMMAND_RING_TYPE, 0, 0, &slot) &&
                   slot != 0U;

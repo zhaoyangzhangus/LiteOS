@@ -1613,8 +1613,6 @@ static bool xhci_release_slot_device(
  * Slot Table is the permanent device store.
  *
 
-*/
-
 /*
  * V3.10.6B8C
  *
