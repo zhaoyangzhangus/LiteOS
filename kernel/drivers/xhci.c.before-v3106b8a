@@ -298,17 +298,18 @@ typedef struct xhci_slot_device {
     xhci_device_context_t context;
 
 
-
     /*
-     * V3.10.6B8A SLOT INVENTORY LOCATOR REMOVED
+     * V3.6.7 SLOT RUNTIME LOCATION
      *
-     * Published device identity is permanently:
+     * Slot ID remains the permanent hardware identity.
      *
-     *     Slot ID -> Slot.context
-     *
-     * There is no secondary context-location state.
+     * The legacy inventory is temporarily retained only as
+     * context storage.  Slot Table records its exact index,
+     * therefore event paths no longer scan inventory[].
      */
+    bool runtime_in_inventory;
 
+    uint32_t inventory_index;
 
 } xhci_slot_device_t;
 
@@ -2831,7 +2832,11 @@ static bool xhci_publish_runtime_working_device(
     /*
      * Runtime publication has no inventory locator.
      */
+    slot_dev->runtime_in_inventory =
+        false;
 
+    slot_dev->inventory_index =
+        UINT32_MAX;
 
     xhci_zero_device_context(
         &state->device);
@@ -6799,14 +6804,35 @@ xhci_audio_context_commit(
     }
 
 
-
     /*
-     * V3.10.6B8A
-     *
-     * inventory.context compatibility shadow removed from the
-     * Audio commit path. Slot.context is already canonical.
+     * Compatibility shadow only.
      */
+    if(slot_dev->
+           runtime_in_inventory)
+    {
+        uint32_t index =
+            slot_dev->
+                inventory_index;
 
+
+        if(index <
+           state->inventory_count)
+        {
+            xhci_inventory_entry_t *entry =
+                &state->inventory[
+                    index];
+
+
+            if(entry->valid &&
+               entry->slot_id ==
+                   slot)
+            {
+                xhci_copy_device_context(
+                    &entry->context,
+                    device);
+            }
+        }
+    }
 }
 
 

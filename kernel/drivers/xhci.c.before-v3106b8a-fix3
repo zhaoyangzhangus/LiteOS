@@ -283,30 +283,12 @@ typedef struct xhci_slot_device {
     uint8_t hub_protocol;
 
 
-    /*
-     * Downstream device slots.
-     *
-     * Index:
-     *   port number - 1
-     *
-     * Value:
-     *   child Slot ID
-     */
-    uint8_t child_slots[16];
-
-
-    xhci_device_context_t context;
-
-
 
     /*
      * V3.10.6B8A SLOT INVENTORY LOCATOR REMOVED
      *
-     * Published device identity is permanently:
-     *
-     *     Slot ID -> Slot.context
-     *
-     * There is no secondary context-location state.
+     * Slot ID + Slot.context permanently identify every
+     * published xHCI device.
      */
 
 

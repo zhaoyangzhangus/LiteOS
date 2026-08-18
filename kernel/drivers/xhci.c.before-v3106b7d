@@ -298,17 +298,18 @@ typedef struct xhci_slot_device {
     xhci_device_context_t context;
 
 
-
     /*
-     * V3.10.6B8A SLOT INVENTORY LOCATOR REMOVED
+     * V3.6.7 SLOT RUNTIME LOCATION
      *
-     * Published device identity is permanently:
+     * Slot ID remains the permanent hardware identity.
      *
-     *     Slot ID -> Slot.context
-     *
-     * There is no secondary context-location state.
+     * The legacy inventory is temporarily retained only as
+     * context storage.  Slot Table records its exact index,
+     * therefore event paths no longer scan inventory[].
      */
+    bool runtime_in_inventory;
 
+    uint32_t inventory_index;
 
 } xhci_slot_device_t;
 
@@ -1095,12 +1096,6 @@ static void xhci_recompute_topology(
     bool mouse_present =
         false;
 
-    bool audio_present =
-        false;
-
-    bool bluetooth_present =
-        false;
-
     uint8_t hub_ports =
         0U;
 
@@ -1180,21 +1175,6 @@ static void xhci_recompute_topology(
         }
 
 
-        if(device->audio_endpoint != 0U)
-        {
-            audio_present =
-                true;
-        }
-
-
-        if(device->bt_event_endpoint != 0U ||
-           device->bt_controller != 0)
-        {
-            bluetooth_present =
-                true;
-        }
-
-
         if(slot_dev->is_hub)
         {
             hub_present =
@@ -1250,20 +1230,8 @@ static void xhci_recompute_topology(
     g_xhci_usb_mouse =
         mouse_present;
 
-    g_xhci_usb_audio =
-        audio_present;
-
-    g_xhci_usb_bluetooth =
-        bluetooth_present;
-
     g_xhci_usb_hub_present =
         hub_present;
-
-    g_xhci_usb_hub =
-        hub_present;
-
-    g_xhci_usb_hub_ports =
-        hub_ports;
 
     /*
      * Keep the existing public/runtime diagnostic field alive
@@ -1277,13 +1245,74 @@ static void xhci_recompute_topology(
 }
 
 
+static bool xhci_take_active_device(xhci_state_t *state,
+                                    xhci_device_context_t *saved,
+                                    uint8_t *kind) {
+    if (state == 0 || saved == 0 || kind == 0) return false;
+    xhci_zero_device_context(saved);
+    if (state->device.device_slot == 0U) {
+        *kind = 0U;
+        xhci_clear_device_flags();
+        return true;
+    }
+    *kind = xhci_current_device_kind();
+    if (*kind == 0U) *kind = xhci_context_kind(&state->device);
+    xhci_copy_device_context(
+        saved,
+        &state->device);
 
-/* V3.10.6B7D-FIX1 removed xhci_take_active_device(): runtime devices never activate state->device. */
+    if(saved->device_slot != 0U)
+    {
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[
+                saved->device_slot];
 
+        slot_dev->runtime_in_inventory =
+            false;
 
+        slot_dev->inventory_index =
+            UINT32_MAX;
 
-/* V3.10.6B7D-FIX1 removed xhci_restore_active_device(): runtime devices never activate state->device. */
+        slot_dev->context =
+            *saved;
+    }
+    xhci_zero_device_context(&state->device);
+    xhci_clear_device_flags();
+    return true;
+}
 
+static bool xhci_restore_active_device(xhci_state_t *state,
+                                       xhci_device_context_t *saved,
+                                       uint8_t kind) {
+    if (state == 0 || saved == 0 || state->device.device_slot != 0U) return false;
+    if (saved->device_slot == 0U) {
+        xhci_clear_device_flags();
+        return true;
+    }
+    xhci_copy_device_context(
+        &state->device,
+        saved);
+
+    if(state->device.device_slot != 0U)
+    {
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[
+                state->device.device_slot];
+
+        slot_dev->runtime_in_inventory =
+            false;
+
+        slot_dev->inventory_index =
+            UINT32_MAX;
+
+        slot_dev->context =
+            state->device;
+    }
+    xhci_zero_device_context(saved);
+    xhci_set_device_kind(kind != 0U ? kind : xhci_context_kind(&state->device));
+    xhci_recompute_topology(state);
+    return true;
+}
 
 
 /*
@@ -2795,125 +2824,34 @@ static bool xhci_remove_root_port_devices(
     return changed;
 }
 
-/*
- * V3.10.6B7D-FIX1 NO RUNTIME ACTIVE DEVICE
- *
- * Publish a newly enumerated runtime device directly into its
- * canonical Slot.context.
- *
- * Runtime hotplug never enters inventory[] and never leaves a
- * published device installed in state->device.
- */
-static bool xhci_publish_runtime_working_device(
-    xhci_state_t *state)
-{
-    if(state == 0 ||
-       state->device.device_slot == 0U)
-    {
+static bool xhci_attach_root_runtime_device(xhci_state_t *state, uint8_t port) {
+    xhci_device_context_t saved_active;
+    uint8_t saved_kind = 0U;
+    bool had_active;
+    bool attached;
+    uint8_t new_kind;
+    if (state == 0 || port == 0U || port > state->max_ports) return false;
+    had_active = state->device.device_slot != 0U;
+    if (!xhci_take_active_device(state, &saved_active, &saved_kind)) return false;
+    xhci_attach_device(state, port);
+    attached = state->device.device_slot != 0U && g_xhci_usb_enumerated;
+    if (!attached) {
+        if (state->device.device_slot != 0U) (void)xhci_release_active_device(state);
+        if (had_active) (void)xhci_restore_active_device(state, &saved_active, saved_kind);
+        xhci_recompute_topology(state);
         return false;
     }
-
-    uint8_t slot =
-        state->device.device_slot;
-
-    xhci_slot_device_t *slot_dev =
-        &g_xhci_slot_devices[
-            slot];
-
-    if(!slot_dev->used)
-    {
-        return false;
-    }
-
-    slot_dev->context =
-        state->device;
-
-    /*
-     * Runtime publication has no inventory locator.
-     */
-
-
-    xhci_zero_device_context(
-        &state->device);
-
-    xhci_clear_device_flags();
-
-    /*
-     * Slot Table is canonical, so rebuild every public presence
-     * flag from the table.
-     */
-    xhci_recompute_topology(
-        state);
-
-    return true;
-}
-
-
-static bool xhci_attach_root_runtime_device(
-    xhci_state_t *state,
-    uint8_t port)
-{
-    if(state == 0 ||
-       port == 0U ||
-       port > state->max_ports)
-    {
-        return false;
-    }
-
-    /*
-     * Runtime event processing is serialized.
-     *
-     * A published device must never be parked here. If this is
-     * non-empty, another enumeration transaction owns the working
-     * context and this topology operation must not destroy it.
-     */
-    if(state->device.device_slot != 0U)
-    {
-        return false;
-    }
-
-    xhci_attach_device(
-        state,
-        port);
-
-    if(state->device.device_slot == 0U)
-    {
-        xhci_recompute_topology(
-            state);
-
-        return false;
-    }
-
-    /*
-     * Enumeration must have produced a real functional device
-     * before it can become canonical.
-     */
-    uint8_t kind =
-        xhci_context_kind(
-            &state->device);
-
-    if(kind == 0U ||
-       !xhci_publish_runtime_working_device(
-           state))
-    {
-        if(state->device.device_slot != 0U)
-        {
-            (void)xhci_release_active_device(
-                state);
+    new_kind = xhci_current_device_kind();
+    if (had_active) {
+        if (new_kind == 0U || !xhci_save_active_device(state, new_kind)) {
+            (void)xhci_release_active_device(state);
+            (void)xhci_restore_active_device(state, &saved_active, saved_kind);
+            xhci_recompute_topology(state);
+            return false;
         }
-
-        xhci_recompute_topology(
-            state);
-
-        return false;
+        (void)xhci_restore_active_device(state, &saved_active, saved_kind);
     }
-
-    /*
-     * Success invariant:
-     *
-     *     new runtime device -> Slot.context
-     *     state->device      -> empty
-     */
+    xhci_recompute_topology(state);
     return true;
 }
 
@@ -5008,8 +4946,9 @@ static bool xhci_reconcile_one_hub(
             xhci_current_device_kind();
 
         if(kind != 0U &&
-           xhci_publish_runtime_working_device(
-               state))
+           xhci_save_active_device(
+               state,
+               kind))
         {
             changed =
                 true;
@@ -5094,24 +5033,13 @@ static bool xhci_reconcile_hub_topology(
      * Existing reconcile helpers temporarily use state->device.
      * Preserve the currently active functional device first.
      */
-    /*
-     * V3.10.6B7D-FIX1
-     *
-     * Runtime reconciliation begins with empty unpublished working
-     * storage. Published devices are already canonical Slot.context.
-     */
-    if(state->device.device_slot != 0U)
+    if(!xhci_take_active_device(
+            state,
+            &saved_active,
+            &saved_kind))
     {
         return false;
     }
-
-    xhci_zero_device_context(
-        &saved_active);
-
-    saved_kind =
-        0U;
-
-    xhci_clear_device_flags();
 
 
     uint32_t slot_limit =
@@ -5229,11 +5157,13 @@ static bool xhci_reconcile_hub_topology(
      * Restore the functional device that was active before topology
      * reconciliation.
      */
-    /*
-     * No active runtime context exists to restore.
-     * Every published device remained in Slot.context throughout
-     * reconciliation.
-     */
+    if(saved_active.device_slot != 0U)
+    {
+        (void)xhci_restore_active_device(
+            state,
+            &saved_active,
+            saved_kind);
+    }
 
 
     /*
@@ -6799,14 +6729,35 @@ xhci_audio_context_commit(
     }
 
 
-
     /*
-     * V3.10.6B8A
-     *
-     * inventory.context compatibility shadow removed from the
-     * Audio commit path. Slot.context is already canonical.
+     * Compatibility shadow only.
      */
+    if(slot_dev->
+           runtime_in_inventory)
+    {
+        uint32_t index =
+            slot_dev->
+                inventory_index;
 
+
+        if(index <
+           state->inventory_count)
+        {
+            xhci_inventory_entry_t *entry =
+                &state->inventory[
+                    index];
+
+
+            if(entry->valid &&
+               entry->slot_id ==
+                   slot)
+            {
+                xhci_copy_device_context(
+                    &entry->context,
+                    device);
+            }
+        }
+    }
 }
 
 
