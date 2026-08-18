@@ -5442,136 +5442,18 @@ static void xhci_init_ring_link(xhci_dma_page_t *ring) {
         XHCI_TRB_CYCLE | XHCI_TRB_LINK_TOGGLE_CYCLE;
 }
 
-/*
- * V3.10.6B10B2-FIX2 INTERRUPT INTERVAL ENCODING
- *
- * xHCI Endpoint Context Interval:
- *
- *     service period = 2^Interval * 125 us
- *
- * USB descriptor bInterval uses different encodings:
- *
- *   Low / Full Speed interrupt:
- *       bInterval is linear milliseconds.
- *
- *   High / Super Speed interrupt:
- *       interval = 2^(bInterval - 1) microframes.
- *
- * Keep the conversion here so endpoint setup never writes raw
- * descriptor bInterval into an xHCI Endpoint Context.
- */
-static uint8_t xhci_interrupt_interval(
-    uint8_t speed,
-    uint8_t b_interval)
-{
-    if(b_interval == 0U)
-    {
-        return 0U;
-    }
-
-    /*
-     * xHCI speed IDs used by this driver:
-     *
-     *   1 = Full
-     *   2 = Low
-     *   3 = High
-     *   4 = Super
-     */
-    if(speed >= 3U)
-    {
-        uint8_t value =
-            b_interval;
-
-        if(value > 16U)
-        {
-            value =
-                16U;
-        }
-
-        return
-            (uint8_t)(
-                value - 1U);
-    }
-
-    /*
-     * Full/Low-Speed bInterval is in 1ms frames.
-     *
-     * Convert:
-     *
-     *     milliseconds -> microframes
-     *
-     * then round DOWN to the nearest power of two, matching the
-     * xHCI scheduling rule used by mature host-controller drivers.
-     */
-    uint32_t microframes =
-        (uint32_t)b_interval *
-        8U;
-
-    uint8_t exponent =
-        0U;
-
-    while(exponent < 15U &&
-          (1U <<
-           (uint32_t)(
-               exponent + 1U)) <=
-              microframes)
-    {
-        ++exponent;
-    }
-
-    /*
-     * FS/LS periodic endpoint valid useful range:
-     *
-     *   2^3 microframes =   1 ms
-     *   2^10 microframes = 128 ms
-     */
-    if(exponent < 3U)
-    {
-        exponent =
-            3U;
-    }
-
-    if(exponent > 10U)
-    {
-        exponent =
-            10U;
-    }
-
-    return exponent;
-}
-
-
 static void xhci_init_endpoint_context(xhci_state_t *state, uint32_t *endpoint,
                                        uint8_t interval, uint8_t type,
                                        uint16_t max_packet,
                                        const dma_mapping_t *ring) {
     uint64_t address = xhci_dma_address(ring);
-    uint8_t encoded_interval =
-        interval;
-
-    /*
-     * Endpoint types:
-     *
-     *   3 = Interrupt OUT
-     *   7 = Interrupt IN
-     */
-    if(type == 3U ||
-       type == 7U)
-    {
-        encoded_interval =
-            xhci_interrupt_interval(
-                state->device_speed,
-                interval);
-    }
-
-    endpoint[0] =
-        (uint32_t)encoded_interval <<
-        16;
+    endpoint[0] = (uint32_t)interval << 16;
     endpoint[1] = (3U << 1) | ((uint32_t)type << 3) |
                   ((uint32_t)max_packet << 16);
     endpoint[2] = (uint32_t)address | 1U;
     endpoint[3] = (uint32_t)(address >> 32);
     endpoint[4] = 0U;
+    (void)state;
 }
 
 /*
@@ -6283,14 +6165,7 @@ static bool xhci_configure_hid_endpoint(xhci_state_t *state) {
     control[0] = 0U;
     /* Add Context Flags 必须同时包含 Slot Context 和目标端点。 */
     control[1] = 1U | (1U << endpoint_id);
-    uint8_t hid_xhci_interval =
-        xhci_interrupt_interval(
-            state->device_speed,
-            state->hid_interval);
-
-    endpoint[0] =
-        (uint32_t)hid_xhci_interval <<
-        16;
+    endpoint[0] = ((uint32_t)state->hid_interval << 16);
     endpoint[1] = (3U << 1) | (7U << 3) |
                   ((uint32_t)state->hid_max_packet << 16);
     endpoint[2] = (uint32_t)xhci_dma_address(&state->hid_ring.mapping) | 1U;
