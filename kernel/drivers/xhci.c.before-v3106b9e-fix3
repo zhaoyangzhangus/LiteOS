@@ -722,7 +722,28 @@ static bool xhci_free_rings(xhci_state_t *state) {
  *
  * DMA/resource lifetime belongs to an explicit device context.
  */
-
+/*
+ * V3.10.6B9E-DIAG2 RESOURCE FREE STAGES
+ *
+ * Temporary diagnostics:
+ *
+ *   681 descriptor_buffer
+ *   682 hid_report
+ *   683 hid_ring
+ *   684 audio_buffer
+ *   685 audio_ring
+ *   686 bt_acl_out_ring
+ *   687 bt_acl_out_buffer
+ *   688 bt_acl_in_buffer
+ *   689 bt_acl_in_ring
+ *   690 bt_event_buffer
+ *   691 bt_event_ring
+ *   692 hub_report
+ *   693 hub_ring
+ *   694 ep0_ring
+ *   695 input_context
+ *   696 output_context
+ */
 static bool xhci_free_device_resources_device(
     xhci_device_context_t *device) {
     bool released = true;
@@ -744,96 +765,240 @@ static bool xhci_free_device_resources_device(
     if(!xhci_free_page(
            &device->descriptor_buffer))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                681U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->hid_report))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                682U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->hid_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                683U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->audio_buffer))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                684U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->audio_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                685U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->bt_acl_out_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                686U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->bt_acl_out_buffer))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                687U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->bt_acl_in_buffer))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                688U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->bt_acl_in_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                689U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->bt_event_buffer))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                690U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->bt_event_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                691U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->hub_report))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                692U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->hub_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                693U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->ep0_ring))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                694U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->input_context))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                695U;
+        }
+
         released =
             false;
     }
     if(!xhci_free_page(
            &device->output_context))
     {
+        /*
+         * Keep the FIRST resource-free failure.
+         */
+        if(released)
+        {
+            g_xhci_error =
+                696U;
+        }
+
         released =
             false;
     }
@@ -2508,12 +2673,6 @@ static bool xhci_remove_root_port_devices(
  * published device installed in state->device.
  */
 /*
- * V3.10.6B9E-FIX3 DMA DIAGNOSTIC CLEANUP
- *
- * The DMA ownership-move fix is runtime-validated.
- * Temporary 681..698 failure staging has been removed.
- */
-/*
  * V3.10.6B9E-FIX2 DMA MAPPING OWNERSHIP MOVE
  *
  * xhci_device_context_t contains embedded dma_mapping_t objects.
@@ -2586,7 +2745,8 @@ static bool xhci_move_device_context(
      */
     if(destination->device_slot != 0U)
     {
-
+        g_xhci_error =
+            697U;
 
         return false;
     }
@@ -2609,7 +2769,8 @@ static bool xhci_move_device_context(
            mapping->mapped_length != 0U ||
            mapping->flags != 0U)
         {
-
+            g_xhci_error =
+                697U;
 
             return false;
         }
@@ -2675,7 +2836,8 @@ static bool xhci_move_device_context(
                      * than an xHCI enumeration failure.  Keep both
                      * contexts intact for diagnosis.
                      */
-
+                    g_xhci_error =
+                        698U;
 
                     return false;
                 }
@@ -2684,7 +2846,8 @@ static bool xhci_move_device_context(
             xhci_zero_device_context(
                 destination);
 
-
+            g_xhci_error =
+                697U;
 
             return false;
         }
@@ -2964,8 +3127,15 @@ static bool xhci_reenumerate_self_test(
            state,
            old_slot))
     {
-        g_xhci_error =
-            664U;
+        /*
+         * Preserve DIAG2's exact DMA/resource failure.
+         */
+        if(g_xhci_error < 681U ||
+           g_xhci_error > 696U)
+        {
+            g_xhci_error =
+                664U;
+        }
 
         return false;
     }
