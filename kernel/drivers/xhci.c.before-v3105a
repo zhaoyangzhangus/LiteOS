@@ -5371,198 +5371,115 @@ static void xhci_init_endpoint_context(xhci_state_t *state, uint32_t *endpoint,
     (void)state;
 }
 
-/*
- * V3.10.5A EXPLICIT BT QUEUES
- *
- * Bluetooth endpoint/ring producer state belongs to the explicit
- * device context.  Controller MMIO state remains in xhci_state_t.
- */
-static bool xhci_queue_bt_event_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_bt_event(xhci_state_t *state) {
     xhci_trb_t *ring;
     uint32_t endpoint_id;
     uint32_t index;
-    if (state == 0 || device->bt_controller == 0 || device->bt_event_endpoint == 0U ||
-        device->bt_event_ring.cpu == 0 || device->bt_event_buffer.cpu == 0 ||
-        device->bt_event_transfer_pending) return false;
-    endpoint_id = (uint32_t)device->bt_event_endpoint * 2U + 1U;
-    index = device->bt_event_enqueue;
+    if (state == 0 || state->bt_controller == 0 || state->bt_event_endpoint == 0U ||
+        state->bt_event_ring.cpu == 0 || state->bt_event_buffer.cpu == 0 ||
+        state->bt_event_transfer_pending) return false;
+    endpoint_id = (uint32_t)state->bt_event_endpoint * 2U + 1U;
+    index = state->bt_event_enqueue;
     if (endpoint_id > 31U || index >= XHCI_RING_TRB_COUNT - 1U ||
-        device->bt_event_max_packet == 0U) return false;
-    ring = (xhci_trb_t *)device->bt_event_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->bt_event_buffer.mapping);
-    ring[index].status = device->bt_event_max_packet;
+        state->bt_event_max_packet == 0U) return false;
+    ring = (xhci_trb_t *)state->bt_event_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->bt_event_buffer.mapping);
+    ring[index].status = state->bt_event_max_packet;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
                           XHCI_TRB_DIRECTION_IN |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->bt_event_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->bt_event_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->bt_event_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->bt_event_enqueue = 0U;
-        device->bt_event_cycle ^= 1U;
+            state->bt_event_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->bt_event_enqueue = 0U;
+        state->bt_event_cycle ^= 1U;
     } else {
-        device->bt_event_enqueue = index;
+        state->bt_event_enqueue = index;
     }
-    device->bt_event_transfer_pending = true;
-    dma_sync_for_device(&device->bt_event_ring.mapping);
-    dma_sync_for_device(&device->bt_event_buffer.mapping);
+    state->bt_event_transfer_pending = true;
+    dma_sync_for_device(&state->bt_event_ring.mapping);
+    dma_sync_for_device(&state->bt_event_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
 }
 
-/*
- * Compatibility wrapper.
- *
- * V3.10.5A does not migrate callers yet.
- */
-static bool xhci_queue_bt_event(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_queue_bt_event_device(
-            state,
-            &state->device);
-}
-
-static bool xhci_queue_bt_acl_in_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_bt_acl_in(xhci_state_t *state) {
     xhci_trb_t *ring;
     uint32_t endpoint_id;
     uint32_t index;
-    if (state == 0 || device->bt_controller == 0 || device->bt_acl_in_endpoint == 0U ||
-        device->bt_acl_in_ring.cpu == 0 || device->bt_acl_in_buffer.cpu == 0 ||
-        device->bt_acl_in_transfer_pending) return false;
-    endpoint_id = (uint32_t)device->bt_acl_in_endpoint * 2U + 1U;
-    index = device->bt_acl_in_enqueue;
+    if (state == 0 || state->bt_controller == 0 || state->bt_acl_in_endpoint == 0U ||
+        state->bt_acl_in_ring.cpu == 0 || state->bt_acl_in_buffer.cpu == 0 ||
+        state->bt_acl_in_transfer_pending) return false;
+    endpoint_id = (uint32_t)state->bt_acl_in_endpoint * 2U + 1U;
+    index = state->bt_acl_in_enqueue;
     if (endpoint_id > 31U || index >= XHCI_RING_TRB_COUNT - 1U) return false;
-    ring = (xhci_trb_t *)device->bt_acl_in_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->bt_acl_in_buffer.mapping);
+    ring = (xhci_trb_t *)state->bt_acl_in_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->bt_acl_in_buffer.mapping);
     ring[index].status = PAGE_SIZE;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
                           XHCI_TRB_DIRECTION_IN |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->bt_acl_in_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->bt_acl_in_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->bt_acl_in_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->bt_acl_in_enqueue = 0U;
-        device->bt_acl_in_cycle ^= 1U;
+            state->bt_acl_in_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->bt_acl_in_enqueue = 0U;
+        state->bt_acl_in_cycle ^= 1U;
     } else {
-        device->bt_acl_in_enqueue = index;
+        state->bt_acl_in_enqueue = index;
     }
-    device->bt_acl_in_transfer_pending = true;
-    dma_sync_for_device(&device->bt_acl_in_ring.mapping);
-    dma_sync_for_device(&device->bt_acl_in_buffer.mapping);
+    state->bt_acl_in_transfer_pending = true;
+    dma_sync_for_device(&state->bt_acl_in_ring.mapping);
+    dma_sync_for_device(&state->bt_acl_in_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
 }
 
-static bool xhci_queue_bt_acl_in(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_queue_bt_acl_in_device(
-            state,
-            &state->device);
-}
-
-static bool xhci_queue_bt_acl_out_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device,
-    size_t length) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_bt_acl_out(xhci_state_t *state, size_t length) {
     xhci_trb_t *ring;
     uint32_t endpoint_id;
     uint32_t index;
-    if (state == 0 || device->bt_acl_out_endpoint == 0U ||
-        device->bt_acl_out_ring.cpu == 0 || device->bt_acl_out_buffer.cpu == 0 ||
-        device->bt_acl_out_buffer.mapping.device == 0 || length == 0U ||
-        length > PAGE_SIZE || device->bt_acl_out_buffer.mapping.segment_count == 0U) {
+    if (state == 0 || state->bt_acl_out_endpoint == 0U ||
+        state->bt_acl_out_ring.cpu == 0 || state->bt_acl_out_buffer.cpu == 0 ||
+        state->bt_acl_out_buffer.mapping.device == 0 || length == 0U ||
+        length > PAGE_SIZE || state->bt_acl_out_buffer.mapping.segment_count == 0U) {
         return false;
     }
-    endpoint_id = (uint32_t)device->bt_acl_out_endpoint * 2U;
-    index = device->bt_acl_out_enqueue;
+    endpoint_id = (uint32_t)state->bt_acl_out_endpoint * 2U;
+    index = state->bt_acl_out_enqueue;
     if (endpoint_id > 31U || index >= XHCI_RING_TRB_COUNT - 1U) return false;
-    ring = (xhci_trb_t *)device->bt_acl_out_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->bt_acl_out_buffer.mapping);
+    ring = (xhci_trb_t *)state->bt_acl_out_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->bt_acl_out_buffer.mapping);
     ring[index].status = (uint32_t)length;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->bt_acl_out_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->bt_acl_out_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->bt_acl_out_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->bt_acl_out_enqueue = 0U;
-        device->bt_acl_out_cycle ^= 1U;
+            state->bt_acl_out_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->bt_acl_out_enqueue = 0U;
+        state->bt_acl_out_cycle ^= 1U;
     } else {
-        device->bt_acl_out_enqueue = index;
+        state->bt_acl_out_enqueue = index;
     }
-    device->bt_acl_out_transfer_pending = true;
-    dma_sync_for_device(&device->bt_acl_out_ring.mapping);
-    dma_sync_for_device(&device->bt_acl_out_buffer.mapping);
+    state->bt_acl_out_transfer_pending = true;
+    dma_sync_for_device(&state->bt_acl_out_ring.mapping);
+    dma_sync_for_device(&state->bt_acl_out_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
-}
-
-static bool xhci_queue_bt_acl_out(
-    xhci_state_t *state,
-    size_t length)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_queue_bt_acl_out_device(
-            state,
-            &state->device,
-            length);
 }
 
 /*

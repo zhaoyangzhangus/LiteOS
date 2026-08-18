@@ -403,30 +403,6 @@ typedef struct xhci_state {
  * state->device remains a temporary active/working context until
  * the final active-device migration is completed.
  */
-/*
- * V3.9.6 HID REGRESSION FIX
- *
- * Slot ID is the permanent runtime device identity.
- *
- * state->device is only a temporary mutable working copy.
- * Otherwise Slot.context is the canonical device context.
- *
- * No inventory locator is required on the event fast path.
- */
-/*
- * V3.10.3A CANONICAL EVENT OWNER
- *
- * Hardware Transfer Event Slot ID identifies the permanent device.
- *
- * Published device:
- *
- *     Slot ID -> Slot.context
- *
- * always wins.
- *
- * state->device is only a fallback for a Slot that is currently
- * being enumerated and has not yet been committed to Slot.context.
- */
 static xhci_device_context_t *
 xhci_slot_context_owner(
     xhci_state_t *state,
@@ -444,34 +420,66 @@ xhci_slot_context_owner(
             slot];
 
 
-    /*
-     * Canonical published runtime owner.
-     *
-     * Do this BEFORE checking state->device.
-     *
-     * A published Slot must never have HID/Hub/BT/Audio producer
-     * state updated in a temporary working copy.
-     */
-    if(slot_dev->used &&
-       slot_dev->context.device_slot ==
-           slot)
+    if(!slot_dev->used)
     {
-        return
-            &slot_dev->context;
+        return 0;
     }
 
 
     /*
-     * Unpublished enumeration-time fallback.
-     *
-     * xhci_enumerate_device() can receive EP0 events before the
-     * finished context has been committed into Slot Table.
+     * Active working copy.
      */
     if(state->device.device_slot ==
        slot)
     {
         return
             &state->device;
+    }
+
+
+    /*
+     * Inactive device:
+     *
+     * inventory[] proves that this Slot is parked, but the actual
+     * mutable context is now Slot Table context.
+     */
+    if(slot_dev->
+           runtime_in_inventory)
+    {
+        uint32_t index =
+            slot_dev->
+                inventory_index;
+
+
+        if(index >=
+           state->inventory_count)
+        {
+            return 0;
+        }
+
+
+        xhci_inventory_entry_t *entry =
+            &state->inventory[
+                index];
+
+
+        if(!entry->valid ||
+           entry->slot_id != slot)
+        {
+            return 0;
+        }
+
+
+        if(slot_dev->
+               context.device_slot !=
+           slot)
+        {
+            return 0;
+        }
+
+
+        return
+            &slot_dev->context;
     }
 
 
@@ -1615,24 +1623,12 @@ xhci_release_inventory_entry(
  *
  * inventory[] is no longer populated.
  */
-/*
- * V3.9.6 FIX2 KEEP INVENTORY METADATA
- *
- * Slot.context remains the real device owner.
- *
- * inventory[] temporarily remains a metadata-only publication list
- * until the last consumer is identified and migrated.
- *
- * No device context is stored in inventory.
- */
 static bool xhci_save_active_device(
     xhci_state_t *state,
     uint8_t kind)
 {
     if(state == 0 ||
        state->device.device_slot == 0U ||
-       state->inventory_count >=
-           XHCI_MAX_USB_INVENTORY ||
        kind == 0U)
     {
         return false;
@@ -1654,41 +1650,104 @@ static bool xhci_save_active_device(
     }
 
 
-    uint32_t index =
-        state->inventory_count++;
+    /*
+     * Finalize permanent Slot metadata.
+     */
+    slot_dev->used =
+        true;
 
+    slot_dev->slot_id =
+        slot;
 
-    xhci_inventory_entry_t *entry =
-        &state->inventory[
-            index];
+    slot_dev->speed =
+        state->device.device_speed;
+
+    slot_dev->parent_slot =
+        state->device.parent_slot;
+
+    slot_dev->parent_port =
+        state->device.parent_port;
+
+    slot_dev->root_port =
+        state->device.root_port;
+
+    slot_dev->route_string =
+        state->device.route_string;
+
+    slot_dev->is_hub =
+        kind == 4U;
 
 
     /*
-     * Slot Table becomes canonical before the active working
-     * context is cleared.
+     * Publish Hub class state to USB Hub Core.
+     */
+    if(slot_dev->is_hub)
+    {
+        slot_dev->hub_port_count =
+            state->device.hub_port_count;
+
+
+        (void)usb_hub_init(
+            slot,
+            state->device.hub_port_count);
+
+
+        usb_device_t *usb_dev =
+            usb_get_device(
+                slot);
+
+
+        if(usb_dev != 0)
+        {
+            usb_dev->device_class =
+                USB_CLASS_HUB;
+        }
+    }
+
+
+    /*
+     * Publish downstream relationship.
+     */
+    if(state->device.parent_slot != 0U &&
+       state->device.parent_port != 0U)
+    {
+        usb_hub_port_connect(
+            state->device.parent_slot,
+            state->device.parent_port,
+            slot);
+
+
+        /*
+         * Slot Table fast child map currently tracks the first
+         * 16 downstream ports.
+         */
+        if(state->device.parent_port <=
+           16U)
+        {
+            xhci_slot_device_t *parent =
+                &g_xhci_slot_devices[
+                    state->
+                        device.parent_slot];
+
+
+            if(parent->used)
+            {
+                parent->child_slots[
+                    state->
+                        device.parent_port -
+                    1U] =
+                        slot;
+            }
+        }
+    }
+
+
+    /*
+     * Commit every DMA/ring/endpoint field before clearing the
+     * working copy.
      */
     slot_dev->context =
         state->device;
-
-
-    entry->slot_id =
-        slot;
-
-    entry->kind =
-        kind;
-
-    entry->valid =
-        true;
-
-
-    /*
-     * Temporary compatibility shadow.
-     *
-     * Hub/BT/Audio will be migrated away from this field next.
-     */
-    xhci_copy_device_context(
-        &entry->context,
-        &slot_dev->context);
 
 
     if(kind == 4U)
@@ -1697,8 +1756,8 @@ static bool xhci_save_active_device(
             true;
 
         g_xhci_usb_hub_inventory_ports =
-            slot_dev->
-                context.hub_port_count;
+            state->
+                device.hub_port_count;
     }
 
 
@@ -1706,6 +1765,7 @@ static bool xhci_save_active_device(
         &state->device);
 
     xhci_clear_device_flags();
+
 
     xhci_recompute_topology(
         state);
@@ -2412,96 +2472,58 @@ static bool xhci_configure_hub_endpoint(xhci_state_t *state) {
     return xhci_queue_hub_status(state);
 }
 
-/*
- * V3.10.4A EXPLICIT AUDIO QUEUE
- *
- * Controller state remains in xhci_state_t.
- * Audio endpoint/ring/runtime producer state belongs to device.
- */
-static bool xhci_queue_audio_transfer_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_audio_transfer(xhci_state_t *state) {
     xhci_trb_t *ring;
     uint32_t index;
     uint32_t endpoint_id;
     uint32_t transfer_bytes;
-    if (state == 0 || !state->initialized || device->audio_ring.cpu == 0 ||
-        device->audio_buffer.cpu == 0 || device->audio_transfer_pending ||
-        device->audio_endpoint == 0U || device->audio_max_packet == 0U) return false;
-    if (device->audio_stream != 0) {
-        if (!device->audio_stream_queued || device->audio_frames == 0U) return false;
-        uint64_t bytes = audio_stream_bytes_for_frames(device->audio_stream,
-                                                       device->audio_frames);
+    if (state == 0 || !state->initialized || state->audio_ring.cpu == 0 ||
+        state->audio_buffer.cpu == 0 || state->audio_transfer_pending ||
+        state->audio_endpoint == 0U || state->audio_max_packet == 0U) return false;
+    if (state->audio_stream != 0) {
+        if (!state->audio_stream_queued || state->audio_frames == 0U) return false;
+        uint64_t bytes = audio_stream_bytes_for_frames(state->audio_stream,
+                                                       state->audio_frames);
         if (bytes == 0U || bytes > PAGE_SIZE) return false;
         transfer_bytes = (uint32_t)bytes;
-        if (!device->audio_endpoint_in &&
-            audio_stream_period_read(device->audio_stream, device->audio_period,
-                                     device->audio_buffer.cpu, bytes) != K_OK) {
+        if (!state->audio_endpoint_in &&
+            audio_stream_period_read(state->audio_stream, state->audio_period,
+                                     state->audio_buffer.cpu, bytes) != K_OK) {
             return false;
         }
     } else {
-        transfer_bytes = device->audio_max_packet;
+        transfer_bytes = state->audio_max_packet;
     }
-    index = device->audio_enqueue;
+    index = state->audio_enqueue;
     if (index >= XHCI_RING_TRB_COUNT - 1U) return false;
-    endpoint_id = (uint32_t)device->audio_endpoint * 2U +
-                  (device->audio_endpoint_in ? 1U : 0U);
-    ring = (xhci_trb_t *)device->audio_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->audio_buffer.mapping);
+    endpoint_id = (uint32_t)state->audio_endpoint * 2U +
+                  (state->audio_endpoint_in ? 1U : 0U);
+    ring = (xhci_trb_t *)state->audio_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->audio_buffer.mapping);
     ring[index].status = transfer_bytes;
     ring[index].control = (XHCI_ISOCH_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
                           XHCI_TRB_INTERRUPT_ON_COMPLETION | XHCI_TRB_SIA |
-                          (device->audio_endpoint_in ? XHCI_TRB_DIRECTION_IN : 0U) |
-                          device->audio_cycle;
+                          (state->audio_endpoint_in ? XHCI_TRB_DIRECTION_IN : 0U) |
+                          state->audio_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->audio_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->audio_enqueue = 0U;
-        device->audio_cycle ^= 1U;
+            state->audio_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->audio_enqueue = 0U;
+        state->audio_cycle ^= 1U;
     } else {
-        device->audio_enqueue = index;
+        state->audio_enqueue = index;
     }
-    device->audio_transfer_pending = true;
-    dma_sync_for_device(&device->audio_ring.mapping);
-    dma_sync_for_device(&device->audio_buffer.mapping);
+    state->audio_transfer_pending = true;
+    dma_sync_for_device(&state->audio_ring.mapping);
+    dma_sync_for_device(&state->audio_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
 }
-
-/*
- * Compatibility wrapper.
- *
- * V3.10.4A intentionally preserves every existing caller.
- * Later Audio patches migrate callers to canonical Slot.context
- * individually.
- */
-static bool xhci_queue_audio_transfer(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-
-    return
-        xhci_queue_audio_transfer_device(
-            state,
-            &state->device);
-}
-
 
 static bool xhci_configure_audio_endpoint(xhci_state_t *state) {
     uint32_t endpoint_id;
@@ -3896,27 +3918,17 @@ static bool xhci_prepare_device_resources(xhci_state_t *state, uint8_t slot,
 }
 
 /*
- * V3.10.1A EXPLICIT EP0 DEVICE
+ * V3.10.1 EXPLICIT CONTROL DEVICE
  *
- * Controller-owned state:
- *   MMIO / doorbell / Event Ring
- *
- * Device-owned state:
- *   Slot ID / EP0 Ring / EP0 enqueue / descriptor buffer
- */
-/*
- * V3.10.1F CONTROL WRAPPER REMOVED
- *
- * Every control-transfer caller now names its device context.
- * This stage changes API shape only; legacy callers explicitly
- * pass &state->device and retain identical ownership semantics.
+ * Controller state owns the Event Ring/MMIO.
+ * Device context owns EP0 and its descriptor buffer.
  */
 static bool xhci_submit_control_transfer_device(
     xhci_state_t *state,
     xhci_device_context_t *device,
-    const uint8_t setup[8],
-    uint32_t length,
-    bool direction_in) {
+
+                                         const uint8_t setup[8],
+                                         uint32_t length, bool direction_in) {
     if (state == 0 || device == 0 || setup == 0 || length > PAGE_SIZE ||
         device->device_slot == 0U) return false;
     xhci_trb_t *ring = (xhci_trb_t *)device->ep0_ring.cpu;
@@ -3991,15 +4003,29 @@ static bool xhci_submit_control_transfer_device(
 }
 
 /*
- * Legacy working-context wrapper.
+ * Legacy active-working-context wrapper.
  *
- * V3.10.1A deliberately leaves every existing caller unchanged.
- * Later patches migrate individual subsystems to the explicit
- * device-context helper one at a time.
+ * Enumeration and several class setup paths still use state->device.
  */
+static bool xhci_submit_control_transfer(
+    xhci_state_t *state,
+    const uint8_t setup[8],
+    uint32_t length,
+    bool direction_in)
+{
+    if(state == 0)
+    {
+        return false;
+    }
 
-
-
+    return
+        xhci_submit_control_transfer_device(
+            state,
+            &state->device,
+            setup,
+            length,
+            direction_in);
+}
 
 
 static bool xhci_read_hub_descriptor(xhci_state_t *state) {
@@ -4009,7 +4035,7 @@ static bool xhci_read_hub_descriptor(xhci_state_t *state) {
     };
     uint8_t *descriptor;
     if (state == 0 || !state->hub_interface_present ||
-        !xhci_submit_control_transfer_device(state, &state->device,  request, 9U, true)) return false;
+        !xhci_submit_control_transfer(state, request, 9U, true)) return false;
     descriptor = (uint8_t *)state->descriptor_buffer.cpu;
     if (descriptor[0] < 3U || descriptor[1] != XHCI_DESCRIPTOR_HUB ||
         descriptor[2] == 0U || descriptor[2] > 15U) {
@@ -4176,15 +4202,7 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
 }
 
 /*
- * V3.10.1B EXPLICIT HUB GET STATUS
- *
- * Hub EP0 state belongs to the supplied device context.
- */
-/*
- * V3.10.1E HUB CONTROL WRAPPERS REMOVED
- *
- * All Hub control callers now name the device context explicitly.
- * Runtime callers still pass &state->device in this stage.
+ * V3.10.1 direct Hub EP0 access.
  */
 static bool xhci_hub_get_port_status_device(
     xhci_state_t *state,
@@ -4224,10 +4242,16 @@ static bool xhci_hub_get_port_status_device(
     }
 
 
-    uint8_t *status =
-        (uint8_t *)
+    const uint8_t *status =
+        (const uint8_t *)
             device->
                 descriptor_buffer.cpu;
+
+
+    if(status == 0)
+    {
+        return false;
+    }
 
 
     *status_out =
@@ -4242,20 +4266,10 @@ static bool xhci_hub_get_port_status_device(
 
 
 /*
- * Compatibility wrapper.
- *
- * V3.10.1B deliberately leaves every existing Hub caller on the
- * old state->device working-context behavior.
+ * Compatibility wrapper for the remaining active-context Hub path.
  */
 
 
-
-
-/*
- * V3.10.1C EXPLICIT HUB SET FEATURE
- *
- * Hub EP0 state belongs to the supplied device context.
- */
 static bool xhci_hub_set_port_feature_device(
     xhci_state_t *state,
     xhci_device_context_t *device,
@@ -4292,14 +4306,6 @@ static bool xhci_hub_set_port_feature_device(
 }
 
 
-/*
- * Compatibility wrapper.
- *
- * Existing Hub paths intentionally keep their old state->device
- * working-context behavior in V3.10.1C.
- */
-
-
 
 
 static uint8_t xhci_hub_port_speed(uint32_t status) {
@@ -4330,13 +4336,11 @@ static bool xhci_child_route(const xhci_device_context_t *hub,
  * allowing arbitrary xHCI-supported Hub nesting without inventory.
  */
 /*
- * V3.10.1D DIRECT STARTUP HUB CONTEXT
+ * V3.10.1 DIRECT HUB CONTEXT WALK
  *
- * Startup Hub control transfers operate directly on the canonical
- * Slot.context.
+ * Hub EP0 operations modify Slot.context directly.
  *
- * state->device is reserved for a child while that child is being
- * enumerated.
+ * state->device is used only when constructing a new child.
  */
 static bool xhci_probe_hub_downstream(
     xhci_state_t *state)
@@ -4347,20 +4351,6 @@ static bool xhci_probe_hub_downstream(
     }
 
 
-    /*
-     * 256 Slot IDs / 64 bits = 4 words.
-     *
-     * Multiple passes allow:
-     *
-     *     Hub
-     *       |
-     *      Hub
-     *       |
-     *     Device
-     *
-     * even when the newly allocated child Hub has a Slot ID that
-     * appears earlier in the table than its parent.
-     */
     uint64_t processed[4] = {
         0U,
         0U,
@@ -4431,10 +4421,10 @@ static bool xhci_probe_hub_downstream(
 
 
             /*
-             * Permanent Hub owner.
+             * Canonical Hub owner.
              *
-             * EP0 enqueue and descriptor-buffer state are updated
-             * in this context directly.
+             * EP0 enqueue and descriptor-buffer state are modified
+             * here directly; no state->device round-trip.
              */
             xhci_device_context_t *hub =
                 &slot_dev->context;
@@ -4447,22 +4437,18 @@ static bool xhci_probe_hub_downstream(
                 uint32_t status =
                     0U;
 
-                uint8_t speed =
-                    0U;
-
                 uint32_t route =
                     0U;
 
                 uint8_t child_slot =
                     0U;
 
+                uint8_t speed;
+
                 bool enabled =
                     false;
 
 
-                /*
-                 * No state->device copy.
-                 */
                 if(!xhci_hub_get_port_status_device(
                        state,
                        hub,
@@ -4474,10 +4460,6 @@ static bool xhci_probe_hub_downstream(
                 }
 
 
-                /*
-                 * Do not enumerate an already published child a
-                 * second time.
-                 */
                 uint8_t existing_child =
                     0U;
 
@@ -4491,20 +4473,18 @@ static bool xhci_probe_hub_downstream(
                 }
 
 
-                (void)
-                    xhci_hub_set_port_feature_device(
-                        state,
-                        hub,
-                        (uint8_t)port,
-                        USB_HUB_FEATURE_PORT_POWER);
+                (void)xhci_hub_set_port_feature_device(
+                    state,
+                    hub,
+                    (uint8_t)port,
+                    USB_HUB_FEATURE_PORT_POWER);
 
 
-                (void)
-                    xhci_hub_set_port_feature_device(
-                        state,
-                        hub,
-                        (uint8_t)port,
-                        USB_HUB_FEATURE_PORT_RESET);
+                (void)xhci_hub_set_port_feature_device(
+                    state,
+                    hub,
+                    (uint8_t)port,
+                    USB_HUB_FEATURE_PORT_RESET);
 
 
                 for(uint32_t spin = 0U;
@@ -4547,8 +4527,9 @@ static bool xhci_probe_hub_downstream(
 
 
                 /*
-                 * state->device belongs exclusively to the child
-                 * during enumeration.
+                 * Hub itself never occupies state->device now.
+                 * The working context is therefore clean for the
+                 * new child.
                  */
                 xhci_zero_device_context(
                     &state->device);
@@ -4575,19 +4556,17 @@ static bool xhci_probe_hub_downstream(
                 {
                     if(child_slot != 0U)
                     {
-                        (void)
-                            xhci_submit_command(
-                                state,
-                                XHCI_DISABLE_SLOT_TYPE,
-                                child_slot,
-                                0U,
-                                0);
+                        (void)xhci_submit_command(
+                            state,
+                            XHCI_DISABLE_SLOT_TYPE,
+                            child_slot,
+                            0U,
+                            0);
                     }
 
 
-                    (void)
-                        xhci_free_device_resources(
-                            state);
+                    (void)xhci_free_device_resources(
+                        state);
 
                     xhci_clear_device_flags();
 
@@ -4611,18 +4590,16 @@ static bool xhci_probe_hub_downstream(
                 }
                 else
                 {
-                    (void)
-                        xhci_submit_command(
-                            state,
-                            XHCI_DISABLE_SLOT_TYPE,
-                            child_slot,
-                            0U,
-                            0);
+                    (void)xhci_submit_command(
+                        state,
+                        XHCI_DISABLE_SLOT_TYPE,
+                        child_slot,
+                        0U,
+                        0);
 
 
-                    (void)
-                        xhci_free_device_resources(
-                            state);
+                    (void)xhci_free_device_resources(
+                        state);
 
                     xhci_clear_device_flags();
                 }
@@ -4630,8 +4607,8 @@ static bool xhci_probe_hub_downstream(
 
 
             /*
-             * Child enumeration should already leave it empty.
-             * Keep this invariant explicit.
+             * Child enumeration always ends with state->device
+             * empty.  Hub remains permanently in Slot.context.
              */
             xhci_zero_device_context(
                 &state->device);
@@ -5025,40 +5002,83 @@ xhci_remove_slot_tree(
 
 
 
-static bool xhci_reconcile_one_hub(xhci_state_t *state,
-                              const xhci_device_context_t *hub,
-                              xhci_device_context_t *saved_active,
-                              uint8_t *saved_kind) {
-    bool changed = false;
-    if (state == 0 || hub == 0 || saved_active == 0 || saved_kind == 0 ||
-        hub->device_slot == 0U || hub->hub_port_count == 0U) return false;
-    for (uint32_t port = 1U; port <= hub->hub_port_count; ++port) {
-        uint32_t status = 0U;
-        uint8_t child_slot = 0U;
-        bool child_present = false;
+/*
+ * V3.10.2 DIRECT RUNTIME HUB CONTEXT
+ *
+ * Runtime Hub control transfers operate directly on the canonical
+ * Slot.context.
+ *
+ * state->device is reserved for construction/teardown of a child.
+ */
+static bool xhci_reconcile_one_hub(
+    xhci_state_t *state,
+    xhci_device_context_t *hub,
+    xhci_device_context_t *saved_active,
+    uint8_t *saved_kind)
+{
+    bool changed =
+        false;
+
+
+    if(state == 0 ||
+       hub == 0 ||
+       saved_active == 0 ||
+       saved_kind == 0 ||
+       hub->device_slot == 0U ||
+       hub->hub_port_count == 0U)
+    {
+        return false;
+    }
+
+
+    for(uint32_t port = 1U;
+        port <= hub->hub_port_count;
+        ++port)
+    {
+        uint32_t status =
+            0U;
+
+        uint8_t child_slot =
+            0U;
+
+        bool child_present;
+
         bool connected;
-        xhci_copy_device_context(&state->device, hub);
-        xhci_set_device_kind(4U);
-        if (!xhci_hub_get_port_status_device(state, &state->device,  (uint8_t)port, &status)) {
-            xhci_zero_device_context(&state->device);
-            xhci_clear_device_flags();
+
+
+        /*
+         * GET_STATUS advances this Hub's own EP0 producer state
+         * directly in Slot.context.
+         */
+        if(!xhci_hub_get_port_status_device(
+               state,
+               hub,
+               (uint8_t)port,
+               &status))
+        {
             continue;
         }
-        connected = (status & 1U) != 0U;
-                child_present =
+
+
+        connected =
+            (status & 1U) != 0U;
+
+
+        child_present =
             xhci_find_hub_child(
                 hub->device_slot,
                 (uint8_t)port,
                 &child_slot);
 
+
+        /*
+         * Disconnect:
+         *
+         * topology already tells us exactly which Slot subtree
+         * belongs to this Hub port.
+         */
         if(!connected)
         {
-            xhci_zero_device_context(
-                &state->device);
-
-            xhci_clear_device_flags();
-
-
             if(child_present &&
                child_slot != 0U &&
                xhci_remove_device_subtree(
@@ -5071,72 +5091,175 @@ static bool xhci_reconcile_one_hub(xhci_state_t *state,
                     true;
             }
 
+
             continue;
         }
 
 
         /*
-         * Port is connected and Slot Table already owns a child.
-         * Nothing to enumerate.
+         * Connected and already represented in Slot topology.
          */
         if(child_present)
         {
-            xhci_zero_device_context(
-                &state->device);
-
-            xhci_clear_device_flags();
-
             continue;
         }
 
-        /* 新连接设备需要由 Hub 供电并复位，随后才能取得可用速度。 */
-        (void)xhci_hub_set_port_feature_device(state, &state->device,  (uint8_t)port,
-                                        USB_HUB_FEATURE_PORT_POWER);
-        (void)xhci_hub_set_port_feature_device(state, &state->device,  (uint8_t)port,
-                                        USB_HUB_FEATURE_PORT_RESET);
-        bool enabled = false;
-        for (uint32_t spin = 0U; spin < 10000U; ++spin) {
-            if (xhci_hub_get_port_status_device(state, &state->device,  (uint8_t)port, &status) &&
-                (status & 1U) != 0U && (status & 2U) != 0U) {
-                enabled = true;
+
+        /*
+         * New downstream device.
+         */
+        (void)xhci_hub_set_port_feature_device(
+            state,
+            hub,
+            (uint8_t)port,
+            USB_HUB_FEATURE_PORT_POWER);
+
+
+        (void)xhci_hub_set_port_feature_device(
+            state,
+            hub,
+            (uint8_t)port,
+            USB_HUB_FEATURE_PORT_RESET);
+
+
+        bool enabled =
+            false;
+
+
+        for(uint32_t spin = 0U;
+            spin < 10000U;
+            ++spin)
+        {
+            if(xhci_hub_get_port_status_device(
+                   state,
+                   hub,
+                   (uint8_t)port,
+                   &status) &&
+               (status & 1U) != 0U &&
+               (status & 2U) != 0U)
+            {
+                enabled =
+                    true;
+
                 break;
             }
-            __asm__ volatile ("pause");
+
+
+            __asm__ volatile(
+                "pause");
         }
-        uint32_t route = 0U;
-        if (!enabled || !xhci_child_route(hub, (uint8_t)port, &route)) {
-            xhci_zero_device_context(&state->device);
-            xhci_clear_device_flags();
+
+
+        uint32_t route =
+            0U;
+
+
+        if(!enabled ||
+           !xhci_child_route(
+               hub,
+               (uint8_t)port,
+               &route))
+        {
             continue;
         }
-        uint8_t speed = xhci_hub_port_speed(status);
-        uint8_t slot = 0U;
-        /* Hub context 的 DMA 所有权由局部副本持有，子设备从空 context 分配。 */
-        xhci_zero_device_context(&state->device);
-        if (!xhci_submit_command(state, XHCI_COMMAND_RING_TYPE, 0U, 0U, &slot) ||
-            slot == 0U || !xhci_enumerate_device(
-                state, slot, (uint8_t)port, speed, hub->root_port,
-                hub->device_slot, (uint8_t)port, route)) {
-            if (slot != 0U) {
-                (void)xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
-                                           slot, 0U, 0);
+
+
+        uint8_t speed =
+            xhci_hub_port_speed(
+                status);
+
+
+        /*
+         * Hub itself never needs to occupy state->device.
+         *
+         * Start child enumeration from a clean working context.
+         */
+        xhci_zero_device_context(
+            &state->device);
+
+        xhci_clear_device_flags();
+
+
+        uint8_t slot =
+            0U;
+
+
+        if(!xhci_submit_command(
+               state,
+               XHCI_COMMAND_RING_TYPE,
+               0U,
+               0U,
+               &slot) ||
+           slot == 0U ||
+           !xhci_enumerate_device(
+               state,
+               slot,
+               (uint8_t)port,
+               speed,
+               hub->root_port,
+               hub->device_slot,
+               (uint8_t)port,
+               route))
+        {
+            if(slot != 0U)
+            {
+                (void)xhci_submit_command(
+                    state,
+                    XHCI_DISABLE_SLOT_TYPE,
+                    slot,
+                    0U,
+                    0);
             }
-            (void)xhci_free_device_resources(state);
+
+
+            (void)xhci_free_device_resources(
+                state);
+
             xhci_clear_device_flags();
+
             continue;
         }
-        uint8_t kind = xhci_current_device_kind();
-        if (kind != 0U && xhci_save_active_device(state, kind)) {
-            changed = true;
-        } else {
-            (void)xhci_submit_command(state, XHCI_DISABLE_SLOT_TYPE,
-                                       slot, 0U, 0);
-            (void)xhci_free_device_resources(state);
+
+
+        uint8_t kind =
+            xhci_current_device_kind();
+
+
+        if(kind != 0U &&
+           xhci_save_active_device(
+               state,
+               kind))
+        {
+            changed =
+                true;
+        }
+        else
+        {
+            (void)xhci_submit_command(
+                state,
+                XHCI_DISABLE_SLOT_TYPE,
+                slot,
+                0U,
+                0);
+
+
+            (void)xhci_free_device_resources(
+                state);
+
             xhci_clear_device_flags();
         }
     }
-    xhci_zero_device_context(&state->device);
+
+
+    /*
+     * Child enumeration normally leaves this empty.
+     */
+    xhci_zero_device_context(
+        &state->device);
+
     xhci_clear_device_flags();
+
+
     return changed;
 }
 
@@ -5159,6 +5282,21 @@ static bool xhci_reconcile_one_hub(xhci_state_t *state,
  *          |
  *       device
  */
+/*
+ * V3.10.2 DIRECT RUNTIME HUB SLOT WALK
+ *
+ * Runtime topology is:
+ *
+ *     Slot Table
+ *        |
+ *        +-- Hub Slot.context
+ *                 |
+ *                 +-- direct EP0 control
+ *                 |
+ *                 +-- child_slots[]
+ *
+ * No Hub context copy through state->device.
+ */
 static bool xhci_reconcile_hub_topology(
     xhci_state_t *state)
 {
@@ -5170,9 +5308,7 @@ static bool xhci_reconcile_hub_topology(
     bool changed =
         false;
 
-    /*
-     * 256 Slot IDs = 256 bits.
-     */
+
     uint64_t processed[4] = {
         0U,
         0U,
@@ -5190,37 +5326,37 @@ static bool xhci_reconcile_hub_topology(
 
 
     /*
-     * Existing reconcile helpers temporarily use state->device.
-     * Preserve the currently active functional device first.
+     * state->device may still contain the preferred functional
+     * working context.
+     *
+     * Move it out temporarily so newly discovered child devices
+     * can use state->device during enumeration.
      */
     if(!xhci_take_active_device(
-            state,
-            &saved_active,
-            &saved_kind))
+           state,
+           &saved_active,
+           &saved_kind))
     {
         return false;
     }
 
 
-    uint32_t slot_limit =
+    uint32_t limit =
         state->max_slots;
 
 
-    if(slot_limit >=
+    if(limit >=
        XHCI_MAX_SLOT_TABLE)
     {
-        slot_limit =
-            XHCI_MAX_SLOT_TABLE - 1U;
+        limit =
+            XHCI_MAX_SLOT_TABLE -
+            1U;
     }
 
 
     /*
-     * Continue until every currently visible Hub Slot has been
-     * processed once.
-     *
-     * If processing Hub A discovers Hub B, Hub B enters the Slot
-     * Table and is picked up by a following pass without waiting
-     * for another global inventory traversal.
+     * Multiple passes are required because handling Hub A can
+     * enumerate a new Hub B.
      */
     for(;;)
     {
@@ -5229,7 +5365,7 @@ static bool xhci_reconcile_hub_topology(
 
 
         for(uint32_t slot = 1U;
-            slot <= slot_limit;
+            slot <= limit;
             ++slot)
         {
             uint32_t word =
@@ -5253,15 +5389,19 @@ static bool xhci_reconcile_hub_topology(
 
 
             if(!slot_dev->used ||
-               !slot_dev->is_hub)
+               !slot_dev->is_hub ||
+               slot_dev->context.device_slot !=
+                   (uint8_t)slot ||
+               slot_dev->context.hub_port_count ==
+                   0U)
             {
                 continue;
             }
 
 
             /*
-             * Mark before walking downstream so a malformed cyclic
-             * software topology can never recurse forever.
+             * Mark first so malformed topology can never make this
+             * walk process the same Hub indefinitely.
              */
             processed[word] |=
                 mask;
@@ -5270,31 +5410,17 @@ static bool xhci_reconcile_hub_topology(
                 true;
 
 
-            xhci_device_context_t hub;
-
-            xhci_copy_device_context(
-                &hub,
-                &slot_dev->context);
-
-
             /*
-             * Slot Table corruption/stale context must not route
-             * control transfers to another hardware Slot.
+             * Pass canonical context itself.
+             *
+             * EP0 enqueue/cycle state remains attached to the Hub
+             * without an intermediate copy.
              */
-            if(hub.device_slot !=
-                   (uint8_t)slot ||
-               hub.hub_port_count ==
-                   0U)
-            {
-                continue;
-            }
-
-
             if(xhci_reconcile_one_hub(
-                    state,
-                    &hub,
-                    &saved_active,
-                    &saved_kind))
+                   state,
+                   &slot_dev->context,
+                   &saved_active,
+                   &saved_kind))
             {
                 changed =
                     true;
@@ -5310,8 +5436,8 @@ static bool xhci_reconcile_hub_topology(
 
 
     /*
-     * Restore the functional device that was active before topology
-     * reconciliation.
+     * Restore whichever functional device occupied the legacy
+     * working context before topology reconciliation.
      */
     if(saved_active.device_slot != 0U)
     {
@@ -5323,10 +5449,6 @@ static bool xhci_reconcile_hub_topology(
     else if(state->device.device_slot ==
             0U)
     {
-        /*
-         * Compatibility path while inventory storage still exists.
-         * Device discovery itself no longer depends on inventory.
-         */
         (void)xhci_activate_next_slot_device(
             state);
     }
@@ -5371,198 +5493,115 @@ static void xhci_init_endpoint_context(xhci_state_t *state, uint32_t *endpoint,
     (void)state;
 }
 
-/*
- * V3.10.5A EXPLICIT BT QUEUES
- *
- * Bluetooth endpoint/ring producer state belongs to the explicit
- * device context.  Controller MMIO state remains in xhci_state_t.
- */
-static bool xhci_queue_bt_event_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_bt_event(xhci_state_t *state) {
     xhci_trb_t *ring;
     uint32_t endpoint_id;
     uint32_t index;
-    if (state == 0 || device->bt_controller == 0 || device->bt_event_endpoint == 0U ||
-        device->bt_event_ring.cpu == 0 || device->bt_event_buffer.cpu == 0 ||
-        device->bt_event_transfer_pending) return false;
-    endpoint_id = (uint32_t)device->bt_event_endpoint * 2U + 1U;
-    index = device->bt_event_enqueue;
+    if (state == 0 || state->bt_controller == 0 || state->bt_event_endpoint == 0U ||
+        state->bt_event_ring.cpu == 0 || state->bt_event_buffer.cpu == 0 ||
+        state->bt_event_transfer_pending) return false;
+    endpoint_id = (uint32_t)state->bt_event_endpoint * 2U + 1U;
+    index = state->bt_event_enqueue;
     if (endpoint_id > 31U || index >= XHCI_RING_TRB_COUNT - 1U ||
-        device->bt_event_max_packet == 0U) return false;
-    ring = (xhci_trb_t *)device->bt_event_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->bt_event_buffer.mapping);
-    ring[index].status = device->bt_event_max_packet;
+        state->bt_event_max_packet == 0U) return false;
+    ring = (xhci_trb_t *)state->bt_event_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->bt_event_buffer.mapping);
+    ring[index].status = state->bt_event_max_packet;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
                           XHCI_TRB_DIRECTION_IN |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->bt_event_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->bt_event_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->bt_event_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->bt_event_enqueue = 0U;
-        device->bt_event_cycle ^= 1U;
+            state->bt_event_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->bt_event_enqueue = 0U;
+        state->bt_event_cycle ^= 1U;
     } else {
-        device->bt_event_enqueue = index;
+        state->bt_event_enqueue = index;
     }
-    device->bt_event_transfer_pending = true;
-    dma_sync_for_device(&device->bt_event_ring.mapping);
-    dma_sync_for_device(&device->bt_event_buffer.mapping);
+    state->bt_event_transfer_pending = true;
+    dma_sync_for_device(&state->bt_event_ring.mapping);
+    dma_sync_for_device(&state->bt_event_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
 }
 
-/*
- * Compatibility wrapper.
- *
- * V3.10.5A does not migrate callers yet.
- */
-static bool xhci_queue_bt_event(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_queue_bt_event_device(
-            state,
-            &state->device);
-}
-
-static bool xhci_queue_bt_acl_in_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_bt_acl_in(xhci_state_t *state) {
     xhci_trb_t *ring;
     uint32_t endpoint_id;
     uint32_t index;
-    if (state == 0 || device->bt_controller == 0 || device->bt_acl_in_endpoint == 0U ||
-        device->bt_acl_in_ring.cpu == 0 || device->bt_acl_in_buffer.cpu == 0 ||
-        device->bt_acl_in_transfer_pending) return false;
-    endpoint_id = (uint32_t)device->bt_acl_in_endpoint * 2U + 1U;
-    index = device->bt_acl_in_enqueue;
+    if (state == 0 || state->bt_controller == 0 || state->bt_acl_in_endpoint == 0U ||
+        state->bt_acl_in_ring.cpu == 0 || state->bt_acl_in_buffer.cpu == 0 ||
+        state->bt_acl_in_transfer_pending) return false;
+    endpoint_id = (uint32_t)state->bt_acl_in_endpoint * 2U + 1U;
+    index = state->bt_acl_in_enqueue;
     if (endpoint_id > 31U || index >= XHCI_RING_TRB_COUNT - 1U) return false;
-    ring = (xhci_trb_t *)device->bt_acl_in_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->bt_acl_in_buffer.mapping);
+    ring = (xhci_trb_t *)state->bt_acl_in_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->bt_acl_in_buffer.mapping);
     ring[index].status = PAGE_SIZE;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
                           XHCI_TRB_DIRECTION_IN |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->bt_acl_in_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->bt_acl_in_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->bt_acl_in_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->bt_acl_in_enqueue = 0U;
-        device->bt_acl_in_cycle ^= 1U;
+            state->bt_acl_in_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->bt_acl_in_enqueue = 0U;
+        state->bt_acl_in_cycle ^= 1U;
     } else {
-        device->bt_acl_in_enqueue = index;
+        state->bt_acl_in_enqueue = index;
     }
-    device->bt_acl_in_transfer_pending = true;
-    dma_sync_for_device(&device->bt_acl_in_ring.mapping);
-    dma_sync_for_device(&device->bt_acl_in_buffer.mapping);
+    state->bt_acl_in_transfer_pending = true;
+    dma_sync_for_device(&state->bt_acl_in_ring.mapping);
+    dma_sync_for_device(&state->bt_acl_in_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
 }
 
-static bool xhci_queue_bt_acl_in(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_queue_bt_acl_in_device(
-            state,
-            &state->device);
-}
-
-static bool xhci_queue_bt_acl_out_device(
-    xhci_state_t *state,
-    xhci_device_context_t *device,
-    size_t length) {
-    if(device == 0 ||
-       device->device_slot == 0U)
-    {
-        return false;
-    }
-
-
+static bool xhci_queue_bt_acl_out(xhci_state_t *state, size_t length) {
     xhci_trb_t *ring;
     uint32_t endpoint_id;
     uint32_t index;
-    if (state == 0 || device->bt_acl_out_endpoint == 0U ||
-        device->bt_acl_out_ring.cpu == 0 || device->bt_acl_out_buffer.cpu == 0 ||
-        device->bt_acl_out_buffer.mapping.device == 0 || length == 0U ||
-        length > PAGE_SIZE || device->bt_acl_out_buffer.mapping.segment_count == 0U) {
+    if (state == 0 || state->bt_acl_out_endpoint == 0U ||
+        state->bt_acl_out_ring.cpu == 0 || state->bt_acl_out_buffer.cpu == 0 ||
+        state->bt_acl_out_buffer.mapping.device == 0 || length == 0U ||
+        length > PAGE_SIZE || state->bt_acl_out_buffer.mapping.segment_count == 0U) {
         return false;
     }
-    endpoint_id = (uint32_t)device->bt_acl_out_endpoint * 2U;
-    index = device->bt_acl_out_enqueue;
+    endpoint_id = (uint32_t)state->bt_acl_out_endpoint * 2U;
+    index = state->bt_acl_out_enqueue;
     if (endpoint_id > 31U || index >= XHCI_RING_TRB_COUNT - 1U) return false;
-    ring = (xhci_trb_t *)device->bt_acl_out_ring.cpu;
-    ring[index].parameter = xhci_dma_address(&device->bt_acl_out_buffer.mapping);
+    ring = (xhci_trb_t *)state->bt_acl_out_ring.cpu;
+    ring[index].parameter = xhci_dma_address(&state->bt_acl_out_buffer.mapping);
     ring[index].status = (uint32_t)length;
     ring[index].control = (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-                          XHCI_TRB_INTERRUPT_ON_COMPLETION | device->bt_acl_out_cycle;
+                          XHCI_TRB_INTERRUPT_ON_COMPLETION | state->bt_acl_out_cycle;
     ++index;
     if (index == XHCI_RING_TRB_COUNT - 1U) {
         ring[XHCI_RING_TRB_COUNT - 1U].control =
             (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
-            device->bt_acl_out_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
-        device->bt_acl_out_enqueue = 0U;
-        device->bt_acl_out_cycle ^= 1U;
+            state->bt_acl_out_cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        state->bt_acl_out_enqueue = 0U;
+        state->bt_acl_out_cycle ^= 1U;
     } else {
-        device->bt_acl_out_enqueue = index;
+        state->bt_acl_out_enqueue = index;
     }
-    device->bt_acl_out_transfer_pending = true;
-    dma_sync_for_device(&device->bt_acl_out_ring.mapping);
-    dma_sync_for_device(&device->bt_acl_out_buffer.mapping);
+    state->bt_acl_out_transfer_pending = true;
+    dma_sync_for_device(&state->bt_acl_out_ring.mapping);
+    dma_sync_for_device(&state->bt_acl_out_buffer.mapping);
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
-                           (uint32_t)device->device_slot * sizeof(uint32_t)) = endpoint_id;
+                           (uint32_t)state->device_slot * sizeof(uint32_t)) = endpoint_id;
     __asm__ volatile ("mfence" : : : "memory");
     return true;
-}
-
-static bool xhci_queue_bt_acl_out(
-    xhci_state_t *state,
-    size_t length)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return
-        xhci_queue_bt_acl_out_device(
-            state,
-            &state->device,
-            length);
 }
 
 /*
@@ -5675,7 +5714,8 @@ static kstatus_t xhci_bt_send_current(
 
 
     return
-        xhci_submit_control_transfer_device(state, &state->device,
+        xhci_submit_control_transfer(
+            state,
             setup,
             (uint32_t)(
                 length - 1U),
@@ -6486,7 +6526,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         return false;
     } while (0);
     }
-    if (!xhci_submit_control_transfer_device(state, &state->device,  get_device_descriptor,
+    if (!xhci_submit_control_transfer(state, get_device_descriptor,
                                       XHCI_DESCRIPTOR_DEVICE_LENGTH, true)) {
         do {
         xhci_unpublish_slot_device(
@@ -6509,7 +6549,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     } while (0);
     }
     g_xhci_usb_enumerated = true;
-    if (!xhci_submit_control_transfer_device(state, &state->device,  get_configuration_descriptor,
+    if (!xhci_submit_control_transfer(state, get_configuration_descriptor,
                                       0xFFU, true) ||
         !xhci_parse_configuration(state)) {
         g_xhci_error = 57U;
@@ -6524,7 +6564,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     set_configuration[0] = 0x00U;
     set_configuration[1] = XHCI_SETUP_SET_CONFIGURATION;
     set_configuration[2] = state->configuration_value;
-    if (!xhci_submit_control_transfer_device(state, &state->device,  set_configuration, 0U, false)) {
+    if (!xhci_submit_control_transfer(state, set_configuration, 0U, false)) {
         g_xhci_error = 58U;
         do {
         xhci_unpublish_slot_device(
@@ -6575,7 +6615,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         set_interface[1] = XHCI_SETUP_SET_INTERFACE;
         set_interface[2] = state->audio_alt_setting;
         set_interface[4] = state->audio_interface;
-        if (!xhci_submit_control_transfer_device(state, &state->device,  set_interface, 0U, false)) {
+        if (!xhci_submit_control_transfer(state, set_interface, 0U, false)) {
             g_xhci_error = 59U;
             do {
         xhci_unpublish_slot_device(
@@ -6593,7 +6633,7 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         };
         /* A Boot-subclass interface may currently be in report protocol.
          * Select Boot protocol before arming its fixed-format interrupt TRB. */
-        if (!xhci_submit_control_transfer_device(state, &state->device,  set_protocol, 0U, false)) {
+        if (!xhci_submit_control_transfer(state, set_protocol, 0U, false)) {
             g_xhci_error = 59U;
             do {
         xhci_unpublish_slot_device(
@@ -6744,10 +6784,6 @@ bool xhci_hardware_present(void) {
 }
 
 bool xhci_hardware_self_test(void) {
-    /* V3.10.3D1 SELF TEST ACTIVATION INLINED
-     * No self-test activation helper remained after V3.10.3C.
-     */
-
     const pci_host_t *host = pci_current_host();
     const pci_device_t *pci = host == 0 ? 0 : pci_find_class(host,
         XHCI_CLASS_SERIAL_BUS, XHCI_SUBCLASS_USB, XHCI_PROG_IF);
@@ -7071,15 +7107,6 @@ xhci_audio_context_commit(
  * Adapt an inactive canonical Slot context to that old ABI only
  * for the duration of the doorbell operation.
  */
-/*
- * V3.10.4B DIRECT AUDIO OWNER
- *
- * Published Audio runtime state lives permanently in the supplied
- * device context.
- *
- * No Slot.context -> state->device -> Slot.context adaptation is
- * required for queue submission anymore.
- */
 static bool
 xhci_queue_audio_owner(
     xhci_state_t *state,
@@ -7093,10 +7120,51 @@ xhci_queue_audio_owner(
     }
 
 
-    return
-        xhci_queue_audio_transfer_device(
-            state,
-            device);
+    if(device ==
+       &state->device)
+    {
+        return
+            xhci_queue_audio_transfer(
+                state);
+    }
+
+
+    xhci_device_context_t saved_active;
+
+
+    xhci_copy_device_context(
+        &saved_active,
+        &state->device);
+
+
+    xhci_copy_device_context(
+        &state->device,
+        device);
+
+
+    bool success =
+        xhci_queue_audio_transfer(
+            state);
+
+
+    /*
+     * Queue operation updates enqueue/cycle/pending state.
+     */
+    xhci_copy_device_context(
+        device,
+        &state->device);
+
+
+    xhci_zero_device_context(
+        &state->device);
+
+
+    xhci_copy_device_context(
+        &state->device,
+        &saved_active);
+
+
+    return success;
 }
 
 
