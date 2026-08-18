@@ -2860,7 +2860,15 @@ static bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
  *          v
  *     publish Slot.context
  */
-
+/*
+ * V3.10.6B9E-DIAG1 REENUM FAILURE STAGES
+ *
+ * 661 = invalid root port
+ * 662 = supplied Slot.context is not canonical
+ * 663 = state->device unexpectedly occupied
+ * 664 = published subtree teardown failed
+ * 665 = physical root port lost CCS after teardown
+ */
 static bool xhci_reenumerate_self_test(
     xhci_state_t *state,
     xhci_device_context_t *device)
@@ -2900,7 +2908,7 @@ static bool xhci_reenumerate_self_test(
        port > state->max_ports)
     {
         g_xhci_error =
-            66U;
+            661U;
 
         return false;
     }
@@ -2928,7 +2936,7 @@ static bool xhci_reenumerate_self_test(
            old_slot)
     {
         g_xhci_error =
-            66U;
+            662U;
 
         return false;
     }
@@ -2941,7 +2949,7 @@ static bool xhci_reenumerate_self_test(
     if(state->device.device_slot != 0U)
     {
         g_xhci_error =
-            66U;
+            663U;
 
         return false;
     }
@@ -2957,7 +2965,7 @@ static bool xhci_reenumerate_self_test(
            old_slot))
     {
         g_xhci_error =
-            66U;
+            664U;
 
         return false;
     }
@@ -2973,7 +2981,7 @@ static bool xhci_reenumerate_self_test(
        (portsc & XHCI_PORTSC_CCS) == 0U)
     {
         g_xhci_error =
-            66U;
+            665U;
 
         return false;
     }
@@ -5471,14 +5479,19 @@ static bool xhci_queue_bt_event_device(
  *
  * V3.10.5A does not migrate callers yet.
  */
-/*
- * V3.10.6B9F BT WORKING WRAPPERS REMOVED
- *
- * Bluetooth enumeration now names state->device explicitly.
- * Runtime Bluetooth paths continue to resolve permanent Slot.context
- * from their Slot ID.
- */
+static bool xhci_queue_bt_event(
+    xhci_state_t *state)
+{
+    if(state == 0)
+    {
+        return false;
+    }
 
+    return
+        xhci_queue_bt_event_device(
+            state,
+            &state->device);
+}
 
 static bool xhci_queue_bt_acl_in_device(
     xhci_state_t *state,
@@ -5525,7 +5538,19 @@ static bool xhci_queue_bt_acl_in_device(
     return true;
 }
 
+static bool xhci_queue_bt_acl_in(
+    xhci_state_t *state)
+{
+    if(state == 0)
+    {
+        return false;
+    }
 
+    return
+        xhci_queue_bt_acl_in_device(
+            state,
+            &state->device);
+}
 
 static bool xhci_queue_bt_acl_out_device(
     xhci_state_t *state,
@@ -5854,12 +5879,8 @@ static bool xhci_configure_bt_endpoints(xhci_state_t *state) {
             transport,
             &state->bt_controller) != K_OK ||
         bt_controller_start(state->bt_controller) != K_OK ||
-        !xhci_queue_bt_event_device(
-            state,
-            &state->device) ||
-        (acl_in_id != 0U && !xhci_queue_bt_acl_in_device(
-            state,
-            &state->device))) return false;
+        !xhci_queue_bt_event(state) ||
+        (acl_in_id != 0U && !xhci_queue_bt_acl_in(state))) return false;
     return true;
 }
 
