@@ -5393,11 +5393,21 @@ static bool xhci_queue_bt_acl_out_device(
     return true;
 }
 
+static bool xhci_queue_bt_acl_out(
+    xhci_state_t *state,
+    size_t length)
+{
+    if(state == 0)
+    {
+        return false;
+    }
 
-/*
- * V3.10.6B7B BT ACL-OUT WRAPPER REMOVED
- */
-
+    return
+        xhci_queue_bt_acl_out_device(
+            state,
+            &state->device,
+            length);
+}
 
 /*
  * Send using the context currently installed in state->device.
@@ -5405,14 +5415,8 @@ static bool xhci_queue_bt_acl_out_device(
  * The public Bluetooth callback below resolves Slot ID first and
  * temporarily installs the owning context when necessary.
  */
-/*
- * V3.10.6B7B EXPLICIT BT SEND CORE
- *
- * All Bluetooth TX state belongs to the supplied device context.
- */
-static kstatus_t xhci_bt_send_device(
+static kstatus_t xhci_bt_send_current(
     xhci_state_t *state,
-    xhci_device_context_t *device,
     const uint8_t *packet,
     size_t length)
 {
@@ -5427,10 +5431,8 @@ static kstatus_t xhci_bt_send_device(
         0x00U
     };
 
+
     if(state == 0 ||
-       device == 0 ||
-       device->device_slot == 0U ||
-       device->bt_controller == 0 ||
        packet == 0 ||
        length < 4U ||
        length - 1U > PAGE_SIZE)
@@ -5438,58 +5440,67 @@ static kstatus_t xhci_bt_send_device(
         return K_EINVAL;
     }
 
+
     /*
-     * HCI ACL packet -> USB Bulk OUT.
+     * HCI ACL packet.
      */
     if(packet[0] == 0x02U)
     {
-        if(device->bt_acl_out_endpoint == 0U ||
-           device->bt_acl_out_transfer_pending ||
-           device->bt_acl_out_buffer.cpu == 0 ||
+        if(state->bt_acl_out_endpoint == 0U ||
+           state->bt_acl_out_transfer_pending ||
+           state->bt_acl_out_buffer.cpu == 0 ||
            length - 1U > PAGE_SIZE)
         {
             return K_EBUSY;
         }
+
 
         for(size_t i = 1U;
             i < length;
             ++i)
         {
             ((uint8_t *)
-                device->
+                state->
                     bt_acl_out_buffer.cpu)
                 [i - 1U] =
                     packet[i];
         }
 
+
         return
-            xhci_queue_bt_acl_out_device(
+            xhci_queue_bt_acl_out(
                 state,
-                device,
                 length - 1U)
             ? K_OK
             : K_EIO;
     }
 
+
     /*
-     * HCI Command packet -> USB class control transfer.
+     * HCI Command packet.
      */
     if(packet[0] != 0x01U ||
-       device->descriptor_buffer.cpu == 0)
+       state->descriptor_buffer.cpu == 0)
     {
         return K_EINVAL;
     }
 
+
+    /*
+     * USB Bluetooth control transfer carries the HCI command
+     * without the packet-type byte.
+     */
     for(size_t i = 1U;
         i < length;
         ++i)
     {
         ((uint8_t *)
-            device->
+            state->
                 descriptor_buffer.cpu)
             [i - 1U] =
                 packet[i];
     }
+
 
     setup[6] =
         (uint8_t)(
@@ -5501,14 +5512,14 @@ static kstatus_t xhci_bt_send_device(
             (length - 1U) >>
             8);
 
+
     dma_sync_for_device(
-        &device->
+        &state->
             descriptor_buffer.mapping);
 
+
     return
-        xhci_submit_control_transfer_device(
-            state,
-            device,
+        xhci_submit_control_transfer_device(state, &state->device,
             setup,
             (uint32_t)(
                 length - 1U),
@@ -5524,22 +5535,6 @@ static kstatus_t xhci_bt_send_device(
  * Bluetooth Core -> xHCI transmission is now routed by the Slot ID
  * permanently bound when bt_controller is created.
  */
-/*
- * V3.10.6B7B CANONICAL BT SEND
- *
- * Bluetooth transport is permanently bound to one hardware Slot:
- *
- *     transport->slot
- *           |
- *           v
- *      Slot.context
- *           |
- *           v
- *   xhci_bt_send_device()
- *
- * No inventory lookup.
- * No state->device activation.
- */
 static kstatus_t xhci_bt_send(
     void *context,
     const uint8_t *packet,
@@ -5548,6 +5543,7 @@ static kstatus_t xhci_bt_send(
     xhci_bt_transport_t *transport =
         (xhci_bt_transport_t *)context;
 
+
     if(transport == 0 ||
        transport->state == 0 ||
        transport->slot == 0U)
@@ -5555,31 +5551,148 @@ static kstatus_t xhci_bt_send(
         return K_EINVAL;
     }
 
+
     xhci_state_t *state =
         transport->state;
 
     uint8_t slot =
         transport->slot;
 
+
     xhci_slot_device_t *slot_dev =
         &g_xhci_slot_devices[
             slot];
 
+
     if(!slot_dev->used ||
        slot_dev->context.device_slot !=
+           slot)
+    {
+        return K_EIO;
+    }
+
+
+    /*
+     * Fast path:
+     *
+     * Bluetooth device is already the active xHCI context.
+     */
+    if(state->device.device_slot ==
+       slot)
+    {
+        kstatus_t status =
+            xhci_bt_send_current(
+                state,
+                packet,
+                length);
+
+
+        slot_dev->context =
+            state->device;
+
+
+        return status;
+    }
+
+
+    /*
+     * Inactive Bluetooth devices are currently stored in the
+     * compatibility inventory, but Slot Table knows the exact
+     * location.
+     */
+    if(!slot_dev->
+           runtime_in_inventory)
+    {
+        /*
+         * The device may temporarily be owned by topology
+         * reconciliation.  Do not accidentally send through
+         * another active Slot.
+         */
+        return K_EBUSY;
+    }
+
+
+    uint32_t index =
+        slot_dev->
+            inventory_index;
+
+
+    if(index >=
+       state->inventory_count)
+    {
+        return K_EIO;
+    }
+
+
+    xhci_inventory_entry_t *entry =
+        &state->inventory[
+            index];
+
+
+    if(!entry->valid ||
+       entry->context.device_slot !=
            slot ||
-       slot_dev->context.bt_controller ==
+       entry->context.bt_controller ==
            0)
     {
         return K_EIO;
     }
 
-    return
-        xhci_bt_send_device(
+
+    /*
+     * Existing control-transfer/doorbell helpers use state->device.
+     *
+     * Temporarily install only the context identified by this
+     * Bluetooth controller's permanent Slot binding.
+     */
+    xhci_device_context_t saved_active;
+
+
+    xhci_copy_device_context(
+        &saved_active,
+        &state->device);
+
+
+    xhci_copy_device_context(
+        &state->device,
+        &entry->context);
+
+
+    kstatus_t status =
+        xhci_bt_send_current(
             state,
-            &slot_dev->context,
             packet,
             length);
+
+
+    /*
+     * Producer state may have changed:
+     *
+     *     enqueue
+     *     cycle
+     *     transfer_pending
+     *
+     * Commit it back to its real owner.
+     */
+    slot_dev->context =
+        state->device;
+
+
+    xhci_copy_device_context(
+        &entry->context,
+        &state->device);
+
+
+    xhci_zero_device_context(
+        &state->device);
+
+
+    xhci_copy_device_context(
+        &state->device,
+        &saved_active);
+
+
+    return status;
 }
 
 
