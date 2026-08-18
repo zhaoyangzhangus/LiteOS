@@ -6632,15 +6632,15 @@ xhci_audio_context(
     /*
      * Active device can be tested without a Slot Table scan.
      */
-    /*
-     * V3.10.6B8E
-     *
-     * Audio UAPI never exposes state->device.
-     *
-     * state->device is unpublished enumeration working storage;
-     * runtime Audio state must already exist in Slot.context.
-     */
+    if(state->device.device_slot != 0U &&
+       state->device.audio_endpoint != 0U)
+    {
+        g_xhci_audio_slot =
+            state->device.device_slot;
 
+        return
+            &state->device;
+    }
 
 
     /*
@@ -6710,15 +6710,54 @@ xhci_audio_context(
  * inventory.context will be removed after all remaining legacy
  * inventory readers have been migrated.
  */
-/*
- * V3.10.6B8E AUDIO CANONICAL UAPI
- *
- * xhci_audio_context_commit() removed.
- *
- * Audio UAPI mutates the canonical Slot.context directly;
- * there is no secondary context to commit or synchronize.
- */
+static void
+xhci_audio_context_commit(
+    xhci_state_t *state,
+    xhci_device_context_t *device)
+{
+    if(state == 0 ||
+       device == 0 ||
+       device->device_slot == 0U)
+    {
+        return;
+    }
 
+
+    uint8_t slot =
+        device->device_slot;
+
+
+    xhci_slot_device_t *slot_dev =
+        &g_xhci_slot_devices[
+            slot];
+
+
+    if(!slot_dev->used)
+    {
+        return;
+    }
+
+
+    /*
+     * V3.10.6B8D
+     *
+     * No mirror commit is required:
+     *
+     * published Audio   -> device == Slot.context
+     * enumeration Audio -> state->device until publication
+     */
+
+
+
+
+    /*
+     * V3.10.6B8A
+     *
+     * inventory.context compatibility shadow removed from the
+     * Audio commit path. Slot.context is already canonical.
+     */
+
+}
 
 
 /*
@@ -6948,6 +6987,9 @@ xhci_audio_stream_configure(
         0U;
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7019,6 +7061,9 @@ xhci_audio_stream_start(
     }
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7081,6 +7126,9 @@ xhci_audio_stream_stop(
     }
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7199,6 +7247,9 @@ xhci_audio_stream_queue(
     }
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7262,6 +7313,9 @@ xhci_audio_stream_reset(
         0U;
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7326,6 +7380,9 @@ xhci_audio_stream_disconnect(
         true;
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();

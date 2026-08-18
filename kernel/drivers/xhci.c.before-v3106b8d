@@ -480,16 +480,35 @@ xhci_slot_context_owner(
  * Later, when Slot Table itself becomes the owner, this function
  * becomes unnecessary and can be removed.
  */
-/*
- * V3.10.6B8D SLOT CONTEXT MIRROR REMOVED
- *
- * xhci_slot_context_sync() removed.
- *
- * Published mutable state already lives directly in Slot.context.
- * Unpublished enumeration state remains in state->device until
- * xhci_publish_working_device().
- */
+static void
+xhci_slot_context_sync(
+    xhci_state_t *state,
+    uint8_t slot)
+{
+    if(slot == 0U)
+    {
+        return;
+    }
 
+
+    xhci_device_context_t *owner =
+        xhci_slot_context_owner(
+            state,
+            slot);
+
+
+    if(owner == 0 ||
+       owner->device_slot !=
+           slot)
+    {
+        return;
+    }
+
+
+    g_xhci_slot_devices[
+        slot].context =
+            *owner;
+}
 
 
 #undef XHCI_DEVICE_FIELDS
@@ -2467,9 +2486,10 @@ static void xhci_attach_device(xhci_state_t *state, uint8_t port) {
 /*
  * V3.9.2 ROOT PORT SLOT LOOKUP
  *
- * Root-port discovery is entirely Slot Table based.
+ * Despite the legacy function name, runtime root-port discovery is
+ * now entirely Slot Table based.
  */
-static bool xhci_slot_has_root_port(
+static bool xhci_inventory_has_root_port(
     const xhci_state_t *state,
     uint8_t port)
 {
@@ -2769,7 +2789,7 @@ static bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
         portsc == UINT32_MAX) return false;
     if ((portsc & XHCI_PORTSC_CCS) == 0U) {
         changed = xhci_remove_root_port_devices(state, port);
-    } else if (!xhci_slot_has_root_port(state, port)) {
+    } else if (!xhci_inventory_has_root_port(state, port)) {
         changed = xhci_attach_root_runtime_device(state, port);
     }
     uint32_t offset = state->operational_offset + XHCI_PORT_REGISTER_BASE +
@@ -3261,13 +3281,19 @@ static bool xhci_handle_hid_transfer_event(xhci_state_t *state,
         }
     }
         /*
-     * V3.10.6B8D
-     *
-     * device already is Slot.context for every published HID.
-     * An unpublished enumeration context remains state->device
-     * until explicit publication.
+     * Keep Slot Table mirror synchronized with the actual
+     * context after producer index/cycle/pending state changes.
      */
+    if(slot != 0U &&
+       g_xhci_slot_devices[slot].used)
+    {
+        g_xhci_slot_devices[slot].context =
+            *device;
+    }
 
+    xhci_slot_context_sync(
+        state,
+        slot);
 
 return true;
 }
@@ -6632,15 +6658,15 @@ xhci_audio_context(
     /*
      * Active device can be tested without a Slot Table scan.
      */
-    /*
-     * V3.10.6B8E
-     *
-     * Audio UAPI never exposes state->device.
-     *
-     * state->device is unpublished enumeration working storage;
-     * runtime Audio state must already exist in Slot.context.
-     */
+    if(state->device.device_slot != 0U &&
+       state->device.audio_endpoint != 0U)
+    {
+        g_xhci_audio_slot =
+            state->device.device_slot;
 
+        return
+            &state->device;
+    }
 
 
     /*
@@ -6710,15 +6736,52 @@ xhci_audio_context(
  * inventory.context will be removed after all remaining legacy
  * inventory readers have been migrated.
  */
-/*
- * V3.10.6B8E AUDIO CANONICAL UAPI
- *
- * xhci_audio_context_commit() removed.
- *
- * Audio UAPI mutates the canonical Slot.context directly;
- * there is no secondary context to commit or synchronize.
- */
+static void
+xhci_audio_context_commit(
+    xhci_state_t *state,
+    xhci_device_context_t *device)
+{
+    if(state == 0 ||
+       device == 0 ||
+       device->device_slot == 0U)
+    {
+        return;
+    }
 
+
+    uint8_t slot =
+        device->device_slot;
+
+
+    xhci_slot_device_t *slot_dev =
+        &g_xhci_slot_devices[
+            slot];
+
+
+    if(!slot_dev->used)
+    {
+        return;
+    }
+
+
+    if(device ==
+       &state->device)
+    {
+        xhci_slot_context_sync(
+            state,
+            slot);
+    }
+
+
+
+    /*
+     * V3.10.6B8A
+     *
+     * inventory.context compatibility shadow removed from the
+     * Audio commit path. Slot.context is already canonical.
+     */
+
+}
 
 
 /*
@@ -6948,6 +7011,9 @@ xhci_audio_stream_configure(
         0U;
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7019,6 +7085,9 @@ xhci_audio_stream_start(
     }
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7081,6 +7150,9 @@ xhci_audio_stream_stop(
     }
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7199,6 +7271,9 @@ xhci_audio_stream_queue(
     }
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7262,6 +7337,9 @@ xhci_audio_stream_reset(
         0U;
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
@@ -7326,6 +7404,9 @@ xhci_audio_stream_disconnect(
         true;
 
 
+    xhci_audio_context_commit(
+        &g_xhci,
+        device);
 
 
     xhci_audio_unlock();
