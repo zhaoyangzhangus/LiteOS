@@ -584,13 +584,21 @@ static void xhci_clear_device_flags(void) {
     g_xhci_usb_bluetooth = false;
 }
 
-/*
- * V3.10.6B9C-FIX1
- *
- * xhci_set_device_kind() removed.
- * Published runtime state is recomputed from Slot Table.
- */
-
+static void xhci_set_device_kind(uint8_t kind) {
+    xhci_clear_device_flags();
+    if (kind != 0U) g_xhci_usb_enumerated = true;
+    if (kind == 1U) {
+        g_xhci_usb_hid = true;
+        g_xhci_usb_mouse = g_xhci.device.hid_protocol == USB_HID_PROTOCOL_MOUSE;
+    } else if (kind == 2U) {
+        g_xhci_usb_audio = true;
+    } else if (kind == 3U) {
+        g_xhci_usb_bluetooth = true;
+    } else if (kind == 4U) {
+        g_xhci_usb_hub = true;
+        g_xhci_usb_hub_ports = g_xhci.device.hub_port_count;
+    }
+}
 
 static uint64_t xhci_dma_address(const dma_mapping_t *mapping) {
     return mapping != 0 && mapping->segment_count != 0 ?
@@ -1357,22 +1365,6 @@ static bool xhci_release_device_context(
  * Published Slot.context is destroyed in place.
  * state->device remains untouched unless it is itself the target.
  */
-/*
- * V3.10.6B9C PURE PUBLISHED SLOT RELEASE
- *
- * This function owns one published hardware Slot only:
- *
- *     Slot ID
- *        |
- *        v
- *   Slot.context
- *        |
- *        v
- * xhci_release_device_context()
- *
- * state->device is a separate unpublished enumeration lifetime and
- * is intentionally invisible here.
- */
 static bool xhci_release_slot_device(
     xhci_state_t *state,
     uint8_t slot)
@@ -1383,24 +1375,80 @@ static bool xhci_release_slot_device(
         return false;
     }
 
-
     xhci_slot_device_t *slot_dev =
         &g_xhci_slot_devices[
             slot];
 
-
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot)
+    if(!slot_dev->used)
     {
         return false;
     }
 
+    /*
+     * Unpublished working-context fast path.
+     */
+    if(state->device.device_slot ==
+       slot)
+    {
+        return
+            xhci_release_active_device(
+                state);
+    }
 
-    return
+    /*
+     * Published device must have a valid canonical context.
+     */
+    if(slot_dev->context.device_slot !=
+       slot)
+    {
+        return false;
+    }
+
+    /*
+     * Working-context global flags are independent from the device
+     * context itself. Preserve their meaning if another unpublished
+     * working device happens to exist.
+     */
+    bool had_active =
+        state->device.device_slot !=
+        0U;
+
+    uint8_t saved_kind =
+        0U;
+
+    if(had_active)
+    {
+        saved_kind =
+            xhci_context_kind(
+                &state->device);
+    }
+
+    uint8_t release_kind =
+        xhci_context_kind(
+            &slot_dev->context);
+
+    xhci_set_device_kind(
+        release_kind);
+
+    bool released =
         xhci_release_device_context(
             state,
             &slot_dev->context);
+
+    /*
+     * release_device_context() deliberately does not own global
+     * current-kind state.
+     */
+    xhci_clear_device_flags();
+
+    if(had_active &&
+       saved_kind != 0U)
+    {
+        xhci_set_device_kind(
+            saved_kind);
+    }
+
+    return released;
 }
 
 
@@ -1481,19 +1529,42 @@ static bool xhci_free_slot_resources(
      */
     if(state->device.device_slot != 0U)
     {
-        /*
-         * V3.10.6B9B WORKING CONTEXT TEARDOWN
-         *
-         * Slot.used may already be true during enumeration before
-         * Slot.context has been published.
-         *
-         * Therefore state->device always owns its own teardown path.
-         */
-        if(!xhci_release_active_device(
-               state))
+        uint8_t active_slot =
+            state->device.device_slot;
+
+
+        if(g_xhci_slot_devices[
+               active_slot].used)
         {
-            released =
-                false;
+            if(!xhci_release_slot_device(
+                    state,
+                    active_slot))
+            {
+                released =
+                    false;
+            }
+        }
+        else
+        {
+            /*
+             * Partial enumeration / failure path:
+             *
+             * no published Slot lifetime exists, therefore there
+             * is nothing to Disable/Unpublish.  Only release DMA
+             * owned by the temporary working context.
+             */
+            if(!xhci_free_device_resources(
+                    state))
+            {
+                released =
+                    false;
+            }
+
+
+            xhci_zero_device_context(
+                &state->device);
+
+            xhci_clear_device_flags();
         }
     }
 

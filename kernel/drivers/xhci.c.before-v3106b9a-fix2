@@ -460,6 +460,8 @@ static bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
 static bool xhci_reconcile_hub_topology(xhci_state_t *state);
 static bool xhci_remove_device_subtree(
     xhci_state_t *state,
+    xhci_device_context_t *saved_active,
+    uint8_t *saved_kind,
     uint8_t slot);
 static void xhci_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
                               void *context);
@@ -584,13 +586,21 @@ static void xhci_clear_device_flags(void) {
     g_xhci_usb_bluetooth = false;
 }
 
-/*
- * V3.10.6B9C-FIX1
- *
- * xhci_set_device_kind() removed.
- * Published runtime state is recomputed from Slot Table.
- */
-
+static void xhci_set_device_kind(uint8_t kind) {
+    xhci_clear_device_flags();
+    if (kind != 0U) g_xhci_usb_enumerated = true;
+    if (kind == 1U) {
+        g_xhci_usb_hid = true;
+        g_xhci_usb_mouse = g_xhci.device.hid_protocol == USB_HID_PROTOCOL_MOUSE;
+    } else if (kind == 2U) {
+        g_xhci_usb_audio = true;
+    } else if (kind == 3U) {
+        g_xhci_usb_bluetooth = true;
+    } else if (kind == 4U) {
+        g_xhci_usb_hub = true;
+        g_xhci_usb_hub_ports = g_xhci.device.hub_port_count;
+    }
+}
 
 static uint64_t xhci_dma_address(const dma_mapping_t *mapping) {
     return mapping != 0 && mapping->segment_count != 0 ?
@@ -1357,22 +1367,6 @@ static bool xhci_release_device_context(
  * Published Slot.context is destroyed in place.
  * state->device remains untouched unless it is itself the target.
  */
-/*
- * V3.10.6B9C PURE PUBLISHED SLOT RELEASE
- *
- * This function owns one published hardware Slot only:
- *
- *     Slot ID
- *        |
- *        v
- *   Slot.context
- *        |
- *        v
- * xhci_release_device_context()
- *
- * state->device is a separate unpublished enumeration lifetime and
- * is intentionally invisible here.
- */
 static bool xhci_release_slot_device(
     xhci_state_t *state,
     uint8_t slot)
@@ -1383,24 +1377,80 @@ static bool xhci_release_slot_device(
         return false;
     }
 
-
     xhci_slot_device_t *slot_dev =
         &g_xhci_slot_devices[
             slot];
 
-
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot)
+    if(!slot_dev->used)
     {
         return false;
     }
 
+    /*
+     * Unpublished working-context fast path.
+     */
+    if(state->device.device_slot ==
+       slot)
+    {
+        return
+            xhci_release_active_device(
+                state);
+    }
 
-    return
+    /*
+     * Published device must have a valid canonical context.
+     */
+    if(slot_dev->context.device_slot !=
+       slot)
+    {
+        return false;
+    }
+
+    /*
+     * Working-context global flags are independent from the device
+     * context itself. Preserve their meaning if another unpublished
+     * working device happens to exist.
+     */
+    bool had_active =
+        state->device.device_slot !=
+        0U;
+
+    uint8_t saved_kind =
+        0U;
+
+    if(had_active)
+    {
+        saved_kind =
+            xhci_context_kind(
+                &state->device);
+    }
+
+    uint8_t release_kind =
+        xhci_context_kind(
+            &slot_dev->context);
+
+    xhci_set_device_kind(
+        release_kind);
+
+    bool released =
         xhci_release_device_context(
             state,
             &slot_dev->context);
+
+    /*
+     * release_device_context() deliberately does not own global
+     * current-kind state.
+     */
+    xhci_clear_device_flags();
+
+    if(had_active &&
+       saved_kind != 0U)
+    {
+        xhci_set_device_kind(
+            saved_kind);
+    }
+
+    return released;
 }
 
 
@@ -1481,19 +1531,42 @@ static bool xhci_free_slot_resources(
      */
     if(state->device.device_slot != 0U)
     {
-        /*
-         * V3.10.6B9B WORKING CONTEXT TEARDOWN
-         *
-         * Slot.used may already be true during enumeration before
-         * Slot.context has been published.
-         *
-         * Therefore state->device always owns its own teardown path.
-         */
-        if(!xhci_release_active_device(
-               state))
+        uint8_t active_slot =
+            state->device.device_slot;
+
+
+        if(g_xhci_slot_devices[
+               active_slot].used)
         {
-            released =
-                false;
+            if(!xhci_release_slot_device(
+                    state,
+                    active_slot))
+            {
+                released =
+                    false;
+            }
+        }
+        else
+        {
+            /*
+             * Partial enumeration / failure path:
+             *
+             * no published Slot lifetime exists, therefore there
+             * is nothing to Disable/Unpublish.  Only release DMA
+             * owned by the temporary working context.
+             */
+            if(!xhci_free_device_resources(
+                    state))
+            {
+                released =
+                    false;
+            }
+
+
+            xhci_zero_device_context(
+                &state->device);
+
+            xhci_clear_device_flags();
         }
     }
 
@@ -2407,13 +2480,20 @@ static bool xhci_remove_root_port_devices(
         }
 
 
+        xhci_device_context_t saved_active;
+
+        uint8_t saved_kind =
+            0U;
 
 
-
+        xhci_zero_device_context(
+            &saved_active);
 
 
         if(xhci_remove_device_subtree(
                state,
+               &saved_active,
+               &saved_kind,
                (uint8_t)slot))
         {
             changed =
@@ -4214,28 +4294,19 @@ static bool xhci_probe_hub_downstream(
  *
  * Runtime inventory access: none.
  */
-/*
- * V3.10.6B9A SLOT-ONLY SUBTREE TEARDOWN
- *
- * Published device-tree destruction is entirely Slot-ID based.
- *
- *     parent Slot
- *         |
- *         +-- child_slots[]
- *         |
- *         v
- *     children first
- *         |
- *         v
- * xhci_release_slot_device()
- *
- * No saved context side channel exists.
- */
 static bool xhci_remove_device_subtree(
     xhci_state_t *state,
+    xhci_device_context_t *saved_active,
+    uint8_t *saved_kind,
     uint8_t slot)
 {
+    bool removed =
+        false;
+
+
     if(state == 0 ||
+       saved_active == 0 ||
+       saved_kind == 0 ||
        slot == 0U)
     {
         return false;
@@ -4247,23 +4318,18 @@ static bool xhci_remove_device_subtree(
             slot];
 
 
-    if(!slot_dev->used ||
-       slot_dev->context.device_slot !=
-           slot)
+    if(!slot_dev->used)
     {
         return false;
     }
 
 
-    bool removed =
-        false;
-
     uint8_t children[16];
 
 
     /*
-     * Child teardown unlinks itself from the parent, so snapshot
-     * the child Slot IDs before recursive destruction.
+     * Snapshot before recursion because child teardown unlinks
+     * itself from the parent's child_slots[] array.
      */
     for(uint32_t port = 0U;
         port < 16U;
@@ -4275,6 +4341,9 @@ static bool xhci_remove_device_subtree(
     }
 
 
+    /*
+     * Children first.
+     */
     for(uint32_t port = 0U;
         port < 16U;
         ++port)
@@ -4292,6 +4361,8 @@ static bool xhci_remove_device_subtree(
 
         if(xhci_remove_device_subtree(
                state,
+               saved_active,
+               saved_kind,
                child))
         {
             removed =
@@ -4300,6 +4371,63 @@ static bool xhci_remove_device_subtree(
     }
 
 
+    /*
+     * Reconciliation temporarily keeps the old active device in
+     * saved_active rather than state->device/Slot.context.
+     */
+    if(saved_active->device_slot ==
+       slot)
+    {
+        /*
+         * V3.10.6B6C SAVED CONTEXT TEARDOWN
+         *
+         * Reconciliation parked this exact working context in
+         * saved_active. Destroy it there; never reinstall it into
+         * state->device.
+         */
+        uint8_t kind =
+            *saved_kind;
+
+        xhci_set_device_kind(
+            kind != 0U
+                ? kind
+                : xhci_context_kind(
+                    saved_active));
+
+        if(xhci_release_device_context(
+               state,
+               saved_active))
+        {
+            removed =
+                true;
+        }
+
+        /*
+         * xhci_free_device_resources_device() normally clears the
+         * context. Force the shadow empty even if a partial DMA free
+         * reported failure.
+         */
+        xhci_zero_device_context(
+            saved_active);
+
+        xhci_clear_device_flags();
+
+        *saved_kind =
+            0U;
+
+        return removed;
+    }
+
+
+    /*
+     * Every normally published device can now be destroyed
+     * directly by Slot ID.
+     *
+     * This handles both:
+     *
+     *   state->device
+     *   Slot.context
+     */
     if(xhci_release_slot_device(
            state,
            slot))
@@ -4519,14 +4647,17 @@ xhci_remove_slot_tree(
  */
 static bool xhci_reconcile_one_hub(
     xhci_state_t *state,
-    xhci_device_context_t *hub)
+    xhci_device_context_t *hub,
+    xhci_device_context_t *saved_active,
+    uint8_t *saved_kind)
 {
     bool changed =
         false;
 
     if(state == 0 ||
        hub == 0 ||
-
+       saved_active == 0 ||
+       saved_kind == 0 ||
        hub->device_slot == 0U ||
        hub->hub_port_count == 0U)
     {
@@ -4585,6 +4716,8 @@ static bool xhci_reconcile_one_hub(
                child_slot != 0U &&
                xhci_remove_device_subtree(
                    state,
+                   saved_active,
+                   saved_kind,
                    child_slot))
             {
                 changed =
@@ -4755,7 +4888,10 @@ static bool xhci_reconcile_one_hub(
 static bool xhci_reconcile_hub_topology(
     xhci_state_t *state)
 {
+    xhci_device_context_t saved_active;
 
+    uint8_t saved_kind =
+        0U;
 
     bool changed =
         false;
@@ -4794,7 +4930,11 @@ static bool xhci_reconcile_hub_topology(
         return false;
     }
 
+    xhci_zero_device_context(
+        &saved_active);
 
+    saved_kind =
+        0U;
 
     xhci_clear_device_flags();
 
@@ -4893,7 +5033,9 @@ static bool xhci_reconcile_hub_topology(
 
             if(xhci_reconcile_one_hub(
                     state,
-                    hub))
+                    hub,
+                    &saved_active,
+                    &saved_kind))
             {
                 changed =
                     true;
