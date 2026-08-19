@@ -1,0 +1,203 @@
+diff --git a/kernel/drivers/xhci.c b/kernel/drivers/xhci.c
+index 87cb66d92058744e1f2746400ae80c67cf425d35..53d0c672abeb8a0b622431ecdb8676ccf1d8eef2 100644
+--- a/kernel/drivers/xhci.c
++++ b/kernel/drivers/xhci.c
+@@ -2863,6 +2863,34 @@ static bool xhci_publish_working_device(
+             : 0U;
+ 
+ 
++    /*
++     * Publish the parent -> child cache edge only after Slot.context
++     * owns the device permanently.
++     *
++     * parent_slot/parent_port in Slot Table remains canonical;
++     * child_slots[] is only an acceleration cache.
++     */
++    if(slot_dev->parent_slot != 0U &&
++       slot_dev->parent_port != 0U &&
++       slot_dev->parent_port <= 16U)
++    {
++        xhci_slot_device_t *parent =
++            &g_xhci_slot_devices[
++                slot_dev->parent_slot];
++
++
++        if(parent->used &&
++           parent->is_hub &&
++           parent->context.device_slot ==
++               slot_dev->parent_slot)
++        {
++            parent->child_slots[
++                slot_dev->parent_port - 1U] =
++                slot;
++        }
++    }
++
++
+     /*
+      * Published devices require no secondary context locator.
+      */
+@@ -5101,74 +5129,100 @@ static bool xhci_find_hub_child(
+ 
+ 
+     if(!parent->used ||
+-       !parent->is_hub)
++       !parent->is_hub ||
++       parent->context.device_slot !=
++           parent_slot)
+     {
+         return false;
+     }
+ 
+ 
++    /*
++     * Fast path:
++     *
++     * child_slots[] is a topology cache only.  Validate both the
++     * published Slot identity and the reverse parent relation before
++     * accepting it.
++     */
+     uint8_t slot =
+         parent->child_slots[
+             parent_port - 1U];
+ 
+ 
+-    if(slot == 0U)
++    if(slot != 0U)
+     {
+-        return false;
+-    }
++        xhci_slot_device_t *child =
++            &g_xhci_slot_devices[
++                slot];
+ 
+ 
+-    xhci_slot_device_t *child =
+-        &g_xhci_slot_devices[
+-            slot];
++        if(child->used &&
++           child->context.device_slot ==
++               slot &&
++           child->parent_slot ==
++               parent_slot &&
++           child->parent_port ==
++               parent_port)
++        {
++            *child_slot =
++                slot;
++
++            return true;
++        }
+ 
+ 
+-    if(!child->used)
+-    {
+         /*
+-         * Repair stale parent topology while we are here.
++         * Stale cache entry.  Drop only the cache; the canonical
++         * Slot Table remains untouched.
+          */
+         parent->child_slots[
+             parent_port - 1U] =
+             0U;
+-
+-        return false;
+     }
+ 
+ 
+     /*
+-     * Verify the reverse topology relation too.
++     * Recovery path:
+      *
+-     * Slot reuse must never make an old child_slots[] entry
+-     * point at an unrelated device.
++     * Slot Table parent_slot/parent_port is canonical.  Scan all
++     * fully published Slots and rebuild child_slots[] if the cache
++     * was absent or stale.
+      */
+-    if(child->parent_slot !=
+-           parent_slot ||
+-       child->parent_port !=
+-           parent_port)
++    for(uint32_t candidate = 1U;
++        candidate < XHCI_MAX_SLOT_TABLE;
++        ++candidate)
+     {
+-        parent->child_slots[
+-            parent_port - 1U] =
+-            0U;
++        xhci_slot_device_t *child =
++            &g_xhci_slot_devices[
++                candidate];
+ 
+-        return false;
+-    }
+ 
++        if(!child->used ||
++           child->context.device_slot !=
++               (uint8_t)candidate)
++        {
++            continue;
++        }
+ 
+-    /*
+-     * Only fully published devices count.
+-     */
+-    if(child->context.device_slot !=
+-       slot)
+-    {
+-        return false;
+-    }
+ 
++        if(child->parent_slot ==
++               parent_slot &&
++           child->parent_port ==
++               parent_port)
++        {
++            parent->child_slots[
++                parent_port - 1U] =
++                (uint8_t)candidate;
+ 
+-    *child_slot =
+-        slot;
++            *child_slot =
++                (uint8_t)candidate;
+ 
+-    return true;
++            return true;
++        }
++    }
++
++
++    return false;
+ }
+ 
+ 
+@@ -6913,27 +6967,6 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
+     }
+ 
+ 
+-    /*
+-     * V3.4.2 parent child link
+-     *
+-     * Build the hardware Slot topology in software.
+-     */
+-    if(parent_slot != 0U &&
+-       parent_port != 0U &&
+-       parent_port <= 16U)
+-    {
+-        xhci_slot_device_t *parent_dev =
+-            &g_xhci_slot_devices[parent_slot];
+-
+-
+-        if(parent_dev->used)
+-        {
+-            parent_dev->child_slots[parent_port-1U] =
+-                slot;
+-        }
+-    }
+-
+-
+ return true;
+ }
+ 

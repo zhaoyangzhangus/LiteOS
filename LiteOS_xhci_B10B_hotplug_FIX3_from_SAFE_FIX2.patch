@@ -1,0 +1,447 @@
+diff --git a/kernel/drivers/xhci.c b/kernel/drivers/xhci.c
+index 53d0c672abeb8a0b622431ecdb8676ccf1d8eef2..8e1afce0c2a7d8e41380daa579fbb9223ff0f1ac 100644
+--- a/kernel/drivers/xhci.c
++++ b/kernel/drivers/xhci.c
+@@ -89,6 +89,7 @@
+ 
+ #define XHCI_SETUP_GET_DESCRIPTOR 6U
+ #define XHCI_SETUP_GET_STATUS     0U
++#define XHCI_SETUP_CLEAR_FEATURE  1U
+ #define XHCI_SETUP_SET_FEATURE    3U
+ #define XHCI_SETUP_SET_CONFIGURATION 9U
+ #define XHCI_SETUP_SET_INTERFACE 11U
+@@ -119,6 +120,17 @@
+ #define USB_TRANSFER_ISOCHRONOUS  0x01U
+ #define USB_HUB_FEATURE_PORT_RESET 4U
+ #define USB_HUB_FEATURE_PORT_POWER 8U
++#define USB_HUB_FEATURE_C_PORT_CONNECTION 16U
++#define USB_HUB_FEATURE_C_PORT_ENABLE 17U
++#define USB_HUB_FEATURE_C_PORT_SUSPEND 18U
++#define USB_HUB_FEATURE_C_PORT_OVER_CURRENT 19U
++#define USB_HUB_FEATURE_C_PORT_RESET 20U
++
++#define USB_HUB_PORT_CHANGE_CONNECTION (1U << 0)
++#define USB_HUB_PORT_CHANGE_ENABLE (1U << 1)
++#define USB_HUB_PORT_CHANGE_SUSPEND (1U << 2)
++#define USB_HUB_PORT_CHANGE_OVER_CURRENT (1U << 3)
++#define USB_HUB_PORT_CHANGE_RESET (1U << 4)
+ 
+ /*
+  * V3.10.6B10B2-FIX3 SLOT HUB AND TT SEMANTICS
+@@ -3575,9 +3587,11 @@ static bool xhci_handle_hub_transfer_event(
+         device->hub_change_bitmap |=
+             bitmap;
+ 
+-        (void)xhci_queue_hub_status_device(
+-            state,
+-            device);
++        /*
++         * Do not re-arm interrupt-IN until reconciliation has read and
++         * acknowledged wPortChange.  Re-arming while C_PORT_* is still
++         * asserted can immediately complete another stale status TRB.
++         */
+     }
+     else if(completion != 0U)
+     {
+@@ -3902,9 +3916,61 @@ static bool xhci_handle_audio_transfer_event(
+ 
+ 
+ 
++
++static void xhci_rearm_hub_interrupts(
++    xhci_state_t *state)
++{
++    if(state == 0 ||
++       !state->initialized)
++    {
++        return;
++    }
++
++
++    uint32_t limit =
++        state->max_slots;
++
++
++    if(limit >=
++       XHCI_MAX_SLOT_TABLE)
++    {
++        limit =
++            XHCI_MAX_SLOT_TABLE -
++            1U;
++    }
++
++
++    for(uint32_t slot = 1U;
++        slot <= limit;
++        ++slot)
++    {
++        xhci_slot_device_t *slot_dev =
++            &g_xhci_slot_devices[
++                slot];
++
++
++        if(!slot_dev->used ||
++           !slot_dev->is_hub ||
++           slot_dev->context.device_slot !=
++               (uint8_t)slot ||
++           slot_dev->context.hub_endpoint == 0U ||
++           slot_dev->context.hub_transfer_pending)
++        {
++            continue;
++        }
++
++
++        (void)xhci_queue_hub_status_device(
++            state,
++            &slot_dev->context);
++    }
++}
++
++
+ static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {
+     bool consumed = false;
+     bool topology_event = false;
++    bool hub_event = false;
+     if (state == 0 || !state->initialized) return false;
+     for (uint32_t i = 0U; i < budget; ++i) {
+         xhci_trb_t event;
+@@ -3926,6 +3992,7 @@ static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {
+         } else if (type == XHCI_TRANSFER_EVENT_TYPE &&
+                    xhci_handle_hub_transfer_event(state, &event)) {
+             topology_event = true;
++            hub_event = true;
+             consumed = true;
+         } else if (type == XHCI_TRANSFER_EVENT_TYPE &&
+                    xhci_handle_hid_transfer_event(state, &event)) {
+@@ -3943,6 +4010,17 @@ static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {
+      * is never sampled from the APIC timer or another periodic poll source. */
+     if (topology_event && g_xhci_usb_hub_present &&
+         xhci_reconcile_hub_topology(state)) consumed = true;
++
++    /*
++     * Hub interrupt-IN is re-armed only after port status/change
++     * reconciliation has finished.
++     */
++    if(hub_event)
++    {
++        xhci_rearm_hub_interrupts(
++            state);
++    }
++
+     return consumed;
+ }
+ 
+@@ -4621,6 +4699,184 @@ static bool xhci_hub_set_port_feature_device(
+ 
+ 
+ 
++
++/*
++ * V3.10.6B10B3 HUB PORT CHANGE ACK
++ *
++ * USB Hub interrupt-IN reports that one or more wPortChange bits are
++ * pending.  GET_STATUS does not acknowledge those bits: each asserted
++ * change bit must be cleared with the matching C_PORT_* feature.
++ *
++ * Keeping stale change bits asserted makes a Hub interrupt endpoint
++ * complete repeatedly and, on QEMU, can make the pre-detach wakeup race
++ * ahead of the actual CONNECTION status transition.
++ */
++static bool xhci_hub_clear_port_feature_device(
++    xhci_state_t *state,
++    xhci_device_context_t *device,
++    uint8_t port,
++    uint16_t feature)
++{
++    uint8_t request[8] = {
++        0x23U,
++        XHCI_SETUP_CLEAR_FEATURE,
++        (uint8_t)feature,
++        (uint8_t)(feature >> 8),
++        port,
++        0x00U,
++        0x00U,
++        0x00U,
++    };
++
++
++    if(state == 0 ||
++       device == 0 ||
++       device->device_slot == 0U ||
++       port == 0U)
++    {
++        return false;
++    }
++
++
++    return
++        xhci_submit_control_transfer_device(
++            state,
++            device,
++            request,
++            0U,
++            false);
++}
++
++
++static bool xhci_hub_ack_port_changes_device(
++    xhci_state_t *state,
++    xhci_device_context_t *device,
++    uint8_t port,
++    uint32_t status)
++{
++    uint16_t change =
++        (uint16_t)(
++            status >> 16);
++
++    bool ok =
++        true;
++
++
++    if((change &
++        USB_HUB_PORT_CHANGE_CONNECTION) != 0U &&
++       !xhci_hub_clear_port_feature_device(
++           state,
++           device,
++           port,
++           USB_HUB_FEATURE_C_PORT_CONNECTION))
++    {
++        ok =
++            false;
++    }
++
++
++    if((change &
++        USB_HUB_PORT_CHANGE_ENABLE) != 0U &&
++       !xhci_hub_clear_port_feature_device(
++           state,
++           device,
++           port,
++           USB_HUB_FEATURE_C_PORT_ENABLE))
++    {
++        ok =
++            false;
++    }
++
++
++    if((change &
++        USB_HUB_PORT_CHANGE_SUSPEND) != 0U &&
++       !xhci_hub_clear_port_feature_device(
++           state,
++           device,
++           port,
++           USB_HUB_FEATURE_C_PORT_SUSPEND))
++    {
++        ok =
++            false;
++    }
++
++
++    if((change &
++        USB_HUB_PORT_CHANGE_OVER_CURRENT) != 0U &&
++       !xhci_hub_clear_port_feature_device(
++           state,
++           device,
++           port,
++           USB_HUB_FEATURE_C_PORT_OVER_CURRENT))
++    {
++        ok =
++            false;
++    }
++
++
++    if((change &
++        USB_HUB_PORT_CHANGE_RESET) != 0U &&
++       !xhci_hub_clear_port_feature_device(
++           state,
++           device,
++           port,
++           USB_HUB_FEATURE_C_PORT_RESET))
++    {
++        ok =
++            false;
++    }
++
++
++    return ok;
++}
++
++
++static bool xhci_hub_ack_all_port_changes_device(
++    xhci_state_t *state,
++    xhci_device_context_t *device)
++{
++    if(state == 0 ||
++       device == 0 ||
++       device->device_slot == 0U ||
++       device->hub_port_count == 0U)
++    {
++        return false;
++    }
++
++
++    bool ok =
++        true;
++
++
++    for(uint32_t port = 1U;
++        port <= device->hub_port_count;
++        ++port)
++    {
++        uint32_t status =
++            0U;
++
++
++        if(!xhci_hub_get_port_status_device(
++               state,
++               device,
++               (uint8_t)port,
++               &status) ||
++           !xhci_hub_ack_port_changes_device(
++               state,
++               device,
++               (uint8_t)port,
++               status))
++        {
++            ok =
++                false;
++        }
++    }
++
++
++    return ok;
++}
++
++
+ static uint8_t xhci_hub_port_speed(uint32_t status) {
+     if ((status & (1U << 10)) != 0U) return 3U;
+     if ((status & (1U << 9)) != 0U) return 2U;
+@@ -4786,8 +5042,25 @@ static bool xhci_probe_hub_downstream(
+                        state,
+                        hub,
+                        (uint8_t)port,
+-                       &status) ||
+-                   (status & 1U) == 0U)
++                       &status))
++                {
++                    continue;
++                }
++
++
++                /*
++                 * Initial probing is explicit and does not depend on the
++                 * Hub interrupt bitmap, so consume any attach/reset change
++                 * bits before runtime interrupt processing begins.
++                 */
++                (void)xhci_hub_ack_port_changes_device(
++                    state,
++                    hub,
++                    (uint8_t)port,
++                    status);
++
++
++                if((status & 1U) == 0U)
+                 {
+                     continue;
+                 }
+@@ -4860,6 +5133,18 @@ static bool xhci_probe_hub_downstream(
+                 }
+ 
+ 
++                /*
++                 * PORT_RESET may leave C_RESET/C_ENABLE asserted.
++                 * Clear those changes before the runtime Hub interrupt
++                 * endpoint is allowed to report topology changes.
++                 */
++                (void)xhci_hub_ack_port_changes_device(
++                    state,
++                    hub,
++                    (uint8_t)port,
++                    status);
++
++
+                 speed =
+                     xhci_hub_port_speed(
+                         status);
+@@ -5369,6 +5654,17 @@ static bool xhci_reconcile_one_hub(
+                 (uint8_t)port,
+                 &child_slot);
+ 
++        /*
++         * Acknowledge the snapshot we just consumed before any child
++         * teardown/re-enumeration.  Connection state is in wPortStatus
++         * and remains valid after C_PORT_* is cleared.
++         */
++        (void)xhci_hub_ack_port_changes_device(
++            state,
++            hub,
++            (uint8_t)port,
++            status);
++
+         /*
+          * Disconnect:
+          *
+@@ -5469,6 +5765,16 @@ static bool xhci_reconcile_one_hub(
+             continue;
+         }
+ 
++        /*
++         * PORT_RESET commonly raises C_RESET and C_ENABLE.
++         * Clear them before the Hub interrupt endpoint is re-armed.
++         */
++        (void)xhci_hub_ack_port_changes_device(
++            state,
++            hub,
++            (uint8_t)port,
++            status);
++
+         uint8_t speed =
+             xhci_hub_port_speed(
+                 status);
+@@ -5552,6 +5858,13 @@ static bool xhci_reconcile_one_hub(
+         }
+     }
+ 
++    /*
++     * Every interrupt-reported port has now been sampled and its
++     * wPortChange snapshot acknowledged.
++     */
++    hub->hub_change_bitmap =
++        0U;
++
+     /*
+      * No unpublished child context may escape reconciliation.
+      */
+@@ -6868,6 +7181,32 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
+             parent_port);
+         return false;
+     } while (0);
++
++        /*
++         * Establish a clean Hub change baseline before interrupt-IN is
++         * armed. Existing downstream devices are discovered explicitly by
++         * xhci_probe_hub_downstream(), so clearing their old C_CONNECTION
++         * state here cannot hide a device.
++         */
++        if(!xhci_hub_ack_all_port_changes_device(
++               state,
++               &state->device))
++        {
++            if(g_xhci_error == 0U)
++            {
++                g_xhci_error =
++                    68U;
++            }
++
++            do {
++        xhci_unpublish_slot_device(
++            slot,
++            parent_slot,
++            parent_port);
++        return false;
++    } while (0);
++        }
++
+         if (state->hub_endpoint != 0U && !xhci_configure_hub_endpoint(state)) {
+             if (g_xhci_error == 0U) g_xhci_error = 68U;
+             do {
