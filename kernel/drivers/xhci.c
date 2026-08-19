@@ -2100,20 +2100,6 @@ static bool xhci_queue_hub_status_device(xhci_state_t *state,
  * Compatibility wrapper for unpublished enumeration/setup paths.
  * Published Hub runtime events never use this wrapper.
  */
-static bool xhci_queue_hub_status(
-    xhci_state_t *state)
-{
-    if(state == 0)
-    {
-        return false;
-    }
-
-    return xhci_queue_hub_status_device(
-        state,
-        &state->device);
-}
-
-
 static bool xhci_configure_hub_endpoint(xhci_state_t *state) {
     uint32_t endpoint_id;
     uint32_t *input;
@@ -2216,7 +2202,22 @@ static bool xhci_configure_hub_endpoint(xhci_state_t *state) {
         xhci_free_page(&state->hub_report);
         return false;
     }
-    return xhci_queue_hub_status(state);
+
+    /*
+     * V3.10.6B10B8 HUB STATUS TD LIFETIME
+     *
+     * Keep one Hub interrupt-IN TD armed from the moment the endpoint becomes
+     * RUNNING.  This is the path QEMU reliably keeps NAKed/retryable and later
+     * wakes through usb_wakeup().
+     *
+     * Startup PORT_RESET / ENABLE / CONNECTION changes are intentionally
+     * allowed to complete this TD.  They are drained and acknowledged at the
+     * explicit startup->runtime barrier before MSI-X runtime begins.
+     */
+    return
+        xhci_queue_hub_status_device(
+            state,
+            &state->device);
 }
 
 /*
@@ -3977,6 +3978,9 @@ static bool xhci_process_event_ring(xhci_state_t *state, uint32_t budget) {
         if (!xhci_next_event(state, &event)) break;
         uint32_t type = (event.control >> XHCI_TRB_TYPE_SHIFT) & 0x3FU;
         if (type == XHCI_PORT_STATUS_CHANGE_TYPE) {
+            liteos_serial_write(
+                "LITEOS_DIAG_ROOT_PSC\r\n");
+
             uint8_t port = (uint8_t)(event.parameter >> 24);
             if (port != 0U && port <= state->max_ports) {
                 uint32_t port_offset = state->operational_offset + XHCI_PORT_REGISTER_BASE +
@@ -4913,6 +4917,204 @@ static bool xhci_child_route(const xhci_device_context_t *hub,
  * state->device is reserved for a child while that child is being
  * enumerated.
  */
+/*
+ * V3.10.6B10B4 HUB RUNTIME ARM BARRIER
+ *
+ * A Hub interrupt-IN TD is allowed to exist only after the explicit startup
+ * topology walk has reached a stable baseline.  This prevents port resets
+ * used for enumeration from becoming runtime hotplug events.
+ */
+/*
+ * V3.10.6B10B8 STARTUP EVENT DRAIN
+ *
+ * Hub endpoints are armed during Configure Endpoint so QEMU can establish its
+ * normal NAK/retry ownership.  Initial downstream probing then produces
+ * expected C_CONNECTION/C_ENABLE/C_RESET notifications.
+ *
+ * Consume those startup completions before MSI-X runtime is exposed.  The
+ * ordinary event handlers perform the same reconciliation/ACK/re-arm logic as
+ * runtime, so there is only one Hub state machine.
+ */
+static bool xhci_drain_startup_events(
+    xhci_state_t *state)
+{
+    if(state == 0 ||
+       !state->initialized)
+    {
+        return false;
+    }
+
+    /*
+     * The event ring is finite and startup topology is bounded.  Repeatedly
+     * drain complete batches until no event remains.  A clean Hub status TD
+     * stays NAKed in QEMU and therefore does not keep this loop alive.
+     */
+    for(uint32_t pass = 0U;
+        pass < 32U;
+        ++pass)
+    {
+        if(!xhci_event_pending(
+               state))
+        {
+            return true;
+        }
+
+        (void)xhci_process_event_ring(
+            state,
+            XHCI_RING_TRB_COUNT);
+    }
+
+    /*
+     * A permanently non-empty event ring at this barrier indicates a broken
+     * producer/re-arm loop rather than normal startup activity.
+     */
+    return
+        !xhci_event_pending(
+            state);
+}
+
+
+static bool xhci_start_hub_runtime(
+    xhci_state_t *state)
+{
+    if(state == 0 ||
+       !state->initialized)
+    {
+        return false;
+    }
+
+
+    uint32_t limit =
+        state->max_slots;
+
+
+    if(limit >=
+       XHCI_MAX_SLOT_TABLE)
+    {
+        limit =
+            XHCI_MAX_SLOT_TABLE -
+            1U;
+    }
+
+
+    /*
+     * Pass 1: establish a clean class-protocol baseline for every published
+     * Hub.  No Hub interrupt TD is pending during initial topology probing,
+     * so CLEAR_FEATURE cannot race a completed stale status transfer.
+     */
+    for(uint32_t slot = 1U;
+        slot <= limit;
+        ++slot)
+    {
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[
+                slot];
+
+
+        if(!slot_dev->used ||
+           !slot_dev->is_hub ||
+           slot_dev->context.device_slot !=
+               (uint8_t)slot ||
+           slot_dev->context.hub_endpoint == 0U)
+        {
+            continue;
+        }
+
+
+        xhci_device_context_t *hub =
+            &slot_dev->context;
+
+
+        /*
+         * A Hub may already own exactly one valid status TD.  That is the
+         * normal state after Configure Endpoint and after startup-event drain.
+         * Never treat an existing single pending TD as a double-arm failure.
+         */
+        if(!xhci_hub_ack_all_port_changes_device(
+               state,
+               hub))
+        {
+            liteos_serial_write(
+                "LITEOS_DIAG_HUB_ARM_ACK_FAIL\r\n");
+
+            if(g_xhci_error == 0U)
+            {
+                g_xhci_error =
+                    75U;
+            }
+
+            return false;
+        }
+
+
+        hub->hub_change_bitmap =
+            0U;
+    }
+
+
+    /*
+     * Pass 2: with every Hub clean, post exactly one interrupt-IN TD per Hub.
+     * QEMU will keep a no-change request NAKed/retryable until a genuine
+     * wPortChange transition occurs.
+     */
+    for(uint32_t slot = 1U;
+        slot <= limit;
+        ++slot)
+    {
+        xhci_slot_device_t *slot_dev =
+            &g_xhci_slot_devices[
+                slot];
+
+
+        if(!slot_dev->used ||
+           !slot_dev->is_hub ||
+           slot_dev->context.device_slot !=
+               (uint8_t)slot ||
+           slot_dev->context.hub_endpoint == 0U)
+        {
+            continue;
+        }
+
+
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_ARM_BEGIN\r\n");
+
+        if(slot_dev->context.hub_transfer_pending)
+        {
+            /*
+             * The endpoint already owns the one permitted runtime TD.
+             */
+            liteos_serial_write(
+                "LITEOS_DIAG_HUB_ARM_EXISTING\r\n");
+
+            continue;
+        }
+
+        if(!xhci_queue_hub_status_device(
+               state,
+               &slot_dev->context))
+        {
+            liteos_serial_write(
+                "LITEOS_DIAG_HUB_ARM_QUEUE_FAIL\r\n");
+
+            if(g_xhci_error == 0U)
+            {
+                g_xhci_error =
+                    76U;
+            }
+
+            return false;
+        }
+
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_ARM_QUEUED\r\n");
+    }
+
+
+    return true;
+}
+
+
 static bool xhci_probe_hub_downstream(
     xhci_state_t *state)
 {
@@ -5250,6 +5452,17 @@ static bool xhci_probe_hub_downstream(
     }
 
 
+    /*
+     * Do not arm Hub interrupt-IN here.
+     *
+     * This helper is also used by startup/self-test re-enumeration.  Posting
+     * runtime Hub TDs here makes them survive into later startup phases and
+     * causes a second xhci_start_hub_runtime() call to see
+     * hub_transfer_pending == true.
+     *
+     * Hub runtime is armed exactly once, after MSI-X is live and every startup
+     * topology/self-test pass has completed.
+     */
     return true;
 }
 
@@ -5655,6 +5868,28 @@ static bool xhci_reconcile_one_hub(
                 &child_slot);
 
         /*
+         * FIX7-DIAG:
+         *
+         * Only represented child edges are interesting here.  In the nested
+         * test there should be exactly two:
+         *   Hub1.port1 -> Hub2
+         *   Hub2.port1 -> Mouse
+         */
+        if(child_present)
+        {
+            if(connected)
+            {
+                liteos_serial_write(
+                    "LITEOS_DIAG_HUB_CHILD_CONNECTED\r\n");
+            }
+            else
+            {
+                liteos_serial_write(
+                    "LITEOS_DIAG_HUB_CHILD_DISCONNECTED\r\n");
+            }
+        }
+
+        /*
          * Acknowledge the snapshot we just consumed before any child
          * teardown/re-enumeration.  Connection state is in wPortStatus
          * and remains valid after C_PORT_* is cleared.
@@ -5673,19 +5908,35 @@ static bool xhci_reconcile_one_hub(
          */
         if(!connected)
         {
-            liteos_serial_write(
-                "LITEOS_DIAG_HUB_DISCONNECT\r\n");
+            /*
+             * Empty Hub ports are normal, not disconnect events.  Keep the
+             * full-port reconcile for robustness but emit hotplug diagnostics
+             * only when software represented a child or interrupt-IN named
+             * this port as changed.
+             */
+            bool reported_change =
+                port <= 32U &&
+                (hub->hub_change_bitmap &
+                 (1U << (port - 1U))) != 0U;
 
-            if(child_present &&
-               child_slot != 0U)
+
+            if(child_present ||
+               reported_change)
             {
                 liteos_serial_write(
-                    "LITEOS_DIAG_HUB_CHILD_FOUND\r\n");
-            }
-            else
-            {
-                liteos_serial_write(
-                    "LITEOS_DIAG_HUB_CHILD_MISSING\r\n");
+                    "LITEOS_DIAG_HUB_DISCONNECT\r\n");
+
+                if(child_present &&
+                   child_slot != 0U)
+                {
+                    liteos_serial_write(
+                        "LITEOS_DIAG_HUB_CHILD_FOUND\r\n");
+                }
+                else
+                {
+                    liteos_serial_write(
+                        "LITEOS_DIAG_HUB_CHILD_MISSING\r\n");
+                }
             }
 
 
@@ -7614,25 +7865,59 @@ bool xhci_hardware_self_test(void) {
     }
     if (success && keep_controller) {
         xhci_recompute_topology(&g_xhci);
+
+        /*
+         * Startup Hub status TDs are deliberately armed before runtime.
+         * Drain every setup-time completion now, while MSI-X is still hidden
+         * from runtime consumers, then normalize every Hub to exactly one
+         * pending status TD.
+         */
+        if(!xhci_drain_startup_events(
+               &g_xhci) ||
+           !xhci_start_hub_runtime(
+               &g_xhci))
+        {
+            if(g_xhci_error == 0U)
+            {
+                g_xhci_error =
+                    76U;
+            }
+
+            liteos_serial_write(
+                "LITEOS_XHCI_HUB_RUNTIME_FAIL\r\n");
+
+            success =
+                false;
+
+            keep_controller =
+                false;
+        }
+
         /* Runtime input is interrupt-only.  Do not silently fall back to the
          * old timer poll path if MSI-X cannot be routed. */
-        g_xhci_runtime_ready = true;
-        if (!xhci_bind_msix(&g_xhci)) {
+        g_xhci_runtime_ready = success;
+        if (success && !xhci_bind_msix(&g_xhci)) {
             g_xhci_runtime_ready = false;
             g_xhci_error = 70U;
             liteos_serial_write("LITEOS_XHCI_MSIX_FAIL\r\n");
             success = false;
             keep_controller = false;
-        } else {
+        } else if(success) {
             liteos_serial_write("LITEOS_XHCI_MSIX_OK\r\n");
+            liteos_serial_write(
+                "LITEOS_XHCI_HUB_RUNTIME_OK\r\n");
+
             /* Count only post-MSI-X runtime HID completions. */
             atomic_store_explicit(&g_xhci_hid_completion_count, 0U,
                                   memory_order_release);
             atomic_store_explicit(&g_xhci_hid_completion_milestone, 0U,
                                   memory_order_release);
-            /* Enumeration can complete a HID TRB before MSI-X is bound.  A
-             * single init-time deferred drain arms the first report; all
-             * subsequent runtime work is driven by MSI-X, never by a timer. */
+
+            /*
+             * A completion may have landed in the tiny bind window after the
+             * startup drain and before MSI-X was unmasked.  Schedule one
+             * bounded deferred pass so such an event cannot be stranded.
+             */
             (void)xhci_schedule_deferred_work();
         }
     }
