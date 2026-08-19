@@ -42,6 +42,7 @@ struct LITEOS_FAT32 {
     UINT32 FatType;
     BOOLEAN Fat3Available;
     LITEOS_BLOCK_CACHE Cache;
+    UINT32 OpenFileLock;
     LITEOS_FAT32_FILE OpenFiles[LITEOS_FAT32_MAX_OPEN_FILES];
     BOOLEAN Mounted;
 };

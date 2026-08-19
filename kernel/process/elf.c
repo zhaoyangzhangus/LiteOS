@@ -4,6 +4,7 @@
 #include <arch/x86_64/smp.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/elf_loader.h>
+#include <kernel/console.h>
 #include <kernel/futex.h>
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
@@ -62,6 +63,36 @@ static uint32_t g_user_runtime_child_flags;
 static uint32_t g_user_runtime_cpu_current_state;
 static uint32_t g_user_runtime_cpu_runnable;
 static uint64_t g_user_runtime_cpu_current_tid;
+
+/*
+ * Exec diagnostics are deliberately failure-only so the successful runtime
+ * timing remains unchanged.
+ */
+static void exec_diag_status(const char *tag, kstatus_t status) {
+    liteos_serial_write("LITEOS_DIAG_EXEC_");
+    liteos_serial_write(tag);
+    liteos_serial_write(" STATUS=");
+    liteos_serial_write_u32((uint32_t)status);
+    liteos_serial_write("\r\n");
+}
+
+static void exec_diag_read(kstatus_t status, uint64_t bytes, uint64_t size) {
+    liteos_serial_write("LITEOS_DIAG_EXEC_READ_FAIL STATUS=");
+    liteos_serial_write_u32((uint32_t)status);
+    liteos_serial_write(" BYTES=");
+    liteos_serial_write_u32((uint32_t)bytes);
+    liteos_serial_write(" SIZE=");
+    liteos_serial_write_u32((uint32_t)size);
+    liteos_serial_write("\r\n");
+}
+
+static void exec_diag_prepare(kstatus_t status, uint32_t stage) {
+    liteos_serial_write("LITEOS_DIAG_EXEC_PREPARE_FAIL STATUS=");
+    liteos_serial_write_u32((uint32_t)status);
+    liteos_serial_write(" SUBSTAGE=");
+    liteos_serial_write_u32(stage);
+    liteos_serial_write("\r\n");
+}
 
 enum {
     AUX_NULL = 0,
@@ -457,12 +488,14 @@ static kstatus_t read_vfs_image(const char *path, uint8_t **image_out,
 static kstatus_t prepare_elf_space(const void *raw_image, size_t image_size,
                                    vm_space_t **space_out, user_elf_image_info_t *info,
                                    const elf_exec_arguments_t *arguments,
-                                   vaddr_t *stack_pointer) {
+                                   vaddr_t *stack_pointer,
+                                   uint32_t *diag_stage) {
     const uint8_t *image = (const uint8_t *)raw_image;
     elf_validation_t main_validation;
     elf_validation_t interpreter_validation;
     uint8_t *interpreter_image = 0;
     size_t interpreter_size = 0;
+    if (diag_stage != 0) *diag_stage = 1U; /* validate main ELF */
     kstatus_t status = validate_elf(image, image_size, ELF_PIE_BIAS,
                                     &main_validation);
     if (status != K_OK) return status;
@@ -474,9 +507,11 @@ static kstatus_t prepare_elf_space(const void *raw_image, size_t image_size,
         for (uint64_t i = 0; i < main_validation.interp_size; ++i) {
             interpreter_path[i] = (char)image[main_validation.interp_offset + i];
         }
+        if (diag_stage != 0) *diag_stage = 2U; /* read PT_INTERP */
         status = read_vfs_image(interpreter_path, &interpreter_image,
                                 &interpreter_size);
         if (status != K_OK) return status;
+        if (diag_stage != 0) *diag_stage = 3U; /* validate PT_INTERP */
         status = validate_elf(interpreter_image, interpreter_size, ELF_INTERP_BIAS,
                               &interpreter_validation);
         if (status != K_OK || interpreter_validation.has_interpreter) {
@@ -486,13 +521,16 @@ static kstatus_t prepare_elf_space(const void *raw_image, size_t image_size,
     }
 
     vm_space_t *space = 0;
+    if (diag_stage != 0) *diag_stage = 4U; /* create new vm_space */
     status = vm_space_create(&space);
     if (status != K_OK) {
         kfree(interpreter_image);
         return status;
     }
+    if (diag_stage != 0) *diag_stage = 5U; /* map main PT_LOADs */
     status = map_elf_segments(space, image, &main_validation);
     if (status == K_OK && interpreter_image != 0) {
+        if (diag_stage != 0) *diag_stage = 6U; /* map interpreter PT_LOADs */
         status = map_elf_segments(space, interpreter_image, &interpreter_validation);
     }
     if (status != K_OK) {
@@ -509,6 +547,7 @@ static kstatus_t prepare_elf_space(const void *raw_image, size_t image_size,
     info->program_header_size = main_validation.header->program_header_size;
     info->program_header_count = main_validation.header->program_header_count;
     info->load_bias = (vaddr_t)main_validation.bias;
+    if (diag_stage != 0) *diag_stage = 7U; /* build initial user stack */
     status = build_initial_stack(space, info, arguments, stack_pointer);
     if (status != K_OK) {
         vm_space_put(space);
@@ -517,6 +556,7 @@ static kstatus_t prepare_elf_space(const void *raw_image, size_t image_size,
     }
     kfree(interpreter_image);
     *space_out = space;
+    if (diag_stage != 0) *diag_stage = 8U;
     return K_OK;
 }
 
@@ -527,7 +567,7 @@ kstatus_t process_load_elf_image(process_t *process, const void *image, size_t i
     (void)copy_exec_arguments(0, &arguments);
     vm_space_t *new_space = 0;
     kstatus_t status = prepare_elf_space(image, image_size, &new_space, info,
-                                          &arguments, stack_pointer);
+                                          &arguments, stack_pointer, 0);
     if (status != K_OK) return status;
     while (atomic_exchange_explicit(&process->thread_lock.state, 1U,
                                      memory_order_acquire) != 0U) {
@@ -554,36 +594,53 @@ kstatus_t process_exec_from_vfs(
 
     elf_exec_arguments_t arguments;
     kstatus_t status = copy_exec_arguments(argv, &arguments);
-    if (status != K_OK) return status;
+    if (status != K_OK) {
+        exec_diag_status("ARGS_FAIL", status);
+        return status;
+    }
+
     file_t *file = 0;
     status = vfs_open(path, VFS_OPEN_READ, 0, &file);
-    if (status != K_OK) return status;
+    if (status != K_OK) {
+        exec_diag_status("OPEN_FAIL", status);
+        return status;
+    }
     if (file->vnode == 0 || file->vnode->size == 0 ||
         file->vnode->size > ELF_MAX_SEGMENT_SIZE * 4ULL) {
         vfs_close(file);
+        exec_diag_status("SIZE_FAIL", K_EINVAL);
         return K_EINVAL;
     }
+
     size_t image_size = (size_t)file->vnode->size;
     uint8_t *image = (uint8_t *)kmalloc(image_size, 0);
     if (image == 0) {
         vfs_close(file);
+        exec_diag_status("ALLOC_FAIL", K_ENOMEM);
         return K_ENOMEM;
     }
+
     uint64_t bytes = 0;
     status = vfs_read_kernel(file, image, image_size, &bytes);
     vfs_close(file);
     if (status != K_OK || bytes != image_size) {
+        kstatus_t failure = status == K_OK ? K_EIO : status;
+        exec_diag_read(failure, bytes, image_size);
         kfree(image);
-        return status == K_OK ? K_EIO : status;
+        return failure;
     }
 
     vm_space_t *new_space = 0;
     user_elf_image_info_t info;
     vaddr_t stack_pointer = 0;
+    uint32_t prepare_stage = 0U;
     status = prepare_elf_space(image, image_size, &new_space, &info,
-                               &arguments, &stack_pointer);
+                               &arguments, &stack_pointer, &prepare_stage);
     kfree(image);
-    if (status != K_OK) return status;
+    if (status != K_OK) {
+        exec_diag_prepare(status, prepare_stage);
+        return status;
+    }
 
     while (atomic_exchange_explicit(&process->thread_lock.state, 1U,
                                     memory_order_acquire) != 0U) {
@@ -591,10 +648,19 @@ kstatus_t process_exec_from_vfs(
     }
     if (atomic_load_explicit(&process->state, memory_order_acquire) != PROCESS_RUNNING ||
         process->thread_count != 1U || thread->exec_pending) {
+        uint32_t thread_count = process->thread_count;
+        uint32_t process_state =
+            atomic_load_explicit(&process->state, memory_order_relaxed);
         atomic_store_explicit(&process->thread_lock.state, 0U, memory_order_release);
         vm_space_put(new_space);
+        liteos_serial_write("LITEOS_DIAG_EXEC_COMMIT_BUSY THREADS=");
+        liteos_serial_write_u32(thread_count);
+        liteos_serial_write(" STATE=");
+        liteos_serial_write_u32(process_state);
+        liteos_serial_write("\r\n");
         return K_EBUSY;
     }
+
     vm_space_t *old_space = process->vm;
     process->vm = new_space;
     thread->exec_entry = info.entry;

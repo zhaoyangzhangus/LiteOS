@@ -20,6 +20,17 @@
 
 static const LITEOS_VFS_FILE_OPERATIONS g_fat32_operations;
 
+static VOID fat32_open_files_lock(LITEOS_FAT32 *filesystem) {
+    while (__atomic_exchange_n(&filesystem->OpenFileLock, 1U,
+                               __ATOMIC_ACQUIRE) != 0U) {
+        __asm__ volatile ("pause");
+    }
+}
+
+static VOID fat32_open_files_unlock(LITEOS_FAT32 *filesystem) {
+    __atomic_store_n(&filesystem->OpenFileLock, 0U, __ATOMIC_RELEASE);
+}
+
 /*
  * 删除操作需要同时修改目录项和所有 FAT 副本。簇链快照只保存将被
  * 清空的 FAT 项，失败时可以把已写入的项恢复到操作前的值；这比只
@@ -1054,14 +1065,22 @@ static BOOLEAN directory_is_empty(LITEOS_FAT32 *filesystem, UINT32 directory) {
     return 0;
 }
 
-static BOOLEAN fat32_file_open_at(const LITEOS_FAT32 *filesystem, UINT64 lba,
+static BOOLEAN fat32_file_open_at(LITEOS_FAT32 *filesystem, UINT64 lba,
                                   UINT32 offset) {
+    BOOLEAN found = 0;
     if (filesystem == 0) return 0;
+
+    fat32_open_files_lock(filesystem);
     for (UINT32 i = 0U; i < LITEOS_FAT32_MAX_OPEN_FILES; ++i) {
         const LITEOS_FAT32_FILE *file = &filesystem->OpenFiles[i];
-        if (file->Used && file->DirectoryLba == lba && file->DirectoryOffset == offset) return 1;
+        if (file->Used && file->DirectoryLba == lba &&
+            file->DirectoryOffset == offset) {
+            found = 1;
+            break;
+        }
     }
-    return 0;
+    fat32_open_files_unlock(filesystem);
+    return found;
 }
 
 static BOOLEAN update_file_directory_entry(LITEOS_FAT32_FILE *file,
@@ -1249,9 +1268,19 @@ static BOOLEAN fat32_write(LITEOS_VFS_NODE *node, UINT64 offset, const VOID *buf
 }
 
 static BOOLEAN fat32_close(LITEOS_VFS_NODE *node) {
-    LITEOS_FAT32_FILE *file = node == 0 ? 0 : (LITEOS_FAT32_FILE *)node->FileContext;
-    if (file == 0 || !file->Used) return 0;
+    LITEOS_FAT32_FILE *file =
+        node == 0 ? 0 : (LITEOS_FAT32_FILE *)node->FileContext;
+    LITEOS_FAT32 *filesystem = file == 0 ? 0 : file->FileSystem;
+    if (file == 0 || filesystem == 0) return 0;
+
+    fat32_open_files_lock(filesystem);
+    if (!file->Used) {
+        fat32_open_files_unlock(filesystem);
+        return 0;
+    }
     file->Used = 0;
+    file->CursorValid = 0;
+    fat32_open_files_unlock(filesystem);
     return 1;
 }
 
@@ -1653,7 +1682,10 @@ BOOLEAN liteos_fat32_init(LITEOS_FAT32 *filesystem,
         liteos_block_cache_destroy(&filesystem->Cache);
         return 0;
     }
-    for (UINT32 i = 0; i < LITEOS_FAT32_MAX_OPEN_FILES; ++i) filesystem->OpenFiles[i].Used = 0;
+    filesystem->OpenFileLock = 0U;
+    for (UINT32 i = 0; i < LITEOS_FAT32_MAX_OPEN_FILES; ++i) {
+        filesystem->OpenFiles[i].Used = 0;
+    }
     filesystem->Mounted = 1;
     return 1;
 }
@@ -1675,13 +1707,16 @@ BOOLEAN liteos_fat32_lookup(VOID *filesystem_context, const CHAR8 *path,
     UINT8 entry[32];
     UINT64 entry_lba = 0U;
     UINT32 entry_offset = 0U;
+
     if (filesystem == 0 || !filesystem->Mounted || path == 0 || node == 0 ||
         !resolve_path(filesystem, path, entry, &entry_lba, &entry_offset) ||
         (entry[11] & FAT32_DIRECTORY) != 0U) return 0;
+
+    fat32_open_files_lock(filesystem);
     for (UINT32 i = 0; i < LITEOS_FAT32_MAX_OPEN_FILES; ++i) {
         LITEOS_FAT32_FILE *file = &filesystem->OpenFiles[i];
         if (file->Used) continue;
-        file->Used = 1;
+
         file->FileSystem = filesystem;
         file->FirstCluster = entry_cluster(entry);
         file->Size = read_u32(entry + 28U);
@@ -1689,13 +1724,22 @@ BOOLEAN liteos_fat32_lookup(VOID *filesystem_context, const CHAR8 *path,
         file->DirectoryLba = entry_lba;
         file->DirectoryOffset = entry_offset;
         file->CursorValid = 0;
+        file->CursorLogicalStart = 0;
+        file->CursorPhysicalStart = 0;
+        file->CursorLength = 0;
+        file->Used = 1;
+
         node->Type = 1U;
         node->Size = file->Size;
         node->FilesystemContext = filesystem;
         node->FileContext = file;
         node->SecurityDescriptor = 0;
         node->Operations = &g_fat32_operations;
+
+        fat32_open_files_unlock(filesystem);
         return 1;
     }
+
+    fat32_open_files_unlock(filesystem);
     return 0;
 }

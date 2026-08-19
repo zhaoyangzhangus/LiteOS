@@ -18,6 +18,7 @@ typedef struct {
     const LITEOS_BLOCK_DEVICE *Device;
     LITEOS_BLOCK_CACHE_ENTRY Entries[LITEOS_BLOCK_CACHE_ENTRY_COUNT];
     UINT64 Clock;
+    UINT32 Lock;
     BOOLEAN Initialized;
 } LITEOS_BLOCK_CACHE;
 
