@@ -2138,7 +2138,11 @@ static void __attribute__((noreturn)) kernel_main(void *context) {
     for (;;) {
         net_manager_status_t net_status;
         __asm__ volatile ("sti; hlt" : : : "memory");
-        (void)deferred_run(8U);
+        /*
+         * Runtime deferred work is owned exclusively by the persistent
+         * scheduler worker.  The idle thread must not become a second
+         * concurrent bottom-half consumer.
+         */
         window_server_pump_input();
         net_manager_poll();
         if (net_manager_get_status(&net_status)) {
@@ -2448,17 +2452,6 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
     }
     serial_write("LITEOS_PROCESS_CORE_OK\r\n");
 
-    /*
-     * deferred_init() intentionally ran during early boot before the
-     * canonical scheduler existed.  Now give the global deferred queue its
-     * persistent Ring0 executor; IRQ producers no longer depend on kernel_main
-     * reaching the idle HLT loop before bottom halves can run.
-     */
-    if (!deferred_start_worker()) {
-        serial_write("LITEOS_DEFERRED_WORKER_FAIL\r\n");
-        halt_forever();
-    }
-    serial_write("LITEOS_DEFERRED_WORKER_OK\r\n");
 #if 0
     if (!user_elf_loader_self_test()) {
         serial_write("LITEOS_USER_ELF_FAIL\r\n");
@@ -2833,6 +2826,21 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
         serial_write("LITEOS_WINDOW_SERVER_INIT_FAIL\r\n");
         halt_forever();
     }
+
+    /*
+     * Start the persistent bottom-half executor only after every boot
+     * self-test has finished.  Runtime device IRQs may already have queued
+     * deferred items; deferred_start_worker() immediately drains those before
+     * Ring3 services begin.
+     *
+     * Starting this worker earlier makes live xHCI/input events race with
+     * deterministic boot self-tests (notably Bluetooth/Input validation).
+     */
+    if (!deferred_start_worker()) {
+        serial_write("LITEOS_DEFERRED_WORKER_FAIL\r\n");
+        halt_forever();
+    }
+    serial_write("LITEOS_DEFERRED_WORKER_OK\r\n");
 
     if (!user_init_start()) {
         serial_write("LITEOS_USER_INIT_START_FAIL\r\n");

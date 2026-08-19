@@ -325,6 +325,20 @@ def main():
         )
 
         #
+        # xHCI can become MSI-X-ready before the kernel has finished its
+        # deterministic boot self-tests.  Do not inject live mouse input until
+        # the persistent deferred worker is deliberately started at the
+        # runtime boundary.
+        #
+        wait_until(
+            lambda:
+                "LITEOS_DEFERRED_WORKER_OK"
+                in serial_text(),
+            "persistent deferred worker ready",
+            20.0
+        )
+
+        #
         # Generate a few initial events, but deliberately stay well
         # below 256 so the 256 milestone can prove post-replug HID.
         #
