@@ -462,6 +462,13 @@ static bool g_xhci_runtime_ready;
 static uint32_t g_xhci_runtime_event_batches;
 static atomic_bool g_xhci_work_queued;
 static atomic_bool g_xhci_irq_pending;
+
+/*
+ * FIX11-DIAG: distinguish "Hub completion never happened" from
+ * "completion happened but no second MSI-X/deferred drain".
+ */
+static atomic_uint g_xhci_diag_msix_count;
+static atomic_uint g_xhci_diag_hid_event_count;
 static atomic_bool g_xhci_input_seen;
 static atomic_bool g_xhci_mouse_input_seen;
 static atomic_bool g_xhci_irq_seen;
@@ -522,6 +529,19 @@ static void xhci_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
     if (!atomic_exchange_explicit(&g_xhci_irq_seen, true,
                                   memory_order_acq_rel)) {
         liteos_serial_write("LITEOS_XHCI_IRQ_FIRED\r\n");
+    }
+
+    unsigned diag_irq =
+        atomic_fetch_add_explicit(
+            &g_xhci_diag_msix_count,
+            1U,
+            memory_order_relaxed) +
+        1U;
+
+    if(diag_irq <= 16U)
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_MSIX\r\n");
     }
     /* The ISR only acknowledges the interrupter and queues bounded work.  It
      * never walks the event ring or emits user input at interrupt level. */
@@ -590,6 +610,79 @@ static void xhci_event_handler_complete(xhci_state_t *state) {
                        XHCI_RUNTIME_ERDP, dequeue | XHCI_ERDP_EHB);
     (void)xhci_write32(state, state->runtime_offset + XHCI_RUNTIME_INTR0,
                        XHCI_IMAN_IP | XHCI_IMAN_IE);
+}
+
+
+static uint32_t xhci_read32(
+    const xhci_state_t *state,
+    uint32_t offset);
+
+
+static void xhci_diag_interrupter_state_after_first_runtime_event(
+    xhci_state_t *state)
+{
+    if(state == 0 ||
+       !state->initialized ||
+       g_xhci_runtime_event_batches != 1U)
+    {
+        return;
+    }
+
+
+    uint32_t runtime =
+        state->runtime_offset +
+        XHCI_RUNTIME_INTR0;
+
+    uint32_t iman =
+        xhci_read32(
+            state,
+            runtime +
+                XHCI_RUNTIME_IMAN);
+
+    uint32_t erdp_low =
+        xhci_read32(
+            state,
+            runtime +
+                XHCI_RUNTIME_ERDP);
+
+
+    if((erdp_low &
+        (uint32_t)XHCI_ERDP_EHB) != 0U)
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_EHB_STUCK\r\n");
+    }
+    else
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_EHB_CLEAR\r\n");
+    }
+
+
+    if((iman &
+        XHCI_IMAN_IE) != 0U)
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_IMAN_IE_ON\r\n");
+    }
+    else
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_IMAN_IE_OFF\r\n");
+    }
+
+
+    if((iman &
+        XHCI_IMAN_IP) != 0U)
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_IMAN_IP_SET\r\n");
+    }
+    else
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_IMAN_IP_CLEAR\r\n");
+    }
 }
 
 static void xhci_zero_device_context(xhci_device_context_t *context) {
@@ -3721,6 +3814,20 @@ static bool xhci_handle_hid_transfer_event(xhci_state_t *state,
                                   memory_order_acq_rel)) {
         liteos_serial_write("LITEOS_XHCI_HID_TRANSFER_OK\r\n");
     }
+
+    unsigned diag_hid =
+        atomic_fetch_add_explicit(
+            &g_xhci_diag_hid_event_count,
+            1U,
+            memory_order_relaxed) +
+        1U;
+
+    if(diag_hid <= 16U)
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_HID_TRANSFER_EVENT\r\n");
+    }
+
     (void)atomic_fetch_add_explicit(&g_xhci_hid_completion_count, 1U,
                                     memory_order_relaxed);
     device->hid_transfer_pending = false;
@@ -8096,6 +8203,8 @@ bool xhci_hardware_self_test(void) {
     g_xhci_runtime_ready = false;
     atomic_init(&g_xhci_work_queued, false);
     atomic_init(&g_xhci_irq_pending, false);
+    atomic_init(&g_xhci_diag_msix_count, 0U);
+    atomic_init(&g_xhci_diag_hid_event_count, 0U);
     atomic_init(&g_xhci_input_seen, false);
     atomic_init(&g_xhci_mouse_input_seen, false);
     atomic_init(&g_xhci_irq_seen, false);
@@ -9018,6 +9127,8 @@ bool xhci_process_events(uint32_t budget) {
                                  memory_order_acquire) != 0U) return false;
     consumed = xhci_process_event_ring(&g_xhci, budget);
     xhci_event_handler_complete(&g_xhci);
+    xhci_diag_interrupter_state_after_first_runtime_event(
+        &g_xhci);
     /*
      * 根口状态由事件环每轮处理；Hub 没有使用中断状态端点时才做周期
      * GET_STATUS。每 32 轮查询一次，避免一次 deferred work 同步等待
