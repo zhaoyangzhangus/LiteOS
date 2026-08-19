@@ -368,18 +368,45 @@ kstatus_t thread_start(thread_t *thread) {
 
 void thread_release_execution_ref(thread_t *thread) {
     if (thread == 0) return;
-    uint32_t old = __atomic_fetch_and(&thread->flags,
-                                      ~THREAD_FLAG_EXECUTION_REF,
-                                      __ATOMIC_ACQ_REL);
-    if ((old & THREAD_FLAG_EXECUTION_REF) != 0) {
-        process_t *process = thread->process;
-        if (process != 0 &&
-            atomic_load_explicit(&process->state, memory_order_acquire) == PROCESS_DEAD) {
-            /* 当前线程已切离其内核栈和 CR3，此时才可销毁僵尸进程的地址空间。 */
-            process_release_runtime_resources(process);
+
+    /*
+     * EXECUTION_REF 本身既是 lifetime ref，也是“离开内核栈/CR3 后的回收完成”
+     * 发布位。不能先清 EXECUTION_REF 再释放 process->vm：观察 CPU 会把
+     * “已经有人开始回收”误认为“回收已经完成”。
+     *
+     * REAPING 只用于抢占唯一回收所有权；EXECUTION_REF 一直保持到地址空间
+     * 和其它 runtime resources 已经释放完毕，最后以 release 语义一起清除。
+     */
+    uint32_t observed = __atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if ((observed & THREAD_FLAG_EXECUTION_REF) == 0U) return;
+        if ((observed & THREAD_FLAG_EXECUTION_REAPING) != 0U) return;
+
+        uint32_t desired = observed | THREAD_FLAG_EXECUTION_REAPING;
+        if (__atomic_compare_exchange_n(&thread->flags, &observed, desired,
+                                        false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_ACQUIRE)) {
+            break;
         }
-        object_put(thread);
     }
+
+    process_t *process = thread->process;
+    if (process != 0 &&
+        atomic_load_explicit(&process->state, memory_order_acquire) == PROCESS_DEAD) {
+        /* 当前线程已切离其内核栈和 CR3，此时才可销毁僵尸进程的地址空间。 */
+        process_release_runtime_resources(process);
+    }
+
+    /*
+     * 只有看到这个 release publication 之后，别的 CPU 才能认为 execution
+     * teardown 已完成。调用者若以 acquire 观察到 EXECUTION_REF=0，也必须
+     * 同时看到上面的 process->vm=0。
+     */
+    __atomic_fetch_and(&thread->flags,
+                       ~(THREAD_FLAG_EXECUTION_REF |
+                         THREAD_FLAG_EXECUTION_REAPING),
+                       __ATOMIC_RELEASE);
+    object_put(thread);
 }
 
 uint32_t process_last_thread_create_stage(void) {

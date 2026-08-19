@@ -952,19 +952,50 @@ bool user_elf_runtime_self_test(void) {
     }
 
     /*
-     * Safe idempotent completion in case exit occurred while
-     * interrupts were disabled.
+     * Execution-ref teardown belongs to the CPU that actually switched away
+     * from the dead thread.  Do not clear a remote thread's execution ref from
+     * this bootstrap/self-test CPU: the remote CPU may still be using that
+     * thread's kernel stack.
+     *
+     * thread_release_execution_ref() now publishes EXECUTION_REF=0 only after
+     * process runtime resources (including process->vm) are released, so an
+     * acquire load of the flag is also the teardown-completion barrier.
      */
-    thread_release_execution_ref(thread);
+    uint64_t reap_deadline = x86_read_tsc();
+    uint64_t reap_budget = x86_timeout_ns_to_tsc(1000000000ULL);
+    reap_deadline = reap_budget > UINT64_MAX - reap_deadline ?
+                    UINT64_MAX : reap_deadline + reap_budget;
 
-    /*
-     * One final finish-switch pass handles an execution reference
-     * released by the call above.
-     */
-    if(process->vm != 0)
-    {
+    while ((__atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE) &
+            THREAD_FLAG_EXECUTION_REF) != 0U) {
+        __asm__ volatile ("sti" : : : "memory");
+
+        /* Handle a local pending reaper immediately. */
         sched_finish_switch();
+
+        if ((__atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE) &
+             THREAD_FLAG_EXECUTION_REF) == 0U) {
+            break;
+        }
+
+        /*
+         * A remote CPU may be sitting in its idle path after this thread
+         * exited.  Nudge it so its post-switch reaper runs promptly.
+         */
+        uint32_t reap_cpu = thread->current_cpu;
+        uint32_t current_cpu = x86_current_cpu_index();
+        if (reap_cpu < MAX_CPUS && reap_cpu != current_cpu &&
+            x86_smp_cpu_online(reap_cpu)) {
+            (void)x86_smp_request_reschedule(reap_cpu);
+        }
+
+        if ((int64_t)(x86_read_tsc() - reap_deadline) >= 0) break;
+
+        schedule();
+        __asm__ volatile ("pause");
     }
+
+    /* Acquire above guarantees process->vm teardown is visible after ref clear. */
 
     thread_t *current = sched_current_thread();
     g_user_runtime_thread_count = process->thread_count;
