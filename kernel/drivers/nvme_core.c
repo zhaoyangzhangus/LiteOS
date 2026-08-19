@@ -1011,50 +1011,89 @@ static void nvme_pending_release(nvme_pending_io_t *pending,
     kfree(pending);
 }
 
-static void nvme_deferred_complete(void *argument) {
-    nvme_queue_t *queue = (nvme_queue_t *)argument;
+/*
+ * CQ 的唯一状态修改入口。
+ *
+ * deferred worker 和同步关键 I/O 都允许调用这里；queue->lock 串行化
+ * completion_head/phase/pending_ios，因此不会发生双完成。pending_release()
+ * 故意在锁外执行，避免 DMA teardown / io_complete 扩大队列锁临界区。
+ */
+static uint32_t nvme_poll_queue_completions(nvme_queue_t *queue,
+                                             uint32_t budget) {
     nvme_controller_t *controller;
     uint32_t processed = 0U;
-    if (queue == 0) return;
+
+    if (queue == 0 || budget == 0U) return 0U;
     controller = queue->controller;
-    if (controller == 0) {
-        atomic_store_explicit(&queue->completion_queued, false,
-                              memory_order_release);
-        nvme_completion_ref_put(queue);
-        return;
-    }
+    if (controller == 0 || !queue->active) return 0U;
 
     nvme_lock(&queue->lock);
     if (queue->completion != 0) dma_sync_for_cpu(&queue->completion_dma);
-    while (processed < 32U && queue->completion != 0) {
-        nvme_completion_t completion = queue->completion[queue->completion_head];
+
+    while (processed < budget && queue->completion != 0) {
+        nvme_completion_t completion =
+            queue->completion[queue->completion_head];
+
         if ((completion.status & 1U) != queue->phase) break;
-        queue->completion_head = (uint16_t)((queue->completion_head + 1U) %
-                                            queue->depth);
+
+        queue->completion_head =
+            (uint16_t)((queue->completion_head + 1U) % queue->depth);
         if (queue->completion_head == 0U) queue->phase ^= 1U;
+
         nvme_ring_io_completion(controller, queue);
-        nvme_pending_io_t *pending = nvme_pending_for_id_locked(
-            queue, completion.command_id);
-        if (pending != 0) nvme_pending_unlink_locked(queue, pending);
-        nvme_unlock(&queue->lock);
+
+        nvme_pending_io_t *pending =
+            nvme_pending_for_id_locked(queue, completion.command_id);
         if (pending != 0) {
-            kstatus_t status = ((completion.status >> 1) & 0x7FFFU) == 0U ?
-                                K_OK : K_EIO;
-            g_nvme_last_completion = completion.status;
-            nvme_pending_release(pending, status,
-                                 status == K_OK ? pending->bytes : 0U);
+            nvme_pending_unlink_locked(queue, pending);
         }
+
+        nvme_unlock(&queue->lock);
+
+        if (pending != 0) {
+            kstatus_t status =
+                ((completion.status >> 1) & 0x7FFFU) == 0U ?
+                    K_OK : K_EIO;
+
+            g_nvme_last_completion = completion.status;
+            nvme_pending_release(
+                pending,
+                status,
+                status == K_OK ? pending->bytes : 0U);
+        }
+
         ++processed;
+
         nvme_lock(&queue->lock);
-        if (queue->completion != 0) dma_sync_for_cpu(&queue->completion_dma);
+        if (queue->completion != 0) {
+            dma_sync_for_cpu(&queue->completion_dma);
+        }
     }
+
     nvme_unlock(&queue->lock);
-    /* 用原子标志发布本轮 CQ 消费结果，避免轮询线程漏掉新完成项。 */
-    atomic_store_explicit(&queue->completion_queued, false, memory_order_release);
+    return processed;
+}
+
+static void nvme_deferred_complete(void *argument) {
+    nvme_queue_t *queue = (nvme_queue_t *)argument;
+    uint32_t processed;
+
+    if (queue == 0) return;
+
+    processed = nvme_poll_queue_completions(queue, 32U);
+
+    /*
+     * This work item owns the completion_queued flag/ref. A synchronous
+     * poll may already have drained the CQ; clearing the flag here is still
+     * correct and lets a later IRQ/poll enqueue fresh work.
+     */
+    atomic_store_explicit(&queue->completion_queued, false,
+                          memory_order_release);
     nvme_completion_ref_put(queue);
 
-    /* 队列深度超过一次 deferred 预算时，继续排队，避免丢失 CQ。 */
-    if (processed == 32U && queue->active) (void)nvme_schedule_queue_completion(queue);
+    if (processed == 32U && queue->active) {
+        (void)nvme_schedule_queue_completion(queue);
+    }
 }
 
 static void nvme_cancel_request(io_request_t *request) {
@@ -1370,6 +1409,36 @@ static kstatus_t nvme_submit_io(device_t *device, io_request_t *request) {
     nvme_publish_pending_locked(queue, pending, &command);
     nvme_unlock(&queue->lock);
     return K_OK;
+}
+
+uint32_t nvme_poll_device_completions(device_t *device,
+                                      uint32_t budget) {
+    nvme_controller_t *controller;
+    uint32_t processed = 0U;
+
+    if (device == 0 || device->driver_data == 0 || budget == 0U) {
+        return 0U;
+    }
+
+    controller = (nvme_controller_t *)device->driver_data;
+    if (!controller->started) return 0U;
+
+    for (uint16_t index = 0U;
+         index < controller->io_queue_count && processed < budget;
+         ++index) {
+        nvme_queue_t *queue = &controller->io_queues[index];
+
+        if (!queue->active ||
+            atomic_load_explicit(&queue->pending_count,
+                                 memory_order_acquire) == 0U) {
+            continue;
+        }
+
+        processed += nvme_poll_queue_completions(
+            queue, budget - processed);
+    }
+
+    return processed;
 }
 
 bool nvme_schedule_deferred_poll(void) {

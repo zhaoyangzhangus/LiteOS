@@ -102,4 +102,11 @@ uint32_t nvme_last_stage(void);
 uint16_t nvme_last_completion_status(void);
 /* 定时器只投递轮询任务，真正的 CQ 消费在可抢占的 deferred 上下文执行。 */
 bool nvme_schedule_deferred_poll(void);
+
+/*
+ * 同步关键 I/O 可直接消费本设备的 CQ，不依赖 deferred worker 获得 CPU。
+ * queue->lock 与普通 deferred completion 共用，因此两条消费者路径不会同时
+ * 修改 completion_head/pending_ios。
+ */
+uint32_t nvme_poll_device_completions(device_t *device, uint32_t budget);
 kstatus_t nvme_recover_after_timeout(device_t *device);

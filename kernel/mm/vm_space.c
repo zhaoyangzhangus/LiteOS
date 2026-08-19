@@ -1224,8 +1224,9 @@ kstatus_t vm_handle_fault(vm_space_t *space, const vm_fault_info_t *fault) {
     uint64_t page_address = fault->address & ~(PAGE_SIZE - 1ULL);
     uint64_t object_index = (area->object_offset + page_address - area->start) >> PAGE_SHIFT;
     paddr_t existing;
+    uint64_t existing_flags = 0;
     kstatus_t translated = x86_translate_page(space->root_table, (vaddr_t)page_address,
-                                              &existing, 0);
+                                              &existing, &existing_flags);
     if (area->object->type == VM_OBJECT_DEVICE) {
         if (translated == K_OK) {
             map_unlock(space);
@@ -1258,6 +1259,18 @@ kstatus_t vm_handle_fault(vm_space_t *space, const vm_fault_info_t *fault) {
             map_unlock(space);
             return K_OK;
         }
+
+        /*
+         * VM_AREA_COW is VMA-wide, but COW is resolved per page.  Once a page
+         * has already been remapped writable, later explicit WRITE pre-faults
+         * (THREAD_CREATE stack validation is one) must not COW/unmap/remap it
+         * again merely because the VMA still carries VM_AREA_COW.
+         */
+        if (x86_page_entry_writable(existing_flags)) {
+            map_unlock(space);
+            return K_OK;
+        }
+
         kstatus_t status;
         if (private_file) {
             page = anon_page_lookup(area->private_object, object_index);

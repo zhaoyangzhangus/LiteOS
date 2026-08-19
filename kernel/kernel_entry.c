@@ -203,26 +203,27 @@ static kstatus_t nvme_fat32_submit(nvme_fat32_backend_t *backend,
         uint64_t start_tsc = x86_read_tsc();
         uint64_t timeout_ticks =
             x86_timeout_ns_to_tsc(5000000000ULL);
-        bool runtime_worker = deferred_worker_started();
 
         while (atomic_load_explicit(&request.state,
                                     memory_order_acquire) ==
                IOREQ_SUBMITTED) {
-            (void)nvme_schedule_deferred_poll();
+            /*
+             * This path is synchronous: consume this NVMe device's CQ
+             * directly instead of depending on the global deferred worker
+             * being scheduled. The NVMe queue lock serializes this with the
+             * normal MSI-X/deferred consumer.
+             */
+            (void)nvme_poll_device_completions(backend->device, 8U);
 
-            if (runtime_worker) {
-                /*
-                 * Runtime has a persistent Ring0 deferred worker. Yield the
-                 * synchronous filesystem caller instead of becoming a second
-                 * deferred consumer.
-                 */
-                schedule();
-            } else {
-                /*
-                 * Early boot mount happens before deferred_start_worker().
-                 * It still needs a local consumer to bring NVMe CQ work home.
-                 */
-                (void)deferred_run(8U);
+            /*
+             * Completion may have happened during the poll above. Recheck
+             * before testing the deadline so a completed request cannot be
+             * misclassified as timed out.
+             */
+            if (atomic_load_explicit(&request.state,
+                                     memory_order_acquire) !=
+                IOREQ_SUBMITTED) {
+                break;
             }
 
             if (timeout_ticks != 0U &&
@@ -2030,6 +2031,26 @@ static void run_user_elf_runtime_self_test(void) {
         serial_write_u32(user_elf_runtime_failure_stage());
         serial_write(" RESULT_LOW=");
         serial_write_u32((UINT32)user_elf_runtime_failure_result());
+        serial_write(" THREAD_CREATE_STAGE=");
+        serial_write_u32(liteos_syscall_thread_create_stage());
+        serial_write(" FUTEX_WORD=");
+        serial_write_u32(user_elf_runtime_futex_word());
+        serial_write(" CHILD_MARK=");
+        serial_write_u32(user_elf_runtime_child_mark());
+        serial_write(" THREADS=");
+        serial_write_u32(user_elf_runtime_thread_count());
+        serial_write(" CHILD_STATE=");
+        serial_write_u32(user_elf_runtime_child_state());
+        serial_write(" CHILD_CPU=");
+        serial_write_u32(user_elf_runtime_child_cpu());
+        serial_write(" CHILD_FLAGS=");
+        serial_write_u32(user_elf_runtime_child_flags());
+        serial_write(" CPU_CUR_STATE=");
+        serial_write_u32(user_elf_runtime_cpu_current_state());
+        serial_write(" CPU_RUNNABLE=");
+        serial_write_u32(user_elf_runtime_cpu_runnable());
+        serial_write(" CPU_CUR_TID_LOW=");
+        serial_write_u32((UINT32)user_elf_runtime_cpu_current_tid());
         serial_write("\r\n");
         halt_forever();
     }

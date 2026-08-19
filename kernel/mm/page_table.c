@@ -255,6 +255,10 @@ kstatus_t x86_translate_page(paddr_t root, vaddr_t virtual_address,
     return K_ENOENT;
 }
 
+bool x86_page_entry_writable(uint64_t entry_flags) {
+    return (entry_flags & PTE_WRITE) != 0U;
+}
+
 kstatus_t x86_unmap_page(paddr_t root, vaddr_t virtual_address, paddr_t *old_physical) {
     uint64_t va = (uint64_t)virtual_address;
     if (!x86_is_canonical(va) || (va & (PAGE_SIZE - 1ULL)) != 0) return K_EINVAL;

@@ -2,11 +2,13 @@
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/futex.h>
+#include <kernel/console.h>
 #include <kernel/completion_port.h>
 #include <kernel/message_port.h>
 #include <kernel/timer.h>
 #include <kernel/deferred.h>
 #include <kernel/mm.h>
+#include <kernel/kmem.h>
 #include <kernel/vm.h>
 #include <kernel/shared_section.h>
 #include <kernel/process.h>
@@ -41,6 +43,19 @@
 #include <uapi/security.h>
 
 static volatile uint32_t g_thread_create_stage;
+
+static int64_t thread_create_diag_fail(uint32_t step, kstatus_t status) {
+    liteos_serial_write("LITEOS_DIAG_THREAD_CREATE_FAIL STEP=");
+    liteos_serial_write_u32(step);
+    liteos_serial_write(" STATUS=");
+    liteos_serial_write_u32((uint32_t)status);
+    liteos_serial_write(" PROCESS_STAGE=");
+    liteos_serial_write_u32(process_last_thread_create_stage());
+    liteos_serial_write(" VMALLOC_FAIL=");
+    liteos_serial_write_u32(vmalloc_last_failure());
+    liteos_serial_write("\r\n");
+    return status;
+}
 
 
 #define USER_IO_MAX_VECTORS 64U
@@ -240,17 +255,17 @@ static int64_t sys_thread_create(uint64_t process_handle, uint64_t arguments_poi
     process_t *caller = current_process();
     g_thread_create_stage = 1U;
     if (caller == 0) {
-        return K_EPERM;
+        return thread_create_diag_fail(1U, K_EPERM);
     }
     os_thread_create_t arguments;
     kstatus_t status = copy_from_user(&arguments,
         (const void __user *)(uintptr_t)arguments_pointer, sizeof(arguments));
     if (status != K_OK) {
-        return status;
+        return thread_create_diag_fail(2U, status);
     }
     if (!versioned_header_valid(&arguments.hdr, sizeof(arguments)) ||
         arguments.flags != 0 || arguments.reserved != 0) {
-        return K_EINVAL;
+        return thread_create_diag_fail(3U, K_EINVAL);
     }
 
     process_t *target = 0;
@@ -259,7 +274,7 @@ static int64_t sys_thread_create(uint64_t process_handle, uint64_t arguments_poi
                             PROCESS_RIGHT_CREATE_THREAD, &target, &target_referenced);
     g_thread_create_stage = 2U;
     if (status != K_OK) {
-        return status;
+        return thread_create_diag_fail(4U, status);
     }
 
     /* 创建前同时验证入口和栈权限；按需匿名页会在这里完成首次缺页。 */
@@ -276,13 +291,16 @@ static int64_t sys_thread_create(uint64_t process_handle, uint64_t arguments_poi
     };
     status = vm_handle_fault(target->vm, &entry_fault);
     g_thread_create_stage = 3U;
-    if (status == K_OK) {
-        status = vm_handle_fault(target->vm, &stack_fault);
-        g_thread_create_stage = 4U;
-    }
     if (status != K_OK) {
         if (target_referenced) object_put(target);
-        return status;
+        return thread_create_diag_fail(5U, status);
+    }
+
+    status = vm_handle_fault(target->vm, &stack_fault);
+    g_thread_create_stage = 4U;
+    if (status != K_OK) {
+        if (target_referenced) object_put(target);
+        return thread_create_diag_fail(6U, status);
     }
 
     thread_t *thread = 0;
@@ -294,17 +312,23 @@ static int64_t sys_thread_create(uint64_t process_handle, uint64_t arguments_poi
     g_thread_create_stage = 5U;
     if (target_referenced) object_put(target);
     if (status != K_OK) {
-        return status;
+        return thread_create_diag_fail(7U, status);
     }
     status = handle_create(&caller->handles, thread, THREAD_RIGHT_ALL, &handle);
     g_thread_create_stage = 6U;
+    uint32_t failure_step = 8U;
     if (status == K_OK) {
+        failure_step = 9U;
         status = copy_to_user((void __user *)(uintptr_t)output_pointer,
                               &handle, sizeof(handle));
     }
     if (status == K_OK) {
+        failure_step = 10U;
         status = thread_start(thread);
         g_thread_create_stage = 7U;
+    }
+    if (status != K_OK) {
+        (void)thread_create_diag_fail(failure_step, status);
     }
     if (status != K_OK && handle != 0) {
         (void)handle_close(&caller->handles, handle);

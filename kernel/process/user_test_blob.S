@@ -241,34 +241,48 @@ liteos_user_runtime_blob_start:
     testq %rax, %rax
     js .Lruntime_failure
 
-    movb $8, STAGE_MARK_ADDRESS
+    movb $0x81, STAGE_MARK_ADDRESS
     movl $SYS_THREAD_CREATE, %eax
     xorl %edi, %edi
     movq $THREAD_ARGS_ADDRESS, %rsi
     movq %rbx, %rdx
     syscall
+    movq %rax, RESULT_MARK_ADDRESS
     testq %rax, %rax
     js .Lruntime_failure
+
+    movb $0x82, STAGE_MARK_ADDRESS
     movq (%rbx), %r14
     testq %r14, %r14
     jz .Lruntime_failure
 
     /* 第一个子线程退出时应唤醒对象等待，并返回退出码 0。 */
+    movb $0x83, STAGE_MARK_ADDRESS
     movl $SYS_WAIT_ONE, %eax
     movq %r14, %rdi
     movl $1000000000, %esi
     leaq 16(%rbx), %rdx
     xorl %r10d, %r10d
     syscall
+    movq %rax, RESULT_MARK_ADDRESS
     testq %rax, %rax
     js .Lruntime_failure
+
+    movb $0x84, STAGE_MARK_ADDRESS
     cmpl $0, 16(%rbx)
     jne .Lruntime_failure
-    cmpq $0, 24(%rbx)
+
+    movb $0x85, STAGE_MARK_ADDRESS
+    movq 24(%rbx), %rax
+    movq %rax, RESULT_MARK_ADDRESS
+    testq %rax, %rax
     jne .Lruntime_failure
+
+    movb $0x86, STAGE_MARK_ADDRESS
     movl $SYS_HANDLE_CLOSE, %eax
     movq %r14, %rdi
     syscall
+    movq %rax, RESULT_MARK_ADDRESS
     testq %rax, %rax
     js .Lruntime_failure
 

@@ -24,6 +24,7 @@ kstatus_t x86_protect_page(paddr_t root, vaddr_t virtual_address, uint32_t flags
                            enum x86_cache_mode cache_mode);
 kstatus_t x86_translate_page(paddr_t root, vaddr_t virtual_address,
                              paddr_t *physical_address, uint64_t *entry_flags);
+bool x86_page_entry_writable(uint64_t entry_flags);
 bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address);
 bool x86_tlb_shootdown_self_test(void);
 void x86_tlb_ipi_interrupt(void);
