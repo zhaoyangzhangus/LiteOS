@@ -32,6 +32,14 @@ TRACE_EVENTS = [
     "usb_xhci_xfer_success",
     "usb_xhci_queue_event",
     "usb_xhci_irq_msix",
+    "usb_xhci_irq_msix_use",
+    "usb_xhci_irq_msix_unuse",
+    "usb_xhci_runtime_write",
+    "usb_xhci_oper_write",
+    "msix_write_config",
+    "apic_deliver_irq",
+    "apic_deliver_irq",
+    "msix_write_config",
 ]
 
 TRACE_MARKERS = tuple(name + " " for name in TRACE_EVENTS)

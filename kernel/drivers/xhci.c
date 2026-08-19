@@ -1871,6 +1871,17 @@ static bool xhci_next_ring_event(xhci_state_t *state, xhci_trb_t *event) {
     if (state->event_index == 0) state->event_cycle ^= 1U;
     uint64_t event_dequeue = xhci_dma_address(&state->event_ring.mapping) +
                              (uint64_t)state->event_index * sizeof(xhci_trb_t);
+
+    /*
+     * Advance ERDP for ring-space accounting, but do NOT clear EHB for every
+     * individual Event TRB.
+     *
+     * EHB belongs to the whole event-processing batch.  Clearing it here can
+     * let the controller generate another MSI-X while the current deferred
+     * worker is still draining the same Event Ring.
+     *
+     * xhci_event_handler_complete() clears EHB exactly once after the batch.
+     */
     (void)xhci_write64(state, state->runtime_offset + XHCI_RUNTIME_INTR0 +
                        XHCI_RUNTIME_ERDP, event_dequeue | XHCI_ERDP_EHB);
     return true;

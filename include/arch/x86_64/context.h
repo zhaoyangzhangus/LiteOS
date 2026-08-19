@@ -44,6 +44,13 @@ void x86_switch_context_root(arch_switch_context_t *from,
                              paddr_t root);
 
 /*
+ * Pure Ring0 thread first-entry trampoline.
+ * R12 carries entry, R13 carries its single void * argument.
+ */
+__attribute__((noreturn))
+void x86_kernel_thread_start(void);
+
+/*
  * 将当前栈切换到同一物理内存的另一个虚拟别名，然后从一个全新的 C 调用链继续执行。
  * 该入口不会返回，适合在撤销引导阶段的低端恒等映射前使用。
  */

@@ -2447,6 +2447,18 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
         halt_forever();
     }
     serial_write("LITEOS_PROCESS_CORE_OK\r\n");
+
+    /*
+     * deferred_init() intentionally ran during early boot before the
+     * canonical scheduler existed.  Now give the global deferred queue its
+     * persistent Ring0 executor; IRQ producers no longer depend on kernel_main
+     * reaching the idle HLT loop before bottom halves can run.
+     */
+    if (!deferred_start_worker()) {
+        serial_write("LITEOS_DEFERRED_WORKER_FAIL\r\n");
+        halt_forever();
+    }
+    serial_write("LITEOS_DEFERRED_WORKER_OK\r\n");
 #if 0
     if (!user_elf_loader_self_test()) {
         serial_write("LITEOS_USER_ELF_FAIL\r\n");

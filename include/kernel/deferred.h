@@ -6,6 +6,13 @@
 typedef void (*deferred_work_fn_t)(void *argument);
 
 bool deferred_init(void);
+
+/*
+ * Start the persistent scheduler-visible Ring0 bottom-half worker.
+ * deferred_init() stays early-boot safe; call this only after sched_init().
+ */
+bool deferred_start_worker(void);
+
 bool deferred_schedule(deferred_work_fn_t function, void *argument);
 /*
  * Hard-IRQ producer.  It uses an IRQ-safe queue lock, so a transient normal

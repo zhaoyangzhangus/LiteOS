@@ -1,8 +1,13 @@
+#include <arch/x86_64/context.h>
+#include <arch/x86_64/cpu.h>
 #include <kernel/deferred.h>
+#include <kernel/process.h>
 #include <kernel/rcu.h>
+#include <kernel/sched.h>
 #include <kernel/spinlock.h>
 
 #define DEFERRED_QUEUE_CAPACITY 128U
+#define DEFERRED_WORKER_STACK_SIZE (64U * 1024U)
 
 enum {
     DEFERRED_CRITICAL_EMPTY = 0U,
@@ -25,7 +30,17 @@ static struct {
     deferred_item_t critical_item;
     atomic_uint critical_state;
     atomic_uint init_state;
+
+    /*
+     * One global worker matches the current one-global-queue architecture.
+     * It is a persistent Ring0 scheduler thread: no process, no user CR3.
+     */
+    thread_t worker;
+    atomic_bool worker_started;
 } g_deferred;
+
+static uint8_t g_deferred_worker_stack[DEFERRED_WORKER_STACK_SIZE]
+    __attribute__((aligned(16)));
 
 /*
  * Device IRQs enqueue work through deferred_try_schedule().  A plain
@@ -68,6 +83,97 @@ static void deferred_unlock(uint64_t flags) {
     deferred_irq_restore(flags);
 }
 
+static void deferred_wake_worker(void) {
+    if (!atomic_load_explicit(&g_deferred.worker_started,
+                              memory_order_acquire)) {
+        return;
+    }
+
+    /*
+     * sched_wake() is IRQ-safe.  If the worker is still RUNNING this is only
+     * a hint; the queue lock handshake below guarantees it will observe the
+     * newly queued item before it can block.
+     */
+    sched_wake(&g_deferred.worker);
+}
+
+static bool deferred_worker_has_work_locked(void) {
+    unsigned critical =
+        atomic_load_explicit(&g_deferred.critical_state,
+                             memory_order_acquire);
+
+    return g_deferred.count != 0U ||
+           critical == DEFERRED_CRITICAL_WRITING ||
+           critical == DEFERRED_CRITICAL_READY;
+}
+
+static bool deferred_worker_prepare_sleep(void) {
+    thread_t *thread = sched_current_thread();
+    if (thread != &g_deferred.worker) return false;
+
+    /*
+     * Lost-wakeup barrier:
+     *
+     * Producer:
+     *     deferred_lock -> enqueue/publish -> unlock -> sched_wake(worker)
+     *
+     * Consumer:
+     *     deferred_lock -> verify empty -> RUNNING->BLOCKED -> unlock
+     *                   -> schedule()
+     *
+     * Therefore an IRQ can never publish work in the gap between the empty
+     * test and BLOCKED publication.  If it publishes after unlock,
+     * sched_wake() sees BLOCKED (or READY/current) and preserves the wakeup.
+     */
+    uint64_t flags = deferred_lock();
+
+    if (deferred_worker_has_work_locked()) {
+        deferred_unlock(flags);
+        return false;
+    }
+
+    unsigned expected = THREAD_RUNNING;
+    bool blocked =
+        atomic_compare_exchange_strong_explicit(
+            &thread->state,
+            &expected,
+            THREAD_BLOCKED,
+            memory_order_acq_rel,
+            memory_order_acquire);
+
+    deferred_unlock(flags);
+    return blocked;
+}
+
+static void __attribute__((noreturn))
+deferred_worker_main(void *argument) {
+    (void)argument;
+
+    for (;;) {
+        /*
+         * A bounded batch prevents a permanently busy device from keeping
+         * this FAIR kernel worker on-CPU forever.
+         */
+        uint32_t completed = deferred_run(64U);
+
+        if (completed == 64U) {
+            schedule();
+            continue;
+        }
+
+        /*
+         * deferred_run() may have stopped because the queue became empty.
+         * Recheck under the producer lock and publish BLOCKED atomically with
+         * that empty observation.
+         */
+        if (deferred_worker_prepare_sleep()) {
+            schedule();
+        } else {
+            __asm__ volatile ("pause");
+        }
+    }
+}
+
 bool deferred_init(void) {
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_deferred.init_state, &expected, 1U,
@@ -80,12 +186,120 @@ bool deferred_init(void) {
         g_deferred.critical_item.function = 0;
         g_deferred.critical_item.argument = 0;
         atomic_init(&g_deferred.critical_state, DEFERRED_CRITICAL_EMPTY);
+        atomic_init(&g_deferred.worker_started, false);
         atomic_store_explicit(&g_deferred.init_state, 2U, memory_order_release);
         return true;
     }
     while (atomic_load_explicit(&g_deferred.init_state, memory_order_acquire) != 2U) {
         __asm__ volatile ("pause");
     }
+    return true;
+}
+
+bool deferred_start_worker(void) {
+    if (!deferred_init()) return false;
+
+    if (atomic_load_explicit(&g_deferred.worker_started,
+                             memory_order_acquire)) {
+        return true;
+    }
+
+    /*
+     * This is the explicit scheduler-ready boundary.  Early boot calls only
+     * deferred_init()/deferred_run(); they never need a schedulable thread.
+     */
+    thread_t *current = sched_current_thread();
+    uint32_t cpu_id = x86_current_cpu_index();
+    if (current == 0 || cpu_id >= MAX_CPUS) return false;
+
+    thread_t *worker = &g_deferred.worker;
+    uint8_t *worker_bytes = (uint8_t *)worker;
+    for (size_t i = 0U; i < sizeof(*worker); ++i) {
+        worker_bytes[i] = 0U;
+    }
+
+    refcount_init(&worker->object.refs, 1U);
+    worker->object.type = KOBJECT_TYPE_THREAD;
+    worker->object.flags = 0U;
+    worker->object.ops = 0;
+    worker->object.security = 0;
+
+    /*
+     * TID 0 is reserved from normal process allocation (user TIDs begin at
+     * 1) and gives the bottom-half worker deterministic first ordering when
+     * FAIR vruntime ties at boot.
+     */
+    worker->tid = 0U;
+    worker->process = 0;
+    atomic_init(&worker->state, THREAD_READY);
+
+    worker->kernel_stack_base = g_deferred_worker_stack;
+    worker->kernel_stack_size = sizeof(g_deferred_worker_stack);
+    worker->kernel_stack_top =
+        ((vaddr_t)(uintptr_t)g_deferred_worker_stack +
+         sizeof(g_deferred_worker_stack)) &
+        ~(vaddr_t)0x0FULL;
+
+    worker->sched_class = SCHED_CLASS_FAIR;
+    worker->base_sched_class = SCHED_CLASS_FAIR;
+    worker->rt_priority = 0U;
+    worker->base_rt_priority = 0U;
+    worker->sched.weight = 1024U;
+    worker->sched.nice = 0;
+    worker->sched.vruntime = 0U;
+
+    list_init(&worker->sched.rt_node);
+    list_init(&worker->process_node);
+    list_init(&worker->global_node);
+    list_init(&worker->owned_mutexes);
+
+    for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
+        worker->affinity.bits[word] = 0U;
+    }
+    worker->affinity.bits[cpu_id >> 6] =
+        1ULL << (cpu_id & 63U);
+    worker->current_cpu = (uint16_t)cpu_id;
+
+    /*
+     * x86_switch_context_root() finishes with RET.
+     *
+     * saved RSP points at the synthetic return address.  After RET the
+     * trampoline sees a 16-byte-aligned RSP; its CALL then enters C with the
+     * SysV-required RSP % 16 == 8.
+     */
+    uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
+    uintptr_t switch_stack = stack_top - sizeof(uint64_t);
+    *(uint64_t *)switch_stack =
+        (uint64_t)(uintptr_t)&x86_kernel_thread_start;
+
+    worker->arch.switch_ctx.rsp = switch_stack;
+    worker->arch.switch_ctx.r12 =
+        (uint64_t)(uintptr_t)&deferred_worker_main;
+    worker->arch.switch_ctx.r13 = 0U;
+    worker->arch.switch_ctx.r14 = stack_top;
+    worker->arch.fs_base = 0U;
+
+    /*
+     * Publish the wake target before making it runnable.  A concurrent IRQ
+     * may call sched_wake() while state is READY; that is harmless because
+     * sched_enqueue() below already preserves the runnable instance.
+     */
+    atomic_store_explicit(&g_deferred.worker_started, true,
+                          memory_order_release);
+
+    sched_enqueue(worker);
+
+    /*
+     * Force the first run now so the worker reaches its BLOCKED idle state
+     * before Ring3 starts.  This also drains any xHCI/NVMe work queued before
+     * sched_init().
+     */
+    if (!sched_try_run_ready()) {
+        atomic_store_explicit(&g_deferred.worker_started, false,
+                              memory_order_release);
+        return false;
+    }
+
     return true;
 }
 
@@ -102,6 +316,7 @@ bool deferred_schedule(deferred_work_fn_t function, void *argument) {
     g_deferred.tail = (g_deferred.tail + 1U) % DEFERRED_QUEUE_CAPACITY;
     ++g_deferred.count;
     deferred_unlock(flags);
+    deferred_wake_worker();
     return true;
 }
 
@@ -118,29 +333,46 @@ bool deferred_try_schedule(deferred_work_fn_t function, void *argument) {
     g_deferred.tail = (g_deferred.tail + 1U) % DEFERRED_QUEUE_CAPACITY;
     ++g_deferred.count;
     deferred_unlock(flags);
+    deferred_wake_worker();
     return true;
 }
 
 bool deferred_schedule_critical(deferred_work_fn_t function, void *argument) {
     unsigned expected = DEFERRED_CRITICAL_EMPTY;
+    uint64_t flags;
+
     /*
      * This single slot is deliberately reserved for the xHCI MSI-X worker.
      * Its caller owns a coalescing queued bit, so a READY/RUNNING item is
      * already sufficient to cover every later interrupt.  Do not turn this
      * into a shared fallback queue without adding per-source ownership.
+     *
+     * Publication now shares deferred_lock with the worker's sleep handshake.
+     * That is what closes the EMPTY->BLOCKED lost-wakeup window for the
+     * emergency slot as well as the normal ring.
      */
     if (function == 0 || !deferred_init()) return false;
+
+    flags = deferred_lock();
+
     if (!atomic_compare_exchange_strong_explicit(&g_deferred.critical_state,
                                                  &expected,
                                                  DEFERRED_CRITICAL_WRITING,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) {
+        deferred_unlock(flags);
         return false;
     }
+
     g_deferred.critical_item.function = function;
     g_deferred.critical_item.argument = argument;
-    atomic_store_explicit(&g_deferred.critical_state, DEFERRED_CRITICAL_READY,
+
+    atomic_store_explicit(&g_deferred.critical_state,
+                          DEFERRED_CRITICAL_READY,
                           memory_order_release);
+
+    deferred_unlock(flags);
+    deferred_wake_worker();
     return true;
 }
 

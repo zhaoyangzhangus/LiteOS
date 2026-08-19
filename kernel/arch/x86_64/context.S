@@ -3,11 +3,37 @@
     .globl liteos_arch_context_switch
     .globl x86_switch_context
     .globl x86_switch_context_root
+    .globl x86_kernel_thread_start
     .globl x86_rebase_stack_and_call
     .def liteos_arch_context_switch; .scl 2; .type 32; .endef
     .def x86_switch_context; .scl 2; .type 32; .endef
     .def x86_switch_context_root; .scl 2; .type 32; .endef
+    .def x86_kernel_thread_start; .scl 2; .type 32; .endef
     .def x86_rebase_stack_and_call; .scl 2; .type 32; .endef
+
+/*
+ * First entry for a pure Ring0 scheduler thread.
+ *
+ * Initial arch_switch_context_t convention:
+ *   R12 = void (*entry)(void *)
+ *   R13 = argument
+ *
+ * x86_switch_context_root() restores RSP/R12/R13 and executes ret into this
+ * trampoline.  The saved stack is chosen so RSP is 16-byte aligned here;
+ * CALL then gives the C entry the SysV-required RSP % 16 == 8.
+ */
+    .p2align 4
+x86_kernel_thread_start:
+    sti
+    xorq %rbp, %rbp
+    movq %r13, %rdi
+    call *%r12
+
+    /* Persistent kernel workers are not allowed to return. */
+    cli
+1:
+    hlt
+    jmp 1b
 
 /*
  * SysV 参数：RDI=虚拟地址增量，RSI=延续函数，RDX=延续函数参数。
