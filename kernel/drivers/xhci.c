@@ -4974,6 +4974,357 @@ static bool xhci_drain_startup_events(
 }
 
 
+
+/*
+ * V3.10.6B10B9 HUB ENDPOINT RING RESYNC
+ *
+ * hub_transfer_pending is software producer state.  It is not sufficient to
+ * prove that the controller still owns the same TD after startup
+ * re-enumeration, endpoint stop/cancel events and synchronous control waits.
+ *
+ * At the startup -> runtime barrier, normalize the Hub interrupt endpoint just
+ * like the HID stopped-endpoint recovery path:
+ *
+ *     Stop Endpoint
+ *          |
+ *          v
+ *     discard old Hub endpoint Transfer Events
+ *          |
+ *          v
+ *     rebuild transfer ring (PCS/DCS = 1)
+ *          |
+ *          v
+ *     Set TR Dequeue Pointer
+ *          |
+ *          v
+ *     queue exactly one fresh interrupt-IN TD
+ *
+ * This synchronizes both sides of the xHCI ring instead of trusting a stale
+ * hub_transfer_pending flag.
+ */
+static bool xhci_is_endpoint_transfer_event(
+    const xhci_trb_t *event,
+    uint8_t slot,
+    uint8_t endpoint_id)
+{
+    if(event == 0)
+    {
+        return false;
+    }
+
+
+    uint32_t type =
+        (event->control >>
+         XHCI_TRB_TYPE_SHIFT) &
+        0x3FU;
+
+
+    if(type !=
+       XHCI_TRANSFER_EVENT_TYPE)
+    {
+        return false;
+    }
+
+
+    return
+        (uint8_t)(
+            event->control >>
+            XHCI_TRB_SLOT_SHIFT) ==
+                slot &&
+        ((event->control >>
+          XHCI_TRB_ENDPOINT_SHIFT) &
+         0x1FU) ==
+            endpoint_id;
+}
+
+
+static bool xhci_drop_endpoint_transfer_events(
+    xhci_state_t *state,
+    uint8_t slot,
+    uint8_t endpoint_id)
+{
+    if(state == 0 ||
+       slot == 0U ||
+       endpoint_id == 0U)
+    {
+        return false;
+    }
+
+
+    /*
+     * First filter events that synchronous command/control waits have already
+     * moved into the software deferred queue.
+     */
+    xhci_trb_t keep[
+        XHCI_DEFERRED_EVENT_COUNT];
+
+    uint32_t keep_count =
+        0U;
+
+    uint32_t deferred_count =
+        state->deferred_event_count;
+
+
+    for(uint32_t i = 0U;
+        i < deferred_count;
+        ++i)
+    {
+        xhci_trb_t event =
+            state->deferred_events[
+                state->deferred_event_head];
+
+        state->deferred_event_head =
+            (state->deferred_event_head +
+             1U) %
+            XHCI_DEFERRED_EVENT_COUNT;
+
+        --state->deferred_event_count;
+
+
+        if(xhci_is_endpoint_transfer_event(
+               &event,
+               slot,
+               endpoint_id))
+        {
+            continue;
+        }
+
+
+        if(keep_count >=
+           XHCI_DEFERRED_EVENT_COUNT)
+        {
+            return false;
+        }
+
+
+        keep[keep_count++] =
+            event;
+    }
+
+
+    state->deferred_event_head =
+        0U;
+
+    state->deferred_event_tail =
+        0U;
+
+    state->deferred_event_count =
+        0U;
+
+
+    for(uint32_t i = 0U;
+        i < keep_count;
+        ++i)
+    {
+        if(!xhci_defer_event(
+               state,
+               &keep[i]))
+        {
+            return false;
+        }
+    }
+
+
+    /*
+     * A Stop Endpoint completion may reach the hardware Event Ring after its
+     * Command Completion.  Drain only the hardware ring here.  Preserve every
+     * unrelated event by moving it to deferred_events.
+     */
+    for(uint32_t i = 0U;
+        i < XHCI_RING_TRB_COUNT;
+        ++i)
+    {
+        xhci_trb_t event;
+
+
+        if(!xhci_next_ring_event(
+               state,
+               &event))
+        {
+            break;
+        }
+
+
+        if(xhci_is_endpoint_transfer_event(
+               &event,
+               slot,
+               endpoint_id))
+        {
+            continue;
+        }
+
+
+        if(!xhci_defer_event(
+               state,
+               &event))
+        {
+            return false;
+        }
+    }
+
+
+    return true;
+}
+
+
+static bool xhci_restart_hub_status_endpoint(
+    xhci_state_t *state,
+    xhci_device_context_t *hub)
+{
+    if(state == 0 ||
+       hub == 0 ||
+       hub->device_slot == 0U ||
+       hub->hub_endpoint == 0U ||
+       hub->hub_ring.cpu == 0 ||
+       hub->hub_report.cpu == 0)
+    {
+        return false;
+    }
+
+
+    uint8_t slot =
+        hub->device_slot;
+
+    uint32_t endpoint_id =
+        (uint32_t)
+            hub->hub_endpoint *
+            2U +
+        1U;
+
+
+    if(endpoint_id == 0U ||
+       endpoint_id > 31U)
+    {
+        return false;
+    }
+
+
+    liteos_serial_write(
+        "LITEOS_DIAG_HUB_RESYNC_BEGIN\r\n");
+
+
+    /*
+     * Force QEMU/xHC to release any NAK/retry TD whose controller-side
+     * dequeue ownership no longer matches hub_enqueue/hub_cycle.
+     */
+    if(!xhci_submit_command_ex(
+           state,
+           XHCI_STOP_ENDPOINT_TYPE,
+           slot,
+           (uint8_t)endpoint_id,
+           0U,
+           0))
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_RESYNC_STOP_FAIL\r\n");
+
+        return false;
+    }
+
+
+    hub->hub_transfer_pending =
+        false;
+
+
+    if(!xhci_drop_endpoint_transfer_events(
+           state,
+           slot,
+           (uint8_t)endpoint_id))
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_RESYNC_DRAIN_FAIL\r\n");
+
+        return false;
+    }
+
+
+    /*
+     * Recreate a pristine producer ring.
+     */
+    xhci_trb_t *ring =
+        (xhci_trb_t *)
+            hub->hub_ring.cpu;
+
+
+    for(uint32_t i = 0U;
+        i < XHCI_RING_TRB_COUNT -
+                1U;
+        ++i)
+    {
+        ring[i].parameter =
+            0U;
+
+        ring[i].status =
+            0U;
+
+        ring[i].control =
+            0U;
+    }
+
+
+    xhci_init_ring_link(
+        &hub->hub_ring);
+
+    hub->hub_enqueue =
+        0U;
+
+    hub->hub_cycle =
+        1U;
+
+    hub->hub_transfer_pending =
+        false;
+
+    hub->hub_change_bitmap =
+        0U;
+
+
+    dma_sync_for_device(
+        &hub->hub_ring.mapping);
+
+    dma_wmb();
+
+
+    /*
+     * Stop Endpoint leaves the EP in STOPPED.  Set TR Dequeue Pointer is
+     * valid in that state.  The following endpoint doorbell transitions the
+     * endpoint back to RUNNING when the fresh TD is queued.
+     */
+    if(!xhci_submit_command_ex(
+           state,
+           XHCI_SET_TR_DEQUEUE_POINTER_TYPE,
+           slot,
+           (uint8_t)endpoint_id,
+           xhci_dma_address(
+               &hub->hub_ring.mapping) |
+               1ULL,
+           0))
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_RESYNC_DEQUEUE_FAIL\r\n");
+
+        return false;
+    }
+
+
+    if(!xhci_queue_hub_status_device(
+           state,
+           hub))
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_RESYNC_QUEUE_FAIL\r\n");
+
+        return false;
+    }
+
+
+    liteos_serial_write(
+        "LITEOS_DIAG_HUB_RESYNC_OK\r\n");
+
+
+    return true;
+}
+
+
 static bool xhci_start_hub_runtime(
     xhci_state_t *state)
 {
@@ -4998,9 +5349,11 @@ static bool xhci_start_hub_runtime(
 
 
     /*
-     * Pass 1: establish a clean class-protocol baseline for every published
-     * Hub.  No Hub interrupt TD is pending during initial topology probing,
-     * so CLEAR_FEATURE cannot race a completed stale status transfer.
+     * Runtime barrier:
+     *
+     *  1. consume all class-level change bits left by startup probing;
+     *  2. synchronize controller dequeue and software producer state;
+     *  3. leave each published Hub with one fresh interrupt-IN TD.
      */
     for(uint32_t slot = 1U;
         slot <= limit;
@@ -5025,11 +5378,10 @@ static bool xhci_start_hub_runtime(
             &slot_dev->context;
 
 
-        /*
-         * A Hub may already own exactly one valid status TD.  That is the
-         * normal state after Configure Endpoint and after startup-event drain.
-         * Never treat an existing single pending TD as a double-arm failure.
-         */
+        liteos_serial_write(
+            "LITEOS_DIAG_HUB_ARM_BEGIN\r\n");
+
+
         if(!xhci_hub_ack_all_port_changes_device(
                state,
                hub))
@@ -5047,56 +5399,10 @@ static bool xhci_start_hub_runtime(
         }
 
 
-        hub->hub_change_bitmap =
-            0U;
-    }
-
-
-    /*
-     * Pass 2: with every Hub clean, post exactly one interrupt-IN TD per Hub.
-     * QEMU will keep a no-change request NAKed/retryable until a genuine
-     * wPortChange transition occurs.
-     */
-    for(uint32_t slot = 1U;
-        slot <= limit;
-        ++slot)
-    {
-        xhci_slot_device_t *slot_dev =
-            &g_xhci_slot_devices[
-                slot];
-
-
-        if(!slot_dev->used ||
-           !slot_dev->is_hub ||
-           slot_dev->context.device_slot !=
-               (uint8_t)slot ||
-           slot_dev->context.hub_endpoint == 0U)
-        {
-            continue;
-        }
-
-
-        liteos_serial_write(
-            "LITEOS_DIAG_HUB_ARM_BEGIN\r\n");
-
-        if(slot_dev->context.hub_transfer_pending)
-        {
-            /*
-             * The endpoint already owns the one permitted runtime TD.
-             */
-            liteos_serial_write(
-                "LITEOS_DIAG_HUB_ARM_EXISTING\r\n");
-
-            continue;
-        }
-
-        if(!xhci_queue_hub_status_device(
+        if(!xhci_restart_hub_status_endpoint(
                state,
-               &slot_dev->context))
+               hub))
         {
-            liteos_serial_write(
-                "LITEOS_DIAG_HUB_ARM_QUEUE_FAIL\r\n");
-
             if(g_xhci_error == 0U)
             {
                 g_xhci_error =
@@ -5105,6 +5411,7 @@ static bool xhci_start_hub_runtime(
 
             return false;
         }
+
 
         liteos_serial_write(
             "LITEOS_DIAG_HUB_ARM_QUEUED\r\n");
@@ -8745,6 +9052,7 @@ bool xhci_schedule_deferred_work(void) {
 void xhci_deferred_work(void *argument) {
     bool consumed = false;
     bool pending = false;
+    bool raced_irq = false;
     uint32_t pass = 0U;
     (void)argument;
     /* Consume the interrupt which caused this work item before draining the
@@ -8758,16 +9066,48 @@ void xhci_deferred_work(void *argument) {
         ++pass;
     } while (consumed && pass < 8U);
     xhci_report_hid_completion_milestones();
-    atomic_store_explicit(&g_xhci_work_queued, false, memory_order_release);
+
+    /*
+     * Release queue ownership before the final IRQ handshake.
+     *
+     * An MSI-X can arrive while this worker is draining the ring.  The ISR
+     * then sets g_xhci_irq_pending, but cannot enqueue another worker while
+     * g_xhci_work_queued is still true.  Therefore the worker that releases
+     * g_xhci_work_queued must inherit that coalesced IRQ.
+     *
+     * The previous code cleared g_xhci_irq_pending unconditionally here and
+     * could erase exactly that IRQ.  This is especially visible when a Hub
+     * disconnect races with the tail of a HID completion batch.
+     */
+    atomic_store_explicit(&g_xhci_work_queued, false,
+                          memory_order_release);
+
+    /*
+     * Check the Event Ring first, then atomically claim any IRQ that raced
+     * with this worker.  The ordering closes every hand-off window:
+     *
+     *   - IRQ before work_queued=false:
+     *       ISR cannot schedule; raced_irq becomes true and we schedule.
+     *
+     *   - IRQ after work_queued=false but before this exchange:
+     *       either ISR schedules a new worker itself, or raced_irq is true.
+     *
+     *   - IRQ after this exchange:
+     *       work_queued is already false, so the ISR schedules the worker.
+     *
+     * A raced IRQ with no visible TRB costs at most one extra bounded worker;
+     * it cannot form the old endless loop because the IRQ bit is consumed
+     * once at worker entry/tail and must be set again by a real ISR.
+     */
     pending = xhci_event_pending(&g_xhci);
-    (void)atomic_exchange_explicit(&g_xhci_irq_pending, false,
-                                   memory_order_acq_rel);
-    /* An IRQ can be raised by QEMU while IP/ERDP is being acknowledged even
-     * though the event ring has no new TRB.  Re-queueing solely because an IRQ
-     * flag was observed creates an endless deferred-work loop and starves the
-     * user input waiter.  A follow-up is needed only when a real event is
-     * visible; a later genuine IRQ will schedule the worker again. */
-    if (pending) {
+
+    raced_irq =
+        atomic_exchange_explicit(
+            &g_xhci_irq_pending,
+            false,
+            memory_order_acq_rel);
+
+    if (pending || raced_irq) {
         (void)xhci_schedule_deferred_work();
     }
 }
