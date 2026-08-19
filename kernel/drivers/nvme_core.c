@@ -8,6 +8,7 @@
 #include <kernel/io.h>
 #include <kernel/kmem.h>
 #include <kernel/nvme_core.h>
+#include <kernel/sched.h>
 
 #define NVME_CLASS_MASS_STORAGE 0x01U
 #define NVME_SUBCLASS_NVM        0x08U
@@ -150,15 +151,36 @@ static kstatus_t nvme_record_status(kstatus_t status) {
     return status;
 }
 
+/*
+ * NVMe queue/admin locks protect state that is also touched by scheduler
+ * threads on other CPUs.  The lock owner must not be involuntarily switched
+ * out by the local timer while another CPU spins for the same lock.
+ *
+ * Hard IRQ handlers never take these locks; they only enqueue deferred work.
+ */
 static void nvme_lock(spinlock_t *lock) {
+    sched_preempt_disable();
     while (atomic_exchange_explicit(&lock->state, 1U,
                                     memory_order_acquire) != 0U) {
         __asm__ volatile ("pause");
     }
 }
 
+static bool nvme_try_lock(spinlock_t *lock) {
+    unsigned expected = 0U;
+    sched_preempt_disable();
+    if (!atomic_compare_exchange_strong_explicit(&lock->state, &expected, 1U,
+                                                 memory_order_acquire,
+                                                 memory_order_relaxed)) {
+        sched_preempt_enable();
+        return false;
+    }
+    return true;
+}
+
 static void nvme_unlock(spinlock_t *lock) {
     atomic_store_explicit(&lock->state, 0U, memory_order_release);
+    sched_preempt_enable();
 }
 
 static void nvme_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
@@ -1019,7 +1041,8 @@ static void nvme_pending_release(nvme_pending_io_t *pending,
  * 故意在锁外执行，避免 DMA teardown / io_complete 扩大队列锁临界区。
  */
 static uint32_t nvme_poll_queue_completions(nvme_queue_t *queue,
-                                             uint32_t budget) {
+                                             uint32_t budget,
+                                             bool wait_for_lock) {
     nvme_controller_t *controller;
     uint32_t processed = 0U;
 
@@ -1027,7 +1050,17 @@ static uint32_t nvme_poll_queue_completions(nvme_queue_t *queue,
     controller = queue->controller;
     if (controller == 0 || !queue->active) return 0U;
 
-    nvme_lock(&queue->lock);
+    /*
+     * Deferred completion owns forward progress and may wait for the short
+     * queue critical section.  Synchronous direct polling is opportunistic:
+     * if another submit/cancel/deferred consumer owns the queue, skip it and
+     * let the outer synchronous loop retry instead of burning the CPU here.
+     */
+    if (wait_for_lock) {
+        nvme_lock(&queue->lock);
+    } else if (!nvme_try_lock(&queue->lock)) {
+        return 0U;
+    }
     if (queue->completion != 0) dma_sync_for_cpu(&queue->completion_dma);
 
     while (processed < budget && queue->completion != 0) {
@@ -1064,7 +1097,11 @@ static uint32_t nvme_poll_queue_completions(nvme_queue_t *queue,
 
         ++processed;
 
-        nvme_lock(&queue->lock);
+        if (wait_for_lock) {
+            nvme_lock(&queue->lock);
+        } else if (!nvme_try_lock(&queue->lock)) {
+            return processed;
+        }
         if (queue->completion != 0) {
             dma_sync_for_cpu(&queue->completion_dma);
         }
@@ -1080,7 +1117,7 @@ static void nvme_deferred_complete(void *argument) {
 
     if (queue == 0) return;
 
-    processed = nvme_poll_queue_completions(queue, 32U);
+    processed = nvme_poll_queue_completions(queue, 32U, true);
 
     /*
      * This work item owns the completion_queued flag/ref. A synchronous
@@ -1435,7 +1472,7 @@ uint32_t nvme_poll_device_completions(device_t *device,
         }
 
         processed += nvme_poll_queue_completions(
-            queue, budget - processed);
+            queue, budget - processed, false);
     }
 
     return processed;

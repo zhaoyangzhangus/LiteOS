@@ -17,8 +17,7 @@
             "problemMatcher": {
                 "owner": "liteos-qemu",
                 "pattern": {
-                    "regexp": "^(QEMU_DEBUG_READY)$",
-                    "message": 1
+                    "regexp": "a^"
                 },
                 "background": {
                     "activeOnStart": true,

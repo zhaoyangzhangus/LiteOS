@@ -15,6 +15,35 @@ enum {
     AP_STATE_FAILED,
 };
 
+enum {
+    SMP_BSP_FAIL_NONE = 0U,
+    SMP_BSP_FAIL_BAD_INPUT = 1U,
+    SMP_BSP_FAIL_TRAMPOLINE_LAYOUT = 2U,
+    SMP_BSP_FAIL_ROOT_TABLE = 3U,
+    SMP_BSP_FAIL_TRAMPOLINE_MAP = 4U,
+    SMP_BSP_FAIL_BSP_BIND = 5U,
+    SMP_BSP_FAIL_APIC_MODE = 6U,
+    SMP_BSP_FAIL_AP_STACK = 7U,
+    SMP_BSP_FAIL_PREPARE_SECONDARY = 8U,
+    SMP_BSP_FAIL_SEND_INIT = 9U,
+    SMP_BSP_FAIL_SEND_SIPI1 = 10U,
+    SMP_BSP_FAIL_SEND_SIPI2 = 11U,
+    SMP_BSP_FAIL_WAIT_AP = 12U,
+    SMP_BSP_FAIL_FINAL_COUNT = 13U,
+};
+
+enum {
+    SMP_AP_STEP_NONE = 0U,
+    SMP_AP_STEP_ENTERED = 101U,
+    SMP_AP_STEP_PLATFORM = 102U,
+    SMP_AP_STEP_FEATURES = 103U,
+    SMP_AP_STEP_CPU_INIT = 104U,
+    SMP_AP_STEP_SYSCALL_INIT = 105U,
+    SMP_AP_STEP_LAPIC_INIT = 106U,
+    SMP_AP_STEP_CPU_LOCAL = 107U,
+    SMP_AP_STEP_STARTED = 108U,
+};
+
 typedef struct __attribute__((packed)) {
     uint64_t cr3;
     uint64_t stack_top;
@@ -42,6 +71,19 @@ static atomic_uint_fast64_t g_ipi_acknowledgements[MAX_CPUS];
 static atomic_bool g_reschedule_pending[MAX_CPUS];
 static atomic_uint_fast64_t g_online_words[MAX_CPUS / 64U];
 static uint32_t g_discovered_count;
+
+static atomic_uint g_ap_boot_steps[MAX_CPUS];
+static atomic_uint g_smp_fail_cpu;
+static atomic_uint g_smp_fail_apic;
+static atomic_uint g_smp_fail_bsp_step;
+
+static void smp_record_bsp_failure(uint32_t cpu_index,
+                                   uint32_t apic_id,
+                                   uint32_t step) {
+    atomic_store_explicit(&g_smp_fail_cpu, cpu_index, memory_order_relaxed);
+    atomic_store_explicit(&g_smp_fail_apic, apic_id, memory_order_relaxed);
+    atomic_store_explicit(&g_smp_fail_bsp_step, step, memory_order_release);
+}
 
 static void bytes_zero(void *memory, size_t size) {
     uint8_t *bytes = (uint8_t *)memory;
@@ -130,24 +172,63 @@ static bool ap_features_match(void) {
 
 __noreturn void x86_smp_ap_entry(uint32_t cpu_index) {
     const x86_acpi_platform_t *platform = x86_acpi_platform();
-    bool valid = platform != 0 && cpu_index < platform->cpu_count &&
-                 platform->cpus[cpu_index].apic_id == current_legacy_apic_id() &&
-                 ap_features_match();
-    uint32_t apic_id = valid ? platform->cpus[cpu_index].apic_id : UINT32_MAX;
-    if (valid) valid = x86_cpu_init_secondary(cpu_index, apic_id);
+    bool valid = true;
+    uint32_t apic_id = UINT32_MAX;
+
+    if (cpu_index < MAX_CPUS) {
+        atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                              SMP_AP_STEP_ENTERED, memory_order_release);
+    }
+
+    if (platform == 0 || cpu_index >= platform->cpu_count ||
+        platform->cpus[cpu_index].apic_id != current_legacy_apic_id()) {
+        valid = false;
+    } else {
+        apic_id = platform->cpus[cpu_index].apic_id;
+        atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                              SMP_AP_STEP_PLATFORM, memory_order_release);
+    }
+
+    if (valid) {
+        if (!ap_features_match()) valid = false;
+        else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                                   SMP_AP_STEP_FEATURES, memory_order_release);
+    }
+
+    if (valid) {
+        if (!x86_cpu_init_secondary(cpu_index, apic_id)) valid = false;
+        else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                                   SMP_AP_STEP_CPU_INIT, memory_order_release);
+    }
+
     if (valid) {
         uint64_t stack_top = (uint64_t)(uintptr_t)g_ap_stacks[cpu_index] +
                              X86_AP_BOOT_STACK_SIZE;
-        valid = liteos_syscall_init(stack_top) &&
-                liteos_lapic_init_secondary(apic_id, 32U, 1000000U);
+        if (!liteos_syscall_init(stack_top)) valid = false;
+        else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                                   SMP_AP_STEP_SYSCALL_INIT, memory_order_release);
     }
+
     if (valid) {
-        valid = x86_cpu_local_current() != 0;
+        if (!liteos_lapic_init_secondary(apic_id, 32U, 1000000U)) valid = false;
+        else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                                   SMP_AP_STEP_LAPIC_INIT, memory_order_release);
     }
+
+    if (valid) {
+        if (x86_cpu_local_current() == 0) valid = false;
+        else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                                   SMP_AP_STEP_CPU_LOCAL, memory_order_release);
+    }
+
     atomic_store_explicit(&g_ap_states[cpu_index],
                           valid ? AP_STATE_STARTED : AP_STATE_FAILED,
                           memory_order_release);
-    if (valid) atomic_fetch_add_explicit(&g_started_count, 1U, memory_order_relaxed);
+    if (valid) {
+        atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                              SMP_AP_STEP_STARTED, memory_order_release);
+        atomic_fetch_add_explicit(&g_started_count, 1U, memory_order_relaxed);
+    }
 
     if (valid) {
         /* BSP 建立全部运行队列后才发布 online，避免调度器观察到半初始化 CPU。 */
@@ -178,21 +259,40 @@ __noreturn void x86_smp_ap_entry(uint32_t cpu_index) {
 
 bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
     const x86_acpi_platform_t *platform = x86_acpi_platform();
+    atomic_init(&g_smp_fail_cpu, UINT32_MAX);
+    atomic_init(&g_smp_fail_apic, UINT32_MAX);
+    atomic_init(&g_smp_fail_bsp_step, SMP_BSP_FAIL_NONE);
+    for (uint32_t diag_i = 0; diag_i < MAX_CPUS; ++diag_i) {
+        atomic_init(&g_ap_boot_steps[diag_i], SMP_AP_STEP_NONE);
+    }
     if (boot_info == 0 || platform == 0 || platform->cpu_count == 0 ||
         boot_info->ApTrampolineSize != PAGE_SIZE ||
         (boot_info->ApTrampolineBase & (PAGE_SIZE - 1ULL)) != 0 ||
         boot_info->ApTrampolineBase < PAGE_SIZE ||
-        boot_info->ApTrampolineBase > 0xFF000ULL) return false;
+        boot_info->ApTrampolineBase > 0xFF000ULL) {
+        smp_record_bsp_failure(UINT32_MAX, UINT32_MAX, SMP_BSP_FAIL_BAD_INPUT);
+        return false;
+    }
 
     size_t blob_size = (size_t)(x86_ap_trampoline_end - x86_ap_trampoline_start);
     size_t parameter_offset = (size_t)(x86_ap_trampoline_parameters -
                                        x86_ap_trampoline_start);
     if (blob_size == 0 || blob_size > PAGE_SIZE ||
-        parameter_offset > blob_size - sizeof(x86_ap_trampoline_parameters_t)) return false;
+        parameter_offset > blob_size - sizeof(x86_ap_trampoline_parameters_t)) {
+        smp_record_bsp_failure(UINT32_MAX, UINT32_MAX,
+                               SMP_BSP_FAIL_TRAMPOLINE_LAYOUT);
+        return false;
+    }
     paddr_t root = x86_current_root_table();
-    if (root.value == 0 || root.value > UINT32_MAX) return false;
+    if (root.value == 0 || root.value > UINT32_MAX) {
+        smp_record_bsp_failure(UINT32_MAX, UINT32_MAX, SMP_BSP_FAIL_ROOT_TABLE);
+        return false;
+    }
     uint8_t *page = (uint8_t *)phys_to_direct(paddr_make(boot_info->ApTrampolineBase));
-    if (page == 0) return false;
+    if (page == 0) {
+        smp_record_bsp_failure(UINT32_MAX, UINT32_MAX, SMP_BSP_FAIL_TRAMPOLINE_MAP);
+        return false;
+    }
     bytes_zero(page, PAGE_SIZE);
     bytes_copy(page, x86_ap_trampoline_start, blob_size);
     x86_ap_trampoline_parameters_t *parameters =
@@ -206,7 +306,11 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
         }
     }
     if (bsp_index == UINT32_MAX ||
-        !x86_cpu_bind_bootstrap(bsp_index, platform->bsp_apic_id)) return false;
+        !x86_cpu_bind_bootstrap(bsp_index, platform->bsp_apic_id)) {
+        smp_record_bsp_failure(bsp_index, platform->bsp_apic_id,
+                               SMP_BSP_FAIL_BSP_BIND);
+        return false;
+    }
 
     g_discovered_count = platform->cpu_count;
     atomic_init(&g_started_count, 1U);
@@ -230,12 +334,21 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
     for (uint32_t i = 0; i < platform->cpu_count; ++i) {
         uint32_t apic_id = platform->cpus[i].apic_id;
         if (apic_id == platform->bsp_apic_id) continue;
-        if (apic_id > 0xFFU || platform->cpus[i].x2apic) return false;
+        if (apic_id > 0xFFU || platform->cpus[i].x2apic) {
+            smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_APIC_MODE);
+            return false;
+        }
         void *stack = vmalloc(X86_AP_BOOT_STACK_SIZE);
-        if (stack == 0) return false;
+        if (stack == 0) {
+            smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_AP_STACK);
+            return false;
+        }
         g_ap_stacks[i] = stack;
         uint64_t stack_top = (uint64_t)(uintptr_t)stack + X86_AP_BOOT_STACK_SIZE;
-        if (!x86_cpu_prepare_secondary(i, apic_id, stack_top)) return false;
+        if (!x86_cpu_prepare_secondary(i, apic_id, stack_top)) {
+            smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_PREPARE_SECONDARY);
+            return false;
+        }
         parameters->cr3 = root.value;
         parameters->stack_top = stack_top;
         parameters->entry = (uint64_t)(uintptr_t)&x86_smp_ap_entry;
@@ -245,16 +358,32 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
         atomic_store_explicit(&g_ap_states[i], AP_STATE_BOOTING, memory_order_release);
         atomic_thread_fence(memory_order_seq_cst);
 
-        if (!liteos_lapic_send_init(apic_id)) return false;
+        if (!liteos_lapic_send_init(apic_id)) {
+            smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_SEND_INIT);
+            return false;
+        }
         tsc_delay(10000000ULL);
-        if (!liteos_lapic_send_startup(apic_id, vector)) return false;
+        if (!liteos_lapic_send_startup(apic_id, vector)) {
+            smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_SEND_SIPI1);
+            return false;
+        }
         if (!wait_for_ap(i, 200000ULL)) {
-            if (!liteos_lapic_send_startup(apic_id, vector) ||
-                !wait_for_ap(i, 1000000000ULL)) return false;
+            if (!liteos_lapic_send_startup(apic_id, vector)) {
+                smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_SEND_SIPI2);
+                return false;
+            }
+            if (!wait_for_ap(i, 1000000000ULL)) {
+                smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_WAIT_AP);
+                return false;
+            }
         }
     }
-    return atomic_load_explicit(&g_started_count, memory_order_acquire) ==
-           platform->cpu_count;
+    if (atomic_load_explicit(&g_started_count, memory_order_acquire) !=
+        platform->cpu_count) {
+        smp_record_bsp_failure(UINT32_MAX, UINT32_MAX, SMP_BSP_FAIL_FINAL_COUNT);
+        return false;
+    }
+    return true;
 }
 
 uint32_t x86_smp_started_count(void) {
@@ -262,6 +391,31 @@ uint32_t x86_smp_started_count(void) {
 }
 
 uint32_t x86_smp_discovered_count(void) { return g_discovered_count; }
+
+void x86_smp_get_start_diag(x86_smp_start_diag_t *diag) {
+    if (diag == 0) return;
+
+    uint32_t cpu_index =
+        atomic_load_explicit(&g_smp_fail_cpu, memory_order_acquire);
+    diag->cpu_index = cpu_index;
+    diag->apic_id =
+        atomic_load_explicit(&g_smp_fail_apic, memory_order_acquire);
+    diag->bsp_step =
+        atomic_load_explicit(&g_smp_fail_bsp_step, memory_order_acquire);
+    diag->started_count =
+        atomic_load_explicit(&g_started_count, memory_order_acquire);
+    diag->discovered_count = g_discovered_count;
+
+    if (cpu_index < MAX_CPUS) {
+        diag->ap_step =
+            atomic_load_explicit(&g_ap_boot_steps[cpu_index], memory_order_acquire);
+        diag->ap_state =
+            atomic_load_explicit(&g_ap_states[cpu_index], memory_order_acquire);
+    } else {
+        diag->ap_step = SMP_AP_STEP_NONE;
+        diag->ap_state = AP_STATE_OFFLINE;
+    }
+}
 
 bool x86_smp_cpu_online(uint32_t cpu_index) {
     if (cpu_index >= g_discovered_count || cpu_index >= MAX_CPUS) return false;
