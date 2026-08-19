@@ -102,3 +102,4 @@ uint32_t nvme_last_stage(void);
 uint16_t nvme_last_completion_status(void);
 /* 定时器只投递轮询任务，真正的 CQ 消费在可抢占的 deferred 上下文执行。 */
 bool nvme_schedule_deferred_poll(void);
+kstatus_t nvme_recover_after_timeout(device_t *device);

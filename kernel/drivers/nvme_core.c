@@ -935,6 +935,24 @@ static void nvme_stop_device(device_t *device) {
     (void)nvme_stop_device_checked(device);
 }
 
+kstatus_t nvme_recover_after_timeout(device_t *device) {
+    if (device == 0 || device->driver_data == 0) return K_EINVAL;
+
+    nvme_controller_t *controller =
+        (nvme_controller_t *)device->driver_data;
+
+    /*
+     * Ignore late MSI-X while nvme_start() disables the controller and tears
+     * down the old queues. nvme_free_io_queues() aborts pending mappings only
+     * after the controller is no longer allowed to DMA.
+     */
+    controller->started = false;
+
+    kstatus_t status = nvme_start(device);
+    g_nvme_last_status = status;
+    return status;
+}
+
 static void nvme_ring_io_submission(nvme_controller_t *controller,
                                     const nvme_queue_t *queue) {
     uint32_t offset = NVME_REG_DBS +

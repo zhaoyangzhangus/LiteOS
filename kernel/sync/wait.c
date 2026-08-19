@@ -121,17 +121,27 @@ kstatus_t wait_on_queue(wait_queue_t *queue, bool (*predicate)(void *), void *co
             wait_unlock(&g_timeout_lock);
             return K_ETIMEDOUT;
         }
-        atomic_store_explicit(&waiter.state, WAITER_WAITING, memory_order_relaxed);
+        atomic_store_explicit(&waiter.state, WAITER_WAITING,
+                              memory_order_relaxed);
+
+        /*
+         * Publish the owning waiter before THREAD_BLOCKED becomes visible.
+         * Any CPU that successfully observes BLOCKED through sched_wake()'s
+         * acquire CAS must therefore also observe blocked_waiter.
+         */
+        thread->blocked_waiter = &waiter;
+
         unsigned expected = THREAD_RUNNING;
         if (!atomic_compare_exchange_strong_explicit(&thread->state, &expected,
                                                       THREAD_BLOCKED,
-                                                      memory_order_acq_rel,
+                                                      memory_order_release,
                                                       memory_order_acquire)) {
+            thread->blocked_waiter = 0;
             wait_unlock(&queue->lock);
             wait_unlock(&g_timeout_lock);
             return K_EBUSY;
         }
-        thread->blocked_waiter = &waiter;
+
         wait_insert_tail(&queue->waiters, &waiter.node);
         if (deadline != UINT64_MAX) {
             wait_insert_tail(&g_timeout_waiters, &waiter.timeout_node);

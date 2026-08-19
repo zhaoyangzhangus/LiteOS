@@ -3,6 +3,7 @@
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/smp.h>
 #include <kernel/process.h>
+#include <kernel/wait.h>
 #include "syscall.h"
 
 #define SCHED_ENTITY_ENQUEUED (1U << 0)
@@ -563,6 +564,19 @@ void sched_enqueue(thread_t *thread) {
 
 void sched_wake(thread_t *thread) {
     if (thread == 0 || g_cpu_count == 0) return;
+
+    /*
+     * wait_on_queue() owns the wake protocol while blocked_waiter is set.
+     * A legal queue wake/timeout/cancel first transitions waiter.state away
+     * from WAITER_WAITING and only then calls sched_wake().
+     */
+    waiter_t *blocked_waiter = thread->blocked_waiter;
+    if (blocked_waiter != 0 &&
+        atomic_load_explicit(&blocked_waiter->state,
+                             memory_order_acquire) == WAITER_WAITING) {
+        return;
+    }
+
     uint32_t caller_cpu = x86_current_cpu_index();
     uint32_t cpu_id = scheduler_cpu_available(thread->current_cpu) ?
                       thread->current_cpu : caller_cpu;

@@ -12,6 +12,7 @@ bool deferred_init(void);
  * deferred_init() stays early-boot safe; call this only after sched_init().
  */
 bool deferred_start_worker(void);
+bool deferred_worker_started(void);
 
 bool deferred_schedule(deferred_work_fn_t function, void *argument);
 /*

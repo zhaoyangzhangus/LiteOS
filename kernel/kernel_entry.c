@@ -148,7 +148,7 @@ static kstatus_t nvme_fat32_submit(nvme_fat32_backend_t *backend,
     bio_vec_t bio_vector = {0};
     io_request_t request;
     bio_t bio = {0};
-    kstatus_t status;
+    kstatus_t status = K_EIO;
 
     if (backend == 0 || backend->device == 0 ||
         (opcode != IO_READ && opcode != IO_WRITE && opcode != IO_FLUSH) ||
@@ -159,18 +159,23 @@ static kstatus_t nvme_fat32_submit(nvme_fat32_backend_t *backend,
 
     if (bio_opcode != BIO_OP_FLUSH) {
         page = page_alloc(0, opcode == IO_WRITE ?
-                          PAGE_ALLOC_ZERO | PAGE_ALLOC_DMA32 : PAGE_ALLOC_DMA32);
+                          PAGE_ALLOC_ZERO | PAGE_ALLOC_DMA32 :
+                          PAGE_ALLOC_DMA32);
         if (page == 0) return K_ENOMEM;
+
         page_memory = phys_to_direct(page_to_phys(page));
         if (page_memory == 0) {
             page_free(page);
             return K_EIO;
         }
+
         if (opcode == IO_WRITE) {
             for (UINT32 index = 0; index < 512U; ++index) {
-                ((UINT8 *)page_memory)[index] = ((const UINT8 *)buffer)[index];
+                ((UINT8 *)page_memory)[index] =
+                    ((const UINT8 *)buffer)[index];
             }
         }
+
         vector.base = page_memory;
         vector.length = 512U;
         bio_vector.page = page;
@@ -178,42 +183,105 @@ static kstatus_t nvme_fat32_submit(nvme_fat32_backend_t *backend,
         bio_vector.length = 512U;
     }
 
-    io_request_init(&request, opcode, backend->device, 0,
-                    bio_opcode == BIO_OP_FLUSH ? 0 : &vector,
-                    bio_opcode == BIO_OP_FLUSH ? 0U : 1U);
-    bio.lba = backend->start_lba + lba;
-    bio.op = bio_opcode;
-    bio.vecs = bio_opcode == BIO_OP_FLUSH ? 0 : &bio_vector;
-    bio.vec_count = bio_opcode == BIO_OP_FLUSH ? 0U : 1U;
-    bio.io = &request;
-    list_init(&bio.node);
-    request.completion_target = &bio;
-    status = io_submit(&request);
-    if (status == K_OK) {
-        for (UINT32 spin = 0U;
-             spin < 10000000U &&
-             atomic_load_explicit(&request.state, memory_order_acquire) ==
-                 IOREQ_SUBMITTED;
-             ++spin) {
+    for (UINT32 attempt = 0U; attempt < 2U; ++attempt) {
+        io_request_init(&request, opcode, backend->device, 0,
+                        bio_opcode == BIO_OP_FLUSH ? 0 : &vector,
+                        bio_opcode == BIO_OP_FLUSH ? 0U : 1U);
+
+        bio = (bio_t){0};
+        bio.lba = backend->start_lba + lba;
+        bio.op = bio_opcode;
+        bio.vecs = bio_opcode == BIO_OP_FLUSH ? 0 : &bio_vector;
+        bio.vec_count = bio_opcode == BIO_OP_FLUSH ? 0U : 1U;
+        bio.io = &request;
+        list_init(&bio.node);
+        request.completion_target = &bio;
+
+        status = io_submit(&request);
+        if (status != K_OK) break;
+
+        uint64_t start_tsc = x86_read_tsc();
+        uint64_t timeout_ticks =
+            x86_timeout_ns_to_tsc(5000000000ULL);
+        bool runtime_worker = deferred_worker_started();
+
+        while (atomic_load_explicit(&request.state,
+                                    memory_order_acquire) ==
+               IOREQ_SUBMITTED) {
             (void)nvme_schedule_deferred_poll();
-            (void)deferred_run(8U);
+
+            if (runtime_worker) {
+                /*
+                 * Runtime has a persistent Ring0 deferred worker. Yield the
+                 * synchronous filesystem caller instead of becoming a second
+                 * deferred consumer.
+                 */
+                schedule();
+            } else {
+                /*
+                 * Early boot mount happens before deferred_start_worker().
+                 * It still needs a local consumer to bring NVMe CQ work home.
+                 */
+                (void)deferred_run(8U);
+            }
+
+            if (timeout_ticks != 0U &&
+                x86_read_tsc() - start_tsc >= timeout_ticks) {
+                liteos_serial_write(
+                    "LITEOS_DIAG_NVME_ROOT_TIMEOUT LBA_LOW=");
+                liteos_serial_write_u32(
+                    (UINT32)(backend->start_lba + lba));
+                liteos_serial_write(" ATTEMPT=");
+                liteos_serial_write_u32(attempt + 1U);
+                liteos_serial_write("\r\n");
+
+                /*
+                 * Do not io_cancel() and free the PRP page immediately.
+                 * Stop/rebuild the controller first so every old pending
+                 * mapping is aborted after DMA has stopped.
+                 */
+                kstatus_t recovery =
+                    nvme_recover_after_timeout(backend->device);
+
+                if (recovery != K_OK) {
+                    liteos_serial_write(
+                        "LITEOS_DIAG_NVME_ROOT_RECOVER_FAIL STATUS=");
+                    liteos_serial_write_u32((UINT32)recovery);
+                    liteos_serial_write("\r\n");
+                    status = recovery;
+                    goto done;
+                }
+
+                status = K_ETIMEDOUT;
+                break;
+            }
+
             __asm__ volatile ("pause");
         }
-        if (atomic_load_explicit(&request.state, memory_order_acquire) ==
-            IOREQ_SUBMITTED) {
-            (void)io_cancel(&request);
-            status = K_ETIMEDOUT;
-        } else {
-            status = request.status;
+
+        if (status == K_ETIMEDOUT) {
+            if (attempt == 0U) {
+                continue;
+            }
+            break;
         }
+
+        status = request.status;
+        if (status == K_OK && bio_opcode != BIO_OP_FLUSH &&
+            request.bytes_done != 512U) {
+            status = K_EIO;
+        }
+        break;
     }
-    if (status == K_OK && bio_opcode != BIO_OP_FLUSH &&
-        request.bytes_done != 512U) status = K_EIO;
+
     if (status == K_OK && opcode == IO_READ) {
         for (UINT32 index = 0; index < 512U; ++index) {
-            ((UINT8 *)buffer)[index] = ((const UINT8 *)page_memory)[index];
+            ((UINT8 *)buffer)[index] =
+                ((const UINT8 *)page_memory)[index];
         }
     }
+
+done:
     if (page != 0) page_free(page);
     return status;
 }

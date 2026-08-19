@@ -303,6 +303,11 @@ bool deferred_start_worker(void) {
     return true;
 }
 
+bool deferred_worker_started(void) {
+    return atomic_load_explicit(&g_deferred.worker_started,
+                                memory_order_acquire);
+}
+
 bool deferred_schedule(deferred_work_fn_t function, void *argument) {
     uint64_t flags;
     if (function == 0 || !deferred_init()) return false;
