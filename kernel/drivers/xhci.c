@@ -1,6 +1,7 @@
 #include <arch/x86_64/paging.h>
 #include <usb/device.h>
 #include <usb/hub.h>
+#include <usb/storage.h>
 
 #include <arch/x86_64/cpu.h>
 #include <kernel/dma.h>
@@ -112,6 +113,9 @@
 #define USB_HID_SET_PROTOCOL       0x0BU
 #define USB_HID_PROTOCOL_BOOT      0x00U
 #define USB_CLASS_HUB             0x09U
+#define USB_CLASS_MASS_STORAGE    0x08U
+#define USB_MSC_SUBCLASS_SCSI     0x06U
+#define USB_MSC_PROTOCOL_BULK_ONLY 0x50U
 #define USB_CLASS_WIRELESS        0xE0U
 #define USB_BT_SUBCLASS           0x01U
 #define USB_BT_PROTOCOL           0x01U
@@ -247,6 +251,12 @@ typedef struct xhci_dma_page {
     uint8_t hub_cycle; \
     bool hub_transfer_pending; \
     uint32_t hub_change_bitmap; \
+    uint8_t msc_interface; \
+    uint8_t msc_bulk_in_endpoint; \
+    uint8_t msc_bulk_out_endpoint; \
+    uint16_t msc_bulk_in_max_packet; \
+    uint16_t msc_bulk_out_max_packet; \
+    bool msc_configured; \
     uint8_t bt_event_endpoint; \
     uint8_t bt_acl_in_endpoint; \
     uint8_t bt_acl_out_endpoint; \
@@ -436,6 +446,53 @@ typedef struct xhci_bt_transport {
 static xhci_bt_transport_t
 g_xhci_bt_transports[
     XHCI_MAX_SLOT_TABLE];
+
+typedef struct xhci_msc_transport {
+    bool configured;
+    uint8_t slot;
+    uint8_t interface_number;
+    uint8_t bulk_in_endpoint;
+    uint8_t bulk_out_endpoint;
+    uint16_t bulk_in_max_packet;
+    uint16_t bulk_out_max_packet;
+    xhci_dma_page_t bulk_in_ring;
+    xhci_dma_page_t bulk_out_ring;
+    xhci_dma_page_t data_buffer;
+    uint32_t bulk_in_enqueue;
+    uint32_t bulk_out_enqueue;
+    uint8_t bulk_in_cycle;
+    uint8_t bulk_out_cycle;
+} xhci_msc_transport_t;
+
+static xhci_msc_transport_t
+g_xhci_msc_transports[XHCI_MAX_SLOT_TABLE];
+
+static bool g_xhci_usb_msc;
+
+static bool xhci_free_page(xhci_dma_page_t *page);
+
+static void xhci_msc_transport_release(uint8_t slot) {
+    if (slot == 0U) return;
+    xhci_msc_transport_t *transport = &g_xhci_msc_transports[slot];
+
+    if (transport->configured || usb_msc_present(slot)) {
+        usb_msc_detach(slot);
+    }
+    (void)xhci_free_page(&transport->bulk_in_ring);
+    (void)xhci_free_page(&transport->bulk_out_ring);
+    (void)xhci_free_page(&transport->data_buffer);
+
+    for (size_t i = 0U; i < sizeof(*transport); ++i)
+        ((uint8_t *)transport)[i] = 0U;
+
+    g_xhci_usb_msc = false;
+    for (uint32_t index = 1U; index < XHCI_MAX_SLOT_TABLE; ++index) {
+        if (g_xhci_msc_transports[index].configured) {
+            g_xhci_usb_msc = true;
+            break;
+        }
+    }
+}
 
 
 static uint32_t g_xhci_error;
@@ -868,6 +925,16 @@ static bool xhci_free_device_resources_device(
         bt_controller_destroy(device->bt_controller);
         device->bt_controller = 0;
     }
+    if (device->msc_configured && device->device_slot != 0U) {
+        xhci_msc_transport_release(device->device_slot);
+        device->msc_interface = 0U;
+        device->msc_bulk_in_endpoint = 0U;
+        device->msc_bulk_out_endpoint = 0U;
+        device->msc_bulk_in_max_packet = 0U;
+        device->msc_bulk_out_max_packet = 0U;
+        device->msc_configured = false;
+    }
+
     if(!xhci_free_page(
            &device->descriptor_buffer))
     {
@@ -1059,6 +1126,9 @@ static uint8_t xhci_context_kind(const xhci_device_context_t *context) {
     if (context->audio_endpoint != 0U) return 2U;
     if (context->bt_event_endpoint != 0U) return 3U;
     if (context->hub_configured || context->hub_interface_present) return 4U;
+    if (context->msc_configured ||
+        (context->msc_bulk_in_endpoint != 0U &&
+         context->msc_bulk_out_endpoint != 0U)) return 5U;
     return 0U;
 }
 
@@ -3024,6 +3094,12 @@ static bool xhci_publish_working_device(
     xhci_recompute_topology(
         state);
 
+    if (slot_dev->context.msc_configured) {
+        if (!usb_msc_schedule_attach(slot)) {
+            liteos_serial_write("LITEOS_USB_MSC_ATTACH_QUEUE_FAIL\r\n");
+        }
+    }
+
     return true;
 }
 
@@ -4544,6 +4620,7 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
     bool audio_interface = false;
     bool hub_interface = false;
     bool bt_interface = false;
+    bool msc_interface = false;
     if (state == 0) return false;
     descriptor = (uint8_t *)state->descriptor_buffer.cpu;
     if (descriptor[0] < 9U || descriptor[1] != XHCI_DESCRIPTOR_CONFIGURATION) {
@@ -4576,6 +4653,12 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
     state->hub_cycle = 1U;
     state->hub_transfer_pending = false;
     state->hub_change_bitmap = 0U;
+    state->msc_interface = 0U;
+    state->msc_bulk_in_endpoint = 0U;
+    state->msc_bulk_out_endpoint = 0U;
+    state->msc_bulk_in_max_packet = 0U;
+    state->msc_bulk_out_max_packet = 0U;
+    state->msc_configured = false;
     state->bt_event_endpoint = 0U;
     state->bt_acl_in_endpoint = 0U;
     state->bt_acl_out_endpoint = 0U;
@@ -4612,6 +4695,14 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
             bt_interface = interface_class == USB_CLASS_WIRELESS &&
                            interface_subclass == USB_BT_SUBCLASS &&
                            descriptor[offset + 7U] == USB_BT_PROTOCOL;
+            msc_interface =
+                interface_class == USB_CLASS_MASS_STORAGE &&
+                interface_subclass == USB_MSC_SUBCLASS_SCSI &&
+                interface_protocol == USB_MSC_PROTOCOL_BULK_ONLY &&
+                alternate == 0U;
+            if (msc_interface) {
+                state->msc_interface = descriptor[offset + 2U];
+            }
             if (audio_interface) {
                 state->audio_interface = descriptor[offset + 2U];
                 state->audio_alt_setting = alternate;
@@ -4663,6 +4754,24 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
             state->audio_max_packet = ((uint16_t)descriptor[offset + 4U] |
                                        ((uint16_t)descriptor[offset + 5U] << 8)) & 0x07FFU;
             state->audio_interval = descriptor[offset + 6U];
+        } else if (type == XHCI_DESCRIPTOR_ENDPOINT && length >= 7U &&
+                   msc_interface &&
+                   (descriptor[offset + 3U] & 0x03U) == USB_TRANSFER_BULK) {
+            uint8_t endpoint = descriptor[offset + 2U] & 0x0FU;
+            bool direction_in = (descriptor[offset + 2U] & 0x80U) != 0U;
+            uint16_t max_packet =
+                (uint16_t)descriptor[offset + 4U] |
+                ((uint16_t)descriptor[offset + 5U] << 8);
+            if (endpoint != 0U && max_packet != 0U) {
+                if (direction_in && state->msc_bulk_in_endpoint == 0U) {
+                    state->msc_bulk_in_endpoint = endpoint;
+                    state->msc_bulk_in_max_packet = max_packet;
+                } else if (!direction_in &&
+                           state->msc_bulk_out_endpoint == 0U) {
+                    state->msc_bulk_out_endpoint = endpoint;
+                    state->msc_bulk_out_max_packet = max_packet;
+                }
+            }
         } else if (type == XHCI_DESCRIPTOR_ENDPOINT && length >= 7U && bt_interface) {
             uint8_t endpoint = descriptor[offset + 2U] & 0x0FU;
             uint8_t direction_in = descriptor[offset + 2U] & 0x80U;
@@ -4690,6 +4799,10 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
     return (state->hid_endpoint != 0U && state->hid_max_packet != 0U) ||
            (state->audio_endpoint != 0U && state->audio_max_packet != 0U) ||
            state->hub_interface_present ||
+           (state->msc_bulk_in_endpoint != 0U &&
+            state->msc_bulk_out_endpoint != 0U &&
+            state->msc_bulk_in_max_packet != 0U &&
+            state->msc_bulk_out_max_packet != 0U) ||
            (state->bt_event_endpoint != 0U &&
             (state->bt_acl_in_endpoint != 0U || state->bt_acl_out_endpoint != 0U));
 }
@@ -7242,6 +7355,191 @@ static kstatus_t xhci_bt_send(
 }
 
 
+
+static bool xhci_configure_msc_endpoints(xhci_state_t *state) {
+    uint32_t in_id;
+    uint32_t out_id;
+    uint32_t *input;
+    uint32_t *control;
+    uint32_t *input_slot;
+    uint32_t *output_slot;
+    uint8_t slot;
+
+    if (state == 0 || state->device_slot == 0U ||
+        state->msc_bulk_in_endpoint == 0U ||
+        state->msc_bulk_out_endpoint == 0U ||
+        state->msc_bulk_in_max_packet == 0U ||
+        state->msc_bulk_out_max_packet == 0U) return false;
+
+    slot = state->device_slot;
+    in_id = (uint32_t)state->msc_bulk_in_endpoint * 2U + 1U;
+    out_id = (uint32_t)state->msc_bulk_out_endpoint * 2U;
+    if (in_id > 31U || out_id > 31U || in_id == out_id) return false;
+
+    xhci_msc_transport_release(slot);
+    xhci_msc_transport_t *transport = &g_xhci_msc_transports[slot];
+
+    if (!xhci_alloc_page(state, &transport->bulk_in_ring, DMA_BIDIRECTIONAL) ||
+        !xhci_alloc_page(state, &transport->bulk_out_ring, DMA_BIDIRECTIONAL) ||
+        !xhci_alloc_page(state, &transport->data_buffer, DMA_BIDIRECTIONAL)) {
+        xhci_msc_transport_release(slot);
+        return false;
+    }
+
+    xhci_init_ring_link(&transport->bulk_in_ring);
+    xhci_init_ring_link(&transport->bulk_out_ring);
+
+    input = (uint32_t *)state->input_context.cpu;
+    control = input;
+    input_slot = (uint32_t *)((uint8_t *)input + state->context_size);
+    output_slot = (uint32_t *)state->output_context.cpu;
+    for (uint32_t i = 0U; i < 4U; ++i) input_slot[i] = output_slot[i];
+
+    uint32_t context_entries = in_id > out_id ? in_id : out_id;
+    input_slot[0] &= ~(0x1FU << 27);
+    input_slot[0] |= context_entries << 27;
+    control[0] = 0U;
+    control[1] = 1U | (1U << in_id) | (1U << out_id);
+
+    xhci_init_endpoint_context(
+        state,
+        (uint32_t *)((uint8_t *)input + state->context_size * (in_id + 1U)),
+        0U, 6U, state->msc_bulk_in_max_packet, &transport->bulk_in_ring.mapping);
+    xhci_init_endpoint_context(
+        state,
+        (uint32_t *)((uint8_t *)input + state->context_size * (out_id + 1U)),
+        0U, 2U, state->msc_bulk_out_max_packet, &transport->bulk_out_ring.mapping);
+
+    dma_sync_for_device(&state->input_context.mapping);
+    dma_sync_for_device(&transport->bulk_in_ring.mapping);
+    dma_sync_for_device(&transport->bulk_out_ring.mapping);
+    dma_sync_for_device(&transport->data_buffer.mapping);
+
+    if (!xhci_submit_command(state, XHCI_CONFIGURE_ENDPOINT_TYPE, slot,
+                             xhci_dma_address(&state->input_context.mapping), 0)) {
+        xhci_msc_transport_release(slot);
+        return false;
+    }
+
+    transport->configured = true;
+    transport->slot = slot;
+    transport->interface_number = state->msc_interface;
+    transport->bulk_in_endpoint = state->msc_bulk_in_endpoint;
+    transport->bulk_out_endpoint = state->msc_bulk_out_endpoint;
+    transport->bulk_in_max_packet = state->msc_bulk_in_max_packet;
+    transport->bulk_out_max_packet = state->msc_bulk_out_max_packet;
+    transport->bulk_in_enqueue = 0U;
+    transport->bulk_out_enqueue = 0U;
+    transport->bulk_in_cycle = 1U;
+    transport->bulk_out_cycle = 1U;
+    state->msc_configured = true;
+    g_xhci_usb_msc = true;
+    return true;
+}
+
+static kstatus_t xhci_msc_transfer_locked(
+    xhci_state_t *state, xhci_msc_transport_t *transport,
+    uint8_t endpoint, bool direction_in, void *buffer,
+    uint32_t length, uint32_t *actual) {
+    xhci_dma_page_t *ring_page;
+    uint32_t *enqueue;
+    uint8_t *cycle;
+    uint32_t endpoint_id;
+    xhci_trb_t *ring;
+
+    if (state == 0 || transport == 0 || !transport->configured ||
+        buffer == 0 || length == 0U || length > PAGE_SIZE ||
+        transport->data_buffer.cpu == 0) return K_EINVAL;
+
+    if (direction_in) {
+        if (endpoint != transport->bulk_in_endpoint) return K_EINVAL;
+        endpoint_id = (uint32_t)endpoint * 2U + 1U;
+        ring_page = &transport->bulk_in_ring;
+        enqueue = &transport->bulk_in_enqueue;
+        cycle = &transport->bulk_in_cycle;
+    } else {
+        if (endpoint != transport->bulk_out_endpoint) return K_EINVAL;
+        endpoint_id = (uint32_t)endpoint * 2U;
+        ring_page = &transport->bulk_out_ring;
+        enqueue = &transport->bulk_out_enqueue;
+        cycle = &transport->bulk_out_cycle;
+    }
+
+    if (endpoint_id > 31U || *enqueue >= XHCI_RING_TRB_COUNT - 1U ||
+        ring_page->cpu == 0) return K_EIO;
+
+    if (!direction_in) {
+        for (uint32_t i = 0U; i < length; ++i)
+            ((uint8_t *)transport->data_buffer.cpu)[i] =
+                ((const uint8_t *)buffer)[i];
+    } else {
+        for (uint32_t i = 0U; i < length; ++i)
+            ((uint8_t *)transport->data_buffer.cpu)[i] = 0U;
+    }
+
+    ring = (xhci_trb_t *)ring_page->cpu;
+    uint32_t index = *enqueue;
+    ring[index].parameter = xhci_dma_address(&transport->data_buffer.mapping);
+    ring[index].status = length;
+    ring[index].control =
+        (XHCI_NORMAL_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
+        XHCI_TRB_INTERRUPT_ON_COMPLETION | *cycle;
+
+    ++index;
+    if (index == XHCI_RING_TRB_COUNT - 1U) {
+        ring[XHCI_RING_TRB_COUNT - 1U].control =
+            (XHCI_LINK_TRB_TYPE << XHCI_TRB_TYPE_SHIFT) |
+            *cycle | XHCI_TRB_LINK_TOGGLE_CYCLE;
+        *enqueue = 0U;
+        *cycle ^= 1U;
+    } else {
+        *enqueue = index;
+    }
+
+    dma_sync_for_device(&ring_page->mapping);
+    dma_sync_for_device(&transport->data_buffer.mapping);
+    dma_wmb();
+    *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
+                           (uint32_t)transport->slot * sizeof(uint32_t)) =
+        endpoint_id;
+    __asm__ volatile ("mfence" : : : "memory");
+
+    for (uint32_t spin = 0U; spin < 5000000U; ++spin) {
+        xhci_trb_t event;
+        if (!xhci_next_ring_event(state, &event)) {
+            __asm__ volatile ("pause");
+            continue;
+        }
+
+        uint32_t type = (event.control >> XHCI_TRB_TYPE_SHIFT) & 0x3FU;
+        uint8_t event_slot = (uint8_t)(event.control >> XHCI_TRB_SLOT_SHIFT);
+        uint32_t event_endpoint =
+            (event.control >> XHCI_TRB_ENDPOINT_SHIFT) & 0x1FU;
+        if (type != XHCI_TRANSFER_EVENT_TYPE ||
+            event_slot != transport->slot || event_endpoint != endpoint_id) {
+            if (!xhci_defer_event(state, &event)) return K_EIO;
+            continue;
+        }
+
+        uint32_t completion = event.status >> XHCI_COMPLETION_SHIFT;
+        uint32_t residual = event.status & 0x00FFFFFFU;
+        if (completion != XHCI_COMPLETION_SUCCESS &&
+            completion != XHCI_COMPLETION_SHORT_PACKET) return K_EIO;
+        if (residual > length) return K_EIO;
+
+        uint32_t completed = length - residual;
+        if (direction_in) {
+            dma_sync_for_cpu(&transport->data_buffer.mapping);
+            for (uint32_t i = 0U; i < completed; ++i)
+                ((uint8_t *)buffer)[i] =
+                    ((const uint8_t *)transport->data_buffer.cpu)[i];
+        }
+        if (actual != 0) *actual = completed;
+        return K_OK;
+    }
+    return K_ETIMEDOUT;
+}
+
 static bool xhci_configure_bt_endpoints(xhci_state_t *state) {
     uint32_t event_id;
     uint32_t acl_in_id;
@@ -7954,6 +8252,15 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         }
         g_xhci_usb_hid = true;
         if (state->hid_protocol == USB_HID_PROTOCOL_MOUSE) g_xhci_usb_mouse = true;
+    } else if (state->msc_bulk_in_endpoint != 0U &&
+               state->msc_bulk_out_endpoint != 0U) {
+        if (!xhci_configure_msc_endpoints(state)) {
+            if (g_xhci_error == 0U) g_xhci_error = 165U;
+            do {
+                xhci_unpublish_slot_device(slot, parent_slot, parent_port);
+                return false;
+            } while (0);
+        }
     } else if (state->audio_endpoint != 0U) {
         if (!xhci_configure_audio_endpoint(state)) {
             if (g_xhci_error == 0U) g_xhci_error = 63U;
@@ -8390,6 +8697,56 @@ uint8_t xhci_usb_hub_port_count(void) {
 
 bool xhci_usb_hub_downstream_configured(void) {
     return g_xhci_usb_hub_downstream;
+}
+
+bool xhci_usb_mass_storage_configured(void) {
+    return g_xhci_usb_msc;
+}
+
+bool xhci_usb_msc_query(uint8_t slot, uint8_t *interface_number,
+                        uint8_t *bulk_in, uint8_t *bulk_out) {
+    if (slot == 0U || interface_number == 0 || bulk_in == 0 || bulk_out == 0)
+        return false;
+    xhci_msc_transport_t *transport = &g_xhci_msc_transports[slot];
+    if (!transport->configured || transport->bulk_in_endpoint == 0U ||
+        transport->bulk_out_endpoint == 0U) return false;
+    *interface_number = transport->interface_number;
+    *bulk_in = transport->bulk_in_endpoint;
+    *bulk_out = transport->bulk_out_endpoint;
+    return true;
+}
+
+kstatus_t xhci_usb_bulk_session_begin(uint8_t slot) {
+    if (slot == 0U || !g_xhci.initialized) return K_EINVAL;
+    while (atomic_exchange_explicit(&g_xhci.event_lock.state, 1U,
+                                    memory_order_acquire) != 0U) {
+        __asm__ volatile ("pause");
+    }
+    xhci_msc_transport_t *transport = &g_xhci_msc_transports[slot];
+    if (!transport->configured || transport->slot != slot) {
+        atomic_store_explicit(&g_xhci.event_lock.state, 0U,
+                              memory_order_release);
+        return K_EDEVREMOVED;
+    }
+    return K_OK;
+}
+
+void xhci_usb_bulk_session_end(uint8_t slot) {
+    (void)slot;
+    atomic_store_explicit(&g_xhci.event_lock.state, 0U,
+                          memory_order_release);
+    if (xhci_event_pending(&g_xhci)) (void)xhci_schedule_deferred_work();
+}
+
+kstatus_t xhci_usb_bulk_transfer_locked(uint8_t slot, uint8_t endpoint,
+                                        bool direction_in, void *buffer,
+                                        uint32_t length, uint32_t *actual) {
+    if (slot == 0U) return K_EINVAL;
+    xhci_msc_transport_t *transport = &g_xhci_msc_transports[slot];
+    if (!transport->configured || transport->slot != slot)
+        return K_EDEVREMOVED;
+    return xhci_msc_transfer_locked(&g_xhci, transport, endpoint,
+                                    direction_in, buffer, length, actual);
 }
 
 bool xhci_usb_bluetooth_configured(void) {

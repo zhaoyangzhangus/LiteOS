@@ -13,6 +13,7 @@ debug=0
 no_build=0
 headless=0
 usb_nested=0
+usb_storage=0
 monitor_socket=""
 keep_open=0
 no_kvm=0
@@ -30,6 +31,7 @@ usage() {
   --gdb-port N        修改 GDB 端口
   --headless          不显示图形窗口
   --usb-nested        测试 xHCI -> Hub -> Hub -> Mouse
+  --usb-storage       测试 xHCI USB Mass Storage U盘
   --monitor-socket P  在 Unix socket P 开启 HMP monitor
   --keep-open         普通运行模式下持续运行，Ctrl-C 退出
   --seconds N         普通运行模式最多运行 N 秒（默认 10）
@@ -51,6 +53,7 @@ while (($# > 0)); do
             gdb_port="$2"; shift 2 ;;
         --headless) headless=1; shift ;;
         --usb-nested) usb_nested=1; shift ;;
+        --usb-storage) usb_storage=1; shift ;;
         --monitor-socket)
             (($# >= 2)) || {
                 echo "--monitor-socket 需要参数" >&2
@@ -91,6 +94,10 @@ fi
 
 if ((usb_nested && headless)); then
     echo "--usb-nested 需要图形窗口以产生鼠标输入" >&2
+    exit 2
+fi
+if ((usb_nested && usb_storage)); then
+    echo "--usb-nested 与 --usb-storage 请分开测试" >&2
     exit 2
 fi
 
@@ -189,13 +196,28 @@ else
             -device "usb-hub,id=liteos-hub2,bus=liteos-xhci.0,port=1.1"
             -device "usb-mouse,id=liteos-nested-mouse,bus=liteos-xhci.0,port=1.1.1"
         )
-    else
+    elif ((usb_storage == 0)); then
         qemu_args+=(
             -device "qemu-xhci,id=liteos-xhci,msix=on"
             -device "usb-kbd,bus=liteos-xhci.0"
             -device "usb-mouse,bus=liteos-xhci.0"
         )
     fi
+fi
+
+if ((usb_storage)); then
+    usb_storage_image="$build_dir/usb-storage.img"
+    if [[ ! -f "$usb_storage_image" ]]; then
+        truncate -s 64M "$usb_storage_image"
+        if command -v mkfs.fat >/dev/null 2>&1; then
+            mkfs.fat -F 32 -n LITEOSUSB "$usb_storage_image" >/dev/null
+        fi
+    fi
+    qemu_args+=(
+        -drive "if=none,id=liteos-usb-stick,format=raw,file=$usb_storage_image"
+        -device "qemu-xhci,id=liteos-xhci,msix=on"
+        -device "usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
+    )
 fi
 if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" ); fi
 
