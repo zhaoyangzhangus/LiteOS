@@ -199,15 +199,18 @@ kstatus_t x86_map_page(paddr_t root, vaddr_t virtual_address, paddr_t physical_a
         if ((flags & X86_PAGE_EXEC) == 0) entry |= PTE_NO_EXECUTE;
         pt[i1] = entry;
         page_t *page = phys_to_page(physical_address);
-        if (page != 0) atomic_fetch_add_explicit(&page->mapcount, 1, memory_order_relaxed);
-        if (!x86_tlb_shootdown_page(root, (vaddr_t)va)) {
-            /* 映射尚未向调用者发布，失败时可安全回滚。 */
-            pt[i1] = 0;
-            if (page != 0) {
-                atomic_fetch_sub_explicit(&page->mapcount, 1, memory_order_relaxed);
-            }
-            status = K_EIO;
+        if (page != 0) {
+            atomic_fetch_add_explicit(&page->mapcount, 1, memory_order_relaxed);
         }
+
+        /*
+         * PTE 从 NOT-PRESENT -> PRESENT 是新映射，没有旧 translation 需要
+         * 失效。这里做全 CPU shootdown 不但没有收益，还会让 vmalloc()
+         * 每映射一个新页都依赖所有 CPU 的 IPI ACK。
+         *
+         * VA 的复用安全性由 unmap 保证：只有旧映射成功 shootdown 后，
+         * 对应虚拟区间才允许被释放/再次分配。
+         */
     }
     table_unlock();
     return status;

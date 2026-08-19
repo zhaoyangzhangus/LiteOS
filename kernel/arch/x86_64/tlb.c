@@ -13,7 +13,6 @@
  */
 static spinlock_t g_tlb_shootdown_lock;
 static atomic_uint_fast64_t g_tlb_generation;
-static atomic_bool g_tlb_poisoned;
 static atomic_uint_fast64_t g_tlb_acknowledgement[MAX_CPUS];
 static atomic_bool g_tlb_waiting[MAX_CPUS];
 static vaddr_t g_tlb_address;
@@ -156,13 +155,17 @@ void x86_tlb_ipi_interrupt(void) {
 
 bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
     if (root.value == 0 || !x86_is_canonical((uint64_t)virtual_address)) return false;
-    /* 一次失效超时后禁止继续释放/复用页面，避免延迟 IPI 污染下一次请求。 */
-    if (atomic_load_explicit(&g_tlb_poisoned, memory_order_acquire)) return false;
+
+    /*
+     * Shootdown 失败由页表调用者回滚 PTE。不要把一次 ACK 延迟升级为
+     * 永久全局 poisoned 状态；否则一次偶发超时会让之后所有
+     * unmap/protect 都永久返回 K_EIO。
+     *
+     * 请求由 g_tlb_shootdown_lock 串行化，IPI handler 总是读取当前
+     * generation/address。旧 IPI 延迟到达最多造成一次额外 invalidation；
+     * 对已经回滚的 PTE 是无害的。
+     */
     shootdown_lock();
-    if (atomic_load_explicit(&g_tlb_poisoned, memory_order_acquire)) {
-        shootdown_unlock();
-        return false;
-    }
 
     uint32_t current_cpu = x86_current_cpu_index();
     uint64_t interrupt_flags = tlb_enable_ipi_delivery(current_cpu);
@@ -181,7 +184,6 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
         for (uint32_t cpu_index = 0; cpu_index < platform->cpu_count; ++cpu_index) {
             if (cpu_index == current_cpu || !x86_smp_cpu_online(cpu_index)) continue;
             if (!send_tlb_ipi_with_retry(platform->cpus[cpu_index].apic_id)) {
-                atomic_store_explicit(&g_tlb_poisoned, true, memory_order_release);
                 tlb_finish_shootdown(current_cpu, interrupt_flags);
                 return false;
             }
@@ -195,7 +197,6 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
             while (atomic_load_explicit(&g_tlb_acknowledgement[cpu_index],
                                         memory_order_acquire) != generation) {
                 if ((int64_t)(x86_read_tsc() - deadline) >= 0) {
-                    atomic_store_explicit(&g_tlb_poisoned, true, memory_order_release);
                     tlb_finish_shootdown(current_cpu, interrupt_flags);
                     return false;
                 }
