@@ -18,7 +18,6 @@ typedef struct {
 
 static scheduler_cpu_t g_cpus[MAX_CPUS];
 static thread_t g_idle_threads[MAX_CPUS];
-static atomic_uint g_preempt_disable_counts[MAX_CPUS];
 static uint32_t g_cpu_count;
 static paddr_t g_kernel_root;
 
@@ -699,30 +698,16 @@ bool sched_try_run_ready(void) {
 }
 
 void sched_preempt_disable(void) {
-    uint32_t cpu_id = x86_current_cpu_index();
-    if (cpu_id < MAX_CPUS) {
-        atomic_fetch_add_explicit(&g_preempt_disable_counts[cpu_id], 1U,
-                                  memory_order_relaxed);
-    }
+    /* GS is CPU-private: one local RMW is enough, no locked atomic needed. */
+    x86_preempt_disable_fast();
 }
 
 void sched_preempt_enable(void) {
-    uint32_t cpu_id = x86_current_cpu_index();
-    if (cpu_id < MAX_CPUS) {
-        unsigned value = atomic_load_explicit(&g_preempt_disable_counts[cpu_id],
-                                              memory_order_relaxed);
-        while (value != 0U &&
-               !atomic_compare_exchange_weak_explicit(
-                   &g_preempt_disable_counts[cpu_id], &value, value - 1U,
-                   memory_order_release, memory_order_relaxed)) { }
-    }
+    if (x86_preempt_disabled_fast()) x86_preempt_enable_fast();
 }
 
 bool sched_preempt_disabled(void) {
-    uint32_t cpu_id = x86_current_cpu_index();
-    return cpu_id < MAX_CPUS &&
-           atomic_load_explicit(&g_preempt_disable_counts[cpu_id],
-                                memory_order_acquire) != 0U;
+    return x86_preempt_disabled_fast();
 }
 
 void sched_finish_switch(void) {

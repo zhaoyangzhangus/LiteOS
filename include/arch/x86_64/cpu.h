@@ -36,9 +36,49 @@ typedef struct x86_cpu_local {
     uint32_t Flags;
     uint32_t Reserved;
     uint64_t UserEntries;
+    /* 本 CPU 独占；无需 locked atomic。Step5 allocator 也复用它固定 CPU。 */
+    uint32_t PreemptDisable;
+    uint32_t PreemptReserved;
 } x86_cpu_local_t;
 
 #define X86_CPU_LOCAL_ONLINE (1U << 0)
+
+#define X86_CPU_LOCAL_SELF_OFFSET             40U
+#define X86_CPU_LOCAL_CPU_INDEX_OFFSET        48U
+#define X86_CPU_LOCAL_PREEMPT_DISABLE_OFFSET  72U
+
+_Static_assert(__builtin_offsetof(x86_cpu_local_t, Self) == X86_CPU_LOCAL_SELF_OFFSET,
+               "x86 CPU-local Self ABI changed");
+_Static_assert(__builtin_offsetof(x86_cpu_local_t, CpuIndex) == X86_CPU_LOCAL_CPU_INDEX_OFFSET,
+               "x86 CPU-local CpuIndex ABI changed");
+_Static_assert(__builtin_offsetof(x86_cpu_local_t, PreemptDisable) ==
+               X86_CPU_LOCAL_PREEMPT_DISABLE_OFFSET,
+               "x86 CPU-local preempt ABI changed");
+
+/*
+ * Fast local helpers are valid after x86 CPU-local setup.  They deliberately
+ * do not perform Self/MAX_CPUS validation; allocator hot paths call them only
+ * after liteos_arch_cpu_init() and liteos_mm_init() boot ordering is complete.
+ */
+static inline uint32_t x86_current_cpu_index_fast(void) {
+    uint32_t cpu;
+    __asm__ volatile ("movl %%gs:48, %0" : "=r"(cpu));
+    return cpu;
+}
+
+static inline void x86_preempt_disable_fast(void) {
+    __asm__ volatile ("incl %%gs:72" : : : "memory", "cc");
+}
+
+static inline void x86_preempt_enable_fast(void) {
+    __asm__ volatile ("decl %%gs:72" : : : "memory", "cc");
+}
+
+static inline bool x86_preempt_disabled_fast(void) {
+    uint32_t value;
+    __asm__ volatile ("movl %%gs:72, %0" : "=r"(value));
+    return value != 0U;
+}
 
 #define X86_PROTECTION_WRITE_PROTECT (1U << 0)
 #define X86_PROTECTION_NX            (1U << 1)
