@@ -1,4 +1,6 @@
 #include <kernel/window_server.h>
+#include <arch/x86_64/context.h>
+#include <arch/x86_64/cpu.h>
 #include <arch/x86_64/paging.h>
 #include <ascii_font.h>
 #include <kernel/elf_loader.h>
@@ -10,6 +12,15 @@
 #include <kernel/vm.h>
 
 #define WINDOW_DAMAGE_MAX_RECTS 16U
+#define WINDOW_DAMAGE_TILE_SIZE 64U
+#define WINDOW_DAMAGE_MAX_TILES_X 128U
+#define WINDOW_DAMAGE_MAX_TILES_Y 128U
+#define WINDOW_DAMAGE_TILE_COUNT \
+    (WINDOW_DAMAGE_MAX_TILES_X * WINDOW_DAMAGE_MAX_TILES_Y)
+#define WINDOW_DAMAGE_TILE_WORDS \
+    ((WINDOW_DAMAGE_TILE_COUNT + 63U) / 64U)
+#define WINDOW_DAMAGE_MAX_SNAPSHOT_RECTS 4096U
+#define WINDOW_SERVER_WORKER_STACK_SIZE (64U * 1024U)
 #define WINDOW_FRAME_BORDER 1U
 #define WINDOW_FRAME_EXTRA (WINDOW_FRAME_BORDER * 2U)
 
@@ -207,7 +218,7 @@ typedef struct compositor_snapshot {
     uint32_t dragging_identifier;
 
     uint32_t damage_count;
-    window_damage_rect_t damage_rects[WINDOW_DAMAGE_MAX_RECTS];
+    window_damage_rect_t damage_rects[WINDOW_DAMAGE_MAX_SNAPSHOT_RECTS];
 
     /*
      * Current region being rendered.  Only the single active compositor
@@ -272,18 +283,26 @@ static struct {
     bool title_pressed_client;
     input_event_t title_pressed_event;
 
+    thread_t worker;
+    atomic_bool worker_started;
+
     bool kernel_ready;
     bool dirty;
     bool composing;
     bool damage_full;
+    bool damage_tiles_active;
     uint32_t damage_count;
     window_damage_rect_t damage_rects[WINDOW_DAMAGE_MAX_RECTS];
+    uint64_t damage_tiles[WINDOW_DAMAGE_TILE_WORDS];
     /* 当前正在合成的矩形，绘制热路径通过它做裁剪。 */
     uint32_t damage_left;
     uint32_t damage_top;
     uint32_t damage_right;
     uint32_t damage_bottom;
 } g_window_server;
+
+static uint8_t g_window_server_worker_stack[WINDOW_SERVER_WORKER_STACK_SIZE]
+    __attribute__((aligned(16)));
 
 static atomic_uint g_window_server_init_state;
 
@@ -373,15 +392,20 @@ bool window_server_init(void) {
         g_window_server.title_pressed_pointer_y = 0U;
         g_window_server.title_pressed_client = false;
         g_window_server.title_pressed_event = (input_event_t){0};
+        atomic_init(&g_window_server.worker_started, false);
         g_window_server.kernel_ready = false;
         g_window_server.dirty = false;
         g_window_server.composing = false;
         g_window_server.damage_full = false;
+        g_window_server.damage_tiles_active = false;
         g_window_server.damage_count = 0U;
         g_window_server.damage_left = 0U;
         g_window_server.damage_top = 0U;
         g_window_server.damage_right = 0U;
         g_window_server.damage_bottom = 0U;
+        for (uint32_t word = 0U; word < WINDOW_DAMAGE_TILE_WORDS; ++word) {
+            g_window_server.damage_tiles[word] = 0U;
+        }
         for (uint32_t i = 0U; i < WINDOW_SERVER_MAX_WINDOWS; ++i) {
             g_window_server.windows[i] = 0;
         }
@@ -392,6 +416,81 @@ bool window_server_init(void) {
     while (atomic_load_explicit(&g_window_server_init_state,
                                 memory_order_acquire) != 2U) {
         __asm__ volatile ("pause");
+    }
+    return true;
+}
+
+static void __attribute__((noreturn)) window_server_worker_main(void *argument) {
+    (void)argument;
+    for (;;) {
+        /* input_core_wait() publishes BLOCKED while holding the queue lock,
+         * so an xHCI producer cannot lose the wakeup between the empty check
+         * and the worker going to sleep. */
+        if (input_core_wait(UINT64_MAX) != K_OK) continue;
+        window_server_pump_input();
+    }
+}
+
+bool window_server_start_worker(void) {
+    if (!window_server_init()) return false;
+    if (atomic_load_explicit(&g_window_server.worker_started,
+                             memory_order_acquire)) return true;
+
+    thread_t *current = sched_current_thread();
+    uint32_t cpu_id = x86_current_cpu_index();
+    if (current == 0 || cpu_id >= MAX_CPUS) return false;
+
+    thread_t *worker = &g_window_server.worker;
+    uint8_t *worker_bytes = (uint8_t *)worker;
+    for (size_t i = 0U; i < sizeof(*worker); ++i) worker_bytes[i] = 0U;
+
+    refcount_init(&worker->object.refs, 1U);
+    worker->object.type = KOBJECT_TYPE_THREAD;
+    worker->object.flags = 0U;
+    worker->object.ops = 0;
+    worker->object.security = 0;
+    worker->tid = UINT64_MAX - 1ULL;
+    worker->process = 0;
+    atomic_init(&worker->state, THREAD_READY);
+    worker->kernel_stack_base = g_window_server_worker_stack;
+    worker->kernel_stack_size = sizeof(g_window_server_worker_stack);
+    worker->kernel_stack_top =
+        ((vaddr_t)(uintptr_t)g_window_server_worker_stack +
+         sizeof(g_window_server_worker_stack)) & ~(vaddr_t)0x0FULL;
+    worker->sched_class = SCHED_CLASS_FAIR;
+    worker->base_sched_class = SCHED_CLASS_FAIR;
+    worker->rt_priority = 0U;
+    worker->base_rt_priority = 0U;
+    worker->sched.weight = 1024U;
+    worker->sched.nice = 0;
+    worker->sched.vruntime = 0U;
+    list_init(&worker->sched.rt_node);
+    list_init(&worker->process_node);
+    list_init(&worker->global_node);
+    list_init(&worker->owned_mutexes);
+    for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
+        worker->affinity.bits[word] = 0U;
+    }
+    worker->affinity.bits[cpu_id >> 6] = 1ULL << (cpu_id & 63U);
+    worker->current_cpu = (uint16_t)cpu_id;
+
+    uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
+    uintptr_t switch_stack = stack_top - sizeof(uint64_t);
+    *(uint64_t *)switch_stack = (uint64_t)(uintptr_t)&x86_kernel_thread_start;
+    worker->arch.switch_ctx.rsp = switch_stack;
+    worker->arch.switch_ctx.r12 =
+        (uint64_t)(uintptr_t)&window_server_worker_main;
+    worker->arch.switch_ctx.r13 = 0U;
+    worker->arch.switch_ctx.r14 = stack_top;
+    worker->arch.fs_base = 0U;
+
+    atomic_store_explicit(&g_window_server.worker_started, true,
+                          memory_order_release);
+    sched_enqueue(worker);
+    if (!sched_try_run_ready()) {
+        atomic_store_explicit(&g_window_server.worker_started, false,
+                              memory_order_release);
+        return false;
     }
     return true;
 }
@@ -508,10 +607,96 @@ static window_server_window_t *find_window_locked(uint32_t identifier) {
     return 0;
 }
 
+static uint32_t window_damage_tile_columns_locked(void) {
+    uint32_t count = (g_window_server.display_width +
+                      WINDOW_DAMAGE_TILE_SIZE - 1U) /
+                     WINDOW_DAMAGE_TILE_SIZE;
+    return count > WINDOW_DAMAGE_MAX_TILES_X ?
+           WINDOW_DAMAGE_MAX_TILES_X : count;
+}
+
+static uint32_t window_damage_tile_rows_locked(void) {
+    uint32_t count = (g_window_server.display_height +
+                      WINDOW_DAMAGE_TILE_SIZE - 1U) /
+                     WINDOW_DAMAGE_TILE_SIZE;
+    return count > WINDOW_DAMAGE_MAX_TILES_Y ?
+           WINDOW_DAMAGE_MAX_TILES_Y : count;
+}
+
+static bool window_damage_tile_is_set_locked(uint32_t tile_x,
+                                             uint32_t tile_y) {
+    uint32_t index = tile_y * WINDOW_DAMAGE_MAX_TILES_X + tile_x;
+    return (g_window_server.damage_tiles[index >> 6] &
+            (1ULL << (index & 63U))) != 0U;
+}
+
+static void window_damage_tile_set_locked(uint32_t tile_x,
+                                          uint32_t tile_y) {
+    uint32_t index = tile_y * WINDOW_DAMAGE_MAX_TILES_X + tile_x;
+    g_window_server.damage_tiles[index >> 6] |= 1ULL << (index & 63U);
+}
+
+static void window_damage_tiles_clear_locked(void) {
+    for (uint32_t word = 0U; word < WINDOW_DAMAGE_TILE_WORDS; ++word) {
+        g_window_server.damage_tiles[word] = 0U;
+    }
+}
+
+static void window_damage_mark_tiles_locked(const window_damage_rect_t *rect) {
+    uint32_t columns;
+    uint32_t rows;
+    uint32_t first_x;
+    uint32_t first_y;
+    uint32_t last_x;
+    uint32_t last_y;
+    if (rect == 0) return;
+    columns = window_damage_tile_columns_locked();
+    rows = window_damage_tile_rows_locked();
+    if (columns == 0U || rows == 0U) return;
+    first_x = rect->left / WINDOW_DAMAGE_TILE_SIZE;
+    first_y = rect->top / WINDOW_DAMAGE_TILE_SIZE;
+    last_x = (rect->right - 1U) / WINDOW_DAMAGE_TILE_SIZE;
+    last_y = (rect->bottom - 1U) / WINDOW_DAMAGE_TILE_SIZE;
+    if (first_x >= columns || first_y >= rows) return;
+    if (last_x >= columns) last_x = columns - 1U;
+    if (last_y >= rows) last_y = rows - 1U;
+    for (uint32_t tile_y = first_y; tile_y <= last_y; ++tile_y) {
+        for (uint32_t tile_x = first_x; tile_x <= last_x; ++tile_x) {
+            window_damage_tile_set_locked(tile_x, tile_y);
+        }
+    }
+}
+
+static void window_mark_dirty_locked(void);
+
+static void window_damage_enable_tiles_locked(void) {
+    if (g_window_server.damage_tiles_active) return;
+    /* The fixed bitmap intentionally covers normal 4K-class outputs.  If a
+     * future mode exceeds it, retain correctness with the existing full
+     * damage path instead of silently clipping the right/bottom edge. */
+    if (g_window_server.display_width >
+            WINDOW_DAMAGE_MAX_TILES_X * WINDOW_DAMAGE_TILE_SIZE ||
+        g_window_server.display_height >
+            WINDOW_DAMAGE_MAX_TILES_Y * WINDOW_DAMAGE_TILE_SIZE) {
+        window_mark_dirty_locked();
+        return;
+    }
+    window_damage_tiles_clear_locked();
+    for (uint32_t index = 0U;
+         index < g_window_server.damage_count;
+         ++index) {
+        window_damage_mark_tiles_locked(&g_window_server.damage_rects[index]);
+    }
+    g_window_server.damage_count = 0U;
+    g_window_server.damage_tiles_active = true;
+}
+
 static void window_mark_dirty_locked(void) {
     g_window_server.dirty = true;
     g_window_server.damage_full = true;
+    g_window_server.damage_tiles_active = false;
     g_window_server.damage_count = 0U;
+    window_damage_tiles_clear_locked();
     g_window_server.damage_left = 0U;
     g_window_server.damage_top = 0U;
     g_window_server.damage_right = g_window_server.display_width;
@@ -545,6 +730,10 @@ static void window_mark_rect_locked(int32_t x, int32_t y,
         .right = (uint32_t)right,
         .bottom = (uint32_t)bottom,
     };
+    if (g_window_server.damage_tiles_active) {
+        window_damage_mark_tiles_locked(&candidate);
+        return;
+    }
     for (uint32_t index = 0U; index < g_window_server.damage_count; ++index) {
         window_damage_rect_t *current = &g_window_server.damage_rects[index];
         uint32_t merged_left;
@@ -622,12 +811,8 @@ static void window_mark_rect_locked(int32_t x, int32_t y,
         return;
     }
     if (g_window_server.damage_count >= WINDOW_DAMAGE_MAX_RECTS) {
-        g_window_server.damage_full = true;
-        g_window_server.damage_count = 0U;
-        g_window_server.damage_left = 0U;
-        g_window_server.damage_top = 0U;
-        g_window_server.damage_right = g_window_server.display_width;
-        g_window_server.damage_bottom = g_window_server.display_height;
+        window_damage_enable_tiles_locked();
+        window_damage_mark_tiles_locked(&candidate);
         return;
     }
     g_window_server.damage_rects[g_window_server.damage_count++] = candidate;
@@ -896,6 +1081,7 @@ static void window_coalesce_damage_locked(void) {
     uint32_t first = 0U;
 
     if (g_window_server.damage_full ||
+        g_window_server.damage_tiles_active ||
         g_window_server.damage_count <= 1U) {
         return;
     }
@@ -1007,6 +1193,70 @@ static uint32_t compositor_corner_inset(uint32_t row, uint32_t width,
     row = height - 1U - row;
     if (row < WINDOW_CORNER_RADIUS) return g_window_corner_inset[row];
     return 0U;
+}
+
+/* Convert overflow tile damage into horizontal spans, merging identical
+ * spans across adjacent rows.  This keeps sparse damage sparse without
+ * forcing the old fullscreen fallback. */
+static uint32_t window_damage_tiles_to_rects_locked(
+    window_damage_rect_t *output, uint32_t capacity) {
+    uint32_t columns = window_damage_tile_columns_locked();
+    uint32_t rows = window_damage_tile_rows_locked();
+    uint32_t count = 0U;
+    if (output == 0 || capacity == 0U) return 0U;
+    for (uint32_t tile_y = 0U; tile_y < rows; ++tile_y) {
+        uint32_t tile_x = 0U;
+        while (tile_x < columns) {
+            uint32_t start_x;
+            uint32_t end_x;
+            window_damage_rect_t candidate;
+            bool merged = false;
+            while (tile_x < columns &&
+                   !window_damage_tile_is_set_locked(tile_x, tile_y)) {
+                ++tile_x;
+            }
+            if (tile_x >= columns) break;
+            start_x = tile_x;
+            while (tile_x < columns &&
+                   window_damage_tile_is_set_locked(tile_x, tile_y)) {
+                ++tile_x;
+            }
+            end_x = tile_x;
+            candidate.left = start_x * WINDOW_DAMAGE_TILE_SIZE;
+            candidate.top = tile_y * WINDOW_DAMAGE_TILE_SIZE;
+            candidate.right = end_x * WINDOW_DAMAGE_TILE_SIZE;
+            candidate.bottom = (tile_y + 1U) * WINDOW_DAMAGE_TILE_SIZE;
+            if (candidate.right > g_window_server.display_width) {
+                candidate.right = g_window_server.display_width;
+            }
+            if (candidate.bottom > g_window_server.display_height) {
+                candidate.bottom = g_window_server.display_height;
+            }
+            for (uint32_t index = 0U; index < count; ++index) {
+                if (output[index].left == candidate.left &&
+                    output[index].right == candidate.right &&
+                    output[index].bottom == candidate.top) {
+                    output[index].bottom = candidate.bottom;
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                if (count < capacity) {
+                    output[count++] = candidate;
+                } else {
+                    /* Pathological checkerboard damage remains bounded: keep
+                     * all earlier spans and conservatively merge the tail. */
+                    window_damage_rect_t *tail = &output[capacity - 1U];
+                    if (candidate.left < tail->left) tail->left = candidate.left;
+                    if (candidate.top < tail->top) tail->top = candidate.top;
+                    if (candidate.right > tail->right) tail->right = candidate.right;
+                    if (candidate.bottom > tail->bottom) tail->bottom = candidate.bottom;
+                }
+            }
+        }
+    }
+    return count;
 }
 
 
@@ -4215,7 +4465,8 @@ static bool compositor_snapshot_begin_locked(void) {
         return false;
     }
 
-    if (g_window_server.damage_full) {
+    if (g_window_server.damage_full ||
+        g_window_server.damage_tiles_active) {
         region_count = 1U;
     } else {
         region_count =
@@ -4264,6 +4515,10 @@ static bool compositor_snapshot_begin_locked(void) {
 
         snapshot->damage_rects[0].bottom =
             g_window_server.display_height;
+    } else if (g_window_server.damage_tiles_active) {
+        snapshot->damage_count = window_damage_tiles_to_rects_locked(
+            snapshot->damage_rects,
+            WINDOW_DAMAGE_MAX_SNAPSHOT_RECTS);
     } else {
         snapshot->damage_count =
             g_window_server.damage_count;
@@ -4371,6 +4626,8 @@ static bool compositor_snapshot_begin_locked(void) {
      */
     g_window_server.damage_count = 0U;
     g_window_server.damage_full = false;
+    g_window_server.damage_tiles_active = false;
+    window_damage_tiles_clear_locked();
     g_window_server.dirty = false;
 
     return true;
@@ -5006,6 +5263,27 @@ static void window_enqueue_resize_event_locked(window_server_window_t *window) {
     ++window->event_count;
 }
 
+/* Wake per-window readers only after releasing window_lock.  The wait
+ * predicate takes window_lock itself, so waking while holding it would invert
+ * the producer/consumer lock order under load. */
+static void window_wake_ready_event_waiters(void) {
+    window_server_window_t *ready[WINDOW_SERVER_MAX_WINDOWS];
+    uint32_t ready_count = 0U;
+    window_lock();
+    for (uint32_t index = 0U; index < g_window_server.count; ++index) {
+        window_server_window_t *window = g_window_server.windows[index];
+        if (window == 0 || window->event_count == 0U ||
+            ready_count >= WINDOW_SERVER_MAX_WINDOWS) continue;
+        object_get(window);
+        ready[ready_count++] = window;
+    }
+    window_unlock();
+    for (uint32_t index = 0U; index < ready_count; ++index) {
+        (void)wake_one(&ready[index]->event_waitq);
+        object_put(ready[index]);
+    }
+}
+
 kstatus_t window_server_register_manager(process_t *process) {
     (void)process;
     /* 合成和输入路由已经属于 Ring0，用户进程不能接管窗口服务器。 */
@@ -5092,6 +5370,7 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->event_read = 0U;
     window->event_write = 0U;
     window->event_count = 0U;
+    wait_queue_init(&window->event_waitq);
     for (uint32_t i = 0U; i + 1U < sizeof(window->title); ++i) {
         window->title[i] = title != 0 ? title[i] : '\0';
         if (window->title[i] == '\0') break;
@@ -5139,13 +5418,20 @@ void window_server_put(window_server_window_t *window) {
 }
 
 void window_server_handle_closed(window_server_window_t *window) {
+    bool referenced = false;
     if (window == 0 || !window_server_init()) return;
     window_lock();
+    object_get(window);
+    referenced = true;
     remove_window_locked(window);
     window_unlock();
+    (void)wake_all(&window->event_waitq);
+    if (referenced) object_put(window);
 }
 
 void window_server_close_process(process_t *owner) {
+    window_server_window_t *removed[WINDOW_SERVER_MAX_WINDOWS];
+    uint32_t removed_count = 0U;
     if (owner == 0 || !window_server_init()) return;
     window_lock();
     for (uint32_t index = 0U; index < g_window_server.count;) {
@@ -5155,9 +5441,19 @@ void window_server_close_process(process_t *owner) {
             continue;
         }
         /* remove_window_locked() compacts the array, so keep the index. */
+        object_get(window);
         remove_window_locked(window);
+        if (removed_count < WINDOW_SERVER_MAX_WINDOWS) {
+            removed[removed_count++] = window;
+        } else {
+            object_put(window);
+        }
     }
     window_unlock();
+    for (uint32_t index = 0U; index < removed_count; ++index) {
+        (void)wake_all(&removed[index]->event_waitq);
+        object_put(removed[index]);
+    }
 }
 
 kstatus_t window_server_set_owner_address(window_server_window_t *window,
@@ -5284,6 +5580,7 @@ kstatus_t window_server_dispatch(uint32_t identifier, const os_input_event_t *ev
     ++window->event_count;
     window_unlock();
     (void)wake_all(&g_window_server.event_waitq);
+    window_wake_ready_event_waiters();
     return K_OK;
 }
 
@@ -5316,14 +5613,29 @@ static bool window_event_available(void *raw_context) {
 kstatus_t window_server_event_read(process_t *process, uint32_t identifier,
                                    os_window_event_t *event, uint64_t timeout_ns) {
     window_event_wait_context_t context;
+    window_server_window_t *wait_window = 0;
+    wait_queue_t *wait_queue = &g_window_server.event_waitq;
+    kstatus_t status;
     if (process == 0 || event == 0 || !window_server_init()) return K_EINVAL;
     context.process = process;
     context.identifier = identifier;
     context.event = event;
     if (window_event_available(&context)) return K_OK;
     if (timeout_ns == 0U) return K_EAGAIN;
-    return wait_on_queue(&g_window_server.event_waitq, window_event_available,
-                         &context, timeout_ns);
+    if (identifier != 0U) {
+        /* Keep the embedded queue alive across a blocked read.  Teardown
+         * wakes this queue before dropping the registry reference. */
+        if (window_server_lookup(identifier, &wait_window) != K_OK ||
+            wait_window->owner != process) {
+            if (wait_window != 0) window_server_put(wait_window);
+            return K_EPERM;
+        }
+        wait_queue = &wait_window->event_waitq;
+    }
+    status = wait_on_queue(wait_queue, window_event_available,
+                           &context, timeout_ns);
+    if (wait_window != 0) window_server_put(wait_window);
+    return status;
 }
 
 kstatus_t window_server_update(process_t *process, uint32_t identifier,
@@ -6452,6 +6764,63 @@ static void window_flush_motion_batch_locked(
     batch->delta_y = 0;
 }
 
+/* Consume one kernel-private HID pointer transaction.  Ring3 still receives
+ * the unchanged button/relative event ABI, but the compositor applies the
+ * report's X/Y pair in one geometry transition. */
+static void window_route_pointer_transaction_locked(
+    const input_event_t *event) {
+    static const uint32_t button_codes[] = {
+        INPUT_BUTTON_LEFT,
+        INPUT_BUTTON_RIGHT,
+        INPUT_BUTTON_MIDDLE,
+    };
+    window_motion_batch_t motion = {0};
+    if (event == 0 || event->type != INPUT_EVENT_POINTER) return;
+
+    for (uint32_t bit = 0U; bit < 3U; ++bit) {
+        uint16_t mask = (uint16_t)(1U << bit);
+        if ((event->code & mask) == 0U) continue;
+        input_event_t button = {
+            .timestamp = event->timestamp,
+            .device_id = event->device_id,
+            .type = INPUT_EVENT_BUTTON,
+            .flags = event->flags,
+            .code = button_codes[bit],
+            .value = (event->value & mask) != 0U ?
+                     INPUT_VALUE_PRESS : INPUT_VALUE_RELEASE,
+        };
+        route_input_locked(&button);
+    }
+
+    if (event->value2 != 0 || event->value3 != 0) {
+        motion.active = true;
+        motion.device_id = event->device_id;
+        motion.flags = event->flags;
+        motion.timestamp = event->timestamp;
+        motion.delta_x = event->value2;
+        motion.delta_y = event->value3;
+        if (!window_route_drag_motion_batch_locked(&motion)) {
+            window_route_motion_axis_locked(&motion, INPUT_REL_X,
+                                            motion.delta_x);
+            window_route_motion_axis_locked(&motion, INPUT_REL_Y,
+                                            motion.delta_y);
+        }
+    }
+
+    if (event->value4 != 0) {
+        input_event_t wheel = {
+            .timestamp = event->timestamp,
+            .device_id = event->device_id,
+            .type = INPUT_EVENT_RELATIVE,
+            .flags = event->flags,
+            .code = INPUT_REL_WHEEL,
+            .value = event->value4,
+        };
+        route_input_locked(&wheel);
+    }
+    window_coalesce_damage_locked();
+}
+
 void window_server_pump_input(void) {
     input_event_t event;
     window_motion_batch_t motion = {0};
@@ -6478,6 +6847,14 @@ void window_server_pump_input(void) {
 
         ++consumed;
         wake = true;
+
+        if (event.type == INPUT_EVENT_POINTER) {
+            window_lock();
+            window_flush_motion_batch_locked(&motion);
+            window_route_pointer_transaction_locked(&event);
+            window_unlock();
+            continue;
+        }
 
         if (is_motion) {
             /*
@@ -6538,6 +6915,7 @@ void window_server_pump_input(void) {
 
     if (wake) {
         (void)wake_all(&g_window_server.event_waitq);
+        window_wake_ready_event_waiters();
     }
 
     for (;;) {

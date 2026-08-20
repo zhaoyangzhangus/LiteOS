@@ -92,6 +92,78 @@ static uint32_t *g_target;
 static uint32_t g_target_width;
 static uint32_t g_target_height;
 
+#define NOTEPAD_DAMAGE_CAPACITY 8U
+typedef struct notepad_damage_rect {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+} notepad_damage_rect_t;
+static notepad_damage_rect_t g_damage[NOTEPAD_DAMAGE_CAPACITY];
+static uint32_t g_damage_count;
+static bool g_damage_full;
+
+static void notepad_damage_all(void) {
+    g_damage_count = 0U;
+    g_damage_full = true;
+}
+
+static void notepad_damage_reset(void) {
+    g_damage_count = 0U;
+    g_damage_full = false;
+}
+
+static void notepad_damage_rect(uint32_t x, uint32_t y,
+                                uint32_t width, uint32_t height) {
+    uint32_t right;
+    uint32_t bottom;
+    if (g_damage_full || width == 0U || height == 0U) return;
+    if (x >= g_window.width || y >= g_window.height) return;
+    if (width > g_window.width - x) width = g_window.width - x;
+    if (height > g_window.height - y) height = g_window.height - y;
+    right = x + width;
+    bottom = y + height;
+    for (uint32_t index = 0U; index < g_damage_count; ++index) {
+        notepad_damage_rect_t *current = &g_damage[index];
+        uint32_t current_right = current->x + current->width;
+        uint32_t current_bottom = current->y + current->height;
+        if (right < current->x || current_right < x ||
+            bottom < current->y || current_bottom < y) continue;
+        if (x > current->x) x = current->x;
+        if (y > current->y) y = current->y;
+        if (right < current_right) right = current_right;
+        if (bottom < current_bottom) bottom = current_bottom;
+        current->x = x;
+        current->y = y;
+        current->width = right - x;
+        current->height = bottom - y;
+        return;
+    }
+    if (g_damage_count >= NOTEPAD_DAMAGE_CAPACITY) {
+        notepad_damage_all();
+        return;
+    }
+    g_damage[g_damage_count++] = (notepad_damage_rect_t){x, y,
+                                                         width, height};
+}
+
+static void notepad_damage_editor(void) {
+    uint32_t top = USER_CLIENT_CHROME_HEIGHT;
+    uint32_t bottom = g_window.height > 32U ? g_window.height - 32U : top;
+    if (bottom > top) notepad_damage_rect(0U, top, g_window.width,
+                                          bottom - top);
+}
+
+static void notepad_damage_title(void) {
+    notepad_damage_rect(0U, 0U, g_window.width,
+                        USER_CLIENT_CHROME_HEIGHT);
+}
+
+static void notepad_damage_status(void) {
+    uint32_t y = g_window.height > 32U ? g_window.height - 32U : 0U;
+    notepad_damage_rect(0U, y, g_window.width, g_window.height - y);
+}
+
 /* MinGW 在标准 main 入口前会发出 __main；LiteOS 用户程序不链接 CRT。 */
 void __main(void) {
 }
@@ -453,12 +525,25 @@ static bool create_window(void) {
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    if (!g_damage_full && g_damage_count == 0U) return;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_window.identifier;
-    request.width = g_window.width;
-    request.height = g_window.height;
-    (void)notepad_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    if (g_damage_full) {
+        request.width = g_window.width;
+        request.height = g_window.height;
+        (void)notepad_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    } else {
+        for (uint32_t index = 0U; index < g_damage_count; ++index) {
+            request.x = (int32_t)g_damage[index].x;
+            request.y = (int32_t)g_damage[index].y;
+            request.width = g_damage[index].width;
+            request.height = g_damage[index].height;
+            (void)notepad_syscall_one(OS_SYS_WINDOW_UPDATE,
+                                      (uint64_t)&request);
+        }
+    }
+    notepad_damage_reset();
 }
 
 static void render(void) {
@@ -466,6 +551,7 @@ static void render(void) {
     g_target_width = g_window.width;
     g_target_height = g_window.height;
     if (g_target == 0) return;
+    if (!g_damage_full && g_damage_count == 0U) notepad_damage_all();
     draw_editor();
     update_window();
 }
@@ -703,6 +789,7 @@ static bool key_matches(const os_input_event_t *input, uint32_t hid_code,
 static bool handle_key(const os_window_event_t *event) {
     const os_input_event_t *input = event != 0 ? &event->input : 0;
     char character;
+    bool dirty_before;
     if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT ||
         input == 0 || input->type != OS_INPUT_EVENT_KEY) return false;
     if (input->code == 0xE1U || input->code == 0xE5U) {
@@ -714,6 +801,7 @@ static bool handle_key(const os_window_event_t *event) {
         return false;
     }
     if (input->value == OS_INPUT_VALUE_RELEASE) return false;
+    dirty_before = g_dirty;
     g_follow_cursor = true;
     if (g_ctrl && key_matches(input, 0x16U, 'S')) {
         save_document();
@@ -759,6 +847,11 @@ static bool handle_key(const os_window_event_t *event) {
         character = key_to_ascii(input->code, g_shift);
         if (character != '\0') insert_character(character);
     }
+    notepad_damage_editor();
+    if (g_ctrl || g_dirty != dirty_before) {
+        notepad_damage_title();
+        notepad_damage_status();
+    }
     render();
     return true;
 }
@@ -781,7 +874,7 @@ static bool handle_event(const os_window_event_t *event) {
         if (g_dirty) {
             set_status(
                 "UNSAVED CHANGES - CTRL+S SAVE OR CTRL+Q EXIT");
-
+            notepad_damage_status();
             render();
             return true;
         }
@@ -796,6 +889,7 @@ static bool handle_event(const os_window_event_t *event) {
         g_window.width = event->resize.width;
         g_window.height = event->resize.height;
         g_follow_cursor = true;
+        notepad_damage_all();
         render();
         return true;
     }
@@ -811,6 +905,7 @@ static bool handle_event(const os_window_event_t *event) {
         if (g_dirty) {
             set_status(
                 "UNSAVED CHANGES - CTRL+S SAVE OR CTRL+Q EXIT");
+            notepad_damage_status();
             render();
             return true;
         }
@@ -819,6 +914,7 @@ static bool handle_event(const os_window_event_t *event) {
     if (input->type == OS_INPUT_EVENT_RELATIVE &&
         input->code == OS_INPUT_REL_WHEEL && input->value != 0) {
         scroll_editor(input->value > 0 ? -3 : 3);
+        notepad_damage_editor();
         render();
         return true;
     }

@@ -62,6 +62,7 @@ typedef struct window_server_window {
     uint32_t event_read;
     uint32_t event_write;
     uint32_t event_count;
+    wait_queue_t event_waitq;
 } window_server_window_t;
 
 typedef struct window_server_snapshot {
@@ -79,6 +80,7 @@ typedef struct window_server_snapshot {
 } window_server_snapshot_t;
 
 bool window_server_init(void);
+bool window_server_start_worker(void);
 /* 初始化后窗口服务器由内核持有显示输出和输入路由权。 */
 bool window_server_kernel_ready(void);
 kstatus_t window_server_register_manager(process_t *process);

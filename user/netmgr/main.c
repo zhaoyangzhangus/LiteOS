@@ -28,6 +28,60 @@ static bool g_status_valid;
 static bool g_ctrl;
 static uint32_t g_refresh_tick;
 
+#define NETMGR_DAMAGE_CAPACITY 4U
+typedef struct netmgr_damage_rect {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+} netmgr_damage_rect_t;
+static netmgr_damage_rect_t g_damage[NETMGR_DAMAGE_CAPACITY];
+static uint32_t g_damage_count;
+static bool g_damage_full;
+
+static void netmgr_damage_all(void) {
+    g_damage_count = 0U;
+    g_damage_full = true;
+}
+
+static void netmgr_damage_reset(void) {
+    g_damage_count = 0U;
+    g_damage_full = false;
+}
+
+static void netmgr_damage_rect(uint32_t x, uint32_t y,
+                               uint32_t width, uint32_t height) {
+    uint32_t right;
+    uint32_t bottom;
+    if (g_damage_full || width == 0U || height == 0U) return;
+    if (x >= g_window.width || y >= g_window.height) return;
+    if (width > g_window.width - x) width = g_window.width - x;
+    if (height > g_window.height - y) height = g_window.height - y;
+    right = x + width;
+    bottom = y + height;
+    for (uint32_t index = 0U; index < g_damage_count; ++index) {
+        netmgr_damage_rect_t *current = &g_damage[index];
+        uint32_t current_right = current->x + current->width;
+        uint32_t current_bottom = current->y + current->height;
+        if (right < current->x || current_right < x ||
+            bottom < current->y || current_bottom < y) continue;
+        if (x > current->x) x = current->x;
+        if (y > current->y) y = current->y;
+        if (right < current_right) right = current_right;
+        if (bottom < current_bottom) bottom = current_bottom;
+        current->x = x;
+        current->y = y;
+        current->width = right - x;
+        current->height = bottom - y;
+        return;
+    }
+    if (g_damage_count >= NETMGR_DAMAGE_CAPACITY) {
+        netmgr_damage_all();
+        return;
+    }
+    g_damage[g_damage_count++] = (netmgr_damage_rect_t){x, y, width, height};
+}
+
 void __main(void) {
 }
 
@@ -195,12 +249,25 @@ static void draw_card(uint32_t x, uint32_t y,
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    if (!g_damage_full && g_damage_count == 0U) return;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_window.identifier;
-    request.width = g_window.width;
-    request.height = g_window.height;
-    (void)netmgr_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    if (g_damage_full) {
+        request.width = g_window.width;
+        request.height = g_window.height;
+        (void)netmgr_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    } else {
+        for (uint32_t index = 0U; index < g_damage_count; ++index) {
+            request.x = (int32_t)g_damage[index].x;
+            request.y = (int32_t)g_damage[index].y;
+            request.width = g_damage[index].width;
+            request.height = g_damage[index].height;
+            (void)netmgr_syscall_one(OS_SYS_WINDOW_UPDATE,
+                                     (uint64_t)&request);
+        }
+    }
+    netmgr_damage_reset();
 }
 
 static void render(void) {
@@ -216,6 +283,7 @@ static void render(void) {
 
     if (g_window.pixels == 0 || g_window.width == 0U ||
         g_window.height == 0U) return;
+    if (!g_damage_full && g_damage_count == 0U) netmgr_damage_all();
 
     hardware = g_status_valid &&
         (g_status.flags & OS_NET_STATUS_HARDWARE_PRESENT) != 0U;
@@ -356,11 +424,15 @@ static bool refresh_status(void) {
     os_net_status_t status;
     if (netmgr_get_status(&status) < 0) {
         g_status_valid = false;
+        netmgr_damage_rect(0U, 60U, g_window.width,
+                           g_window.height > 60U ? g_window.height - 60U : 0U);
         render();
         return false;
     }
     g_status = status;
     g_status_valid = true;
+    netmgr_damage_rect(0U, 60U, g_window.width,
+                       g_window.height > 60U ? g_window.height - 60U : 0U);
     render();
     return true;
 }
@@ -471,6 +543,7 @@ static void handle_event(const os_window_event_t *event) {
             event->resize.buffer_size / sizeof(uint32_t)) return;
         g_window.width = event->resize.width;
         g_window.height = event->resize.height;
+        netmgr_damage_all();
         render();
         return;
     }

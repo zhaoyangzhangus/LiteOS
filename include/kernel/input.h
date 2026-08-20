@@ -10,6 +10,8 @@ enum input_event_type {
     INPUT_EVENT_BUTTON = 2,
     INPUT_EVENT_RELATIVE = 3,
     INPUT_EVENT_ABSOLUTE = 4,
+    /* Kernel-internal HID report transaction; never exposed as Ring3 ABI. */
+    INPUT_EVENT_POINTER = 5,
 };
 
 enum input_event_value {
@@ -43,13 +45,30 @@ typedef struct input_event {
     uint16_t flags;
     uint32_t code;
     int32_t value;
+    int32_t value2;
+    int32_t value3;
+    int32_t value4;
 } input_event_t;
+
+typedef struct input_pointer_motion {
+    uint64_t timestamp;
+    uint32_t device_id;
+    uint16_t flags;
+    uint16_t buttons_changed;
+    uint8_t buttons;
+    uint8_t reserved[3];
+    int32_t dx;
+    int32_t dy;
+    int32_t wheel;
+} input_pointer_motion_t;
 
 #define INPUT_CORE_CAPACITY 256U
 
 bool input_core_init(void);
 kstatus_t input_core_push(const input_event_t *event);
+kstatus_t input_core_push_pointer(const input_pointer_motion_t *motion);
 kstatus_t input_core_pop(input_event_t *event);
+kstatus_t input_core_wait(uint64_t timeout_ns);
 kstatus_t input_core_read(input_event_t *event, uint64_t timeout_ns);
 uint32_t input_core_pending(void);
 uint64_t input_core_dropped(void);

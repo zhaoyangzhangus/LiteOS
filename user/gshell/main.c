@@ -102,9 +102,64 @@ static uint32_t g_display_height;
 static uint32_t *g_target;
 static uint32_t g_target_width;
 static uint32_t g_target_height;
+static bool g_damage_full;
+static uint32_t g_damage_x;
+static uint32_t g_damage_y;
+static uint32_t g_damage_width;
+static uint32_t g_damage_height;
 static uint8_t g_file_buffer[128];
 static char g_file_line[SHELL_LINE_CAPACITY];
 static char g_display_line[SHELL_LINE_CAPACITY];
+
+static void shell_damage_all(void) {
+    g_damage_full = true;
+    g_damage_x = 0U;
+    g_damage_y = 0U;
+    g_damage_width = g_shell.width;
+    g_damage_height = g_shell.height;
+}
+
+static void shell_damage_rect(uint32_t x, uint32_t y,
+                              uint32_t width, uint32_t height) {
+    uint32_t right;
+    uint32_t bottom;
+    if (g_damage_full || width == 0U || height == 0U) return;
+    if (x >= g_shell.width || y >= g_shell.height) return;
+    if (width > g_shell.width - x) width = g_shell.width - x;
+    if (height > g_shell.height - y) height = g_shell.height - y;
+    right = x + width;
+    bottom = y + height;
+    if (g_damage_width == 0U || g_damage_height == 0U) {
+        g_damage_x = x;
+        g_damage_y = y;
+        g_damage_width = width;
+        g_damage_height = height;
+        return;
+    }
+    if (x < g_damage_x) g_damage_x = x;
+    if (y < g_damage_y) g_damage_y = y;
+    if (right > g_damage_x + g_damage_width) {
+        g_damage_width = right - g_damage_x;
+    }
+    if (bottom > g_damage_y + g_damage_height) {
+        g_damage_height = bottom - g_damage_y;
+    }
+}
+
+static void shell_damage_reset(void) {
+    g_damage_full = false;
+    g_damage_x = 0U;
+    g_damage_y = 0U;
+    g_damage_width = 0U;
+    g_damage_height = 0U;
+}
+
+static void shell_damage_input_line(void) {
+    uint32_t y = g_shell.height > FONT12X24_HEIGHT + 4U ?
+        g_shell.height - FONT12X24_HEIGHT - 4U : 0U;
+    shell_damage_rect(0U, y, g_shell.width,
+                      g_shell.height - y);
+}
 
 static int64_t stat_path(const char *path, os_file_info_t *info);
 static bool file_exists(const char *path);
@@ -307,12 +362,23 @@ static void draw_terminal(void) {
 static void update_window(void) {
     os_window_update_t request = {0};
     if (g_shell.identifier == 0U) return;
+    if (!g_damage_full && (g_damage_width == 0U || g_damage_height == 0U)) {
+        return;
+    }
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_shell.identifier;
-    request.width = g_shell.width;
-    request.height = g_shell.height;
+    if (g_damage_full) {
+        request.width = g_shell.width;
+        request.height = g_shell.height;
+    } else {
+        request.x = (int32_t)g_damage_x;
+        request.y = (int32_t)g_damage_y;
+        request.width = g_damage_width;
+        request.height = g_damage_height;
+    }
     (void)gshell_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    shell_damage_reset();
 }
 
 static void render_window(void) {
@@ -320,6 +386,9 @@ static void render_window(void) {
     g_target_width = g_shell.width;
     g_target_height = g_shell.height;
     if (g_target == 0) return;
+    if (!g_damage_full && (g_damage_width == 0U || g_damage_height == 0U)) {
+        shell_damage_all();
+    }
     draw_terminal();
     update_window();
 }
@@ -1202,6 +1271,7 @@ static void complete_command(void) {
 static bool handle_key(const os_window_event_t *event) {
     const os_input_event_t *input = event != 0 ? &event->input : 0;
     char character;
+    bool full_damage = false;
     /* EVENT_READ 已按 g_shell.identifier 过滤；不要因某个输入后端未回填
      * event.identifier 而丢弃本来属于 shell 的按键。 */
     if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT ||
@@ -1225,14 +1295,17 @@ static bool handle_key(const os_window_event_t *event) {
     } else if (g_ctrl && (input->code == 0x06U || input->code == (uint32_t)'C')) {
         if (g_command_length != 0U) append_output("^C");
         clear_command_line();
+        full_damage = true;
     } else if (g_ctrl && (input->code == 0x0FU || input->code == (uint32_t)'L')) {
         clear_output();
+        full_damage = true;
     } else if (g_ctrl && (input->code == 0x18U || input->code == (uint32_t)'U')) {
         clear_command_line();
     } else if (g_ctrl && (input->code == 0x07U || input->code == (uint32_t)'G')) {
         delete_command_character();
     } else if (input->code == 0x28U || input->code == 0x58U) {
         execute_command();
+        full_damage = true;
     } else if (input->code == 0x2AU) {
         backspace_command_character();
     } else if (input->code == 0x4FU) {
@@ -1251,10 +1324,16 @@ static bool handle_key(const os_window_event_t *event) {
         history_next();
     } else if (input->code == 0x2BU) {
         complete_command();
+        /* Multiple matches append output rows; a unique completion only
+         * changes the input line, but the conservative full path keeps both
+         * cases correct without a command-result return value. */
+        full_damage = true;
     } else if (!g_ctrl) {
         character = key_to_ascii(input->code, g_shift);
         if (character != '\0') insert_command_character(character);
     }
+    if (full_damage) shell_damage_all();
+    else shell_damage_input_line();
     render_window();
     return true;
 }
@@ -1277,6 +1356,7 @@ static bool handle_event(const os_window_event_t *event) {
         if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return false;
         g_shell.width = event->resize.width;
         g_shell.height = event->resize.height;
+        shell_damage_all();
         render_window();
         return true;
     }
@@ -1297,6 +1377,7 @@ __attribute__((noreturn)) void gshell_entry(void) {
     append_output("LITEOS GRAPHICAL SHELL READY");
     append_output("WINDOW CONTENT IS COMPOSITED BY KERNEL");
     append_output("TYPE HELP FOR COMMANDS");
+    shell_damage_all();
     render_window();
     for (;;) {
         os_window_event_read_t request = {0};

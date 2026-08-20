@@ -2023,6 +2023,26 @@ static void xhci_hid_emit_event(const xhci_device_context_t *context,
     (void)input_core_push(&event);
 }
 
+static void xhci_hid_emit_pointer(const xhci_device_context_t *context,
+                                  uint16_t buttons_changed, uint8_t buttons,
+                                  int32_t dx, int32_t dy, int32_t wheel) {
+    input_pointer_motion_t motion = {
+        .timestamp = 0U,
+        .device_id = xhci_hid_input_device_id(context),
+        .flags = 0U,
+        .buttons_changed = buttons_changed,
+        .buttons = buttons,
+        .dx = dx,
+        .dy = dy,
+        .wheel = wheel,
+    };
+    if (!atomic_exchange_explicit(&g_xhci_input_seen, true,
+                                  memory_order_acq_rel)) {
+        liteos_serial_write("LITEOS_USB_INPUT_EVENT_OK\r\n");
+    }
+    (void)input_core_push_pointer(&motion);
+}
+
 static void xhci_hid_emit_key(const xhci_device_context_t *context,
                               uint8_t key, int32_t value) {
     xhci_hid_emit_event(context, INPUT_EVENT_KEY, key, value);
@@ -2060,22 +2080,21 @@ static void xhci_hid_consume_keyboard_report(xhci_device_context_t *state,
 static void xhci_hid_consume_mouse_report(xhci_device_context_t *state,
                                            const uint8_t *report,
                                            uint32_t report_length) {
-    static const uint32_t buttons[] = {
-        INPUT_BUTTON_LEFT,
-        INPUT_BUTTON_RIGHT,
-        INPUT_BUTTON_MIDDLE,
-    };
     uint8_t current_buttons;
+    uint16_t changed_buttons;
     if (state == 0 || report == 0 || report_length < 3U) return;
     if (!atomic_exchange_explicit(&g_xhci_mouse_input_seen, true,
                                   memory_order_acq_rel)) {
         liteos_serial_write("LITEOS_USB_MOUSE_EVENT_OK\r\n");
     }
     current_buttons = report[0] & 0x07U;
-    for (uint32_t bit = 0U; bit < sizeof(buttons) / sizeof(buttons[0]); ++bit) {
-        uint8_t mask = (uint8_t)(1U << bit);
-        if ((current_buttons & mask) != (state->hid_previous_buttons & mask)) {
-            xhci_hid_emit_event(state, INPUT_EVENT_BUTTON, buttons[bit],
+    changed_buttons = (uint16_t)(current_buttons ^ state->hid_previous_buttons);
+    /* Button transitions travel in the same private transaction as motion. */
+    if (false) {
+        uint8_t mask = 0U;
+        if (false &&
+            (current_buttons & mask) != (state->hid_previous_buttons & mask)) {
+            xhci_hid_emit_event(state, INPUT_EVENT_BUTTON, 0U,
                                 (current_buttons & mask) != 0U ?
                                     INPUT_VALUE_PRESS : INPUT_VALUE_RELEASE);
         }
@@ -2087,17 +2106,13 @@ static void xhci_hid_consume_mouse_report(xhci_device_context_t *state,
      * forward the value unchanged rather than applying a second inversion. */
     int32_t delta_x = (int32_t)(int8_t)report[1];
     int32_t hid_delta_y = (int32_t)(int8_t)report[2];
-    if (delta_x != 0) {
-        xhci_hid_emit_event(state, INPUT_EVENT_RELATIVE, INPUT_REL_X, delta_x);
-    }
-    if (hid_delta_y != 0) {
-        xhci_hid_emit_event(state, INPUT_EVENT_RELATIVE, INPUT_REL_Y, hid_delta_y);
-    }
     /* The optional fourth byte is the Boot mouse wheel.  Preserve its HID
      * signed direction; consumers can apply their own scroll convention. */
-    if (report_length >= 4U && report[3] != 0U) {
-        xhci_hid_emit_event(state, INPUT_EVENT_RELATIVE, INPUT_REL_WHEEL,
-                            (int32_t)(int8_t)report[3]);
+    int32_t wheel = report_length >= 4U ? (int32_t)(int8_t)report[3] : 0;
+    if (changed_buttons != 0U || delta_x != 0 || hid_delta_y != 0 ||
+        wheel != 0) {
+        xhci_hid_emit_pointer(state, changed_buttons, current_buttons,
+                              delta_x, hid_delta_y, wheel);
     }
     state->hid_previous_buttons = current_buttons;
 }

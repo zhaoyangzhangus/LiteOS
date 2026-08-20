@@ -1,6 +1,8 @@
 #include <kernel/input.h>
 #include <kernel/sched.h>
 
+#define INPUT_COALESCE_THRESHOLD (INPUT_CORE_CAPACITY * 3U / 4U)
+
 static struct {
     spinlock_t lock;
     input_event_t events[INPUT_CORE_CAPACITY];
@@ -52,13 +54,20 @@ static int32_t input_add_delta(int32_t left, int32_t right) {
     return (int32_t)sum;
 }
 
+static bool input_event_is_motion(const input_event_t *event) {
+    return event != 0 &&
+           (event->type == INPUT_EVENT_RELATIVE ||
+            (event->type == INPUT_EVENT_POINTER && event->code == 0U));
+}
+
 static bool input_coalesce_relative(const input_event_t *incoming) {
     uint32_t offset;
     if (incoming == 0 || incoming->type != INPUT_EVENT_RELATIVE ||
         g_input.count == 0U) return false;
-    /* X and Y are emitted as separate events by boot-mouse HID.  Coalesce
-     * within the trailing motion run, so a busy pointer cannot fill the ring
-     * merely because the axes alternate.  Never cross a key/button event. */
+    /* X and Y are emitted as separate events by boot-mouse HID.  Under queue
+     * pressure, coalesce within the trailing motion run so a busy pointer
+     * cannot fill the ring merely because the axes alternate.  Never cross a
+     * key/button event. */
     for (offset = 0U; offset < g_input.count; ++offset) {
         uint32_t index = (g_input.write + INPUT_CORE_CAPACITY - 1U - offset) %
                          INPUT_CORE_CAPACITY;
@@ -66,21 +75,42 @@ static bool input_coalesce_relative(const input_event_t *incoming) {
         if (input_same_relative(&g_input.events[index], incoming)) {
             g_input.events[index].value = input_add_delta(
                 g_input.events[index].value, incoming->value);
+            g_input.events[index].timestamp = incoming->timestamp;
             return true;
         }
     }
     return false;
 }
 
-/* Remove one queued relative-motion event without disturbing key/button order. */
-static bool input_drop_oldest_relative(void) {
+static bool input_coalesce_pointer(const input_event_t *incoming) {
+    uint32_t offset;
+    if (incoming == 0 || incoming->type != INPUT_EVENT_POINTER ||
+        incoming->code != 0U || g_input.count == 0U) return false;
+    for (offset = 0U; offset < g_input.count; ++offset) {
+        uint32_t index = (g_input.write + INPUT_CORE_CAPACITY - 1U - offset) %
+                         INPUT_CORE_CAPACITY;
+        input_event_t *queued = &g_input.events[index];
+        if (queued->type != INPUT_EVENT_POINTER || queued->code != 0U) break;
+        if (queued->device_id != incoming->device_id ||
+            queued->flags != incoming->flags) continue;
+        queued->value2 = input_add_delta(queued->value2, incoming->value2);
+        queued->value3 = input_add_delta(queued->value3, incoming->value3);
+        queued->value4 = input_add_delta(queued->value4, incoming->value4);
+        queued->timestamp = incoming->timestamp;
+        return true;
+    }
+    return false;
+}
+
+/* Remove one queued pointer-motion event without disturbing key/button order. */
+static bool input_drop_oldest_motion(void) {
     uint32_t offset;
     uint32_t target = 0U;
     bool found = false;
     if (g_input.count == 0U) return false;
     for (offset = 0U; offset < g_input.count; ++offset) {
         uint32_t index = (g_input.read + offset) % INPUT_CORE_CAPACITY;
-        if (g_input.events[index].type == INPUT_EVENT_RELATIVE) {
+        if (input_event_is_motion(&g_input.events[index])) {
             target = index;
             found = true;
             break;
@@ -119,7 +149,11 @@ kstatus_t input_core_push(const input_event_t *event) {
     incoming = *event;
     if (incoming.timestamp == 0U) incoming.timestamp = input_timestamp();
     input_lock();
-    if (input_coalesce_relative(&incoming)) {
+    if (g_input.count >= INPUT_COALESCE_THRESHOLD &&
+        ((incoming.type == INPUT_EVENT_RELATIVE &&
+          input_coalesce_relative(&incoming)) ||
+         (incoming.type == INPUT_EVENT_POINTER &&
+          input_coalesce_pointer(&incoming)))) {
         input_unlock();
         (void)wake_one(&g_input.waitq);
         return K_OK;
@@ -132,8 +166,9 @@ kstatus_t input_core_push(const input_event_t *event) {
          * 丢弃最旧事件并接收最新事件可使队列恢复流动；键盘状态的
          * 最新变化比过期的重复/移动事件更有价值。
          */
-        if (!input_drop_oldest_relative()) {
-            if (incoming.type == INPUT_EVENT_RELATIVE) {
+        if (!input_drop_oldest_motion()) {
+            if (input_event_is_motion(&incoming) ||
+                incoming.type == INPUT_EVENT_POINTER) {
                 atomic_fetch_add_explicit(&g_input.dropped, 1U,
                                           memory_order_relaxed);
                 input_unlock();
@@ -152,6 +187,21 @@ kstatus_t input_core_push(const input_event_t *event) {
     input_unlock();
     (void)wake_one(&g_input.waitq);
     return K_OK;
+}
+
+kstatus_t input_core_push_pointer(const input_pointer_motion_t *motion) {
+    input_event_t event = {0};
+    if (motion == 0) return K_EINVAL;
+    event.timestamp = motion->timestamp;
+    event.device_id = motion->device_id;
+    event.type = INPUT_EVENT_POINTER;
+    event.flags = motion->flags;
+    event.code = motion->buttons_changed;
+    event.value = motion->buttons;
+    event.value2 = motion->dx;
+    event.value3 = motion->dy;
+    event.value4 = motion->wheel;
+    return input_core_push(&event);
 }
 
 kstatus_t input_core_pop(input_event_t *event) {
@@ -196,6 +246,12 @@ uint32_t input_core_pending(void) {
     return atomic_load_explicit(&g_input.pending, memory_order_acquire);
 }
 
+kstatus_t input_core_wait(uint64_t timeout_ns) {
+    if (!g_input.initialized) return K_EINVAL;
+    if (input_core_pending() != 0U) return K_OK;
+    return wait_on_queue(&g_input.waitq, input_has_event, 0, timeout_ns);
+}
+
 uint64_t input_core_dropped(void) {
     if (!g_input.initialized) return 0U;
     return atomic_load_explicit(&g_input.dropped, memory_order_acquire);
@@ -210,11 +266,30 @@ bool input_core_self_test(void) {
         .code = 0x04U,
         .value = INPUT_VALUE_PRESS,
     };
+    input_pointer_motion_t pointer = {
+        .timestamp = 13U,
+        .device_id = 2U,
+        .flags = 0U,
+        .buttons_changed = 1U,
+        .buttons = 1U,
+        .dx = 3,
+        .dy = -2,
+        .wheel = 1,
+    };
     input_event_t received = {0};
     if (!g_input.initialized || input_core_push(&sent) != K_OK ||
         input_core_pop(&received) != K_OK || received.device_id != sent.device_id ||
         received.type != INPUT_EVENT_KEY || received.code != sent.code ||
         received.value != sent.value || received.timestamp == 0U) {
+        return false;
+    }
+    if (input_core_push_pointer(&pointer) != K_OK ||
+        input_core_pop(&received) != K_OK ||
+        received.type != INPUT_EVENT_POINTER ||
+        received.code != pointer.buttons_changed ||
+        received.value != pointer.buttons ||
+        received.value2 != pointer.dx || received.value3 != pointer.dy ||
+        received.value4 != pointer.wheel) {
         return false;
     }
     return input_core_pending() == 0U && input_core_dropped() == 0U;

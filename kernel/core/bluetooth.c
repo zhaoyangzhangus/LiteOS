@@ -397,12 +397,14 @@ kstatus_t bt_hid_keyboard_report(bt_controller_t *controller, const void *report
     for (uint32_t i = 0; i < 6U; ++i) {
         if (old_keys[i] == 0U || bt_contains_key(new_keys, old_keys[i])) continue;
         events[event_count++] = (input_event_t){0, device_id, INPUT_EVENT_KEY, 0,
-                                                old_keys[i], INPUT_VALUE_RELEASE};
+                                                old_keys[i], INPUT_VALUE_RELEASE,
+                                                0, 0, 0};
     }
     for (uint32_t i = 0; i < 6U; ++i) {
         if (new_keys[i] == 0U || bt_contains_key(old_keys, new_keys[i])) continue;
         events[event_count++] = (input_event_t){0, device_id, INPUT_EVENT_KEY, 0,
-                                                new_keys[i], INPUT_VALUE_PRESS};
+                                                new_keys[i], INPUT_VALUE_PRESS,
+                                                0, 0, 0};
     }
     for (uint32_t i = 0; i < event_count; ++i) {
         kstatus_t status = input_core_push(&events[i]);
