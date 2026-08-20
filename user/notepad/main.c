@@ -4,6 +4,7 @@
 #include <uapi/all.h>
 
 #include "../font12x24.h"
+#include "../client_chrome.h"
 
 #define NOTEPAD_TEXT_CAPACITY 8192U
 #define NOTEPAD_MAP_BASE      0x08000000ULL
@@ -358,7 +359,7 @@ static void ensure_cursor_visible(uint32_t columns, uint32_t visible_lines) {
 }
 
 static void draw_editor(void) {
-    const uint32_t text_top = 32U;
+    const uint32_t text_top = USER_CLIENT_CHROME_HEIGHT;
     const uint32_t status_height = 32U;
     uint32_t columns = g_target_width > 20U ?
         (g_target_width - 20U) / FONT12X24_WIDTH : 1U;
@@ -371,10 +372,13 @@ static void draw_editor(void) {
     if (g_follow_cursor) ensure_cursor_visible(columns, visible_lines);
     cursor_position(columns, &cursor_line, &cursor_column);
     fill_rect(0U, 0U, g_target_width, g_target_height, 0x0015222AU);
-    fill_rect(0U, 0U, g_target_width, 32U, 0x00223948U);
-    draw_text(10U, 4U, "LITEOS NOTEPAD", 0x00B9D7E8U);
-    draw_text(184U, 4U, g_dirty ? "*" : " ", 0x008FD6C4U);
-    draw_text(202U, 4U, g_file_path, 0x008FD6C4U);
+    fill_rect(0U, 0U, g_target_width, USER_CLIENT_CHROME_HEIGHT,
+              USER_CLIENT_CHROME_BACKGROUND);
+    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
+              USER_CLIENT_CHROME_SEPARATOR);
+    draw_text(64U, 16U, "NOTEPAD", USER_CLIENT_CHROME_TEXT);
+    draw_text(160U, 16U, g_dirty ? "*" : " ", USER_CLIENT_CHROME_TEXT);
+    draw_text(178U, 16U, g_file_path, USER_CLIENT_CHROME_TEXT);
     for (size_t index = 0U; index < g_text_length; ++index) {
         char character = g_text[index];
         if (character != '\n' && character != '\t' && line >= g_scroll_line &&
@@ -403,22 +407,35 @@ static void draw_editor(void) {
     fill_rect(0U, g_target_height - status_height, g_target_width,
               status_height, 0x00102028U);
     draw_text(10U, g_target_height - 28U, g_status, 0x008FD6C4U);
+    user_client_chrome_close(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             USER_CLIENT_CHROME_HEIGHT,
+                             USER_CLIENT_CHROME_CLOSE_BG,
+                             USER_CLIENT_CHROME_CLOSE_FG);
 }
 
 static bool create_window(void) {
     os_display_info_t display = {0};
     os_window_create_t request = {0};
+    uint32_t width;
+    uint32_t height;
     display.hdr.size = sizeof(display);
     display.hdr.version = OS_SYSCALL_ABI_VERSION;
     if (notepad_syscall_one(OS_SYS_DISPLAY_GET_INFO, (uint64_t)&display) < 0 ||
         display.width < 320U || display.height < 240U) return false;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
-    request.x = 24;
-    request.y = 24;
-    request.width = display.width > 48U ? display.width - 48U : display.width;
-    request.height = display.height > 48U ? display.height - 48U : display.height;
-    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
+    width = display.width * 3U / 4U;
+    height = display.height * 3U / 4U;
+    if (width < 640U && display.width > 640U) width = 640U;
+    if (height < 420U && display.height > 420U) height = 420U;
+    request.x = (int32_t)((display.width - width) / 2U);
+    request.y = (int32_t)((display.height - height) / 2U);
+    request.width = width;
+    request.height = height;
+    request.flags = OS_WINDOW_VISIBLE |
+                    OS_WINDOW_RESIZABLE |
+                    OS_WINDOW_CLIENT_DECORATIONS;
     request.background = 0x0015222AU;
     request.title[0] = 'N'; request.title[1] = 'O'; request.title[2] = 'T';
     request.title[3] = 'E'; request.title[4] = 'P'; request.title[5] = 'A';
@@ -643,8 +660,10 @@ static void move_vertical(int32_t direction) {
 static void scroll_editor(int32_t direction) {
     uint32_t columns = g_window.width > 20U ?
         (g_window.width - 20U) / FONT12X24_WIDTH : 1U;
-    uint32_t visible_lines = g_window.height > 64U ?
-        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
+    uint32_t visible_lines =
+        g_window.height > USER_CLIENT_CHROME_HEIGHT + 32U ?
+        (g_window.height - USER_CLIENT_CHROME_HEIGHT - 32U) /
+        FONT12X24_HEIGHT : 1U;
     uint32_t line = 0U;
     uint32_t column = 0U;
     uint32_t total_lines;
@@ -668,8 +687,9 @@ static void scroll_editor(int32_t direction) {
 }
 
 static void page_editor(int32_t direction) {
-    uint32_t page = g_window.height > 64U ?
-        (g_window.height - 64U) / FONT12X24_HEIGHT : 1U;
+    uint32_t page = g_window.height > USER_CLIENT_CHROME_HEIGHT + 32U ?
+        (g_window.height - USER_CLIENT_CHROME_HEIGHT - 32U) /
+        FONT12X24_HEIGHT : 1U;
     if (page > 1000000000U) page = 1000000000U;
     scroll_editor(direction < 0 ? -(int32_t)page : (int32_t)page);
 }
@@ -782,6 +802,20 @@ static bool handle_event(const os_window_event_t *event) {
     if (event->type != OS_WINDOW_EVENT_INPUT) return false;
 
     input = &event->input;
+    if (input->type == OS_INPUT_EVENT_BUTTON &&
+        input->code == OS_INPUT_BUTTON_LEFT &&
+        input->value == OS_INPUT_VALUE_PRESS &&
+        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
+                                     g_window.width,
+                                     USER_CLIENT_CHROME_HEIGHT)) {
+        if (g_dirty) {
+            set_status(
+                "UNSAVED CHANGES - CTRL+S SAVE OR CTRL+Q EXIT");
+            render();
+            return true;
+        }
+        notepad_exit(0U);
+    }
     if (input->type == OS_INPUT_EVENT_RELATIVE &&
         input->code == OS_INPUT_REL_WHEEL && input->value != 0) {
         scroll_editor(input->value > 0 ? -3 : 3);

@@ -27,6 +27,13 @@
 #define FM4_CONTEXT_WIDTH          180U
 #define FM4_CONTEXT_ROW_HEIGHT      34U
 
+/* The sidebar is intentionally a volume shelf.  Navigation shortcuts such
+ * as Home/Recent/Trash consume valuable space and do not describe storage
+ * devices, which is the useful information in a small LiteOS desktop. */
+#define FM4_VOLUME_CAPACITY         16U
+#define FM4_VOLUME_ROW_HEIGHT       39U
+#define FM4_VOLUME_FIRST_Y          58U
+
 #define FM4_HISTORY_CAPACITY        16U
 /*
  * input.timestamp currently contains raw x86 TSC ticks.
@@ -52,6 +59,11 @@ typedef struct fileman_entry {
     os_file_info_t info;
     char path[FILEMAN_PATH_CAPACITY];
 } fileman_entry_t;
+
+typedef struct fileman_volume {
+    char label[OS_FILE_NAME_MAX];
+    char path[FILEMAN_PATH_CAPACITY];
+} fileman_volume_t;
 
 static const uint8_t g_upper_font[37][7] = {
     {0,0,0,0,0,0,0},
@@ -101,9 +113,11 @@ static const char g_notepad_path[] = "/sbin/notepad";
 static const char g_notepad_name[] = "notepad";
 static fileman_window_t g_window = {OS_INVALID_HANDLE, 0U, 0U, 0U, 0};
 static fileman_entry_t g_entries[FILEMAN_ENTRY_CAPACITY];
+static fileman_volume_t g_volumes[FM4_VOLUME_CAPACITY];
 static char g_path[FILEMAN_PATH_CAPACITY] = "/";
 static char g_status[128] = "READY";
 static uint32_t g_entry_count;
+static uint32_t g_volume_count;
 static uint32_t g_selected;
 static uint32_t g_first_entry;
 static bool g_ctrl;
@@ -139,6 +153,19 @@ static uint32_t g_history_index;
 static uint32_t *g_target;
 static uint32_t g_target_width;
 static uint32_t g_target_height;
+
+#define FM4_DAMAGE_CAPACITY 24U
+
+typedef struct fm4_damage_rect {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+} fm4_damage_rect_t;
+
+static fm4_damage_rect_t g_damage[FM4_DAMAGE_CAPACITY];
+static uint32_t g_damage_count;
+static bool g_damage_full;
 
 void __main(void) {
 }
@@ -231,14 +258,131 @@ static __attribute__((unused)) const uint8_t *glyph_for(char character) {
     return g_upper_font[0];
 }
 
+static void fm4_damage_all(void) {
+    g_damage_count = 0U;
+    g_damage_full = true;
+}
+
+static void fm4_damage_reset(void) {
+    g_damage_count = 0U;
+    g_damage_full = false;
+}
+
+static bool fm4_damage_contains(uint32_t x, uint32_t y) {
+    if (g_damage_full) return true;
+    for (uint32_t index = 0U; index < g_damage_count; ++index) {
+        const fm4_damage_rect_t *rect = &g_damage[index];
+        if (x >= rect->x && y >= rect->y &&
+            x - rect->x < rect->width && y - rect->y < rect->height) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool fm4_damage_touches(const fm4_damage_rect_t *a,
+                               const fm4_damage_rect_t *b) {
+    uint32_t a_right = a->x + a->width;
+    uint32_t a_bottom = a->y + a->height;
+    uint32_t b_right = b->x + b->width;
+    uint32_t b_bottom = b->y + b->height;
+
+    return a->x <= b_right && b->x <= a_right &&
+           a->y <= b_bottom && b->y <= a_bottom;
+}
+
+static void fm4_damage_rect(uint32_t x, uint32_t y,
+                            uint32_t width, uint32_t height) {
+    uint32_t surface_width = g_window.width != 0U ?
+                             g_window.width : g_target_width;
+    uint32_t surface_height = g_window.height != 0U ?
+                              g_window.height : g_target_height;
+    fm4_damage_rect_t candidate;
+
+    if (g_damage_full || width == 0U || height == 0U ||
+        surface_width == 0U || surface_height == 0U ||
+        x >= surface_width || y >= surface_height) return;
+    if (width > surface_width - x) width = surface_width - x;
+    if (height > surface_height - y) height = surface_height - y;
+    candidate.x = x;
+    candidate.y = y;
+    candidate.width = width;
+    candidate.height = height;
+
+    if (g_damage_count >= FM4_DAMAGE_CAPACITY) {
+        fm4_damage_all();
+        return;
+    }
+    g_damage[g_damage_count++] = candidate;
+
+    /* Coalesce overlapping or adjacent regions until no pair can merge. */
+    for (;;) {
+        bool merged = false;
+        for (uint32_t first = 0U; first < g_damage_count; ++first) {
+            for (uint32_t second = first + 1U;
+                 second < g_damage_count;
+                 ++second) {
+                fm4_damage_rect_t *a = &g_damage[first];
+                fm4_damage_rect_t *b = &g_damage[second];
+                if (!fm4_damage_touches(a, b)) continue;
+                {
+                    uint32_t right = a->x + a->width;
+                    uint32_t bottom = a->y + a->height;
+                    uint32_t other_right = b->x + b->width;
+                    uint32_t other_bottom = b->y + b->height;
+                    if (b->x < a->x) a->x = b->x;
+                    if (b->y < a->y) a->y = b->y;
+                    if (other_right > right) right = other_right;
+                    if (other_bottom > bottom) bottom = other_bottom;
+                    a->width = right - a->x;
+                    a->height = bottom - a->y;
+                }
+                g_damage[second] = g_damage[g_damage_count - 1U];
+                --g_damage_count;
+                merged = true;
+                break;
+            }
+            if (merged) break;
+        }
+        if (!merged) break;
+    }
+}
+
 static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
                       uint32_t color) {
+    uint32_t right;
+    uint32_t bottom;
+
     if (g_target == 0 || x >= g_target_width || y >= g_target_height) return;
     if (width > g_target_width - x) width = g_target_width - x;
     if (height > g_target_height - y) height = g_target_height - y;
-    for (uint32_t row = 0U; row < height; ++row) {
-        for (uint32_t column = 0U; column < width; ++column) {
-            g_target[(uint64_t)(y + row) * g_target_width + x + column] = color;
+
+    right = x + width;
+    bottom = y + height;
+    if (g_damage_full) {
+        for (uint32_t row = y; row < bottom; ++row) {
+            for (uint32_t column = x; column < right; ++column) {
+                g_target[(uint64_t)row * g_target_width + column] = color;
+            }
+        }
+        return;
+    }
+
+    for (uint32_t damage_index = 0U;
+         damage_index < g_damage_count;
+         ++damage_index) {
+        const fm4_damage_rect_t *damage = &g_damage[damage_index];
+        uint32_t left = x > damage->x ? x : damage->x;
+        uint32_t top = y > damage->y ? y : damage->y;
+        uint32_t clipped_right = right < damage->x + damage->width ?
+                                 right : damage->x + damage->width;
+        uint32_t clipped_bottom = bottom < damage->y + damage->height ?
+                                   bottom : damage->y + damage->height;
+        if (left >= clipped_right || top >= clipped_bottom) continue;
+        for (uint32_t row = top; row < clipped_bottom; ++row) {
+            for (uint32_t column = left; column < clipped_right; ++column) {
+                g_target[(uint64_t)row * g_target_width + column] = color;
+            }
         }
     }
 }
@@ -246,10 +390,28 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
     if (text == 0) return;
     for (uint32_t index = 0U; text[index] != '\0'; ++index) {
-        font12x24_draw_glyph(g_target, g_target_width,
-                             g_target_width, g_target_height,
-                             (int32_t)(x + index * FONT12X24_WIDTH),
-                             (int32_t)y, text[index], color);
+        const uint8_t *glyph = font12x24_glyph(text[index]);
+        uint32_t glyph_x = x + index * FONT12X24_WIDTH;
+        for (uint32_t row = 0U; row < FONT12X24_HEIGHT; ++row) {
+            uint32_t draw_y = y + row;
+            if (draw_y >= g_target_height) continue;
+            for (uint32_t column = 0U; column < FONT12X24_WIDTH; ++column) {
+                uint32_t draw_x = glyph_x + column;
+                uint8_t alpha;
+                uint32_t *destination;
+                if (draw_x >= g_target_width ||
+                    !fm4_damage_contains(draw_x, draw_y)) continue;
+                alpha = glyph[row * FONT12X24_WIDTH + column];
+                if (alpha == 0U) continue;
+                destination = &g_target[(uint64_t)draw_y * g_target_width + draw_x];
+                if (alpha == 255U) {
+                    *destination = color;
+                } else {
+                    *destination = font12x24_blend_xrgb8888(
+                        *destination, color, alpha);
+                }
+            }
+        }
     }
 }
 
@@ -311,6 +473,39 @@ static int64_t stat_path(const char *path, os_file_info_t *info) {
 
 
 static bool load_directory(void);
+static int32_t fm4_compare(const char *a, const char *b);
+static void fm4_dialog_geometry(uint32_t *out_x, uint32_t *out_y,
+                                uint32_t *out_width, uint32_t *out_height);
+
+static void fm4_fit_text(char *text, uint32_t capacity,
+                         uint32_t maximum_chars) {
+    uint32_t length;
+
+    if (text == 0 || capacity == 0U || maximum_chars + 1U > capacity) {
+        return;
+    }
+    length = text_length(text);
+    if (length <= maximum_chars) return;
+    if (maximum_chars <= 3U) {
+        for (uint32_t index = 0U; index < maximum_chars; ++index) {
+            text[index] = '.';
+        }
+    } else {
+        text[maximum_chars - 3U] = '.';
+        text[maximum_chars - 2U] = '.';
+        text[maximum_chars - 1U] = '.';
+    }
+    text[maximum_chars] = '\0';
+}
+
+static void fm4_volume_label(char *destination, uint32_t capacity,
+                             const char *name) {
+    copy_text(destination, capacity, name);
+    /* Sidebar labels start at x=50 and have 12-pixel glyphs.  Keep the
+     * rendered text inside the 200-pixel shelf instead of relying on the
+     * framebuffer edge clip, which made "System Volume" bleed outside. */
+    fm4_fit_text(destination, capacity, 12U);
+}
 
 
 enum {
@@ -319,14 +514,13 @@ enum {
     FM4_CONTROL_BACK,
     FM4_CONTROL_FORWARD,
 
-    FM4_CONTROL_HOME,
-    FM4_CONTROL_RECENT,
-    FM4_CONTROL_STARRED,
-    FM4_CONTROL_NETWORK,
-    FM4_CONTROL_TRASH,
-
     FM4_CONTROL_SEARCH,
     FM4_CONTROL_VIEW,
+    FM4_CONTROL_SORT,
+    FM4_CONTROL_CLOSE,
+
+    /* Volume controls are allocated as FM4_CONTROL_VOLUME_BASE + index. */
+    FM4_CONTROL_VOLUME_BASE = 0x100U,
 
     FM4_CONTROL_CONTEXT_OPEN,
     FM4_CONTROL_CONTEXT_DELETE,
@@ -335,6 +529,88 @@ enum {
     FM4_CONTROL_DIALOG_CANCEL,
     FM4_CONTROL_DIALOG_DELETE,
 };
+
+static void fm4_volume_add(const char *path, const char *name) {
+    if (path == 0 || name == 0 || path[0] == '\0' || name[0] == '\0' ||
+        g_volume_count >= FM4_VOLUME_CAPACITY) return;
+
+    for (uint32_t index = 0U; index < g_volume_count; ++index) {
+        if (fm4_compare(g_volumes[index].path, path) == 0) return;
+    }
+
+    copy_text(g_volumes[g_volume_count].path,
+              sizeof(g_volumes[g_volume_count].path), path);
+    fm4_volume_label(g_volumes[g_volume_count].label,
+                     sizeof(g_volumes[g_volume_count].label), name);
+    ++g_volume_count;
+}
+
+/*
+ * There is one VFS namespace today, while removable filesystems are exposed
+ * below conventional mount directories.  Keep the UI honest by showing the
+ * root filesystem plus only directories found below those mount containers;
+ * ordinary folders in the user's home are never presented as disks.
+ */
+static void fm4_load_volumes(void) {
+    static const char *const containers[] = {
+        "/mnt", "/media", "/volumes", "/disks", "/drives",
+    };
+
+    g_volume_count = 0U;
+    fm4_volume_add("/", "System Volume");
+
+    for (uint32_t container_index = 0U;
+         container_index < sizeof(containers) / sizeof(containers[0]);
+         ++container_index) {
+        os_file_info_t container_info = {0};
+        if (stat_path(containers[container_index], &container_info) < 0 ||
+            container_info.type != OS_FILE_TYPE_DIRECTORY) continue;
+
+        for (uint32_t entry_index = 0U;
+             entry_index < FILEMAN_ENTRY_CAPACITY;
+             ++entry_index) {
+            os_file_enumerate_t request = {0};
+            char volume_path[FILEMAN_PATH_CAPACITY];
+            char volume_label[OS_FILE_NAME_MAX];
+
+            request.hdr.size = sizeof(request);
+            request.hdr.version = OS_SYSCALL_ABI_VERSION;
+            request.path = (uint64_t)(uintptr_t)containers[container_index];
+            request.index = entry_index;
+
+            int64_t status = fileman_syscall_one(
+                OS_SYS_FILE_ENUMERATE, (uint64_t)&request);
+            if (status == -2) break;
+            if (status < 0 || request.info.type != OS_FILE_TYPE_DIRECTORY) {
+                continue;
+            }
+            if (!join_path(volume_path, containers[container_index],
+                           request.info.name)) continue;
+
+            copy_text(volume_label, sizeof(volume_label), request.info.name);
+            append_text(volume_label, sizeof(volume_label), " Volume");
+            fm4_volume_add(volume_path, volume_label);
+        }
+    }
+}
+
+static bool fm4_volume_path_active(const fileman_volume_t *volume) {
+    uint32_t base_length;
+    if (volume == 0) return false;
+    base_length = text_length(volume->path);
+    if (base_length == 1U && volume->path[0] == '/') {
+        /* Prefer a mounted child volume when the current path is below it. */
+        for (uint32_t index = 1U; index < g_volume_count; ++index) {
+            if (fm4_volume_path_active(&g_volumes[index])) return false;
+        }
+        return true;
+    }
+    if (text_length(g_path) < base_length) return false;
+    for (uint32_t index = 0U; index < base_length; ++index) {
+        if (g_path[index] != volume->path[index]) return false;
+    }
+    return g_path[base_length] == '\0' || g_path[base_length] == '/';
+}
 
 
 static bool fm4_inside(
@@ -458,6 +734,21 @@ static uint32_t fm4_text_width(
         FONT12X24_WIDTH;
 }
 
+static uint32_t fm4_text_y_centered(uint32_t y, uint32_t height) {
+    return height > FONT12X24_HEIGHT ?
+        y + (height - FONT12X24_HEIGHT) / 2U : y;
+}
+
+static void fm4_text_box_centered(uint32_t x, uint32_t y,
+                                  uint32_t width, uint32_t height,
+                                  const char *text, uint32_t color) {
+    uint32_t text_width = fm4_text_width(text);
+    uint32_t text_x = x;
+
+    if (text_width < width) text_x += (width - text_width) / 2U;
+    fm4_text(text_x, fm4_text_y_centered(y, height), text, color);
+}
+
 static void fm4_center_text(
     uint32_t x,
     uint32_t width,
@@ -568,6 +859,127 @@ static void fm4_file_icon(
             2U,
             0x00CECECEU);
     }
+}
+
+/* Small drive glyph used for every sidebar volume. */
+static void fm4_volume_icon(uint32_t x, uint32_t y, bool active) {
+    uint32_t color = active ? 0x005B6670U : 0x00666B71U;
+    fm4_round_rect(x + 1U, y + 7U, 18U, 16U, color);
+    fill_rect(x + 4U, y + 11U, 12U, 2U, 0x00ECECEFU);
+    fill_rect(x + 5U, y + 18U, 2U, 2U, 0x00ECECEFU);
+    fill_rect(x + 13U, y + 18U, 2U, 2U, 0x00ECECEFU);
+}
+
+static void fm4_composite_pixel(uint32_t x, uint32_t y,
+                                uint32_t color, uint8_t alpha) {
+    uint32_t *destination;
+
+    if (g_target == 0 || x >= g_target_width || y >= g_target_height ||
+        alpha == 0U || !fm4_damage_contains(x, y)) return;
+    destination = &g_target[(uint64_t)y * g_target_width + x];
+    if (alpha == 255U) {
+        *destination = color;
+    } else {
+        *destination = font12x24_blend_xrgb8888(*destination, color, alpha);
+    }
+}
+
+static void fm4_composite_bitmap(uint32_t x, uint32_t y,
+                                 const char (*bitmap)[17],
+                                 uint32_t width, uint32_t height,
+                                 uint32_t color) {
+    for (uint32_t row = 0U; row < height; ++row) {
+        for (uint32_t column = 0U; column < width; ++column) {
+            char value = bitmap[row][column];
+            uint8_t nibble;
+
+            if (value >= '0' && value <= '9') {
+                nibble = (uint8_t)(value - '0');
+            } else if (value >= 'A' && value <= 'F') {
+                nibble = (uint8_t)(value - 'A' + 10U);
+            } else {
+                nibble = 0U;
+            }
+            fm4_composite_pixel(x + column, y + row, color,
+                                (uint8_t)(nibble * 17U));
+        }
+    }
+}
+
+/* 16x16 alpha rasters of the existing Adwaita symbolic actions.  They are
+ * composited source-over into the app surface, preserving transparent edges
+ * instead of being reconstructed from text glyphs or coarse rectangles. */
+static void fm4_search_icon(uint32_t x, uint32_t y, uint32_t color) {
+    static const char bitmap[16][17] = {
+        "0004AEFEA4000000", "009FFFFFFF900000",
+        "09FE82028EF90000", "4FE3000003EF4000",
+        "AF800000008FA000", "EF200000002FE000",
+        "FF000000000FF000", "EF200000002FE000",
+        "AF800000008FA000", "4FE3000003EF4000",
+        "09FE82028EFD0000", "009FFFFFFFDF9000",
+        "0004AEFEA409F900", "0000000000009F90",
+        "00000000000009E0", "0000000000000000",
+    };
+    fm4_composite_bitmap(x, y, bitmap, 16U, 16U, color);
+}
+
+static void fm4_chevron_icon(uint32_t x, uint32_t y, bool forward,
+                             uint32_t color) {
+    for (uint32_t row = 0U; row < 8U; ++row) {
+        uint32_t offset = row < 4U ? row : 7U - row;
+        uint32_t px = forward ? x + 5U + offset : x + 13U - offset;
+        fill_rect(px, y + 4U + row, 2U, 2U, color);
+    }
+}
+
+static void fm4_list_icon(uint32_t x, uint32_t y, uint32_t color) {
+    static const char bitmap[16][17] = {
+        "0000000000000000", "0FFFF00000000000",
+        "0FFFF00FFFFFFFF0", "0FFFF00FFFFFFFF0",
+        "0FFFF00000000000", "0000000000000000",
+        "0FFFF00000000000", "0FFFF00FFFFFFFF0",
+        "0FFFF00FFFFFFFF0", "0FFFF00000000000",
+        "0000000000000000", "0FFFF00000000000",
+        "0FFFF00FFFFFFFF0", "0FFFF00FFFFFFFF0",
+        "0FFFF00000000000", "0000000000000000",
+    };
+    fm4_composite_bitmap(x, y, bitmap, 16U, 16U, color);
+}
+
+static void fm4_menu_icon(uint32_t x, uint32_t y, uint32_t color) {
+    for (uint32_t row = 0U; row < 3U; ++row) {
+        fill_rect(x, y + row * 6U, 18U, 2U, color);
+    }
+}
+
+static void fm4_sort_icon(uint32_t x, uint32_t y, uint32_t color) {
+    static const char bitmap[16][17] = {
+        "0000000000000000", "00FF000000000000",
+        "00FF000000000000", "00FF000000000000",
+        "00FF000000000000", "00FF000000000000",
+        "00FF00FFFFFFFFF0", "00FF00FFFFFFFFF0",
+        "00FF000000000000", "00FF00FFFFFFF000",
+        "00FF00FFFFFFF000", "00FF000000000000",
+        "0FFFF0FFFFF00000", "FFFFFFFFFFF00000",
+        "FFFFFF0000000000", "0000000000000000",
+    };
+    fm4_composite_bitmap(x, y, bitmap, 16U, 16U, color);
+}
+
+static void fm4_close_icon(uint32_t x, uint32_t y) {
+    static const char bitmap[16][17] = {
+        "FE30000000003EFE", "EFE300000003EFE3",
+        "3EFE3000003EFE30", "03EFE30003EFE300",
+        "003EFE303EFE3000", "0003EFE6EFE30000",
+        "00003EFFFE300000", "000006FFF6000000",
+        "00003EFFFE300000", "0003EFE6EFE30000",
+        "003EFE303EFE3000", "03EFE30003EFE300",
+        "3EFE3000003EFE30", "EFE300000003EFE3",
+        "FE30000000003EFE", "E3000000000003EF",
+    };
+    fm4_round_rect(x, y, 24U, 24U, 0x00E2E2E4U);
+    fm4_composite_bitmap(x + 4U, y + 4U, bitmap, 16U, 16U,
+                         0x00484D53U);
 }
 
 
@@ -934,6 +1346,95 @@ static bool fm4_item_rect(
     return true;
 }
 
+static void fm4_damage_item(uint32_t index) {
+    uint32_t x;
+    uint32_t y;
+    if (index != FM4_INDEX_NONE && fm4_item_rect(index, &x, &y)) {
+        fm4_damage_rect(x, y, FM4_GRID_CARD_WIDTH, FM4_GRID_CARD_HEIGHT);
+    }
+}
+
+static void fm4_damage_grid(void) {
+    uint32_t y = FM4_HEADER_HEIGHT;
+    uint32_t width = g_window.width > FM4_SIDEBAR_WIDTH ?
+                     g_window.width - FM4_SIDEBAR_WIDTH : 0U;
+    uint32_t height = g_window.height > y ? g_window.height - y : 0U;
+    fm4_damage_rect(FM4_SIDEBAR_WIDTH, y, width, height);
+}
+
+static void fm4_damage_status(void) {
+    uint32_t x = FM4_SIDEBAR_WIDTH + 16U;
+    uint32_t y = g_window.height > 44U ? g_window.height - 44U : 0U;
+    uint32_t width = g_window.width > x + 10U ?
+                     g_window.width - x - 10U : 0U;
+    fm4_damage_rect(x, y, width, 36U);
+}
+
+static void fm4_damage_control(uint32_t control) {
+    uint32_t x;
+    uint32_t y = 4U;
+    uint32_t width = 34U;
+    uint32_t height = 34U;
+
+    switch (control) {
+    case FM4_CONTROL_BACK:
+        x = FM4_SIDEBAR_WIDTH + 14U;
+        break;
+    case FM4_CONTROL_FORWARD:
+        x = FM4_SIDEBAR_WIDTH + 54U;
+        break;
+    case FM4_CONTROL_SEARCH:
+        x = g_window.width > 140U ? g_window.width - 140U : 0U;
+        width = 32U;
+        height = 32U;
+        break;
+    case FM4_CONTROL_VIEW:
+        x = g_window.width > 106U ? g_window.width - 106U : 0U;
+        width = 32U;
+        height = 32U;
+        break;
+    case FM4_CONTROL_SORT:
+        x = g_window.width > 74U ? g_window.width - 74U : 0U;
+        width = 32U;
+        height = 32U;
+        break;
+    case FM4_CONTROL_CLOSE:
+        x = g_window.width > 30U ? g_window.width - 30U : 0U;
+        y = 8U;
+        width = 24U;
+        height = 24U;
+        break;
+    default:
+        if (control >= FM4_CONTROL_VOLUME_BASE &&
+            control < FM4_CONTROL_VOLUME_BASE + g_volume_count) {
+            uint32_t index = control - FM4_CONTROL_VOLUME_BASE;
+            fm4_damage_rect(0U,
+                            FM4_VOLUME_FIRST_Y + index * FM4_VOLUME_ROW_HEIGHT,
+                            FM4_SIDEBAR_WIDTH,
+                            FM4_VOLUME_ROW_HEIGHT);
+        }
+        return;
+    }
+    fm4_damage_rect(x, y, width, height);
+}
+
+static void fm4_damage_context(void) {
+    if (g_context_visible) {
+        fm4_damage_rect(g_context_x, g_context_y, FM4_CONTEXT_WIDTH,
+                        FM4_CONTEXT_ROW_HEIGHT * 3U);
+    }
+}
+
+static void fm4_damage_dialog(void) {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+    if (!g_delete_dialog) return;
+    fm4_dialog_geometry(&x, &y, &width, &height);
+    fm4_damage_rect(x, y, width, height);
+}
+
 
 static uint32_t fm4_item_at(
     int32_t px,
@@ -1268,33 +1769,6 @@ static void fm4_parent(void) {
 
 
 /*
- * Network sidebar launches netmgr.
- */
-static void fm4_launch_network(void) {
-    static const char path[] =
-        "/sbin/netmgr";
-
-    static char arg0[] =
-        "netmgr";
-
-    char *arguments[2];
-
-    arguments[0] = arg0;
-    arguments[1] = 0;
-
-    if (fileman_syscall_three(
-            OS_SYS_PROCESS_EXEC,
-            (uint64_t)(uintptr_t)path,
-            (uint64_t)(uintptr_t)arguments,
-            0U) < 0) {
-
-        fm4_status(
-            "NETWORK LAUNCH FAILED");
-    }
-}
-
-
-/*
  * Top/sidebar controls.
  */
 static uint32_t fm4_control_at(
@@ -1304,7 +1778,7 @@ static uint32_t fm4_control_at(
     if (fm4_inside(
             px, py,
             FM4_SIDEBAR_WIDTH + 14U,
-            10U,
+            4U,
             34U,
             34U)) {
 
@@ -1314,61 +1788,40 @@ static uint32_t fm4_control_at(
     if (fm4_inside(
             px, py,
             FM4_SIDEBAR_WIDTH + 54U,
-            10U,
+            4U,
             34U,
             34U)) {
 
         return FM4_CONTROL_FORWARD;
     }
 
-    if (g_window.width > 96U &&
-        fm4_inside(
-            px, py,
-            g_window.width - 92U,
-            10U,
-            34U,
-            34U)) {
+    if (g_window.width > 140U &&
+        fm4_inside(px, py, g_window.width - 140U, 4U, 32U, 32U)) {
 
         return FM4_CONTROL_SEARCH;
     }
 
-    if (g_window.width > 54U &&
-        fm4_inside(
-            px, py,
-            g_window.width - 50U,
-            10U,
-            34U,
-            34U)) {
+    if (g_window.width > 106U &&
+        fm4_inside(px, py, g_window.width - 106U, 4U, 32U, 32U)) {
 
         return FM4_CONTROL_VIEW;
     }
 
-    {
-        static const uint32_t controls[] = {
-            FM4_CONTROL_HOME,
-            FM4_CONTROL_RECENT,
-            FM4_CONTROL_STARRED,
-            FM4_CONTROL_NETWORK,
-            FM4_CONTROL_TRASH,
-        };
+    if (g_window.width > 74U &&
+        fm4_inside(px, py, g_window.width - 74U, 4U, 32U, 32U)) {
+        return FM4_CONTROL_SORT;
+    }
 
-        for (uint32_t i = 0U;
-             i < 5U;
-             ++i) {
+    if (g_window.width > 40U &&
+        fm4_inside(px, py, g_window.width - 40U, 4U, 36U, 32U)) {
+        return FM4_CONTROL_CLOSE;
+    }
 
-            uint32_t y =
-                58U +
-                i * 39U;
-
-            if (fm4_inside(
-                    px, py,
-                    10U,
-                    y,
-                    FM4_SIDEBAR_WIDTH - 20U,
-                    35U)) {
-
-                return controls[i];
-            }
+    for (uint32_t index = 0U; index < g_volume_count; ++index) {
+        uint32_t y = FM4_VOLUME_FIRST_Y + index * FM4_VOLUME_ROW_HEIGHT;
+        if (fm4_inside(px, py, 10U, y,
+                       FM4_SIDEBAR_WIDTH - 20U, 35U)) {
+            return FM4_CONTROL_VOLUME_BASE + index;
         }
     }
 
@@ -1542,31 +1995,20 @@ static void fm4_breadcrumb(
     char *buffer,
     uint32_t capacity) {
 
-    buffer[0] = '\0';
-
-    append_text(
-        buffer,
-        capacity,
-        "Home");
-
-    if (!(g_path[0] == '/' &&
-          g_path[1] == '\0')) {
-
-        append_text(
-            buffer,
-            capacity,
-            " / ");
-
-        append_text(
-            buffer,
-            capacity,
-            g_path + 1U);
+    /* Home is not a LiteOS volume/location.  At the root, use the same
+     * volume name as the sidebar; below it, show the actual VFS path. */
+    if (g_path[0] == '\0' ||
+        (g_path[0] == '/' && g_path[1] == '\0')) {
+        copy_text(buffer, capacity, "System Volume");
+    } else {
+        copy_text(buffer, capacity, g_path);
     }
 }
 
 
 static bool load_directory(void) {
     os_file_info_t directory_info = {0};
+    fm4_load_volumes();
     if (stat_path(g_path, &directory_info) < 0 ||
         directory_info.type != OS_FILE_TYPE_DIRECTORY) {
         copy_text(g_status, sizeof(g_status), "NOT A DIRECTORY");
@@ -1622,18 +2064,14 @@ static bool create_window(void) {
         return false;
     }
 
-    /*
-     * Medium centered desktop window instead of almost-fullscreen.
-     */
-    /*
-     * Initial Fileman window:
-     * centered at 50% of the display width and height.
-     */
-    width =
-        display.width / 2U;
-
-    height =
-        display.height / 2U;
+    /* Start as a clearly non-maximized centered app window.  The server still
+     * reserves a full display-sized resizable surface, but the visible Files
+     * rectangle starts at 75% of the display in each direction, leaving a
+     * usable desktop margin and all four resize edges reachable. */
+    width = display.width * 3U / 4U;
+    height = display.height * 3U / 4U;
+    if (width < 640U && display.width > 640U) width = 640U;
+    if (height < 420U && display.height > 420U) height = 420U;
 
     request.hdr.size =
         sizeof(request);
@@ -1641,22 +2079,15 @@ static bool create_window(void) {
     request.hdr.version =
         OS_SYSCALL_ABI_VERSION;
 
-    request.x =
-        (int32_t)(
-            (display.width - width) /
-            2U);
-
-    request.y =
-        (int32_t)(
-            (display.height - height) /
-            2U);
+    request.x = (int32_t)((display.width - width) / 2U);
+    request.y = (int32_t)((display.height - height) / 2U);
 
     request.width = width;
     request.height = height;
 
-    request.flags =
-        OS_WINDOW_VISIBLE |
-        OS_WINDOW_RESIZABLE;
+    request.flags = OS_WINDOW_VISIBLE |
+                    OS_WINDOW_RESIZABLE |
+                    OS_WINDOW_CLIENT_DECORATIONS;
 
     request.background =
         0x00FAFAFAU;
@@ -1702,23 +2133,31 @@ static bool create_window(void) {
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    uint32_t count;
+
+    if (!g_damage_full && g_damage_count == 0U) return;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.identifier = g_window.identifier;
-    request.width = g_window.width;
-    request.height = g_window.height;
-    (void)fileman_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    if (g_damage_full) {
+        request.width = g_window.width;
+        request.height = g_window.height;
+        (void)fileman_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    } else {
+        count = g_damage_count;
+        for (uint32_t index = 0U; index < count; ++index) {
+            request.x = (int32_t)g_damage[index].x;
+            request.y = (int32_t)g_damage[index].y;
+            request.width = g_damage[index].width;
+            request.height = g_damage[index].height;
+            (void)fileman_syscall_one(OS_SYS_WINDOW_UPDATE,
+                                      (uint64_t)&request);
+        }
+    }
+    fm4_damage_reset();
 }
 
 static void render(void) {
-    static const char *const sidebar[] = {
-        "Home",
-        "Recent",
-        "Starred",
-        "Network",
-        "Trash",
-    };
-
     char breadcrumb[
         FILEMAN_PATH_CAPACITY + 16U];
 
@@ -1738,17 +2177,25 @@ static void render(void) {
         return;
     }
 
+    /* A caller that has no precise invalidation falls back to a safe full
+     * frame.  Interactive paths below add only the regions whose state
+     * changed, so ordinary selection/hover clicks stay clipped. */
+    if (!g_damage_full && g_damage_count == 0U) fm4_damage_all();
+
     fm4_normalize_scroll();
 
     /*
      * White content canvas.
      */
-    fill_rect(
-        0U,
-        0U,
-        g_target_width,
-        g_target_height,
-        0x00FAFAFAU);
+    if (g_damage_full) {
+        fill_rect(0U, 0U, g_target_width, g_target_height, 0x00FAFAFAU);
+    } else {
+        for (uint32_t index = 0U; index < g_damage_count; ++index) {
+            fill_rect(g_damage[index].x, g_damage[index].y,
+                      g_damage[index].width, g_damage[index].height,
+                      0x00FAFAFAU);
+        }
+    }
 
     /*
      * Sidebar.
@@ -1770,89 +2217,27 @@ static void render(void) {
     /*
      * Sidebar title.
      */
-    draw_text(
-        68U,
-        12U,
-        "Files",
-        0x00303438U);
-
-    fm4_text(
-        22U,
-        20U,
-        "O",
-        0x00585E64U);
-
-    fm4_text(
-        FM4_SIDEBAR_WIDTH - 30U,
-        20U,
-        "=",
-        0x00585E64U);
+    fm4_search_icon(12U, 20U, 0x00585E64U);
+    draw_text(80U, fm4_text_y_centered(0U, FM4_HEADER_HEIGHT),
+              "Files", 0x00303438U);
+    fm4_menu_icon(FM4_SIDEBAR_WIDTH - 29U, 21U, 0x00585E64U);
 
     /*
-     * Sidebar entries.
+     * Volumes only.  A selected volume gets the same soft pill used by the
+     * reference design; there are no Home/Recent/Network pseudo-locations.
      */
-    for (uint32_t i = 0U;
-         i < 5U;
-         ++i) {
+    for (uint32_t index = 0U; index < g_volume_count; ++index) {
+        uint32_t y = FM4_VOLUME_FIRST_Y + index * FM4_VOLUME_ROW_HEIGHT;
+        bool active = fm4_volume_path_active(&g_volumes[index]);
 
-        uint32_t y =
-            58U +
-            i * 39U;
-
-        uint32_t control =
-            FM4_CONTROL_HOME + i;
-
-        bool active =
-            i == 0U;
-
-        if (active ||
-            g_hover_control ==
-                control) {
-
-            fm4_round_rect(
-                10U,
-                y,
-                FM4_SIDEBAR_WIDTH - 20U,
-                35U,
-                active ?
-                    0x00DCDCDFAU :
-                    0x00E3E3E6U);
+        if (active || g_hover_control == FM4_CONTROL_VOLUME_BASE + index) {
+            fm4_round_rect(10U, y, FM4_SIDEBAR_WIDTH - 20U, 35U,
+                           active ? 0x00DCDCDFAU : 0x00E3E3E6U);
         }
 
-        /*
-         * Minimal sidebar glyphs.
-         */
-        if (i == 0U) {
-            fill_rect(
-                23U,
-                y + 13U,
-                13U,
-                11U,
-                0x00666B71U);
-
-            fill_rect(
-                27U,
-                y + 9U,
-                5U,
-                6U,
-                0x00666B71U);
-
-        } else {
-            fm4_text(
-                24U,
-                y + 11U,
-                i == 1U ? "o" :
-                i == 2U ? "*" :
-                i == 3U ? "#" :
-                          "x",
-                0x00666B71U);
-        }
-
-        fm4_text(
-            50U,
-            y + 11U,
-            sidebar[i],
-            0x003B3F44U);
+        fm4_volume_icon(22U, y + 2U, active);
+        fm4_text(50U, fm4_text_y_centered(y, 35U),
+                 g_volumes[index].label, 0x003B3F44U);
     }
 
     /*
@@ -1874,19 +2259,14 @@ static void render(void) {
 
         fm4_round_rect(
             FM4_SIDEBAR_WIDTH + 14U,
-            10U,
+            4U,
             34U,
             34U,
             0x00ECECECU);
     }
 
-    fm4_text(
-        FM4_SIDEBAR_WIDTH + 26U,
-        20U,
-        "<",
-        g_history_index != 0U ?
-            0x0031373CU :
-            0x00BFC1C3U);
+    fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 20U, 13U, false,
+                     g_history_index != 0U ? 0x0031373CU : 0x00BFC1C3U);
 
     /*
      * Forward.
@@ -1896,30 +2276,25 @@ static void render(void) {
 
         fm4_round_rect(
             FM4_SIDEBAR_WIDTH + 54U,
-            10U,
+            4U,
             34U,
             34U,
             0x00ECECECU);
     }
 
-    fm4_text(
-        FM4_SIDEBAR_WIDTH + 66U,
-        20U,
-        ">",
-        g_history_index + 1U <
-            g_history_count ?
-            0x0031373CU :
-            0x00BFC1C3U);
+    fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 60U, 13U, true,
+                     g_history_index + 1U < g_history_count ?
+                     0x0031373CU : 0x00BFC1C3U);
 
     /*
      * Breadcrumb pill.
      */
     {
         uint32_t x =
-            FM4_SIDEBAR_WIDTH + 100U;
+            FM4_SIDEBAR_WIDTH + 88U;
 
         uint32_t reserved =
-            112U;
+            150U;
 
         uint32_t width =
             g_target_width >
@@ -1931,7 +2306,7 @@ static void render(void) {
 
         fm4_round_rect(
             x,
-            10U,
+            4U,
             width,
             34U,
             0x00E9E9E9U);
@@ -1940,56 +2315,38 @@ static void render(void) {
             breadcrumb,
             sizeof(breadcrumb));
 
-        fm4_text(
-            x + 14U,
-            20U,
-            "H",
-            0x00676C72U);
+        if (width > 22U) {
+            fm4_fit_text(breadcrumb, sizeof(breadcrumb),
+                         (width - 22U) / FONT12X24_WIDTH);
+        }
 
-        fm4_text(
-            x + 36U,
-            20U,
-            breadcrumb,
-            0x0043484DU);
+        fm4_text(x + 14U, fm4_text_y_centered(4U, 34U),
+                 breadcrumb, 0x0043484DU);
     }
 
     /*
      * Search / grid controls.
      */
-    if (g_target_width > 100U) {
-        if (g_hover_control ==
-            FM4_CONTROL_SEARCH) {
-
-            fm4_round_rect(
-                g_target_width - 92U,
-                10U,
-                34U,
-                34U,
-                0x00ECECECU);
+    if (g_target_width > 140U) {
+        if (g_hover_control == FM4_CONTROL_SEARCH) {
+            fm4_round_rect(g_target_width - 140U, 4U, 32U, 32U,
+                           0x00ECECECU);
         }
+        fm4_search_icon(g_target_width - 132U, 12U, 0x003E444AU);
 
-        fm4_text(
-            g_target_width - 81U,
-            20U,
-            "O",
-            0x003E444AU);
-
-        if (g_hover_control ==
-            FM4_CONTROL_VIEW) {
-
-            fm4_round_rect(
-                g_target_width - 50U,
-                10U,
-                34U,
-                34U,
-                0x00ECECECU);
+        if (g_hover_control == FM4_CONTROL_VIEW) {
+            fm4_round_rect(g_target_width - 106U, 4U, 32U, 32U,
+                           0x00ECECECU);
         }
+        fm4_list_icon(g_target_width - 98U, 12U, 0x003E444AU);
 
-        fm4_text(
-            g_target_width - 39U,
-            20U,
-            "#",
-            0x003E444AU);
+        if (g_hover_control == FM4_CONTROL_SORT) {
+            fm4_round_rect(g_target_width - 74U, 4U, 32U, 32U,
+                           0x00ECECECU);
+        }
+        fm4_sort_icon(g_target_width - 66U, 12U, 0x003E444AU);
+
+        fm4_close_icon(g_target_width - 30U, 8U);
     }
 
     /*
@@ -2064,9 +2421,12 @@ static void render(void) {
      * Empty folder.
      */
     if (g_entry_count == 0U) {
-        fm4_text(
-            fm4_content_left(),
-            fm4_grid_top() + 24U,
+        fm4_text_box_centered(
+            FM4_SIDEBAR_WIDTH,
+            fm4_grid_top() + 16U,
+            g_target_width > FM4_SIDEBAR_WIDTH ?
+                g_target_width - FM4_SIDEBAR_WIDTH : 0U,
+            34U,
             "This folder is empty",
             0x00818589U);
     }
@@ -2156,16 +2516,13 @@ static void render(void) {
              i < 3U;
              ++i) {
 
-            fm4_text(
+            fm4_text_box_centered(
                 g_context_x + 16U,
-                g_context_y +
-                    i *
-                    FM4_CONTEXT_ROW_HEIGHT +
-                    10U,
+                g_context_y + i * FM4_CONTEXT_ROW_HEIGHT,
+                FM4_CONTEXT_WIDTH - 32U,
+                FM4_CONTEXT_ROW_HEIGHT,
                 labels[i],
-                i == 1U ?
-                    0x00B33D3DU :
-                    0x00373B40U);
+                i == 1U ? 0x00B33D3DU : 0x00373B40U);
         }
     }
 
@@ -2221,11 +2578,9 @@ static void render(void) {
             30U,
             0x00ECECECU);
 
-        fm4_text(
-            x + 40U,
-            y + height - 35U,
-            "Cancel",
-            0x00363A3FU);
+        fm4_text_box_centered(
+            x + 20U, y + height - 44U, 104U, 30U,
+            "Cancel", 0x00363A3FU);
 
         fm4_round_rect(
             x + width - 124U,
@@ -2234,11 +2589,9 @@ static void render(void) {
             30U,
             0x00D94A4AU);
 
-        fm4_text(
-            x + width - 98U,
-            y + height - 35U,
-            "Delete",
-            0x00FFFFFFU);
+        fm4_text_box_centered(
+            x + width - 124U, y + height - 44U, 104U, 30U,
+            "Delete", 0x00FFFFFFU);
     }
 
     /*
@@ -2283,11 +2636,8 @@ static void render(void) {
                 28U,
                 0x00E5E5E5U);
 
-            fm4_text(
-                x + 11U,
-                y + 7U,
-                g_status,
-                0x0052585EU);
+            fm4_text(x + 11U, fm4_text_y_centered(y, 28U),
+                     g_status, 0x0052585EU);
         }
     }
 
@@ -2412,6 +2762,8 @@ static void handle_key(
     uint32_t page =
         columns *
         fm4_visible_rows();
+    uint32_t old_selected = g_selected;
+    uint32_t old_first_entry = g_first_entry;
 
     if (event == 0 ||
         event->type !=
@@ -2456,6 +2808,7 @@ static void handle_key(
 
         (void)load_directory();
 
+        fm4_damage_all();
         render();
         return;
     }
@@ -2465,6 +2818,10 @@ static void handle_key(
      * dialog -> context -> selection.
      */
     if (input->code == 0x29U) {
+        fm4_damage_context();
+        fm4_damage_dialog();
+        fm4_damage_item(g_selection_valid ? g_selected : FM4_INDEX_NONE);
+        fm4_damage_status();
         if (g_delete_dialog) {
             g_delete_dialog = false;
 
@@ -2485,6 +2842,7 @@ static void handle_key(
 
     if (input->code == 0x2AU) {
         fm4_parent();
+        fm4_damage_all();
         render();
         return;
     }
@@ -2493,12 +2851,14 @@ static void handle_key(
         input->code == 0x58U) {
 
         open_selected();
+        fm4_damage_all();
         render();
         return;
     }
 
     if (input->code == 0x4CU) {
         remove_selected();
+        fm4_damage_all();
         render();
         return;
     }
@@ -2513,6 +2873,7 @@ static void handle_key(
 
         fm4_selection_visible();
 
+        fm4_damage_item(g_selected);
         render();
         return;
     }
@@ -2591,10 +2952,17 @@ static void handle_key(
         return;
     }
 
+    fm4_damage_context();
     g_context_visible = false;
 
     fm4_selection_visible();
 
+    if (old_first_entry != g_first_entry) {
+        fm4_damage_grid();
+    } else {
+        fm4_damage_item(old_selected);
+        fm4_damage_item(g_selected);
+    }
     render();
 }
 
@@ -2645,6 +3013,7 @@ static void handle_event(
 
         g_context_visible = false;
 
+        fm4_damage_all();
         render();
         return;
     }
@@ -2684,6 +3053,7 @@ static void handle_event(
 
             g_context_visible = false;
 
+            fm4_damage_grid();
             render();
             return;
         }
@@ -2728,7 +3098,10 @@ static void handle_event(
                     g_hover_item ||
                 old_control !=
                     g_hover_control) {
-
+                fm4_damage_item(old_item);
+                fm4_damage_item(g_hover_item);
+                fm4_damage_control(old_control);
+                fm4_damage_control(g_hover_control);
                 render();
             }
 
@@ -2771,6 +3144,8 @@ static void handle_event(
 
         if (item !=
             FM4_INDEX_NONE) {
+            fm4_damage_context();
+            fm4_damage_item(g_selection_valid ? g_selected : FM4_INDEX_NONE);
 
             g_selected = item;
             g_selection_valid = true;
@@ -2779,6 +3154,8 @@ static void handle_event(
                 g_pointer_x,
                 g_pointer_y);
 
+            fm4_damage_item(item);
+            fm4_damage_context();
             render();
         }
 
@@ -2795,6 +3172,7 @@ static void handle_event(
      * Delete modal owns left-click input.
      */
     if (g_delete_dialog) {
+        fm4_damage_dialog();
         uint32_t control =
             fm4_dialog_at(
                 g_pointer_x,
@@ -2811,7 +3189,8 @@ static void handle_event(
 
             g_delete_dialog = false;
 
-            (void)fm4_remove_now();
+            if (fm4_remove_now()) fm4_damage_all();
+            else fm4_damage_status();
         }
 
         render();
@@ -2822,6 +3201,7 @@ static void handle_event(
      * Context menu.
      */
     if (g_context_visible) {
+        fm4_damage_context();
         uint32_t control =
             fm4_context_at(
                 g_pointer_x,
@@ -2884,6 +3264,13 @@ static void handle_event(
             }
         }
 
+        if (control == FM4_CONTROL_CONTEXT_OPEN) {
+            fm4_damage_all();
+        } else {
+            fm4_damage_context();
+            fm4_damage_dialog();
+            fm4_damage_status();
+        }
         render();
         return;
     }
@@ -2904,30 +3291,14 @@ static void handle_event(
                 FM4_CONTROL_BACK) {
 
                 (void)fm4_history_go(-1);
+                fm4_damage_all();
 
             } else if (
                 control ==
                 FM4_CONTROL_FORWARD) {
 
                 (void)fm4_history_go(1);
-
-            } else if (
-                control ==
-                FM4_CONTROL_HOME) {
-
-                if (!(g_path[0] == '/' &&
-                      g_path[1] == '\0')) {
-
-                    (void)fm4_navigate(
-                        "/",
-                        true);
-                }
-
-            } else if (
-                control ==
-                FM4_CONTROL_NETWORK) {
-
-                fm4_launch_network();
+                fm4_damage_all();
 
             } else if (
                 control ==
@@ -2935,6 +3306,7 @@ static void handle_event(
 
                 fm4_status(
                     "SEARCH NOT IMPLEMENTED");
+                fm4_damage_status();
 
             } else if (
                 control ==
@@ -2942,17 +3314,20 @@ static void handle_event(
 
                 fm4_status(
                     "GRID VIEW");
+                fm4_damage_status();
 
-            } else if (
-                control ==
-                    FM4_CONTROL_RECENT ||
-                control ==
-                    FM4_CONTROL_STARRED ||
-                control ==
-                    FM4_CONTROL_TRASH) {
+            } else if (control == FM4_CONTROL_SORT) {
+                fm4_status("SORTED BY NAME");
+                fm4_damage_status();
 
-                fm4_status(
-                    "LOCATION NOT IMPLEMENTED");
+            } else if (control == FM4_CONTROL_CLOSE) {
+                fileman_exit(0U);
+
+            } else if (control >= FM4_CONTROL_VOLUME_BASE &&
+                       control < FM4_CONTROL_VOLUME_BASE + g_volume_count) {
+                uint32_t volume_index = control - FM4_CONTROL_VOLUME_BASE;
+                (void)fm4_navigate(g_volumes[volume_index].path, true);
+                fm4_damage_all();
             }
 
             render();
@@ -2974,6 +3349,8 @@ static void handle_event(
          */
         if (item ==
             FM4_INDEX_NONE) {
+            fm4_damage_item(g_selection_valid ? g_selected : FM4_INDEX_NONE);
+            fm4_damage_status();
 
             g_selection_valid = false;
 
@@ -3007,6 +3384,7 @@ static void handle_event(
 
             open_selected();
 
+            fm4_damage_all();
             render();
             return;
         }
@@ -3014,6 +3392,9 @@ static void handle_event(
         /*
          * First click only selects.
          */
+        uint32_t previous_selected =
+            g_selection_valid ? g_selected : FM4_INDEX_NONE;
+        fm4_damage_item(previous_selected);
         g_selected = item;
         g_selection_valid = true;
 
@@ -3024,6 +3405,8 @@ static void handle_event(
 
         fm4_status("READY");
 
+        fm4_damage_item(item);
+        fm4_damage_status();
         render();
     }
 }

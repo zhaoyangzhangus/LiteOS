@@ -4,6 +4,7 @@
 #include <uapi/all.h>
 
 #include "../font12x24.h"
+#include "../client_chrome.h"
 
 #define SHELL_LINE_CAPACITY 256U
 #define SHELL_OUTPUT_LINES 24U
@@ -277,19 +278,30 @@ static void draw_input_line(void) {
 }
 
 static void draw_terminal(void) {
-    uint32_t visible = g_target_height > 64U ?
-        (g_target_height - 64U) / FONT12X24_HEIGHT : 0U;
+    uint32_t visible = g_target_height > USER_CLIENT_CHROME_HEIGHT + 32U ?
+        (g_target_height - USER_CLIENT_CHROME_HEIGHT - 32U) /
+        FONT12X24_HEIGHT : 0U;
     uint32_t first = g_output_count > visible ? g_output_count - visible : 0U;
-    uint32_t y = 32U;
+    uint32_t y = USER_CLIENT_CHROME_HEIGHT;
 
     fill_rect(0U, 0U, g_target_width, g_target_height, g_shell.color);
-    draw_text(10U, 4U, "LITEOS GRAPHICAL SHELL", 0x00B9D7E8U);
+    fill_rect(0U, 0U, g_target_width, USER_CLIENT_CHROME_HEIGHT,
+              USER_CLIENT_CHROME_BACKGROUND);
+    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
+              USER_CLIENT_CHROME_SEPARATOR);
+    draw_text(64U, 16U, "LITEOS GRAPHICAL SHELL",
+              USER_CLIENT_CHROME_TEXT);
     for (uint32_t index = first;
          index < g_output_count && y + FONT12X24_HEIGHT + 32U <= g_target_height;
          ++index, y += FONT12X24_HEIGHT) {
         draw_text(10U, y, g_output[index], 0x00C5EAF4U);
     }
     if (g_target_height >= FONT12X24_HEIGHT + 4U) draw_input_line();
+    user_client_chrome_close(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             USER_CLIENT_CHROME_HEIGHT,
+                             USER_CLIENT_CHROME_CLOSE_BG,
+                             USER_CLIENT_CHROME_CLOSE_FG);
 }
 
 static void update_window(void) {
@@ -321,7 +333,9 @@ static bool create_window(int32_t x, int32_t y, uint32_t width,
     request.y = y;
     request.width = width;
     request.height = height;
-    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
+    request.flags = OS_WINDOW_VISIBLE |
+                    OS_WINDOW_RESIZABLE |
+                    OS_WINDOW_CLIENT_DECORATIONS;
     request.background = g_shell.color;
     for (uint32_t i = 0U; i < 31U && g_shell.title[i] != '\0'; ++i) {
         request.title[i] = g_shell.title[i];
@@ -347,13 +361,15 @@ static bool setup_windows(void) {
         info.width < 320U || info.height < 240U) return false;
     g_display_width = info.width;
     g_display_height = info.height;
-    shell_width = info.width > 32U ? info.width - 32U : info.width;
-    /* Window decorations are part of this client surface now.  The kernel
-     * compositor only adds the 1px frame and rounded clipping. */
-    shell_height = info.height > 32U ? info.height - 32U : info.height;
-    if (shell_width < 240U) shell_width = 240U;
-    if (shell_height < 120U) shell_height = 120U;
-    if (!create_window(16, 16, shell_width, shell_height)) return false;
+    /* Keep the shell as a normal centered app window.  The compositor does
+     * not add a titlebar; all visible chrome belongs to this surface. */
+    shell_width = info.width * 3U / 4U;
+    shell_height = info.height * 3U / 4U;
+    if (shell_width < 640U && info.width > 640U) shell_width = 640U;
+    if (shell_height < 420U && info.height > 420U) shell_height = 420U;
+    if (!create_window((int32_t)((info.width - shell_width) / 2U),
+                       (int32_t)((info.height - shell_height) / 2U),
+                       shell_width, shell_height)) return false;
     return true;
 }
 
@@ -1263,6 +1279,15 @@ static bool handle_event(const os_window_event_t *event) {
         g_shell.height = event->resize.height;
         render_window();
         return true;
+    }
+    if (event->type == OS_WINDOW_EVENT_INPUT &&
+        event->input.type == OS_INPUT_EVENT_BUTTON &&
+        event->input.code == OS_INPUT_BUTTON_LEFT &&
+        event->input.value == OS_INPUT_VALUE_PRESS &&
+        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
+                                     g_shell.width,
+                                     USER_CLIENT_CHROME_HEIGHT)) {
+        gshell_exit(0U);
     }
     return handle_key(event);
 }

@@ -8,7 +8,8 @@
             "cppStandard": "c++11",
             "includePath": [
                 "${workspaceFolder}/include",
-                "${workspaceFolder}/kernel"
+                "${workspaceFolder}/kernel",
+                "${workspaceFolder}/build/generated"
             ],
             "defines": [
                 "LITEOS_KERNEL_BUILD"

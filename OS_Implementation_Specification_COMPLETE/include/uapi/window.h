@@ -5,8 +5,10 @@
 
 /* 窗口由应用拥有内容缓冲，由 Ring0 Window Server 负责摆放和合成。 */
 enum os_window_flags {
-    OS_WINDOW_VISIBLE   = 1u << 0,
-    OS_WINDOW_RESIZABLE = 1u << 1,
+    OS_WINDOW_VISIBLE             = 1u << 0,
+    OS_WINDOW_RESIZABLE           = 1u << 1,
+    /* Ring3 owns the complete surface chrome and receives all client input. */
+    OS_WINDOW_CLIENT_DECORATIONS  = 1u << 2,
 };
 
 typedef struct os_window_create {

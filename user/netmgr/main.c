@@ -4,6 +4,7 @@
 #include <uapi/all.h>
 
 #include "../font12x24.h"
+#include "../client_chrome.h"
 
 #define NETMGR_MAP_BASE          0x0C000000ULL
 #define NETMGR_EVENT_TIMEOUT     100000000ULL
@@ -225,11 +226,13 @@ static void render(void) {
 
     fill_rect(0U, 0U, g_window.width, g_window.height, 0x00121D26U);
 
-    fill_rect(0U, 0U, g_window.width, 52U, 0x001D3444U);
-    fill_rect(0U, 51U, g_window.width, 1U, 0x003E667CU);
-    draw_text(18U, 8U, "LITEOS NETWORK", 0x00E9F4F7U);
-    draw_text(18U, 29U, "Network status and configuration",
-              0x008FAEBDU);
+    fill_rect(0U, 0U, g_window.width, USER_CLIENT_CHROME_HEIGHT,
+              USER_CLIENT_CHROME_BACKGROUND);
+    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_window.width, 1U,
+              USER_CLIENT_CHROME_SEPARATOR);
+    draw_text(64U, 4U, "NETWORK", USER_CLIENT_CHROME_TEXT);
+    draw_text(64U, 29U, "Network status and configuration",
+              USER_CLIENT_CHROME_TEXT);
 
     content_width = g_window.width > 36U ? g_window.width - 36U :
                                            g_window.width;
@@ -340,6 +343,12 @@ static void render(void) {
                   g_status_valid ? 0x007FAFC3U : 0x00DE8C75U);
     }
 
+    user_client_chrome_close(g_window.pixels, g_window.width,
+                             g_window.width, g_window.height,
+                             USER_CLIENT_CHROME_HEIGHT,
+                             USER_CLIENT_CHROME_CLOSE_BG,
+                             USER_CLIENT_CHROME_CLOSE_FG);
+
     update_window();
 }
 
@@ -388,7 +397,9 @@ static bool create_window(void) {
         (int32_t)((display.width - request.width) / 2U) : 0;
     request.y = display.height > request.height ?
         (int32_t)((display.height - request.height) / 2U) : 0;
-    request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE;
+    request.flags = OS_WINDOW_VISIBLE |
+                    OS_WINDOW_RESIZABLE |
+                    OS_WINDOW_CLIENT_DECORATIONS;
     request.background = 0x00121D26U;
     request.title[0] = 'N';
     request.title[1] = 'E';
@@ -462,6 +473,15 @@ static void handle_event(const os_window_event_t *event) {
         g_window.height = event->resize.height;
         render();
         return;
+    }
+    if (event->type == OS_WINDOW_EVENT_INPUT &&
+        event->input.type == OS_INPUT_EVENT_BUTTON &&
+        event->input.code == OS_INPUT_BUTTON_LEFT &&
+        event->input.value == OS_INPUT_VALUE_PRESS &&
+        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
+                                     g_window.width,
+                                     USER_CLIENT_CHROME_HEIGHT)) {
+        netmgr_exit(0U);
     }
     handle_key(event);
 }
