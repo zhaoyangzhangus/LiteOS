@@ -1186,8 +1186,9 @@ liteos_user_runtime_blob_start:
     movl $SYS_GPU_WAIT_FENCE, %eax
     movq %r14, %rdi
     movl $1, %esi
-    xorl %edx, %edx
+    movl $1000000000, %edx
     syscall
+    movq %rax, RESULT_MARK_ADDRESS
     testq %rax, %rax
     js .Lruntime_failure
 
@@ -1227,8 +1228,9 @@ liteos_user_runtime_blob_start:
     movl $SYS_GPU_WAIT_FENCE, %eax
     movq %r14, %rdi
     movl $1, %esi
-    xorl %edx, %edx
+    movl $1000000000, %edx
     syscall
+    movq %rax, RESULT_MARK_ADDRESS
     testq %rax, %rax
     js .Lruntime_failure
     movb $0x67, STAGE_MARK_ADDRESS

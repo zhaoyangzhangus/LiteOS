@@ -2,6 +2,7 @@
 #include <kernel/deferred.h>
 #include <kernel/kmem.h>
 #include <kernel/mm.h>
+#include <kernel/sched.h>
 #include <kernel/telemetry.h>
 
 static atomic_uint_fast64_t g_next_gpu_va;
@@ -39,6 +40,7 @@ static void gpu_submission_unlink(gpu_pending_submission_t *submission) {
 }
 
 static void gpu_context_lock(gpu_context_t *context) {
+    sched_preempt_disable();
     while (atomic_exchange_explicit(&context->lock.state, 1U,
                                     memory_order_acquire) != 0U) {
         __asm__ volatile ("pause");
@@ -47,9 +49,11 @@ static void gpu_context_lock(gpu_context_t *context) {
 
 static void gpu_context_unlock(gpu_context_t *context) {
     atomic_store_explicit(&context->lock.state, 0U, memory_order_release);
+    sched_preempt_enable();
 }
 
 static void gpu_fence_lock(gpu_fence_t *fence) {
+    sched_preempt_disable();
     while (atomic_exchange_explicit(&fence->lock.state, 1U,
                                     memory_order_acquire) != 0U) {
         __asm__ volatile ("pause");
@@ -58,6 +62,7 @@ static void gpu_fence_lock(gpu_fence_t *fence) {
 
 static void gpu_fence_unlock(gpu_fence_t *fence) {
     atomic_store_explicit(&fence->lock.state, 0U, memory_order_release);
+    sched_preempt_enable();
 }
 
 static bool gpu_fence_is_signaled(const void *object) {

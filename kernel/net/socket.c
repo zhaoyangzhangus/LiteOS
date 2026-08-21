@@ -4,6 +4,7 @@
 #include <kernel/socket.h>
 #include <kernel/completion_port.h>
 #include <kernel/deferred.h>
+#include <kernel/sched.h>
 #include <kernel/wait.h>
 
 #define SOCKET_BINDING_COUNT 64U
@@ -167,6 +168,13 @@ static bool socket_address6_zero(const uint8_t address[16]) {
 }
 
 static void socket_lock(spinlock_t *lock) {
+    /*
+     * LiteOS is preemptive.  A thread that owns a spin lock must not be
+     * scheduled out on this CPU while another local thread spins for it.
+     * The preempt-disable state is a nesting counter, so nested socket
+     * locks remain valid.
+     */
+    sched_preempt_disable();
     while (atomic_exchange_explicit(&lock->state, 1U, memory_order_acquire) != 0U) {
         __asm__ volatile ("pause");
     }
@@ -174,6 +182,7 @@ static void socket_lock(spinlock_t *lock) {
 
 static void socket_unlock(spinlock_t *lock) {
     atomic_store_explicit(&lock->state, 0U, memory_order_release);
+    sched_preempt_enable();
 }
 
 static void socket_initialize_globals(void) {
@@ -566,7 +575,11 @@ static int32_t socket_find_tcp_locked(uint32_t source_address, uint16_t source_p
 }
 
 static void socket_lock_pair(socket_t *left, socket_t *right) {
-    if (left < right) {
+    if (left == right) {
+        socket_lock(&left->lock);
+        return;
+    }
+    if ((uintptr_t)left < (uintptr_t)right) {
         socket_lock(&left->lock);
         socket_lock(&right->lock);
     } else {
@@ -576,8 +589,17 @@ static void socket_lock_pair(socket_t *left, socket_t *right) {
 }
 
 static void socket_unlock_pair(socket_t *left, socket_t *right) {
-    socket_unlock(&left->lock);
-    socket_unlock(&right->lock);
+    if (left == right) {
+        socket_unlock(&left->lock);
+        return;
+    }
+    if ((uintptr_t)left < (uintptr_t)right) {
+        socket_unlock(&right->lock);
+        socket_unlock(&left->lock);
+    } else {
+        socket_unlock(&left->lock);
+        socket_unlock(&right->lock);
+    }
 }
 
 static void socket_detach_peer(socket_t *socket, socket_private_t *private) {
@@ -1757,6 +1779,7 @@ kstatus_t socket_inject_tcp_ack_ipv4_reply(uint32_t source_address,
                                            socket_tcp_reply_t *reply) {
     socket_t *target = 0;
     socket_private_t *private;
+    bool notify = false;
     if (source_address == 0U || source_port == 0U || destination_address == 0U ||
         destination_port == 0U || (flags & NET_TCP_FLAG_ACK) == 0U) return K_EINVAL;
     if (reply != 0) socket_zero(reply, sizeof(*reply));
@@ -1834,10 +1857,11 @@ kstatus_t socket_inject_tcp_ack_ipv4_reply(uint32_t source_address,
         private->tcp_send_unacknowledged = acknowledgement;
         private->tcp_send_retransmits = 0U;
         private->tcp_send_deadline_tsc = 0U;
-        (void)wake_all(&target->waitq);
+        notify = true;
     }
     bool established = private->tcp_state == SOCKET_TCP_ESTABLISHED;
     socket_unlock(&target->lock);
+    if (notify) (void)wake_all(&target->waitq);
     object_put(target);
     return established ? K_OK : K_EAGAIN;
 }
@@ -1852,6 +1876,7 @@ kstatus_t socket_inject_tcp_ack_ipv6_reply(const uint8_t source_address[16],
                                            socket_tcp_reply_t *reply) {
     socket_t *target = 0;
     socket_private_t *private;
+    bool notify = false;
     if (source_address == 0 || destination_address == 0 ||
         socket_address6_zero(source_address) || socket_address6_zero(destination_address) ||
         source_port == 0U || destination_port == 0U ||
@@ -1931,10 +1956,11 @@ kstatus_t socket_inject_tcp_ack_ipv6_reply(const uint8_t source_address[16],
         private->tcp_send_unacknowledged = acknowledgement;
         private->tcp_send_retransmits = 0U;
         private->tcp_send_deadline_tsc = 0U;
-        (void)wake_all(&target->waitq);
+        notify = true;
     }
     bool established = private->tcp_state == SOCKET_TCP_ESTABLISHED;
     socket_unlock(&target->lock);
+    if (notify) (void)wake_all(&target->waitq);
     object_put(target);
     return established ? K_OK : K_EAGAIN;
 }
