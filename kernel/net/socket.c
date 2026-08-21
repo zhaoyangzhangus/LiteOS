@@ -1981,9 +1981,41 @@ static kstatus_t socket_send_stream(socket_t *socket, socket_private_t *private,
     socket_tcp_output_get(&output4, &output4_context);
     socket_tcp6_output_get(&output6, &output6_context);
     socket_lock(&socket->lock);
-    wire_output = (socket->family == OS_AF_INET4 || socket->family == OS_AF_INET6) &&
-                  private->peer == 0 &&
-                  private->tcp_state == SOCKET_TCP_ESTABLISHED;
+
+    /*
+    * An active TCP connect is asynchronous.  socket_connect() may return
+    * after SYN has been queued but before SYN+ACK arrives.
+    *
+    * This is NOT a removed peer.  Tell Ring3 to retry until the handshake
+    * becomes ESTABLISHED.
+    */
+    if ((socket->family == OS_AF_INET4 ||
+        socket->family == OS_AF_INET6) &&
+        private->peer == 0 &&
+        private->tcp_state != SOCKET_TCP_ESTABLISHED) {
+
+        kstatus_t status;
+
+        if (private->tcp_send_failed) {
+            status = K_EIO;
+        } else if (private->tcp_state == SOCKET_TCP_SYN_SENT ||
+                private->tcp_state == SOCKET_TCP_SYN_RECEIVED) {
+            status = K_EAGAIN;
+        } else {
+            status = K_EDEVREMOVED;
+        }
+
+        socket_unlock(&socket->lock);
+
+        *bytes = 0U;
+        return status;
+    }
+
+    wire_output =
+        (socket->family == OS_AF_INET4 ||
+        socket->family == OS_AF_INET6) &&
+        private->peer == 0 &&
+        private->tcp_state == SOCKET_TCP_ESTABLISHED;
     if (wire_output) {
         if (private->tcp_send_pending || private->tcp_send_failed ||
             private->tcp_peer_window == 0U || length > private->tcp_peer_window ||
