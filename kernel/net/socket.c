@@ -2361,9 +2361,40 @@ kstatus_t socket_recv(socket_t *socket, void *buffer, size_t length,
                 source->port = private->peer_port;
                 source->reserved = 0;
                 *bytes = copy_length;
-                atomic_store_explicit(&private->stream_count, count - (uint32_t)copy_length,
+                uint32_t new_count = count - (uint32_t)copy_length;
+                bool window_update =
+                    private->peer == 0 &&
+                    private->tcp_state == SOCKET_TCP_ESTABLISHED &&
+                    private->tcp_sequence_valid &&
+                    count >= (SOCKET_STREAM_BUFFER_SIZE * 3U / 4U);
+                uint32_t update_source = private->local_address;
+                uint16_t update_source_port = private->local_port;
+                uint32_t update_destination = private->peer_address;
+                uint16_t update_destination_port = private->peer_port;
+                uint32_t update_sequence = private->tcp_send_next_sequence;
+                uint32_t update_acknowledgement = private->tcp_next_sequence;
+                uint16_t update_window =
+                    (uint16_t)(SOCKET_STREAM_BUFFER_SIZE - new_count);
+                atomic_store_explicit(&private->stream_count, new_count,
                                       memory_order_release);
                 socket_unlock(&socket->lock);
+
+                /* WGET/TCP receive-window reopening: a peer that observed a
+                 * near-zero advertised window must be told when userspace
+                 * drains the 8 KiB stream ring.  Keep the ACK outside the
+                 * socket lock; the NIC output path may perform ARP/NDP work. */
+                if (window_update) {
+                    socket_tcp_ipv4_output_fn output = 0;
+                    void *output_context = 0;
+                    socket_tcp_output_get(&output, &output_context);
+                    if (output != 0) {
+                        (void)output(output_context, update_source,
+                                     update_source_port, update_destination,
+                                     update_destination_port, update_sequence,
+                                     update_acknowledgement, NET_TCP_FLAG_ACK,
+                                     update_window, 0, 0U);
+                    }
+                }
                 return K_OK;
             }
             bool closed = atomic_load_explicit(&private->closed, memory_order_acquire) ||
@@ -2430,10 +2461,39 @@ kstatus_t socket_recv_ipv6(socket_t *socket, void *buffer, size_t length,
                 source->port = private->peer_port;
                 source->reserved = 0U;
                 *bytes = copy_length;
-                atomic_store_explicit(&private->stream_count,
-                                      stream_count - (uint32_t)copy_length,
+                uint32_t new_count = stream_count - (uint32_t)copy_length;
+                bool window_update =
+                    private->peer == 0 &&
+                    private->tcp_state == SOCKET_TCP_ESTABLISHED &&
+                    private->tcp_sequence_valid &&
+                    stream_count >= (SOCKET_STREAM_BUFFER_SIZE * 3U / 4U);
+                uint8_t update_source[16];
+                uint8_t update_destination[16];
+                socket_copy(update_source, private->local_address6, 16U);
+                socket_copy(update_destination, private->peer_address6, 16U);
+                uint16_t update_source_port = private->local_port;
+                uint16_t update_destination_port = private->peer_port;
+                uint32_t update_sequence = private->tcp_send_next_sequence;
+                uint32_t update_acknowledgement = private->tcp_next_sequence;
+                uint16_t update_window =
+                    (uint16_t)(SOCKET_STREAM_BUFFER_SIZE - new_count);
+                atomic_store_explicit(&private->stream_count, new_count,
                                       memory_order_release);
                 socket_unlock(&socket->lock);
+
+                /* WGET/TCP receive-window reopening (IPv6 mirror). */
+                if (window_update) {
+                    socket_tcp_ipv6_output_fn output = 0;
+                    void *output_context = 0;
+                    socket_tcp6_output_get(&output, &output_context);
+                    if (output != 0) {
+                        (void)output(output_context, update_source,
+                                     update_source_port, update_destination,
+                                     update_destination_port, update_sequence,
+                                     update_acknowledgement, NET_TCP_FLAG_ACK,
+                                     update_window, 0, 0U);
+                    }
+                }
                 return K_OK;
             }
             bool stream_closed = atomic_load_explicit(&private->closed, memory_order_acquire) ||

@@ -32,9 +32,11 @@ typedef struct dhcp_offer {
     uint32_t subnet_mask;
     uint32_t gateway;
     uint32_t server_id;
+    uint32_t dns_server;
     uint8_t message_type;
     bool has_subnet_mask;
     bool has_server_id;
+    bool has_dns_server;
 } dhcp_offer_t;
 
 typedef struct netd_context {
@@ -46,6 +48,7 @@ typedef struct netd_context {
     uint32_t transaction;
     uint32_t offered_address;
     uint32_t server_id;
+    uint32_t offered_dns_server;
 } netd_context_t;
 
 static int64_t netd_syscall_one(uint64_t number, uint64_t arg0) {
@@ -64,6 +67,19 @@ static int64_t netd_syscall_three(uint64_t number, uint64_t arg0,
     register uint64_t rdx __asm__("rdx") = arg2;
     __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
                       "+d"(rdx) : : "rcx", "r11", "memory");
+    return (int64_t)rax;
+}
+
+static int64_t netd_syscall_four(uint64_t number, uint64_t arg0,
+                                 uint64_t arg1, uint64_t arg2,
+                                 uint64_t arg3) {
+    register uint64_t rax __asm__("rax") = number;
+    register uint64_t rdi __asm__("rdi") = arg0;
+    register uint64_t rsi __asm__("rsi") = arg1;
+    register uint64_t rdx __asm__("rdx") = arg2;
+    register uint64_t r10 __asm__("r10") = arg3;
+    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
+                      "+d"(rdx), "+r"(r10) : : "rcx", "r11", "memory");
     return (int64_t)rax;
 }
 
@@ -94,6 +110,77 @@ static void close_handle(os_handle_t *handle) {
     if (handle == 0 || *handle == OS_INVALID_HANDLE) return;
     (void)netd_syscall_one(OS_SYS_HANDLE_CLOSE, *handle);
     *handle = OS_INVALID_HANDLE;
+}
+
+static bool resolver_append_decimal(char *buffer, size_t capacity,
+                                    size_t *length, uint32_t value) {
+    char digits[3];
+    uint32_t count = 0U;
+    do {
+        digits[count++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value != 0U && count < sizeof(digits));
+    while (count != 0U) {
+        if (*length + 1U >= capacity) return false;
+        buffer[(*length)++] = digits[--count];
+    }
+    buffer[*length] = '\0';
+    return true;
+}
+
+static void write_resolver_config(uint32_t address) {
+    static const char directory[] = "/etc";
+    static const char path[] = "/etc/resolv.conf";
+    os_file_path_op_t operation = {0};
+    os_handle_t file = OS_INVALID_HANDLE;
+    char line[64] = "nameserver ";
+    size_t length = 11U;
+    uint64_t written = 0U;
+
+    operation.hdr.size = sizeof(operation);
+    operation.hdr.version = OS_SYSCALL_ABI_VERSION;
+    operation.path = (uint64_t)(uintptr_t)directory;
+    operation.mode = 0755U;
+    (void)netd_syscall_one(OS_SYS_FILE_MKDIR,
+                           (uint64_t)(uintptr_t)&operation);
+
+    if (address == 0U) {
+        operation = (os_file_path_op_t){0};
+        operation.hdr.size = sizeof(operation);
+        operation.hdr.version = OS_SYSCALL_ABI_VERSION;
+        operation.path = (uint64_t)(uintptr_t)path;
+        (void)netd_syscall_one(OS_SYS_FILE_REMOVE,
+                               (uint64_t)(uintptr_t)&operation);
+        return;
+    }
+
+    for (uint32_t shift = 24U;; shift -= 8U) {
+        if (!resolver_append_decimal(line, sizeof(line), &length,
+                                     (address >> shift) & 0xFFU)) return;
+        if (shift == 0U) break;
+        if (length + 2U >= sizeof(line)) return;
+        line[length++] = '.';
+        line[length] = '\0';
+    }
+    if (length + 2U >= sizeof(line)) return;
+    line[length++] = '\n';
+    line[length] = '\0';
+
+    if (netd_syscall_four(OS_SYS_FILE_OPEN,
+                          (uint64_t)(uintptr_t)path,
+                          OS_FILE_OPEN_WRITE | OS_FILE_OPEN_CREATE |
+                          OS_FILE_OPEN_TRUNCATE,
+                          0644U,
+                          (uint64_t)(uintptr_t)&file) < 0 ||
+        file == OS_INVALID_HANDLE) return;
+
+    if (netd_syscall_four(OS_SYS_FILE_WRITE, file,
+                          (uint64_t)(uintptr_t)line, length,
+                          (uint64_t)(uintptr_t)&written) >= 0 &&
+        written == length) {
+        (void)netd_syscall_one(OS_SYS_FILE_FSYNC, file);
+    }
+    close_handle(&file);
 }
 
 static int64_t netd_get_status(os_net_status_t *status) {
@@ -312,6 +399,9 @@ static bool parse_dhcp_packet(const uint8_t *packet, size_t length,
             offer->has_subnet_mask = true;
         } else if (type == 3U && option_length >= 4U) {
             offer->gateway = get_be32(packet + offset);
+        } else if (type == 6U && option_length >= 4U) {
+            offer->dns_server = get_be32(packet + offset);
+            offer->has_dns_server = offer->dns_server != 0U;
         } else if (type == 54U && option_length == 4U) {
             offer->server_id = get_be32(packet + offset);
             offer->has_server_id = true;
@@ -431,6 +521,7 @@ static bool start_dhcp(netd_context_t *context) {
     ++context->transaction;
     context->offered_address = 0U;
     context->server_id = 0U;
+    context->offered_dns_server = 0U;
     context->state = NETD_STATE_WAIT_OFFER;
     (void)send_discover(context);
     return arm_timer(context, NETD_DHCP_RETRY_NS);
@@ -494,6 +585,8 @@ static bool process_socket(netd_context_t *context) {
 
             context->offered_address = offer.address;
             context->server_id = offer.server_id;
+            context->offered_dns_server =
+                offer.has_dns_server ? offer.dns_server : 0U;
             if (send_request(context)) {
                 context->state = NETD_STATE_WAIT_ACK;
                 if (!arm_timer(context, NETD_DHCP_RETRY_NS)) return false;
@@ -512,6 +605,8 @@ static bool process_socket(netd_context_t *context) {
                 context->status.ipv4_address = offer.address;
                 context->status.ipv4_gateway = offer.gateway;
                 context->status.ipv4_prefix_length = prefix;
+                write_resolver_config(offer.has_dns_server ?
+                    offer.dns_server : context->offered_dns_server);
                 return enter_bound(context);
             }
             return start_dhcp(context);

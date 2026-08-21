@@ -37,6 +37,16 @@ static void wait_remove(list_head_t *node) {
     list_init(node);
 }
 
+static void waiter_unlink_locked(waiter_t *waiter) {
+    if (waiter == 0) return;
+    if (waiter->node.next != &waiter->node) {
+        wait_remove(&waiter->node);
+    }
+    if (waiter->timeout_node.next != &waiter->timeout_node) {
+        wait_remove(&waiter->timeout_node);
+    }
+}
+
 static waiter_t *waiter_from_node(list_head_t *node) {
     return (waiter_t *)((uint8_t *)node - __builtin_offsetof(waiter_t, node));
 }
@@ -151,8 +161,27 @@ kstatus_t wait_on_queue(wait_queue_t *queue, bool (*predicate)(void *), void *co
 
         /* 状态已在队列锁内置为 BLOCKED，避免发布 waiter 与真正休眠之间丢唤醒。 */
         schedule();
-        thread->blocked_waiter = 0;
         unsigned state = atomic_load_explicit(&waiter.state, memory_order_acquire);
+        if (state == WAITER_WAITING) {
+            /*
+             * A scheduler failure must not let this stack-local waiter escape
+             * while it is still linked in a global queue.  Normally schedule()
+             * returns only after a wake/timeout changed the state; retain this
+             * defensive cancellation for early/idle transition failures.
+             */
+            wait_lock(&g_timeout_lock);
+            wait_lock(&queue->lock);
+            unsigned expected = WAITER_WAITING;
+            if (atomic_compare_exchange_strong_explicit(
+                    &waiter.state, &expected, WAITER_CANCELLED,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                waiter_unlink_locked(&waiter);
+            }
+            wait_unlock(&queue->lock);
+            wait_unlock(&g_timeout_lock);
+            state = atomic_load_explicit(&waiter.state, memory_order_acquire);
+        }
+        thread->blocked_waiter = 0;
         if (state == WAITER_TIMED_OUT) return K_ETIMEDOUT;
         if (state == WAITER_CANCELLED) return K_ECANCELED;
         if (state != WAITER_WOKEN) return K_EIO;
@@ -166,10 +195,7 @@ static thread_t *wake_waiter_locked(waiter_t *waiter, unsigned terminal_state) {
                                                   terminal_state,
                                                   memory_order_acq_rel,
                                                   memory_order_acquire)) return 0;
-    if (waiter->node.next != &waiter->node) wait_remove(&waiter->node);
-    if (waiter->timeout_node.next != &waiter->timeout_node) {
-        wait_remove(&waiter->timeout_node);
-    }
+    waiter_unlink_locked(waiter);
     return waiter->thread;
 }
 

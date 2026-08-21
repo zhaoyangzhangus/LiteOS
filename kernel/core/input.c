@@ -1,5 +1,6 @@
 #include <kernel/input.h>
 #include <kernel/sched.h>
+#include <kernel/window_server.h>
 
 #define INPUT_COALESCE_THRESHOLD (INPUT_CORE_CAPACITY * 3U / 4U)
 
@@ -156,6 +157,7 @@ kstatus_t input_core_push(const input_event_t *event) {
           input_coalesce_pointer(&incoming)))) {
         input_unlock();
         (void)wake_one(&g_input.waitq);
+        window_server_notify_worker();
         return K_OK;
     }
     if (g_input.count >= INPUT_CORE_CAPACITY) {
@@ -186,6 +188,7 @@ kstatus_t input_core_push(const input_event_t *event) {
     atomic_fetch_add_explicit(&g_input.pending, 1U, memory_order_release);
     input_unlock();
     (void)wake_one(&g_input.waitq);
+    window_server_notify_worker();
     return K_OK;
 }
 

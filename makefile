@@ -1,6 +1,7 @@
 TOOLPREFIX ?= x86_64-w64-mingw32-
 CC = $(TOOLPREFIX)gcc
 LD = $(TOOLPREFIX)gcc
+AR = $(TOOLPREFIX)ar
 OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 # These programs run in the build environment rather than in LiteOS.  Keep
@@ -63,6 +64,31 @@ USER_NETMGR_ELF = $(BUILD)/user/netmgr.elf
 USER_NETMGR_LDFLAGS = -nostdlib -Wl,--entry,netmgr_entry -Wl,--subsystem,0 \
                       -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                       -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
+USER_WGET_PE = $(BUILD)/user/wget.pe
+USER_WGET_ELF = $(BUILD)/user/wget.elf
+USER_WGET_OBJECTS = $(BUILD)/user/wget-start.o $(BUILD)/user/wget-main.o \
+                    $(BUILD)/user/wget-tls.o $(BUILD)/user/wget-libc-compat.o \
+                    $(BUILD)/user/wget-trust-anchors.o
+USER_WGET_LDFLAGS = -nostdlib -Wl,--entry,wget_entry -Wl,--subsystem,0 \
+                     -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
+                     -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
+
+# BearSSL is built as a freestanding static library for the Wget user image.
+# The x86 intrinsics and host OS entropy/time backends are disabled: LiteOS
+# supplies the transport callbacks and injects per-connection entropy.
+BEARSSL_DIR = third_party/bearssl
+BEARSSL_SOURCES = $(shell find $(BEARSSL_DIR)/src -type f -name '*.c' -print)
+BEARSSL_OBJECTS = $(patsubst $(BEARSSL_DIR)/src/%.c,$(BUILD)/bearssl/%.o,$(BEARSSL_SOURCES))
+BEARSSL_LIB = $(BUILD)/bearssl/libbearssl.a
+BEARSSL_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -ffreestanding -fno-builtin \
+                 -fno-stack-protector -fno-stack-check -fno-pic -mno-red-zone \
+                 -mno-sse -mno-mmx -mno-stack-arg-probe -mabi=sysv \
+                 -I$(BEARSSL_DIR)/port -I$(BEARSSL_DIR)/src -I$(BEARSSL_DIR)/inc \
+                 -DBR_GCC=0 -DBR_CLANG=0 -DBR_MSC=0 \
+                 -DBR_GCC_4_4=0 -DBR_CLANG_3_7=0 -DBR_MSC_2005=0 \
+                 -DBR_i386=0 -DBR_amd64=0 -DBR_AES_X86NI=0 -DBR_SSE2=0 \
+                 -DBR_USE_URANDOM=0 -DBR_USE_WIN32_RAND=0 \
+                 -DBR_USE_UNIX_TIME=0 -DBR_USE_WIN32_TIME=0 -DBR_RDRAND=0
 USER_NETD_PE = $(BUILD)/user/netd.pe
 USER_NETD_ELF = $(BUILD)/user/netd.elf
 USER_NETD_LDFLAGS = -nostdlib -Wl,--entry,netd_entry -Wl,--subsystem,0 \
@@ -77,7 +103,8 @@ USER_NETD_LDFLAGS = -nostdlib -Wl,--entry,netd_entry -Wl,--subsystem,0 \
 
 all: esp
 
-$(BUILD)/loader $(BUILD)/kernel $(BUILD)/user $(BUILD)/esp $(BUILD)/esp/EFI/BOOT $(BUILD)/esp/EFI/LITEOS:
+$(BUILD)/loader $(BUILD)/kernel $(BUILD)/user $(BUILD)/bearssl \
+$(BUILD)/esp $(BUILD)/esp/EFI/BOOT $(BUILD)/esp/EFI/LITEOS:
 	mkdir -p $@
 
 $(BUILD)/generated:
@@ -200,6 +227,36 @@ $(USER_NETD_PE): $(BUILD)/user/netd.o | $(BUILD)/user
 	$(LD) $(USER_NETD_LDFLAGS) $^ -o $@
 
 $(USER_NETD_ELF): $(USER_NETD_PE) | $(BUILD)/user
+	$(OBJCOPY) -O elf64-x86-64 $< $@
+
+$(BUILD)/user/wget-start.o: user/wget/start.S | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/user/wget-main.o: user/wget/main.c | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/user/wget-tls.o: user/wget/tls.c user/wget/tls.h | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -I$(BEARSSL_DIR)/port -I$(BEARSSL_DIR)/src \
+		-I$(BEARSSL_DIR)/inc -c $< -o $@
+
+$(BUILD)/user/wget-libc-compat.o: user/wget/libc_compat.c | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/user/wget-trust-anchors.o: user/wget/trust_anchors.c | $(BUILD)/user
+	$(CC) $(USER_CFLAGS) -I$(BEARSSL_DIR)/port -I$(BEARSSL_DIR)/src \
+		-I$(BEARSSL_DIR)/inc -c $< -o $@
+
+$(BUILD)/bearssl/%.o: $(BEARSSL_DIR)/src/%.c
+	mkdir -p $(@D)
+	$(CC) $(BEARSSL_CFLAGS) -c $< -o $@
+
+$(BEARSSL_LIB): $(BEARSSL_OBJECTS) | $(BUILD)/bearssl
+	$(AR) rcs $@ $^
+
+$(USER_WGET_PE): $(USER_WGET_OBJECTS) $(BEARSSL_LIB) | $(BUILD)/user
+	$(LD) $(USER_WGET_LDFLAGS) $^ -o $@
+
+$(USER_WGET_ELF): $(USER_WGET_PE) | $(BUILD)/user
 	$(OBJCOPY) -O elf64-x86-64 $< $@
 
 $(BUILD)/kernel/entry.o: kernel/kernel_entry.c | $(BUILD)/kernel
@@ -665,6 +722,13 @@ $(BUILD)/esp/sbin/audiod: $(USER_AUDIOD_ELF) | $(BUILD)/esp/sbin
 $(BUILD)/esp/sbin/netmgr: $(USER_NETMGR_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
+
+# QEMU 10's vvfat backend asserts when a ninth root entry is added to the
+# synthetic ESP directory.  /sbin is already on LiteOS's command search path,
+# so keep wget there instead of creating a new root-level /bin directory.
+$(BUILD)/esp/sbin/wget: $(USER_WGET_ELF) | $(BUILD)/esp/sbin
+	cp $< $@
+
 $(BUILD)/esp/sbin/netd: $(USER_NETD_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
@@ -676,7 +740,8 @@ esp: $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI $(KERNEL_ELF) \
      $(BUILD)/esp/sbin/crashd $(BUILD)/esp/sbin/gshell \
      $(BUILD)/esp/sbin/notepad $(BUILD)/esp/sbin/fileman \
      $(BUILD)/esp/sbin/fm $(BUILD)/esp/sbin/audiod \
-     $(BUILD)/esp/sbin/netmgr $(BUILD)/esp/sbin/netd
+     $(BUILD)/esp/sbin/netmgr $(BUILD)/esp/sbin/netd \
+     $(BUILD)/esp/sbin/wget
 	@echo ESP image prepared at $(BUILD)/esp
 
 release-metadata: $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS)

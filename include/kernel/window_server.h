@@ -81,6 +81,8 @@ typedef struct window_server_snapshot {
 
 bool window_server_init(void);
 bool window_server_start_worker(void);
+/* Wake the compositor for a client damage submission or an input report. */
+void window_server_notify_worker(void);
 /* 初始化后窗口服务器由内核持有显示输出和输入路由权。 */
 bool window_server_kernel_ready(void);
 kstatus_t window_server_register_manager(process_t *process);

@@ -379,6 +379,21 @@ static void usb_msc_attach_work(void *argument) {
     liteos_serial_write("\r\nLITEOS_USB_MSC_BLOCK_OK\r\n");
 }
 
+/*
+ * LITEOS_USB_ROOT_PATCH_V1
+ *
+ * Boot can need the same USB Mass Storage device that UEFI used to load
+ * BOOTX64.EFI before the persistent deferred worker has started.
+ *
+ * The normal hotplug path remains deferred.  This helper reuses the exact
+ * same SCSI/BOT attach routine synchronously during root discovery.
+ */
+bool usb_msc_attach(uint8_t slot) {
+    if (slot == 0U) return false;
+    usb_msc_attach_work((void *)(uintptr_t)slot);
+    return usb_msc_present(slot);
+}
+
 bool usb_msc_schedule_attach(uint8_t slot) {
     if (slot == 0U) return false;
     return deferred_schedule(usb_msc_attach_work, (void *)(uintptr_t)slot);

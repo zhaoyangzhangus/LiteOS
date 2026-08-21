@@ -17,6 +17,7 @@ usb_storage=0
 monitor_socket=""
 keep_open=0
 no_kvm=0
+net_dump=""
 seconds=10
 cpu_count=4
 gdb_port=1234
@@ -39,6 +40,7 @@ usage() {
   --debug-level N     编译 DEBUG 等级（默认 2）
   --cpu N             vCPU 数量（默认 4）
   --no-kvm            强制使用软件模拟
+  --net-dump PATH     将 QEMU 虚拟网卡报文保存到 PATH（诊断用）
   --qemu PATH         指定 Linux QEMU 路径
   --firmware PATH     指定 OVMF_CODE 固件路径
   -h, --help          显示帮助
@@ -75,6 +77,9 @@ while (($# > 0)); do
             (($# >= 2)) || { echo "--cpu 需要参数" >&2; exit 2; }
             cpu_count="$2"; shift 2 ;;
         --no-kvm) no_kvm=1; shift ;;
+        --net-dump)
+            (($# >= 2)) || { echo "--net-dump 需要参数" >&2; exit 2; }
+            net_dump="$2"; shift 2 ;;
         --qemu)
             (($# >= 2)) || { echo "--qemu 需要参数" >&2; exit 2; }
             qemu_path="$2"; shift 2 ;;
@@ -123,6 +128,19 @@ fi
     echo "找不到 $build_dir/esp/EFI/LITEOS/kernel.elf，请先构建镜像" >&2
     exit 1
 }
+
+# The kernel VFS file-mapping self-test creates this temporary file at the
+# ESP root.  The QEMU 10 vvfat backend cannot reopen the synthetic FAT image
+# after that extra root entry appears, so quarantine it between runs instead
+# of letting the next invocation abort inside block/vvfat.c.
+stale_vfs_test="$build_dir/esp/vfs-filemap-test"
+if [[ -e "$stale_vfs_test" ]]; then
+    stale_dir="$build_dir/qemu-stale"
+    mkdir -p "$stale_dir"
+    stale_target="$stale_dir/vfs-filemap-test.$$"
+    mv "$stale_vfs_test" "$stale_target"
+    echo "Quarantined stale VFS test file: $stale_target"
+fi
 
 mkdir -p "$build_dir"
 qemu_args=(
@@ -220,6 +238,16 @@ if ((usb_storage)); then
     )
 fi
 if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" ); fi
+if [[ -n "$net_dump" ]]; then
+    # Give the diagnostic filter a named user-net backend.  `-net dump` was
+    # removed from newer QEMU builds and cannot attach to the implicit NIC.
+    qemu_args+=(
+        -net none
+        -netdev "user,id=liteos-net"
+        -device "e1000e,netdev=liteos-net,mac=52:54:00:12:34:56"
+        -object "filter-dump,id=liteos-net-dump,netdev=liteos-net,file=$net_dump"
+    )
+fi
 
 stdout_log="$build_dir/qemu-stdout.log"
 stderr_log="$build_dir/qemu-stderr.log"

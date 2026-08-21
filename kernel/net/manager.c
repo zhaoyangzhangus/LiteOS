@@ -1,7 +1,9 @@
+#include <arch/x86_64/cpu.h>
 #include <kernel/e1000.h>
 #include <kernel/message_port.h>
 #include <kernel/net_manager.h>
 #include <kernel/spinlock.h>
+#include <kernel/socket.h>
 #include <uapi/network.h>
 #include <uapi/syscall.h>
 
@@ -87,10 +89,17 @@ void net_manager_poll(void) {
     if (atomic_load_explicit(&g_net_manager_init_state, memory_order_acquire) != 2U) {
         return;
     }
-    /* Runtime E1000 receive is interrupt-driven when MSI is available.  The
-     * legacy QEMU e1000 has no MSI capability; only that fallback is kicked
-     * from this low-priority manager path. */
-    if (!e1000_interrupt_ready()) (void)e1000_schedule_deferred_poll();
+    /* RX is interrupt-driven when MSI is available, but TCP retransmission
+     * and ARP/NDP resolution still need a periodic poll after an initial
+     * output returned K_EAGAIN.  In particular, wget's first SYN can be
+     * queued behind an ARP request; an IRQ for the ARP reply alone is not a
+     * timer.  The deferred-poll gate coalesces this with an IRQ-triggered
+     * poll, so keeping the kick here is bounded and does not duplicate work. */
+    (void)e1000_schedule_deferred_poll();
+    /* Keep the retransmission clock independent from RX/deferred-worker
+     * progress.  An ARP reply may be the last packet received before a
+     * pending SYN needs to be emitted. */
+    socket_tcp_poll(x86_read_tsc());
     if (++g_net_manager_poll_divider < 64U) return;
     g_net_manager_poll_divider = 0U;
     hardware_present = e1000_hardware_present();

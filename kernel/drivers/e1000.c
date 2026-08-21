@@ -1269,13 +1269,22 @@ static bool e1000_poll_receive(e1000_state_t *state) {
                 &state->ndp_cache, ndp_view.target_address, ndp_view.target_mac,
                 telemetry_timestamp()) == K_OK || received;
         } else if (descriptor->length != 0 &&
-            net_arp_parse_ipv4(buffer, descriptor->length, &arp_view) == K_OK) {
+                   net_arp_parse_ipv4(buffer, descriptor->length, &arp_view) == K_OK) {
             /* ARP 只更新缓存；回复策略由上层网络管理器决定。 */
             received = net_arp_cache_update(&state->arp_cache, arp_view.sender_address,
                                             arp_view.sender_mac,
                                             telemetry_timestamp()) == K_OK || received;
             /* 只有配置了本机 IPv4 且目标地址命中时才回复 ARP。 */
             if (!e1000_arp_reply(state, &arp_view)) received = true;
+            /* A pending TCP SYN/data segment may have been held only because
+             * this ARP entry was missing.  Flush that queue immediately after
+             * learning the peer MAC instead of waiting for another RX IRQ. */
+            uint64_t flush_now = x86_read_tsc();
+            uint64_t flush_after = x86_timeout_ns_to_tsc(
+                SOCKET_TCP_RETRANSMIT_TIMEOUT_NS);
+            /* The TSC cannot wrap during one packet dispatch in practice. */
+            flush_now += flush_after + 1U;
+            socket_tcp_poll(flush_now);
         } else if (descriptor->length != 0 &&
             net_udp_parse_ipv4(buffer, descriptor->length, &view) == K_OK) {
             e1000_zero(&packet, sizeof(packet));

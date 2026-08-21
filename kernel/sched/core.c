@@ -22,6 +22,41 @@ static uint32_t g_cpu_count;
 static paddr_t g_kernel_root;
 
 /*
+ * Idle is a real scheduler target, but it is not created through the normal
+ * thread creation path and therefore has no saved context at boot.  Seed a
+ * synthetic context so a blocked thread can always switch to an interruptible
+ * idle loop, even before the first live idle->thread transition captures the
+ * AP/BSP startup loop.
+ */
+static __attribute__((noreturn)) void scheduler_idle_main(void *argument) {
+    (void)argument;
+    for (;;) {
+        __asm__ volatile ("sti; hlt" : : : "memory");
+        sched_finish_switch();
+        if (x86_smp_take_reschedule_request()) {
+            (void)sched_try_run_ready();
+        }
+        __asm__ volatile ("cli" : : : "memory");
+    }
+}
+
+static void scheduler_init_idle_context(thread_t *idle,
+                                        vaddr_t stack_top) {
+    uintptr_t switch_stack;
+    if (idle == 0 || stack_top < sizeof(uint64_t) ||
+        (stack_top & 0x0FU) != 0U) return;
+    switch_stack = (uintptr_t)stack_top - sizeof(uint64_t);
+    *(uint64_t *)switch_stack = (uint64_t)(uintptr_t)&x86_kernel_thread_start;
+    idle->arch.switch_ctx.rsp = switch_stack;
+    idle->arch.switch_ctx.rbx = 0U;
+    idle->arch.switch_ctx.rbp = 0U;
+    idle->arch.switch_ctx.r12 = (uint64_t)(uintptr_t)&scheduler_idle_main;
+    idle->arch.switch_ctx.r13 = 0U;
+    idle->arch.switch_ctx.r14 = stack_top;
+    idle->arch.switch_ctx.r15 = 0U;
+}
+
+/*
  * 运行队列中的 current 指针必须和当前真正使用的内核栈同步提交。
  * 本地中断若落在“已选择 next、尚未切栈”的窗口，会把旧栈误认为 next 的栈，
  * 所以调度全过程都保持关中断；线程以后恢复到这里时再恢复原来的 IF。
@@ -514,6 +549,7 @@ void sched_cpu_init(uint32_t cpu_id) {
     cpu->queue.idle = &g_idle_threads[cpu_id];
     cpu->queue.current = cpu->queue.idle;
     cpu->idle_stack_top = x86_cpu_kernel_stack(cpu_id);
+    scheduler_init_idle_context(&g_idle_threads[cpu_id], cpu->idle_stack_top);
     if (cpu_id + 1U > g_cpu_count) g_cpu_count = cpu_id + 1U;
 }
 
@@ -651,7 +687,9 @@ void schedule(void) {
      * 只有具备真实保存栈的线程才触发架构切换。这样早期纯数据结构自检仍可使用
      * 临时 thread_t，而正式线程会同步 CR3、TSS.RSP0、FS.base 和系统调用栈。
      */
-    if (next != 0 && next != current && next->arch.switch_ctx.rsp != 0) {
+    if (next != 0 && next != current && current != 0 &&
+        current->arch.switch_ctx.rsp != 0 &&
+        next->arch.switch_ctx.rsp != 0) {
         paddr_t root = g_kernel_root;
         vaddr_t kernel_stack = cpu->idle_stack_top;
         if (next->process != 0 && next->process->vm != 0) {

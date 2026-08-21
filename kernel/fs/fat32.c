@@ -97,10 +97,22 @@ static BOOLEAN root_directory_cluster(const LITEOS_FAT32 *filesystem,
 static BOOLEAN read_sector(const LITEOS_FAT32 *filesystem, UINT64 lba, UINT8 *buffer) {
     if (filesystem == 0 || buffer == 0 || filesystem->Device == 0 ||
         lba >= filesystem->Device->BlockCount) return 0;
-    if (filesystem->Cache.Initialized) {
-        return liteos_block_cache_read((LITEOS_BLOCK_CACHE *)&filesystem->Cache, lba, buffer);
+    /*
+     * The NVMe backend is asynchronous even for this synchronous FAT API.
+     * A completion can race the deferred queue consumer and transiently
+     * return an I/O error.  Retry the same sector here while the request is
+     * still local to this read; callers then see a real media error only after
+     * several independent submissions have failed.
+     */
+    for (UINT32 attempt = 0U; attempt < 3U; ++attempt) {
+        BOOLEAN success = filesystem->Cache.Initialized ?
+            liteos_block_cache_read((LITEOS_BLOCK_CACHE *)&filesystem->Cache,
+                                    lba, buffer) :
+            liteos_block_read(filesystem->Device, lba, 1U, buffer);
+        if (success) return 1;
+        __asm__ volatile ("pause");
     }
-    return liteos_block_read(filesystem->Device, lba, 1U, buffer);
+    return 0;
 }
 
 static BOOLEAN write_sector(LITEOS_FAT32 *filesystem, UINT64 lba,

@@ -1,0 +1,21 @@
+LiteOS USB root patch
+Baseline: 05423e88e3ccd716bf9972ceb10d7248f8b08b5d
+
+Apply:
+  ./apply.sh ~/LiteOS
+  cd ~/LiteOS
+  make clean
+  make -j$(nproc)
+  make test
+
+Put the CONTENTS of build/esp/ on the FAT USB volume.
+
+Expected:
+  LITEOS_ROOT_USB_ATTACH SLOT=...
+  LITEOS_USB_MSC_BLOCK_OK
+  LITEOS_ROOT_USB_VOLUME_OK SLOT=...
+  LITEOS_ROOT_USB_OK
+  LITEOS_ROOT_SOURCE=USB
+
+Rollback:
+  ./rollback.sh ~/LiteOS

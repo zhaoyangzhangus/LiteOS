@@ -10,6 +10,7 @@
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
 #include <kernel/vm.h>
+#include <arch/x86_64/smp.h>
 
 #define WINDOW_DAMAGE_MAX_RECTS 16U
 #define WINDOW_DAMAGE_TILE_SIZE 64U
@@ -23,6 +24,26 @@
 #define WINDOW_SERVER_WORKER_STACK_SIZE (64U * 1024U)
 #define WINDOW_FRAME_BORDER 1U
 #define WINDOW_FRAME_EXTRA (WINDOW_FRAME_BORDER * 2U)
+
+/* Keep the compositor off the bootstrap CPU when an AP is available.  The
+ * xHCI/deferred worker and most early user work start on CPU0; sharing that
+ * run queue makes a frame copy delay the next mouse report by one or more
+ * scheduler quanta.  A private CPU is only a placement hint: the worker
+ * remains fully serialized by window_lock and falls back to CPU0 on UP. */
+#define WINDOW_COMPOSITOR_PUBLICATION_ROW_CHUNK 16U
+#define WINDOW_COMPOSITOR_ATOMIC_PIXELS (32U * 1024U)
+#define WINDOW_COMPOSITOR_COPY_MAX_WORKERS 3U
+#define WINDOW_COMPOSITOR_COPY_STACK_SIZE (32U * 1024U)
+#ifndef WINDOW_COMPOSITOR_TARGET_HZ
+/* QEMU's GOP is normally 60 Hz; callers can override this at build time
+ * (for example -DWINDOW_COMPOSITOR_TARGET_HZ=120). */
+#define WINDOW_COMPOSITOR_TARGET_HZ 60U
+#endif
+#if WINDOW_COMPOSITOR_TARGET_HZ == 0U
+#error "WINDOW_COMPOSITOR_TARGET_HZ must be non-zero"
+#endif
+#define WINDOW_COMPOSITOR_FRAME_PERIOD_NS \
+    (1000000000ULL / WINDOW_COMPOSITOR_TARGET_HZ)
 
 #define WINDOW_TITLEBAR_HEIGHT 30U
 
@@ -217,6 +238,16 @@ typedef struct compositor_snapshot {
      */
     uint32_t dragging_identifier;
 
+    /* A topmost move can reuse the already-composited overlap instead of
+     * rasterizing the whole surface for every one-pixel pointer report. */
+    bool drag_blit_valid;
+    int32_t drag_old_x;
+    int32_t drag_old_y;
+    int32_t drag_new_x;
+    int32_t drag_new_y;
+    uint32_t drag_width;
+    uint32_t drag_height;
+
     uint32_t damage_count;
     window_damage_rect_t damage_rects[WINDOW_DAMAGE_MAX_SNAPSHOT_RECTS];
 
@@ -231,6 +262,33 @@ typedef struct compositor_snapshot {
 } compositor_snapshot_t;
 
 static compositor_snapshot_t g_compositor_snapshot;
+
+/*
+ * The scene is still composed by one owner, but the expensive final copy from
+ * the retained WB buffer to the WC GOP mapping is safely parallelizable by
+ * scanline.  Workers never share a row, and each worker executes an SFENCE
+ * before publishing completion.  This keeps the framebuffer transaction
+ * coherent while allowing large drag rectangles to use the other CPUs.
+ */
+typedef struct compositor_copy_job {
+    volatile uint32_t *destination;
+    const volatile uint32_t *source;
+    uint32_t destination_stride;
+    uint32_t source_stride;
+    window_damage_rect_t rect;
+} compositor_copy_job_t;
+
+static compositor_copy_job_t g_compositor_copy_job;
+static wait_queue_t g_compositor_copy_waitq;
+static atomic_uint_fast64_t g_compositor_copy_generation;
+static atomic_uint g_compositor_copy_completed;
+static atomic_uint g_compositor_copy_worker_count;
+static atomic_bool g_compositor_copy_workers_started;
+static thread_t g_compositor_copy_workers[WINDOW_COMPOSITOR_COPY_MAX_WORKERS];
+static uint8_t g_compositor_copy_worker_stacks
+    [WINDOW_COMPOSITOR_COPY_MAX_WORKERS]
+    [WINDOW_COMPOSITOR_COPY_STACK_SIZE]
+    __attribute__((aligned(16)));
 
 
 
@@ -247,6 +305,9 @@ typedef struct{
 static struct {
     spinlock_t lock;
     wait_queue_t event_waitq;
+    wait_queue_t worker_waitq;
+    atomic_uint_fast64_t worker_generation;
+    uint64_t last_frame_tsc;
     window_server_window_t *windows[WINDOW_SERVER_MAX_WINDOWS];
     uint32_t count;
     uint32_t next_identifier;
@@ -269,6 +330,13 @@ static struct {
     int32_t drag_offset_x;
     int32_t drag_offset_y;
     uint32_t resize_edges;
+    bool drag_blit_valid;
+    int32_t drag_old_x;
+    int32_t drag_old_y;
+    int32_t drag_new_x;
+    int32_t drag_new_y;
+    uint32_t drag_width;
+    uint32_t drag_height;
 
     /*
      * Decoration-button capture.
@@ -337,11 +405,20 @@ static void window_mark_surface_locked(const window_server_window_t *window,
                                        uint32_t width, uint32_t height);
 static void window_mark_moved_rect_locked(int32_t old_x, int32_t old_y,
                                           int32_t new_x, int32_t new_y,
-                                          uint32_t width, uint32_t height);
+                                          uint32_t width, uint32_t height,
+                                          bool render_new_position);
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
                                             uint32_t new_x, uint32_t new_y);
 static void window_coalesce_damage_locked(void);
 static void focus_locked(window_server_window_t *window);
+static void window_server_pump_input_mode(bool compose_now);
+static bool window_server_start_copy_workers(uint32_t compositor_cpu);
+static bool compositor_copy_rect_parallel_buffers(
+    volatile uint32_t *destination,
+    const volatile uint32_t *source,
+    uint32_t destination_stride,
+    uint32_t source_stride,
+    const window_damage_rect_t *rect);
 
 static void window_lock(void) {
     sched_preempt_disable();
@@ -364,6 +441,14 @@ bool window_server_init(void) {
                                                 memory_order_acquire)) {
         atomic_init(&g_window_server.lock.state, 0U);
         wait_queue_init(&g_window_server.event_waitq);
+        wait_queue_init(&g_window_server.worker_waitq);
+        wait_queue_init(&g_compositor_copy_waitq);
+        atomic_init(&g_window_server.worker_generation, 0U);
+        atomic_init(&g_compositor_copy_generation, 0U);
+        atomic_init(&g_compositor_copy_completed, 0U);
+        atomic_init(&g_compositor_copy_worker_count, 0U);
+        atomic_init(&g_compositor_copy_workers_started, false);
+        g_window_server.last_frame_tsc = 0U;
         g_window_server.count = 0U;
         g_window_server.next_identifier = 1U;
         g_window_server.focused_identifier = 0U;
@@ -385,6 +470,13 @@ bool window_server_init(void) {
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
         g_window_server.resize_edges = 0U;
+        g_window_server.drag_blit_valid = false;
+        g_window_server.drag_old_x = 0;
+        g_window_server.drag_old_y = 0;
+        g_window_server.drag_new_x = 0;
+        g_window_server.drag_new_y = 0;
+        g_window_server.drag_width = 0U;
+        g_window_server.drag_height = 0U;
         g_window_server.title_pressed_identifier = 0U;
         g_window_server.title_pressed_button =
             WINDOW_TITLE_BUTTON_NONE;
@@ -420,14 +512,97 @@ bool window_server_init(void) {
     return true;
 }
 
+static bool window_server_worker_ready(void *context) {
+    bool dirty;
+    (void)context;
+
+    if (input_core_pending() != 0U) return true;
+    window_lock();
+    dirty = g_window_server.dirty;
+    window_unlock();
+    return dirty;
+}
+
+typedef struct window_worker_change_context {
+    uint64_t generation;
+} window_worker_change_context_t;
+
+static bool window_server_worker_change_ready(void *context) {
+    window_worker_change_context_t *wait =
+        (window_worker_change_context_t *)context;
+    return input_core_pending() != 0U ||
+           (wait != 0 &&
+            atomic_load_explicit(&g_window_server.worker_generation,
+                                 memory_order_acquire) != wait->generation);
+}
+
+void window_server_notify_worker(void) {
+    if (!window_server_init() ||
+        !atomic_load_explicit(&g_window_server.worker_started,
+                              memory_order_acquire)) {
+        return;
+    }
+    atomic_fetch_add_explicit(&g_window_server.worker_generation, 1U,
+                              memory_order_release);
+    (void)wake_one(&g_window_server.worker_waitq);
+}
+
 static void __attribute__((noreturn)) window_server_worker_main(void *argument) {
     (void)argument;
     for (;;) {
-        /* input_core_wait() publishes BLOCKED while holding the queue lock,
-         * so an xHCI producer cannot lose the wakeup between the empty check
-         * and the worker going to sleep. */
-        if (input_core_wait(UINT64_MAX) != K_OK) continue;
-        window_server_pump_input();
+        window_worker_change_context_t wait_context;
+        uint64_t remaining_ns;
+
+        /* The worker is woken by both input reports and client
+         * WINDOW_UPDATE submissions.  The predicate/blocked handshake in
+         * wait_on_queue closes the producer-to-sleep lost-wakeup window. */
+        if (wait_on_queue(&g_window_server.worker_waitq,
+                          window_server_worker_ready, 0,
+                          UINT64_MAX) != K_OK) continue;
+
+        /* Update pointer/window state as soon as reports arrive, but keep
+         * expensive WB rendering and GOP publication on the frame deadline.
+         * This is the key separation between input latency and composition
+         * frequency required by W2. */
+        for (;;) {
+            if (input_core_pending() != 0U) {
+                window_server_pump_input_mode(false);
+            }
+
+            {
+                bool dirty;
+                window_lock();
+                dirty = g_window_server.dirty;
+                window_unlock();
+                if (!dirty) break;
+            }
+
+            if (g_window_server.last_frame_tsc == 0U) {
+                /* Anchor the deadline at frame start.  Anchoring it after
+                 * composition adds a full period on top of a slow render,
+                 * turning an already expensive drag into visible lag. */
+                g_window_server.last_frame_tsc = x86_read_tsc();
+                window_server_pump_input_mode(true);
+                break;
+            }
+
+            remaining_ns = x86_tsc_to_ns(
+                x86_read_tsc() - g_window_server.last_frame_tsc);
+            remaining_ns = remaining_ns >= WINDOW_COMPOSITOR_FRAME_PERIOD_NS ?
+                           0U :
+                           WINDOW_COMPOSITOR_FRAME_PERIOD_NS - remaining_ns;
+            if (remaining_ns == 0U) {
+                g_window_server.last_frame_tsc = x86_read_tsc();
+                window_server_pump_input_mode(true);
+                break;
+            }
+
+            wait_context.generation = atomic_load_explicit(
+                &g_window_server.worker_generation, memory_order_acquire);
+            (void)wait_on_queue(&g_window_server.worker_waitq,
+                                window_server_worker_change_ready,
+                                &wait_context, remaining_ns);
+        }
     }
 }
 
@@ -438,7 +613,24 @@ bool window_server_start_worker(void) {
 
     thread_t *current = sched_current_thread();
     uint32_t cpu_id = x86_current_cpu_index();
+    uint32_t worker_cpu = cpu_id;
     if (current == 0 || cpu_id >= MAX_CPUS) return false;
+
+    /*
+     * Keep the compositor away from the bootstrap CPU when an AP is online.
+     * xHCI/deferred work and early user startup are concentrated on CPU0;
+     * pinning the expensive compositor there makes pointer input wait behind
+     * a full retained-buffer publication.  A single AP is sufficient because
+     * window_lock still serializes scene mutation and composition.
+     */
+    for (uint32_t candidate = 0U;
+         candidate < x86_smp_discovered_count() && candidate < MAX_CPUS;
+         ++candidate) {
+        if (candidate != cpu_id && x86_smp_cpu_online(candidate)) {
+            worker_cpu = candidate;
+            break;
+        }
+    }
 
     thread_t *worker = &g_window_server.worker;
     uint8_t *worker_bytes = (uint8_t *)worker;
@@ -457,6 +649,10 @@ bool window_server_start_worker(void) {
     worker->kernel_stack_top =
         ((vaddr_t)(uintptr_t)g_window_server_worker_stack +
          sizeof(g_window_server_worker_stack)) & ~(vaddr_t)0x0FULL;
+    /* Keep composition in the normal fair class.  A large retained-buffer
+     * render must not starve the user applications that produce the next
+     * frame; input wakeups are already prompt because the worker blocks when
+     * idle and is directly notified by the input queue. */
     worker->sched_class = SCHED_CLASS_FAIR;
     worker->base_sched_class = SCHED_CLASS_FAIR;
     worker->rt_priority = 0U;
@@ -471,8 +667,8 @@ bool window_server_start_worker(void) {
     for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
         worker->affinity.bits[word] = 0U;
     }
-    worker->affinity.bits[cpu_id >> 6] = 1ULL << (cpu_id & 63U);
-    worker->current_cpu = (uint16_t)cpu_id;
+    worker->affinity.bits[worker_cpu >> 6] = 1ULL << (worker_cpu & 63U);
+    worker->current_cpu = (uint16_t)worker_cpu;
 
     uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
     uintptr_t switch_stack = stack_top - sizeof(uint64_t);
@@ -487,7 +683,10 @@ bool window_server_start_worker(void) {
     atomic_store_explicit(&g_window_server.worker_started, true,
                           memory_order_release);
     sched_enqueue(worker);
-    if (!sched_try_run_ready()) {
+    /* Best effort: one compositor remains the scene owner; only the final
+     * disjoint scanline publication is delegated to these helpers. */
+    (void)window_server_start_copy_workers(worker_cpu);
+    if (worker_cpu == cpu_id && !sched_try_run_ready()) {
         atomic_store_explicit(&g_window_server.worker_started, false,
                               memory_order_release);
         return false;
@@ -524,8 +723,16 @@ bool window_server_kernel_ready(void) {
     }
     g_window_server.pointer_x = width / 2U;
     g_window_server.pointer_y = height / 2U;
+    window_lock();
     g_window_server.kernel_ready = true;
     window_mark_dirty_locked();
+    window_unlock();
+
+    /* Present the initial desktop immediately.  The compositor worker may
+     * be placed on an AP and can legitimately remain asleep until its first
+     * wake-up; boot must not require a keyboard or mouse report to show the
+     * already-dirty desktop. */
+    window_server_pump_input_mode(true);
     return true;
 }
 
@@ -589,6 +796,7 @@ static void remove_window_locked(window_server_window_t *window) {
             g_window_server.drag_offset_x = 0;
             g_window_server.drag_offset_y = 0;
             g_window_server.resize_edges = 0U;
+            g_window_server.drag_blit_valid = false;
         }
         window_mark_window_locked(new_focused);
         object_put(window); /* registry reference */
@@ -869,8 +1077,9 @@ static void window_mark_surface_locked(const window_server_window_t *window,
  * bounding box wastes <=25%, while large moves remain as two independent
  * regions.
  *
- * Framebuffer publication is performed atomically for the whole compositor
- * snapshot, so keeping two regions no longer exposes an intermediate frame.
+ * For a topmost drag the overlapping pixels are moved in the retained
+ * composite buffer, so only the exposed strips need rasterization.  Other
+ * callers request the complete new rectangle with render_new_position=true.
  */
 static void window_mark_moved_rect_locked(
     int32_t old_x,
@@ -878,7 +1087,8 @@ static void window_mark_moved_rect_locked(
     int32_t new_x,
     int32_t new_y,
     uint32_t width,
-    uint32_t height) {
+    uint32_t height,
+    bool render_new_position) {
 
     int64_t old_left;
     int64_t old_top;
@@ -1039,14 +1249,53 @@ static void window_mark_moved_rect_locked(
         }
     }
 
-    /*
-     * The complete final window position must still be rendered.
-     */
-    window_mark_rect_locked(
-        new_x,
-        new_y,
-        width,
-        height);
+    if (!render_new_position) {
+        /* NEW \ OLD: the overlap has already been copied by the retained
+         * drag blit, so render only the newly uncovered horizontal/vertical
+         * strips at the destination position. */
+        if (old_left > new_left) {
+            uint32_t exposed_width =
+                (uint32_t)(overlap_left - new_left);
+            if (exposed_width != 0U) {
+                window_mark_rect_locked(new_x, new_y,
+                                        exposed_width, height);
+            }
+        } else if (old_left < new_left) {
+            uint32_t exposed_width =
+                (uint32_t)(new_right - overlap_right);
+            if (exposed_width != 0U) {
+                window_mark_rect_locked((int32_t)overlap_right, new_y,
+                                        exposed_width, height);
+            }
+        }
+
+        {
+            uint32_t overlap_width =
+                (uint32_t)(overlap_right - overlap_left);
+            if (old_top > new_top) {
+                uint32_t exposed_height =
+                    (uint32_t)(overlap_top - new_top);
+                if (overlap_width != 0U && exposed_height != 0U) {
+                    window_mark_rect_locked((int32_t)overlap_left, new_y,
+                                            overlap_width, exposed_height);
+                }
+            } else if (old_top < new_top) {
+                uint32_t exposed_height =
+                    (uint32_t)(new_bottom - overlap_bottom);
+                if (overlap_width != 0U && exposed_height != 0U) {
+                    window_mark_rect_locked((int32_t)overlap_left,
+                                            (int32_t)overlap_bottom,
+                                            overlap_width, exposed_height);
+                }
+            }
+        }
+    }
+
+    if (render_new_position) {
+        /* Without a retained-pixel move, the complete final position must
+         * still be rendered. */
+        window_mark_rect_locked(new_x, new_y, width, height);
+    }
 }
 
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
@@ -2308,6 +2557,26 @@ static void desktop_copy_cached_region(void) {
         left >= right ||
         top >= bottom) {
         return;
+    }
+
+    {
+        window_damage_rect_t cached_rect = {
+            .left = left,
+            .top = top,
+            .right = right,
+            .bottom = bottom,
+        };
+        uint64_t pixels = (uint64_t)(right - left) *
+                          (uint64_t)(bottom - top);
+        if (pixels > WINDOW_COMPOSITOR_ATOMIC_PIXELS &&
+            compositor_copy_rect_parallel_buffers(
+                g_window_server.composite_framebuffer,
+                (const volatile uint32_t *)g_desktop_cache,
+                g_window_server.display_stride,
+                g_desktop_cache_stride,
+                &cached_rect)) {
+            return;
+        }
     }
 
     for (uint32_t row = top;
@@ -4449,7 +4718,44 @@ static void compositor_region_locked(void) {
      * All dirty regions are first completed in composite_framebuffer.
      * compositor_commit_snapshot() publishes the entire frame transaction
      * after every region is ready.
-     */
+    */
+}
+
+/* A drag is one visible transaction.  Rendering only the old/new strips and
+ * then copying their bounding box leaves stale pixels in diagonal gaps, which
+ * is the source of the severe geometric tearing seen during fast moves.  Use
+ * one complete damage rectangle for the drag snapshot so every pixel copied to
+ * scanout was produced by this frame. */
+static void compositor_collapse_drag_damage(compositor_snapshot_t *snapshot) {
+    uint32_t left;
+    uint32_t top;
+    uint32_t right;
+    uint32_t bottom;
+
+    if (snapshot == 0 || snapshot->dragging_identifier == 0U ||
+        snapshot->damage_count <= 1U) {
+        return;
+    }
+
+    left = snapshot->damage_rects[0].left;
+    top = snapshot->damage_rects[0].top;
+    right = snapshot->damage_rects[0].right;
+    bottom = snapshot->damage_rects[0].bottom;
+    for (uint32_t index = 1U; index < snapshot->damage_count; ++index) {
+        const window_damage_rect_t *rect =
+            &snapshot->damage_rects[index];
+        if (rect->left < left) left = rect->left;
+        if (rect->top < top) top = rect->top;
+        if (rect->right > right) right = rect->right;
+        if (rect->bottom > bottom) bottom = rect->bottom;
+    }
+    snapshot->damage_rects[0] = (window_damage_rect_t){
+        .left = left,
+        .top = top,
+        .right = right,
+        .bottom = bottom,
+    };
+    snapshot->damage_count = 1U;
 }
 
 static bool compositor_snapshot_begin_locked(void) {
@@ -4500,6 +4806,21 @@ static bool compositor_snapshot_begin_locked(void) {
 
     snapshot->dragging_identifier =
         g_window_server.dragging_identifier;
+
+    snapshot->drag_blit_valid =
+        g_window_server.drag_blit_valid;
+    snapshot->drag_old_x =
+        g_window_server.drag_old_x;
+    snapshot->drag_old_y =
+        g_window_server.drag_old_y;
+    snapshot->drag_new_x =
+        g_window_server.drag_new_x;
+    snapshot->drag_new_y =
+        g_window_server.drag_new_y;
+    snapshot->drag_width =
+        g_window_server.drag_width;
+    snapshot->drag_height =
+        g_window_server.drag_height;
 
     /*
      * Snapshot the current damage before clearing the producer side.
@@ -4617,6 +4938,8 @@ static bool compositor_snapshot_begin_locked(void) {
             sizeof(view->title) - 1U] =
             '\0';
     }
+
+    compositor_collapse_drag_damage(snapshot);
 
     /*
      * Consume only the damage represented by this snapshot.
@@ -4828,9 +5151,299 @@ static void compositor_copy_wc_scanline(
     }
 }
 
+typedef struct compositor_copy_wait_context {
+    uint64_t generation;
+} compositor_copy_wait_context_t;
+
+static bool compositor_copy_worker_ready(void *context) {
+    compositor_copy_wait_context_t *wait =
+        (compositor_copy_wait_context_t *)context;
+    return wait != 0 &&
+           atomic_load_explicit(&g_compositor_copy_generation,
+                                memory_order_acquire) != wait->generation;
+}
+
+static void compositor_copy_rows(const compositor_copy_job_t *job,
+                                 uint32_t participant,
+                                 uint32_t participants) {
+    uint64_t row;
+
+    if (job == 0 || participants == 0U ||
+        job->destination == 0 || job->source == 0 ||
+        job->rect.left >= job->rect.right ||
+        job->rect.top >= job->rect.bottom) {
+        return;
+    }
+
+    for (row = (uint64_t)job->rect.top + participant;
+         row < job->rect.bottom;
+         row += participants) {
+        volatile uint32_t *destination =
+            job->destination + row * job->destination_stride +
+            job->rect.left;
+        const volatile uint32_t *source =
+            job->source + row * job->source_stride + job->rect.left;
+        compositor_copy_wc_scanline(destination, source,
+                                     job->rect.right - job->rect.left);
+    }
+}
+
+static void __attribute__((noreturn)) compositor_copy_worker_main(void *argument) {
+    uint32_t worker_index = (uint32_t)(uintptr_t)argument;
+    uint64_t generation = atomic_load_explicit(
+        &g_compositor_copy_generation, memory_order_acquire);
+    uint32_t worker_count = atomic_load_explicit(
+        &g_compositor_copy_worker_count, memory_order_acquire);
+
+    for (;;) {
+        compositor_copy_wait_context_t wait_context = {
+            .generation = generation,
+        };
+
+        if (wait_on_queue(&g_compositor_copy_waitq,
+                          compositor_copy_worker_ready,
+                          &wait_context, UINT64_MAX) != K_OK) {
+            continue;
+        }
+
+        generation = atomic_load_explicit(
+            &g_compositor_copy_generation, memory_order_acquire);
+        worker_count = atomic_load_explicit(
+            &g_compositor_copy_worker_count, memory_order_acquire);
+        if (worker_count == 0U || worker_index >= worker_count) continue;
+
+        /* Participant zero is the compositor itself; worker indices start at
+         * one so no scanline is ever written by two CPUs. */
+        compositor_copy_rows(&g_compositor_copy_job,
+                             worker_index + 1U,
+                             worker_count + 1U);
+        __asm__ volatile ("sfence" : : : "memory");
+        atomic_fetch_add_explicit(&g_compositor_copy_completed, 1U,
+                                  memory_order_release);
+    }
+}
+
+static bool window_server_start_copy_workers(uint32_t compositor_cpu) {
+    uint32_t cpu_ids[WINDOW_COMPOSITOR_COPY_MAX_WORKERS];
+    uint32_t count = 0U;
+    uint32_t current_cpu = x86_current_cpu_index();
+
+    if (atomic_load_explicit(&g_compositor_copy_workers_started,
+                             memory_order_acquire)) {
+        return true;
+    }
+
+    for (uint32_t candidate = 0U;
+         candidate < x86_smp_discovered_count() && candidate < MAX_CPUS;
+         ++candidate) {
+        if (candidate == compositor_cpu ||
+            !x86_smp_cpu_online(candidate)) {
+            continue;
+        }
+        cpu_ids[count++] = candidate;
+        if (count == WINDOW_COMPOSITOR_COPY_MAX_WORKERS) break;
+    }
+
+    if (count == 0U) return false;
+
+    atomic_store_explicit(&g_compositor_copy_worker_count, count,
+                          memory_order_release);
+    atomic_store_explicit(&g_compositor_copy_workers_started, true,
+                          memory_order_release);
+
+    for (uint32_t index = 0U; index < count; ++index) {
+        thread_t *worker = &g_compositor_copy_workers[index];
+        uint8_t *worker_bytes = (uint8_t *)worker;
+        for (size_t byte = 0U; byte < sizeof(*worker); ++byte) {
+            worker_bytes[byte] = 0U;
+        }
+
+        refcount_init(&worker->object.refs, 1U);
+        worker->object.type = KOBJECT_TYPE_THREAD;
+        worker->object.flags = 0U;
+        worker->object.ops = 0;
+        worker->object.security = 0;
+        worker->tid = UINT64_MAX - 2ULL - index;
+        worker->process = 0;
+        atomic_init(&worker->state, THREAD_READY);
+        worker->kernel_stack_base = g_compositor_copy_worker_stacks[index];
+        worker->kernel_stack_size = WINDOW_COMPOSITOR_COPY_STACK_SIZE;
+        worker->kernel_stack_top =
+            ((vaddr_t)(uintptr_t)worker->kernel_stack_base +
+             worker->kernel_stack_size) & ~(vaddr_t)0x0FULL;
+        worker->sched_class = SCHED_CLASS_FAIR;
+        worker->base_sched_class = SCHED_CLASS_FAIR;
+        worker->rt_priority = 0U;
+        worker->base_rt_priority = 0U;
+        worker->sched.weight = 1024U;
+        worker->sched.nice = 0;
+        worker->sched.vruntime = 0U;
+        list_init(&worker->sched.rt_node);
+        list_init(&worker->process_node);
+        list_init(&worker->global_node);
+        list_init(&worker->owned_mutexes);
+        for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
+            worker->affinity.bits[word] = 0U;
+        }
+        worker->affinity.bits[cpu_ids[index] >> 6] =
+            1ULL << (cpu_ids[index] & 63U);
+        worker->current_cpu = (uint16_t)cpu_ids[index];
+
+        uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
+        uintptr_t switch_stack = stack_top - sizeof(uint64_t);
+        *(uint64_t *)switch_stack =
+            (uint64_t)(uintptr_t)&x86_kernel_thread_start;
+        worker->arch.switch_ctx.rsp = switch_stack;
+        worker->arch.switch_ctx.r12 =
+            (uint64_t)(uintptr_t)&compositor_copy_worker_main;
+        worker->arch.switch_ctx.r13 = (uint64_t)(uintptr_t)index;
+        worker->arch.switch_ctx.r14 = stack_top;
+        worker->arch.fs_base = 0U;
+
+        sched_enqueue(worker);
+    }
+
+    /* If a helper landed on this CPU, let it reach its wait state before the
+     * first frame.  Remote helpers are started by their reschedule IPIs. */
+    for (uint32_t index = 0U; index < count; ++index) {
+        if (cpu_ids[index] == current_cpu) {
+            (void)sched_try_run_ready();
+            break;
+        }
+    }
+    return true;
+}
+
+static bool compositor_copy_rect_parallel_buffers(
+    volatile uint32_t *destination,
+    const volatile uint32_t *source,
+    uint32_t destination_stride,
+    uint32_t source_stride,
+    const window_damage_rect_t *rect) {
+    uint32_t worker_count = atomic_load_explicit(
+        &g_compositor_copy_worker_count, memory_order_acquire);
+    uint32_t participants;
+    uint64_t generation;
+    uint64_t pixels;
+
+    if (!atomic_load_explicit(&g_compositor_copy_workers_started,
+                              memory_order_acquire) ||
+        sched_preempt_disabled() ||
+        worker_count == 0U || rect == 0 ||
+        rect->left >= rect->right || rect->top >= rect->bottom) {
+        return false;
+    }
+
+    pixels = (uint64_t)(rect->right - rect->left) *
+             (uint64_t)(rect->bottom - rect->top);
+    if (pixels <= WINDOW_COMPOSITOR_ATOMIC_PIXELS) return false;
+
+    participants = worker_count + 1U;
+    g_compositor_copy_job.destination = destination;
+    g_compositor_copy_job.source = source;
+    g_compositor_copy_job.destination_stride = destination_stride;
+    g_compositor_copy_job.source_stride = source_stride;
+    g_compositor_copy_job.rect = *rect;
+    atomic_store_explicit(&g_compositor_copy_completed, 0U,
+                          memory_order_relaxed);
+    generation = atomic_load_explicit(&g_compositor_copy_generation,
+                                      memory_order_relaxed) + 1U;
+    atomic_store_explicit(&g_compositor_copy_generation, generation,
+                          memory_order_release);
+    (void)wake_all(&g_compositor_copy_waitq);
+
+    /* The compositor owns participant zero and handles every Nth row while
+     * the helpers handle the remaining rows. */
+    compositor_copy_rows(&g_compositor_copy_job, 0U, participants);
+    __asm__ volatile ("sfence" : : : "memory");
+
+    while (atomic_load_explicit(&g_compositor_copy_completed,
+                                memory_order_acquire) < worker_count) {
+        /* Give the scheduler a chance to run local work while remote CPUs
+         * drain the rows.  No framebuffer lock is held here. */
+        schedule();
+    }
+    __asm__ volatile ("sfence" : : : "memory");
+    return true;
+}
+
+static bool compositor_copy_rect_parallel(const window_damage_rect_t *rect) {
+    return compositor_copy_rect_parallel_buffers(
+        g_window_server.framebuffer,
+        g_window_server.composite_framebuffer,
+        g_window_server.display_stride,
+        g_window_server.display_stride,
+        rect);
+}
+
+static uint64_t compositor_damage_pixels(void) {
+    uint64_t pixels = 0U;
+
+    for (uint32_t region = 0U;
+         region < g_compositor_snapshot.damage_count;
+         ++region) {
+        const window_damage_rect_t *rect =
+            &g_compositor_snapshot.damage_rects[region];
+        uint32_t width;
+        uint32_t height;
+        uint64_t area;
+
+        if (rect->left >= rect->right || rect->top >= rect->bottom) continue;
+        width = rect->right - rect->left;
+        height = rect->bottom - rect->top;
+        area = (uint64_t)width * height;
+        if (UINT64_MAX - pixels < area) return UINT64_MAX;
+        pixels += area;
+    }
+    return pixels;
+}
+
+/* Publish one damage rectangle.  The caller holds one preemption disable
+ * around the publication.  Large ordinary updates periodically drop that
+ * disable and yield so an incoming HID report can run; drag/move frames keep
+ * the single atomic transaction by passing allow_yield=false. */
+static void compositor_publish_rect(const window_damage_rect_t *rect,
+                                    bool allow_yield) {
+    uint32_t rows_since_yield = 0U;
+
+    if (rect == 0 || rect->left >= rect->right || rect->top >= rect->bottom) {
+        return;
+    }
+
+    for (uint32_t row = rect->top; row < rect->bottom; ++row) {
+        volatile uint32_t *destination =
+            g_window_server.framebuffer +
+            (uint64_t)row * g_window_server.display_stride +
+            rect->left;
+        const volatile uint32_t *source =
+            g_window_server.composite_framebuffer +
+            (uint64_t)row * g_window_server.display_stride +
+            rect->left;
+
+        compositor_copy_wc_scanline(destination, source,
+                                     rect->right - rect->left);
+
+        if (!allow_yield) continue;
+        ++rows_since_yield;
+        if (rows_since_yield < WINDOW_COMPOSITOR_PUBLICATION_ROW_CHUNK ||
+            row + 1U >= rect->bottom) {
+            continue;
+        }
+
+        /* WC stores remain ordered by the final fence.  Releasing the local
+         * preemption guard here is safe because no other compositor can run
+         * while snapshot.composing is true. */
+        sched_preempt_enable();
+        schedule();
+        sched_preempt_disable();
+        rows_since_yield = 0U;
+    }
+}
+
 
 static void compositor_commit_snapshot(void) {
     bool commit_as_move_transaction;
+    bool allow_yield;
 
     if (g_window_server.framebuffer == 0 ||
         g_window_server.composite_framebuffer == 0 ||
@@ -4841,8 +5454,27 @@ static void compositor_commit_snapshot(void) {
     }
 
     commit_as_move_transaction =
-        g_compositor_snapshot.dragging_identifier != 0U &&
-        g_compositor_snapshot.damage_count > 1U;
+        g_compositor_snapshot.dragging_identifier != 0U;
+
+    /* Keep cursor-sized and other tiny updates atomic (there is no useful
+     * scheduling point in a 24x24 copy), but make a large ordinary client
+     * repaint preemptible in bounded row chunks.  A drag/move is always kept
+     * atomic until a real page-flip path exists. */
+    allow_yield = !commit_as_move_transaction &&
+                  compositor_damage_pixels() >
+                  WINDOW_COMPOSITOR_ATOMIC_PIXELS;
+
+    /* Drag/resize frames are already collapsed to one complete rectangle.
+     * Copy that transaction on disjoint rows across helper CPUs.  The helper
+     * path includes per-CPU fences and returns only after every row is visible,
+     * so it cannot expose the stale-gap corruption caused by the old bounding
+     * box copy. */
+    if (commit_as_move_transaction &&
+        g_compositor_snapshot.damage_count == 1U &&
+        compositor_copy_rect_parallel(
+            &g_compositor_snapshot.damage_rects[0])) {
+        return;
+    }
 
     /*
      * Only GOP publication is non-preemptible.  All expensive scene
@@ -4898,27 +5530,13 @@ static void compositor_commit_snapshot(void) {
         }
 
         if (left < right && top < bottom) {
-            for (uint32_t row = top;
-                 row < bottom;
-                 ++row) {
-
-                volatile uint32_t *destination =
-                    g_window_server.framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
-
-                const volatile uint32_t *source =
-                    g_window_server.composite_framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
-
-                compositor_copy_wc_scanline(
-                    destination,
-                    source,
-                    right - left);
-            }
+            window_damage_rect_t transaction = {
+                .left = left,
+                .top = top,
+                .right = right,
+                .bottom = bottom,
+            };
+            compositor_publish_rect(&transaction, false);
         }
     } else {
         /*
@@ -4941,27 +5559,13 @@ static void compositor_commit_snapshot(void) {
                 continue;
             }
 
-            for (uint32_t row = top;
-                 row < bottom;
-                 ++row) {
-
-                volatile uint32_t *destination =
-                    g_window_server.framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
-
-                const volatile uint32_t *source =
-                    g_window_server.composite_framebuffer +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    left;
-
-                compositor_copy_wc_scanline(
-                    destination,
-                    source,
-                    right - left);
-            }
+            window_damage_rect_t ordinary = {
+                .left = left,
+                .top = top,
+                .right = right,
+                .bottom = bottom,
+            };
+            compositor_publish_rect(&ordinary, allow_yield);
         }
     }
 
@@ -4978,6 +5582,115 @@ static void compositor_commit_snapshot(void) {
 }
 
 
+/* Move the overlap of a topmost dragged window inside the retained compose
+ * buffer.  The source is the last committed frame, so this avoids rereading
+ * the client section and repainting every pixel for a one-pixel motion. */
+static void compositor_blit_drag_overlap(void) {
+    const compositor_snapshot_t *snapshot = &g_compositor_snapshot;
+    int64_t old_left;
+    int64_t old_top;
+    int64_t old_right;
+    int64_t old_bottom;
+    int64_t new_left;
+    int64_t new_top;
+    int64_t new_right;
+    int64_t new_bottom;
+    int64_t left;
+    int64_t top;
+    int64_t right;
+    int64_t bottom;
+    uint32_t width;
+    uint32_t height;
+
+    if (!snapshot->drag_blit_valid ||
+        snapshot->dragging_identifier == 0U ||
+        snapshot->drag_width == 0U ||
+        snapshot->drag_height == 0U ||
+        g_window_server.composite_framebuffer == 0 ||
+        snapshot->window_count == 0U ||
+        snapshot->windows[snapshot->window_count - 1U].identifier !=
+            snapshot->dragging_identifier) {
+        return;
+    }
+
+    old_left = snapshot->drag_old_x;
+    old_top = snapshot->drag_old_y;
+    old_right = old_left + (int64_t)snapshot->drag_width;
+    old_bottom = old_top + (int64_t)snapshot->drag_height;
+    new_left = snapshot->drag_new_x;
+    new_top = snapshot->drag_new_y;
+    new_right = new_left + (int64_t)snapshot->drag_width;
+    new_bottom = new_top + (int64_t)snapshot->drag_height;
+
+    left = old_left > new_left ? old_left : new_left;
+    top = old_top > new_top ? old_top : new_top;
+    right = old_right < new_right ? old_right : new_right;
+    bottom = old_bottom < new_bottom ? old_bottom : new_bottom;
+
+    /* The mathematical overlap may contain pixels whose source lies just
+     * outside the physical screen when a window crosses an edge.  Clip the
+     * destination coordinates so both source and destination are valid. */
+    {
+        int64_t source_left = new_left - old_left;
+        int64_t source_top = new_top - old_top;
+        int64_t source_right = source_left +
+                               (int64_t)g_window_server.display_width;
+        int64_t source_bottom = source_top +
+                                (int64_t)g_window_server.display_height;
+        if (left < source_left) left = source_left;
+        if (top < source_top) top = source_top;
+        if (right > source_right) right = source_right;
+        if (bottom > source_bottom) bottom = source_bottom;
+    }
+
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > (int64_t)g_window_server.display_width) {
+        right = g_window_server.display_width;
+    }
+    if (bottom > (int64_t)g_window_server.display_height) {
+        bottom = g_window_server.display_height;
+    }
+    if (left >= right || top >= bottom) return;
+
+    width = (uint32_t)(right - left);
+    height = (uint32_t)(bottom - top);
+
+    /* Copy bottom-up when the destination is below the source, otherwise
+     * copy top-down.  Horizontal overlap is handled in the corresponding
+     * direction for the same row, making this a true memmove. */
+    for (uint32_t row_index = 0U; row_index < height; ++row_index) {
+        uint32_t row = snapshot->drag_new_y > snapshot->drag_old_y ?
+                        height - 1U - row_index : row_index;
+        int64_t world_y = top + (int64_t)row;
+        int64_t source_world_y = world_y - snapshot->drag_new_y +
+                                 snapshot->drag_old_y;
+        volatile uint32_t *destination =
+            g_window_server.composite_framebuffer +
+            (uint64_t)(world_y) * g_window_server.display_stride +
+            (uint64_t)(left - snapshot->drag_new_x);
+        volatile uint32_t *source =
+            g_window_server.composite_framebuffer +
+            (uint64_t)(source_world_y) * g_window_server.display_stride +
+            (uint64_t)(left - snapshot->drag_old_x);
+
+        /* The destination offset in the retained buffer is
+         * (left - new_x), while the source offset is (left - old_x).
+         * Copy backwards only when the destination starts to the right of
+         * the source; this is the usual memmove overlap rule. */
+        if (snapshot->drag_new_y == snapshot->drag_old_y &&
+            snapshot->drag_new_x < snapshot->drag_old_x) {
+            for (uint32_t column = width; column != 0U; --column) {
+                destination[column - 1U] = source[column - 1U];
+            }
+        } else {
+            for (uint32_t column = 0U; column < width; ++column) {
+                destination[column] = source[column];
+            }
+        }
+    }
+}
+
 static void compositor_render_snapshot(void) {
     bool direct_framebuffer =
         g_window_server.composite_framebuffer ==
@@ -4993,6 +5706,10 @@ static void compositor_render_snapshot(void) {
      */
     if (direct_framebuffer) {
         sched_preempt_disable();
+    }
+
+    if (!direct_framebuffer) {
+        compositor_blit_drag_overlap();
     }
 
     for (uint32_t index = 0U;
@@ -5395,6 +6112,7 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window_mark_window_locked(old_focused);
     window_mark_window_locked(window);
     window_unlock();
+    window_server_notify_worker();
     *out = window;
     return K_OK;
 }
@@ -5425,6 +6143,7 @@ void window_server_handle_closed(window_server_window_t *window) {
     referenced = true;
     remove_window_locked(window);
     window_unlock();
+    window_server_notify_worker();
     (void)wake_all(&window->event_waitq);
     if (referenced) object_put(window);
 }
@@ -5454,6 +6173,7 @@ void window_server_close_process(process_t *owner) {
         (void)wake_all(&removed[index]->event_waitq);
         object_put(removed[index]);
     }
+    if (removed_count != 0U) window_server_notify_worker();
 }
 
 kstatus_t window_server_set_owner_address(window_server_window_t *window,
@@ -5465,6 +6185,7 @@ kstatus_t window_server_set_owner_address(window_server_window_t *window,
     window->owner_address = address;
     window_mark_window_locked(window);
     window_unlock();
+    window_server_notify_worker();
     return K_OK;
 }
 
@@ -5504,7 +6225,8 @@ kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y
     old_focused = find_window_locked(g_window_server.focused_identifier);
     window_mark_moved_rect_locked(old_x, old_y, x, y,
                                   window_outer_width(window->width, window->flags),
-                                  window_outer_height(window->height, window->flags));
+                                  window_outer_height(window->height, window->flags),
+                                  true);
     window->x = x;
     window->y = y;
     if (visible != 0U) window->flags |= OS_WINDOW_VISIBLE;
@@ -5522,6 +6244,7 @@ kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y
     window_mark_window_locked(old_focused);
     window_mark_window_locked(window);
     window_unlock();
+    window_server_notify_worker();
     return K_OK;
 }
 
@@ -5536,6 +6259,7 @@ kstatus_t window_server_focus(uint32_t identifier) {
     }
     focus_locked(window);
     window_unlock();
+    window_server_notify_worker();
     return K_OK;
 }
 
@@ -5669,6 +6393,10 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
         window_mark_surface_locked(window, x, y, width, height);
     }
     window_unlock();
+    /* A client update is independent of input.  Wake the compositor even
+     * when the input queue is empty; otherwise the worker can sleep until the
+     * next mouse report and every redraw appears one event late. */
+    window_server_notify_worker();
     return K_OK;
 }
 
@@ -5713,6 +6441,7 @@ static bool window_minimize_locked(
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
         g_window_server.resize_edges = 0U;
+        g_window_server.drag_blit_valid = false;
     }
 
     if (g_window_server.title_pressed_identifier ==
@@ -6184,6 +6913,7 @@ static void route_input_locked(const input_event_t *event) {
                 g_window_server.drag_offset_x = 0;
                 g_window_server.drag_offset_y = 0;
                 g_window_server.resize_edges = 0U;
+                g_window_server.drag_blit_valid = false;
             } else if (g_window_server.resize_edges != 0U) {
                 int32_t delta_x =
                     (int32_t)((int64_t)g_window_server.pointer_x - old_pointer_x);
@@ -6203,7 +6933,8 @@ static void route_input_locked(const input_event_t *event) {
                 window_mark_moved_rect_locked(
                     old_x, old_y, dragged->x, dragged->y,
                     window_outer_width(dragged->width, dragged->flags),
-                    window_outer_height(dragged->height, dragged->flags));
+                    window_outer_height(dragged->height, dragged->flags),
+                    true);
                 dragged->dirty = true;
                 target = dragged;
                 deliver_input = false;
@@ -6418,6 +7149,7 @@ static void route_input_locked(const input_event_t *event) {
             g_window_server.drag_offset_x = 0;
             g_window_server.drag_offset_y = 0;
             g_window_server.resize_edges = 0U;
+            g_window_server.drag_blit_valid = false;
         }
     } else if (event->type == INPUT_EVENT_KEY) {
         /*
@@ -6566,6 +7298,7 @@ static bool window_route_drag_motion_batch_locked(
         g_window_server.drag_offset_x = 0;
         g_window_server.drag_offset_y = 0;
         g_window_server.resize_edges = 0U;
+        g_window_server.drag_blit_valid = false;
 
         return false;
     }
@@ -6648,6 +7381,7 @@ static bool window_route_drag_motion_batch_locked(
             (int64_t)old_pointer_y);
 
     if (g_window_server.resize_edges != 0U) {
+        g_window_server.drag_blit_valid = false;
         /*
          * window_resize_locked() already accepts both axes together, so call
          * it exactly once for this batch.
@@ -6675,11 +7409,32 @@ static bool window_route_drag_motion_batch_locked(
             (int32_t)g_window_server.pointer_y -
             g_window_server.drag_offset_y;
 
+        g_window_server.drag_blit_valid = false;
+
         /*
          * One old/new damage pair for the complete diagonal move.
          */
         if (old_x != new_x ||
             old_y != new_y) {
+            uint32_t outer_width =
+                window_outer_width(dragged->width, dragged->flags);
+            uint32_t outer_height =
+                window_outer_height(dragged->height, dragged->flags);
+
+            /* A captured window is normally raised by focus_locked() on
+             * press.  Only a genuinely topmost surface may reuse composite
+             * pixels; otherwise a window above it could be copied away. */
+            /* Keep the retained-pixel experiment disabled until the source
+             * frame can be proven free of cursor/underlay pixels.  A drag
+             * must prefer a complete, correct composition over a possible
+             * stale-pixel shortcut. */
+            g_window_server.drag_blit_valid = false;
+            g_window_server.drag_old_x = old_x;
+            g_window_server.drag_old_y = old_y;
+            g_window_server.drag_new_x = new_x;
+            g_window_server.drag_new_y = new_y;
+            g_window_server.drag_width = outer_width;
+            g_window_server.drag_height = outer_height;
 
             dragged->x =
                 new_x;
@@ -6692,8 +7447,9 @@ static bool window_route_drag_motion_batch_locked(
                 old_y,
                 new_x,
                 new_y,
-                window_outer_width(dragged->width, dragged->flags),
-                window_outer_height(dragged->height, dragged->flags));
+                outer_width,
+                outer_height,
+                !g_window_server.drag_blit_valid);
 
             dragged->dirty =
                 true;
@@ -6821,7 +7577,7 @@ static void window_route_pointer_transaction_locked(
     window_coalesce_damage_locked();
 }
 
-void window_server_pump_input(void) {
+static void window_server_pump_input_mode(bool compose_now) {
     input_event_t event;
     window_motion_batch_t motion = {0};
     bool wake = false;
@@ -6948,6 +7704,8 @@ void window_server_pump_input(void) {
         }
     }
 
+    if (!compose_now) return;
+
     /*
      * Only the scene snapshot is taken while holding window_lock.
      *
@@ -6964,4 +7722,8 @@ void window_server_pump_input(void) {
         compositor_render_snapshot();
         compositor_snapshot_finish();
     }
+}
+
+void window_server_pump_input(void) {
+    window_server_pump_input_mode(true);
 }

@@ -79,6 +79,7 @@
 #include "slab.h"
 #include "syscall.h"
 #include "usb.h"
+#include <usb/storage.h>
 #include "vfs.h"
 #include "window.h"
 #include <kernel/sched.h>
@@ -100,6 +101,26 @@ static LITEOS_BLOCK_MANAGER g_nvme_root_block_manager;
 static LITEOS_BLOCK_DEVICE *g_nvme_root_block_device;
 static LITEOS_FAT32 g_nvme_root_filesystem;
 static nvme_fat32_backend_t g_nvme_root_backend;
+
+/*
+ * LITEOS_USB_ROOT_PATCH_V1
+ *
+ * USB root is a lightweight partition view over the MSC whole-disk block
+ * device. FAT code sees sector zero of the selected volume.
+ */
+typedef struct {
+    LITEOS_BLOCK_DEVICE *parent;
+    UINT64 start_lba;
+    UINT64 block_count;
+} usb_root_backend_t;
+
+static LITEOS_BLOCK_DEVICE g_usb_root_block_device;
+static LITEOS_FAT32 g_usb_root_filesystem;
+static usb_root_backend_t g_usb_root_backend;
+
+/* USB-root probing runs before the serial helper definitions below. */
+static void serial_write(const CHAR8 *text);
+static void serial_write_u32(UINT32 value);
 
 static VOID store_u16(UINT8 *destination, UINT16 value) {
     destination[0] = (UINT8)value;
@@ -137,6 +158,304 @@ static BOOLEAN fat32_test_write(VOID *context, UINT64 lba, UINT32 count,
 static UINT32 load_u32(const UINT8 *source) {
     return (UINT32)source[0] | ((UINT32)source[1] << 8) |
            ((UINT32)source[2] << 16) | ((UINT32)source[3] << 24);
+}
+
+static UINT64 usb_root_load_u64(const UINT8 *source) {
+    return (UINT64)source[0] |
+           ((UINT64)source[1] << 8) |
+           ((UINT64)source[2] << 16) |
+           ((UINT64)source[3] << 24) |
+           ((UINT64)source[4] << 32) |
+           ((UINT64)source[5] << 40) |
+           ((UINT64)source[6] << 48) |
+           ((UINT64)source[7] << 56);
+}
+
+static VOID usb_root_zero(VOID *memory, UINTN size) {
+    UINT8 *bytes = (UINT8 *)memory;
+    if (bytes == 0) return;
+    for (UINTN index = 0U; index < size; ++index) bytes[index] = 0U;
+}
+
+static BOOLEAN usb_root_read(VOID *context, UINT64 lba,
+                             UINT32 count, VOID *buffer) {
+    usb_root_backend_t *backend = (usb_root_backend_t *)context;
+    if (backend == 0 || backend->parent == 0 || buffer == 0 ||
+        count == 0U || lba > backend->block_count ||
+        count > backend->block_count - lba ||
+        backend->start_lba > UINT64_MAX - lba) {
+        return 0;
+    }
+    return liteos_block_read(backend->parent,
+                             backend->start_lba + lba,
+                             count, buffer);
+}
+
+static BOOLEAN usb_root_write(VOID *context, UINT64 lba,
+                              UINT32 count, const VOID *buffer) {
+    usb_root_backend_t *backend = (usb_root_backend_t *)context;
+    if (backend == 0 || backend->parent == 0 || buffer == 0 ||
+        count == 0U || lba > backend->block_count ||
+        count > backend->block_count - lba ||
+        backend->start_lba > UINT64_MAX - lba) {
+        return 0;
+    }
+    return liteos_block_write(backend->parent,
+                              backend->start_lba + lba,
+                              count, buffer);
+}
+
+static BOOLEAN usb_root_flush(VOID *context) {
+    usb_root_backend_t *backend = (usb_root_backend_t *)context;
+    return backend != 0 && backend->parent != 0 &&
+           liteos_block_flush(backend->parent);
+}
+
+static VOID usb_root_prepare_slice(LITEOS_BLOCK_DEVICE *parent,
+                                   UINT64 start_lba,
+                                   UINT64 block_count) {
+    usb_root_zero(&g_usb_root_backend, sizeof(g_usb_root_backend));
+    usb_root_zero(&g_usb_root_block_device, sizeof(g_usb_root_block_device));
+
+    g_usb_root_backend.parent = parent;
+    g_usb_root_backend.start_lba = start_lba;
+    g_usb_root_backend.block_count = block_count;
+
+    g_usb_root_block_device.Name[0] = 'u';
+    g_usb_root_block_device.Name[1] = 's';
+    g_usb_root_block_device.Name[2] = 'b';
+    g_usb_root_block_device.Name[3] = 'r';
+    g_usb_root_block_device.Name[4] = 'o';
+    g_usb_root_block_device.Name[5] = 'o';
+    g_usb_root_block_device.Name[6] = 't';
+    g_usb_root_block_device.Name[7] = 0;
+    g_usb_root_block_device.BlockSize = parent->BlockSize;
+    g_usb_root_block_device.BlockCount = block_count;
+    g_usb_root_block_device.Read = usb_root_read;
+    g_usb_root_block_device.Write = usb_root_write;
+    g_usb_root_block_device.Flush = usb_root_flush;
+    g_usb_root_block_device.Context = &g_usb_root_backend;
+    g_usb_root_block_device.Registered = 1;
+}
+
+static BOOLEAN usb_root_has_required_files(LITEOS_FAT32 *filesystem) {
+    os_file_info_t info = {0};
+
+    if (filesystem == 0 ||
+        !liteos_fat32_stat_path(filesystem, "/init", &info) ||
+        info.type != OS_FILE_TYPE_REGULAR) {
+        return 0;
+    }
+
+    info = (os_file_info_t){0};
+    return liteos_fat32_stat_path(filesystem, "/init-runtime", &info) &&
+           info.type == OS_FILE_TYPE_REGULAR;
+}
+
+static BOOLEAN usb_root_try_slice(LITEOS_BLOCK_DEVICE *parent,
+                                  UINT64 start_lba,
+                                  UINT64 block_count) {
+    if (parent == 0 || !parent->Registered ||
+        parent->BlockSize < 512U || parent->BlockSize > 4096U ||
+        start_lba >= parent->BlockCount ||
+        block_count == 0U ||
+        block_count > parent->BlockCount - start_lba) {
+        return 0;
+    }
+
+    usb_root_prepare_slice(parent, start_lba, block_count);
+    usb_root_zero(&g_usb_root_filesystem, sizeof(g_usb_root_filesystem));
+
+    if (!liteos_fat32_init(&g_usb_root_filesystem,
+                            &g_usb_root_block_device)) {
+        return 0;
+    }
+
+    if (!usb_root_has_required_files(&g_usb_root_filesystem)) {
+        (void)liteos_fat32_destroy(&g_usb_root_filesystem);
+        usb_root_zero(&g_usb_root_filesystem,
+                      sizeof(g_usb_root_filesystem));
+        return 0;
+    }
+
+    if (vfs_mount_fat32("/", &g_usb_root_filesystem) != K_OK) {
+        (void)liteos_fat32_destroy(&g_usb_root_filesystem);
+        usb_root_zero(&g_usb_root_filesystem,
+                      sizeof(g_usb_root_filesystem));
+        return 0;
+    }
+
+    return 1;
+}
+
+static BOOLEAN usb_root_try_gpt(LITEOS_BLOCK_DEVICE *device) {
+    UINT8 sector[4096];
+    UINT64 entries_lba;
+    UINT32 entry_count;
+    UINT32 entry_size;
+    UINT32 entries_per_block;
+    UINT64 loaded_lba = UINT64_MAX;
+
+    if (device == 0 || device->BlockSize > sizeof(sector) ||
+        device->BlockCount <= 2U ||
+        !liteos_block_read(device, 1U, 1U, sector)) {
+        return 0;
+    }
+
+    static const UINT8 signature[8] = {
+        'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T'
+    };
+    for (UINT32 index = 0U; index < sizeof(signature); ++index) {
+        if (sector[index] != signature[index]) return 0;
+    }
+
+    entries_lba = usb_root_load_u64(sector + 72U);
+    entry_count = load_u32(sector + 80U);
+    entry_size = load_u32(sector + 84U);
+
+    if (entries_lba == 0U || entries_lba >= device->BlockCount ||
+        entry_count == 0U || entry_size < 128U ||
+        entry_size > device->BlockSize ||
+        device->BlockSize % entry_size != 0U) {
+        return 0;
+    }
+
+    entries_per_block = device->BlockSize / entry_size;
+    if (entry_count > 128U) entry_count = 128U;
+
+    for (UINT32 index = 0U; index < entry_count; ++index) {
+        UINT64 entry_block =
+            entries_lba + (UINT64)(index / entries_per_block);
+        UINT32 entry_offset =
+            (index % entries_per_block) * entry_size;
+        UINT8 *entry;
+        BOOLEAN type_nonzero = 0;
+
+        if (entry_block >= device->BlockCount) break;
+        if (loaded_lba != entry_block) {
+            if (!liteos_block_read(device, entry_block, 1U, sector)) {
+                return 0;
+            }
+            loaded_lba = entry_block;
+        }
+
+        entry = sector + entry_offset;
+        for (UINT32 byte = 0U; byte < 16U; ++byte) {
+            if (entry[byte] != 0U) {
+                type_nonzero = 1;
+                break;
+            }
+        }
+        if (!type_nonzero) continue;
+
+        UINT64 first_lba = usb_root_load_u64(entry + 32U);
+        UINT64 last_lba = usb_root_load_u64(entry + 40U);
+        if (first_lba == 0U || last_lba < first_lba ||
+            first_lba >= device->BlockCount ||
+            last_lba >= device->BlockCount) {
+            continue;
+        }
+
+        if (usb_root_try_slice(device, first_lba,
+                               last_lba - first_lba + 1U)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static BOOLEAN usb_root_try_device(LITEOS_BLOCK_DEVICE *device) {
+    UINT8 sector[4096];
+    BOOLEAN protective_gpt = 0;
+
+    if (device == 0 || !device->Registered ||
+        device->BlockSize < 512U ||
+        device->BlockSize > sizeof(sector) ||
+        device->BlockCount == 0U) {
+        return 0;
+    }
+
+    if (usb_root_try_slice(device, 0U, device->BlockCount)) {
+        return 1;
+    }
+
+    if (!liteos_block_read(device, 0U, 1U, sector) ||
+        sector[510] != 0x55U || sector[511] != 0xAAU) {
+        return 0;
+    }
+
+    for (UINT32 partition = 0U; partition < 4U; ++partition) {
+        UINT32 offset = 446U + partition * 16U;
+        if (sector[offset + 4U] == 0xEEU) {
+            protective_gpt = 1;
+            break;
+        }
+    }
+
+    if (protective_gpt && usb_root_try_gpt(device)) {
+        return 1;
+    }
+
+    for (UINT32 partition = 0U; partition < 4U; ++partition) {
+        UINT32 offset = 446U + partition * 16U;
+        UINT8 type = sector[offset + 4U];
+        UINT64 start_lba = load_u32(sector + offset + 8U);
+        UINT64 block_count = load_u32(sector + offset + 12U);
+
+        if (type == 0U || type == 0xEEU ||
+            start_lba == 0U || block_count == 0U) {
+            continue;
+        }
+
+        if (usb_root_try_slice(device, start_lba, block_count)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static BOOLEAN mount_usb_root_filesystem(void) {
+    if (!xhci_hardware_present() ||
+        !xhci_usb_mass_storage_configured()) {
+        return 0;
+    }
+
+    for (UINT32 slot = 1U; slot < 256U; ++slot) {
+        uint8_t interface_number = 0U;
+        uint8_t bulk_in = 0U;
+        uint8_t bulk_out = 0U;
+
+        if (!xhci_usb_msc_query((uint8_t)slot, &interface_number,
+                                &bulk_in, &bulk_out)) {
+            continue;
+        }
+
+        serial_write("LITEOS_ROOT_USB_ATTACH SLOT=");
+        serial_write_u32(slot);
+        serial_write("\r\n");
+
+        if (!usb_msc_attach((uint8_t)slot)) {
+            serial_write("LITEOS_ROOT_USB_ATTACH_FAIL SLOT=");
+            serial_write_u32(slot);
+            serial_write("\r\n");
+            continue;
+        }
+
+        LITEOS_BLOCK_DEVICE *device =
+            usb_msc_block_device((uint8_t)slot);
+        if (device == 0) continue;
+
+        if (usb_root_try_device(device)) {
+            serial_write("LITEOS_ROOT_USB_VOLUME_OK SLOT=");
+            serial_write_u32(slot);
+            serial_write("\r\n");
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 static kstatus_t nvme_fat32_submit(nvme_fat32_backend_t *backend,
@@ -2756,11 +3075,31 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
         halt_forever();
     }
     serial_write("LITEOS_FAT32_OK\r\n");
-    if (!mount_nvme_root_filesystem(active_nvme == 0 ? 0 : active_nvme->device)) {
-        serial_write("LITEOS_ROOT_NVME_MOUNT_FAIL\r\n");
+    /*
+     * LITEOS_USB_ROOT_PATCH_V1
+     *
+     * Prefer a removable root volume containing the complete LiteOS payload.
+     * If no suitable USB volume exists, retain the original NVMe behavior.
+     */
+    BOOLEAN root_mounted = 0;
+
+    if (mount_usb_root_filesystem()) {
+        root_mounted = 1;
+        serial_write("LITEOS_ROOT_USB_OK\r\n");
+        serial_write("LITEOS_ROOT_SOURCE=USB\r\n");
+    }
+
+    if (!root_mounted && active_nvme != 0 &&
+        mount_nvme_root_filesystem(active_nvme->device)) {
+        root_mounted = 1;
+        serial_write("LITEOS_ROOT_NVME_OK\r\n");
+        serial_write("LITEOS_ROOT_SOURCE=NVME\r\n");
+    }
+
+    if (!root_mounted) {
+        serial_write("LITEOS_ROOT_MOUNT_FAIL USB_OR_NVME\r\n");
         halt_forever();
     }
-    serial_write("LITEOS_ROOT_NVME_OK\r\n");
     if (!user_elf_loader_self_test()) {
         serial_write("LITEOS_USER_ELF_FAIL\r\n");
         halt_forever();
