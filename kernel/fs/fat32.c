@@ -32,6 +32,23 @@ static VOID fat32_open_files_unlock(LITEOS_FAT32 *filesystem) {
 }
 
 /*
+ * The block-cache lock only protects one cached sector.  FAT allocation and
+ * directory updates are multi-sector transactions, so writers need a
+ * filesystem-wide mutation lock to keep two threads from allocating or
+ * linking the same free cluster concurrently.
+ */
+static VOID fat32_mutation_lock(LITEOS_FAT32 *filesystem) {
+    while (__atomic_exchange_n(&filesystem->MutationLock, 1U,
+                               __ATOMIC_ACQUIRE) != 0U) {
+        __asm__ volatile ("pause");
+    }
+}
+
+static VOID fat32_mutation_unlock(LITEOS_FAT32 *filesystem) {
+    __atomic_store_n(&filesystem->MutationLock, 0U, __ATOMIC_RELEASE);
+}
+
+/*
  * 删除操作需要同时修改目录项和所有 FAT 副本。簇链快照只保存将被
  * 清空的 FAT 项，失败时可以把已写入的项恢复到操作前的值；这比只
  * 恢复 FAT1 更安全，也兼容可选的第三份 extent FAT。
@@ -1246,8 +1263,9 @@ static BOOLEAN fat32_read(LITEOS_VFS_NODE *node, UINT64 offset, VOID *buffer,
     return 1;
 }
 
-static BOOLEAN fat32_write(LITEOS_VFS_NODE *node, UINT64 offset, const VOID *buffer,
-                           UINT32 size, UINT32 *written_size) {
+static BOOLEAN fat32_write_locked(LITEOS_VFS_NODE *node, UINT64 offset,
+                                  const VOID *buffer, UINT32 size,
+                                  UINT32 *written_size) {
     LITEOS_FAT32_FILE *file = node == 0 ? 0 : (LITEOS_FAT32_FILE *)node->FileContext;
     LITEOS_FAT32 *filesystem = file == 0 ? 0 : file->FileSystem;
     UINT8 sector[4096];
@@ -1277,6 +1295,21 @@ static BOOLEAN fat32_write(LITEOS_VFS_NODE *node, UINT64 offset, const VOID *buf
         *written_size += copy_size;
     }
     return 1;
+}
+
+static BOOLEAN fat32_write(LITEOS_VFS_NODE *node, UINT64 offset,
+                           const VOID *buffer, UINT32 size,
+                           UINT32 *written_size) {
+    LITEOS_FAT32_FILE *file =
+        node == 0 ? 0 : (LITEOS_FAT32_FILE *)node->FileContext;
+    LITEOS_FAT32 *filesystem = file == 0 ? 0 : file->FileSystem;
+    BOOLEAN success;
+    if (filesystem == 0) return 0;
+
+    fat32_mutation_lock(filesystem);
+    success = fat32_write_locked(node, offset, buffer, size, written_size);
+    fat32_mutation_unlock(filesystem);
+    return success;
 }
 
 static BOOLEAN fat32_close(LITEOS_VFS_NODE *node) {
@@ -1336,8 +1369,8 @@ BOOLEAN liteos_fat32_write_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
     return success;
 }
 
-BOOLEAN liteos_fat32_truncate_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
-                                    UINT64 size) {
+static BOOLEAN fat32_truncate_path_locked(LITEOS_FAT32 *filesystem,
+                                          const CHAR8 *path, UINT64 size) {
     LITEOS_VFS_NODE node = {0};
     LITEOS_FAT32_FILE *file;
     BOOLEAN success;
@@ -1348,6 +1381,16 @@ BOOLEAN liteos_fat32_truncate_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
     success = truncate_file_to(file, size);
     if (node.Operations != 0 && node.Operations->Close != 0 &&
         !node.Operations->Close(&node)) success = 0;
+    return success;
+}
+
+BOOLEAN liteos_fat32_truncate_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+                                    UINT64 size) {
+    BOOLEAN success;
+    if (filesystem == 0) return 0;
+    fat32_mutation_lock(filesystem);
+    success = fat32_truncate_path_locked(filesystem, path, size);
+    fat32_mutation_unlock(filesystem);
     return success;
 }
 
@@ -1478,8 +1521,9 @@ static BOOLEAN make_creation_name(LITEOS_FAT32 *filesystem, UINT32 parent,
     return 0;
 }
 
-BOOLEAN liteos_fat32_create_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
-                                  BOOLEAN directory) {
+static BOOLEAN fat32_create_path_locked(LITEOS_FAT32 *filesystem,
+                                        const CHAR8 *path,
+                                        BOOLEAN directory) {
     CHAR8 leaf[LITEOS_VFS_PATH_LENGTH];
     UINT8 entry[FAT32_ENTRY_SIZE];
     UINT8 short_name[11];
@@ -1548,7 +1592,18 @@ BOOLEAN liteos_fat32_create_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
     return 0;
 }
 
-BOOLEAN liteos_fat32_remove_path(LITEOS_FAT32 *filesystem, const CHAR8 *path) {
+BOOLEAN liteos_fat32_create_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+                                  BOOLEAN directory) {
+    BOOLEAN success;
+    if (filesystem == 0) return 0;
+    fat32_mutation_lock(filesystem);
+    success = fat32_create_path_locked(filesystem, path, directory);
+    fat32_mutation_unlock(filesystem);
+    return success;
+}
+
+static BOOLEAN fat32_remove_path_locked(LITEOS_FAT32 *filesystem,
+                                        const CHAR8 *path) {
     CHAR8 leaf[LITEOS_VFS_PATH_LENGTH];
     UINT8 entry[FAT32_ENTRY_SIZE];
     UINT64 lfn_lba[FAT32_MAX_LFN_ENTRIES];
@@ -1606,9 +1661,22 @@ BOOLEAN liteos_fat32_remove_path(LITEOS_FAT32 *filesystem, const CHAR8 *path) {
     return 0;
 }
 
+BOOLEAN liteos_fat32_remove_path(LITEOS_FAT32 *filesystem, const CHAR8 *path) {
+    BOOLEAN success;
+    if (filesystem == 0) return 0;
+    fat32_mutation_lock(filesystem);
+    success = fat32_remove_path_locked(filesystem, path);
+    fat32_mutation_unlock(filesystem);
+    return success;
+}
+
 BOOLEAN liteos_fat32_sync(LITEOS_FAT32 *filesystem) {
-    return filesystem != 0 && filesystem->Mounted &&
-           liteos_block_cache_flush(&filesystem->Cache);
+    BOOLEAN success;
+    if (filesystem == 0 || !filesystem->Mounted) return 0;
+    fat32_mutation_lock(filesystem);
+    success = liteos_block_cache_flush(&filesystem->Cache);
+    fat32_mutation_unlock(filesystem);
+    return success;
 }
 
 BOOLEAN liteos_fat32_init(LITEOS_FAT32 *filesystem,
@@ -1695,6 +1763,7 @@ BOOLEAN liteos_fat32_init(LITEOS_FAT32 *filesystem,
         return 0;
     }
     filesystem->OpenFileLock = 0U;
+    filesystem->MutationLock = 0U;
     for (UINT32 i = 0; i < LITEOS_FAT32_MAX_OPEN_FILES; ++i) {
         filesystem->OpenFiles[i].Used = 0;
     }

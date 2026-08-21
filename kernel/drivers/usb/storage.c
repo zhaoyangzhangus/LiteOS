@@ -97,14 +97,33 @@ static bool usb_msc_manager_init_once(void) {
     return state == 2U;
 }
 
+/*
+ * BOT is strictly single-command-at-a-time for one interface.  `busy` used to
+ * behave like a try-lock, so a second filesystem request racing the current
+ * request was reported as an I/O error.  That is especially easy to hit while
+ * the desktop loads files and writes state concurrently.
+ *
+ * Wait for the current BOT transaction instead.  Do not disable preemption
+ * here: the owner may be running on this CPU and must be allowed to complete.
+ */
 static bool usb_msc_enter(usb_msc_device_t *device) {
-    bool expected = false;
-    if (device == 0 ||
-        !atomic_compare_exchange_strong_explicit(
-            &device->busy, &expected, true,
-            memory_order_acq_rel, memory_order_acquire)) {
-        return false;
+    if (device == 0) return false;
+
+    for (;;) {
+        if (!atomic_load_explicit(&device->online, memory_order_acquire)) {
+            return false;
+        }
+
+        bool expected = false;
+        if (atomic_compare_exchange_weak_explicit(
+                &device->busy, &expected, true,
+                memory_order_acq_rel, memory_order_acquire)) {
+            break;
+        }
+        __asm__ volatile ("pause");
     }
+
+    /* Detach can race the acquisition.  Never start a new command offline. */
     if (!atomic_load_explicit(&device->online, memory_order_acquire)) {
         atomic_store_explicit(&device->busy, false, memory_order_release);
         return false;

@@ -6,7 +6,11 @@
 #include "vfs.h"
 #include <uapi/file.h>
 
-#define LITEOS_FAT32_MAX_OPEN_FILES 16U
+/*
+ * Path based VFS I/O uses a short-lived FAT file slot for every operation.
+ * Keep the table bounded, but allow normal SMP desktop I/O concurrency.
+ */
+#define LITEOS_FAT32_MAX_OPEN_FILES 64U
 
 typedef struct LITEOS_FAT32 LITEOS_FAT32;
 
@@ -43,6 +47,8 @@ struct LITEOS_FAT32 {
     BOOLEAN Fat3Available;
     LITEOS_BLOCK_CACHE Cache;
     UINT32 OpenFileLock;
+    /* Serializes FAT/directory metadata mutation transactions. */
+    UINT32 MutationLock;
     LITEOS_FAT32_FILE OpenFiles[LITEOS_FAT32_MAX_OPEN_FILES];
     BOOLEAN Mounted;
 };

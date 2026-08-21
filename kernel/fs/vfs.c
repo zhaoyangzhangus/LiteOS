@@ -634,9 +634,11 @@ static kstatus_t vfs_create_fat32_vnode(const char *path, vnode_t **out) {
         kfree(backend);
         return K_ENOMEM;
     }
-    /* FAT32 路径也必须拥有规范 vnode，否则不同句柄各自维护页缓存，
-     * mmap 与直接 I/O 会观察到不同内容。注册引用长期保留，调用者再持有
-     * 一个引用，语义与内存后端节点一致。 */
+    /*
+     * Prefer a canonical FAT vnode so mmap and direct I/O share one page
+     * cache.  The registry is only a cache, though: exhausting its fixed
+     * slots must never make an otherwise valid disk file impossible to open.
+     */
     vfs_initialize();
     vfs_lock();
     vnode_t *existing = vfs_find_node_locked(path);
@@ -655,9 +657,15 @@ static kstatus_t vfs_create_fat32_vnode(const char *path, vnode_t **out) {
         }
     }
     if (slot == VFS_MEMORY_NODE_LIMIT) {
+        /*
+         * All canonical slots are occupied.  Return this vnode uncached
+         * instead of turning the 65th distinct FAT path into K_ENOMEM.
+         * Existing cached paths remain canonical; this transient vnode is
+         * destroyed when its last file/mapping reference is released.
+         */
         vfs_unlock();
-        object_put(vnode);
-        return K_ENOMEM;
+        *out = vnode;
+        return K_OK;
     }
     g_vfs_nodes[slot] = vnode;
     object_get(vnode);
