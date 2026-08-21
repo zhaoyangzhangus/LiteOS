@@ -123,6 +123,42 @@ $(FONT_HEADER): $(FONT_GENERATOR) $(FONT_TTF) | $(BUILD)/generated
 $(BUILD)/esp/boot $(BUILD)/esp/lib $(BUILD)/esp/sbin:
 	mkdir -p $@
 
+# Desktop artwork is kept at its original resolution on the boot volume.
+# The compositor can load these files after the root filesystem is mounted;
+# no scaled or pixel-expanded copy is embedded in the kernel image.
+DESKTOP_ASSET_DIR = $(BUILD)/esp/etc/desktop
+VFS_SELF_TEST_SEED = $(BUILD)/esp/etc/vfsmap.tst
+DESKTOP_ASSETS = $(DESKTOP_ASSET_DIR)/wall.png \
+	$(DESKTOP_ASSET_DIR)/icons.png \
+	$(DESKTOP_ASSET_DIR)/fm.png \
+	$(DESKTOP_ASSET_DIR)/wall.raw \
+	$(DESKTOP_ASSET_DIR)/icons.raw \
+	$(DESKTOP_ASSET_DIR)/fm.raw
+
+$(DESKTOP_ASSET_DIR):
+	mkdir -p $@
+
+$(DESKTOP_ASSET_DIR)/wall.png: assets/desktop/liteos-wallpaper.png | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
+$(DESKTOP_ASSET_DIR)/icons.png: assets/desktop/macos-icons.png | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
+$(DESKTOP_ASSET_DIR)/fm.png: assets/desktop/file-manager-icon.png | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
+$(DESKTOP_ASSET_DIR)/wall.raw: assets/desktop/liteos-wallpaper.rgba | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
+$(DESKTOP_ASSET_DIR)/icons.raw: assets/desktop/macos-icons.rgba | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
+$(DESKTOP_ASSET_DIR)/fm.raw: assets/desktop/file-manager-icon.rgba | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
+$(VFS_SELF_TEST_SEED): assets/desktop/vfsmap.tst | $(DESKTOP_ASSET_DIR)
+	cp $< $@
+
 $(BUILD)/loader/%.o: src/%.c | $(BUILD)/loader
 	$(CC) $(COMMON_CFLAGS) -c $< -o $@
 
@@ -734,6 +770,8 @@ $(BUILD)/esp/sbin/netd: $(USER_NETD_ELF) | $(BUILD)/esp/sbin
 
 esp: $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI $(KERNEL_ELF) \
      $(BUILD)/esp/EFI/LITEOS/loader.conf $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS) \
+     $(DESKTOP_ASSETS) \
+     $(VFS_SELF_TEST_SEED) \
      $(BUILD)/esp/init $(BUILD)/esp/init-runtime \
      $(BUILD)/esp/boot/exec-exit.elf $(BUILD)/esp/lib/ld-liteos.so.1 \
      $(BUILD)/esp/sbin/deviced $(BUILD)/esp/sbin/logd \

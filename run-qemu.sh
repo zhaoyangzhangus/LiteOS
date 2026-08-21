@@ -129,18 +129,24 @@ fi
     exit 1
 }
 
-# The kernel VFS file-mapping self-test creates this temporary file at the
-# ESP root.  The QEMU 10 vvfat backend cannot reopen the synthetic FAT image
-# after that extra root entry appears, so quarantine it between runs instead
-# of letting the next invocation abort inside block/vvfat.c.
-stale_vfs_test="$build_dir/esp/vfs-filemap-test"
-if [[ -e "$stale_vfs_test" ]]; then
-    stale_dir="$build_dir/qemu-stale"
-    mkdir -p "$stale_dir"
-    stale_target="$stale_dir/vfs-filemap-test.$$"
-    mv "$stale_vfs_test" "$stale_target"
-    echo "Quarantined stale VFS test file: $stale_target"
-fi
+# The kernel VFS self-tests create temporary entries at the ESP root.  QEMU
+# 10's vvfat backend can leave those entries visible on the host after the
+# guest removes them; on the next boot they make the mkdir/create checks fail
+# (or trigger a vvfat assertion).  Quarantine every known self-test artifact
+# before constructing the synthetic FAT image.  Moving keeps the evidence
+# recoverable while making the boot directory deterministic.
+stale_dir="$build_dir/qemu-stale"
+mkdir -p "$stale_dir"
+for stale_entry in \
+    "$build_dir/esp/vfs-api" \
+    "$build_dir/esp/vfs-filemap-test"* \
+    "$build_dir/esp/etc/vfs-filemap-test"*; do
+    [[ -e "$stale_entry" ]] || continue
+    stale_name="$(basename -- "$stale_entry")"
+    stale_target="$stale_dir/"$stale_name".$$"
+    mv -- "$stale_entry" "$stale_target"
+    echo "Quarantined stale VFS artifact: $stale_target"
+done
 
 mkdir -p "$build_dir"
 qemu_args=(

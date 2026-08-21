@@ -43,22 +43,12 @@
 #endif
 #define WINDOW_COMPOSITOR_COPY_MAX_WORKERS 2U
 #define WINDOW_COMPOSITOR_COPY_STACK_SIZE (32U * 1024U)
+#define WINDOW_DESKTOP_ASSET_WORKER_STACK_SIZE (32U * 1024U)
 
 /* WB desktop-cache -> WB retained-scene copies must stay cached. */
 #ifndef WINDOW_COMPOSITOR_PARALLEL_WB_COPY
 #define WINDOW_COMPOSITOR_PARALLEL_WB_COPY 0U
 #endif
-#ifndef WINDOW_COMPOSITOR_TARGET_HZ
-/* QEMU's GOP is normally 60 Hz; callers can override this at build time
- * (for example -DWINDOW_COMPOSITOR_TARGET_HZ=120). */
-#define WINDOW_COMPOSITOR_TARGET_HZ 60U
-#endif
-#if WINDOW_COMPOSITOR_TARGET_HZ == 0U
-#error "WINDOW_COMPOSITOR_TARGET_HZ must be non-zero"
-#endif
-#define WINDOW_COMPOSITOR_FRAME_PERIOD_NS \
-    (1000000000ULL / WINDOW_COMPOSITOR_TARGET_HZ)
-
 #define WINDOW_TITLEBAR_HEIGHT 30U
 
 /*
@@ -83,7 +73,7 @@
 #define WINDOW_CURSOR_HOTSPOT_Y 1U
 
 /* LiteOS desktop shell: wallpaper, icons and launcher. */
-#define DESKTOP_TOPBAR_HEIGHT        38U
+#define DESKTOP_TOPBAR_HEIGHT        0U
 
 #define DESKTOP_DOCK_HEIGHT          84U
 #define DESKTOP_DOCK_BOTTOM          18U
@@ -98,6 +88,8 @@
 #define DESKTOP_ICON_IMAGE_WIDTH     48U
 #define DESKTOP_ICON_IMAGE_HEIGHT    48U
 #define DESKTOP_PROGRAM_MAX_BYTES    (16ULL * 1024ULL * 1024ULL)
+#define DESKTOP_ASSET_MAX_BYTES      (16ULL * 1024ULL * 1024ULL)
+#define DESKTOP_ASSET_HEADER_SIZE    21U
 
 enum {
     DESKTOP_APP_NONE = 0U,
@@ -122,9 +114,10 @@ enum {
 
 /*
  * Most legacy clients still use the compositor-owned frame.  A client that
- * opts into OS_WINDOW_CLIENT_DECORATIONS owns the entire visible rectangle:
- * no Ring0 frame/titlebar is painted and pointer coordinates are delivered
- * directly in client space.
+ * opts into OS_WINDOW_CLIENT_DECORATIONS owns the visible surface and its
+ * chrome: no Ring0 frame/titlebar is painted and pointer coordinates are
+ * delivered directly in client space.  The compositor still clips every
+ * window to the common rounded-corner shape.
  */
 static bool window_client_decorations(uint32_t flags) {
     return (flags & OS_WINDOW_CLIENT_DECORATIONS) != 0U;
@@ -304,6 +297,10 @@ static uint8_t g_compositor_copy_worker_stacks
     [WINDOW_COMPOSITOR_COPY_STACK_SIZE]
     __attribute__((aligned(16)));
 
+static wait_queue_t g_desktop_asset_waitq;
+static atomic_bool g_desktop_assets_available;
+static atomic_bool g_desktop_assets_pending;
+
 
 
 
@@ -321,7 +318,6 @@ static struct {
     wait_queue_t event_waitq;
     wait_queue_t worker_waitq;
     atomic_uint_fast64_t worker_generation;
-    uint64_t last_frame_tsc;
     window_server_window_t *windows[WINDOW_SERVER_MAX_WINDOWS];
     uint32_t count;
     uint32_t next_identifier;
@@ -339,7 +335,7 @@ static struct {
     /* The WB composite buffer is a clean reusable scene and never contains
      * the software cursor.  These fields track the cursor actually overlaid
      * on the WC scanout so pointer motion can be presented independently of
-     * the 60Hz scene scheduler. */
+     * scene composition. */
     uint32_t presented_pointer_x;
     uint32_t presented_pointer_y;
     bool presented_pointer_valid;
@@ -376,6 +372,8 @@ static struct {
 
     thread_t worker;
     atomic_bool worker_started;
+    thread_t desktop_asset_worker;
+    atomic_bool desktop_asset_worker_started;
 
     bool kernel_ready;
     bool dirty;
@@ -393,6 +391,10 @@ static struct {
 } g_window_server;
 
 static uint8_t g_window_server_worker_stack[WINDOW_SERVER_WORKER_STACK_SIZE]
+    __attribute__((aligned(16)));
+
+static uint8_t g_desktop_asset_worker_stack
+    [WINDOW_DESKTOP_ASSET_WORKER_STACK_SIZE]
     __attribute__((aligned(16)));
 
 static atomic_uint g_window_server_init_state;
@@ -437,6 +439,9 @@ static void focus_locked(window_server_window_t *window);
 static void window_server_pump_input_mode(bool compose_now);
 static void compositor_present_cursor_direct(bool force);
 static bool window_server_start_copy_workers(uint32_t compositor_cpu);
+static bool window_server_start_desktop_asset_worker(uint32_t compositor_cpu);
+static void __attribute__((noreturn)) desktop_asset_worker_main(void *argument);
+static bool desktop_load_assets(void);
 static bool compositor_copy_rect_parallel_buffers(
     volatile uint32_t *destination,
     const volatile uint32_t *source,
@@ -467,12 +472,14 @@ bool window_server_init(void) {
         wait_queue_init(&g_window_server.event_waitq);
         wait_queue_init(&g_window_server.worker_waitq);
         wait_queue_init(&g_compositor_copy_waitq);
+        wait_queue_init(&g_desktop_asset_waitq);
         atomic_init(&g_window_server.worker_generation, 0U);
         atomic_init(&g_compositor_copy_generation, 0U);
         atomic_init(&g_compositor_copy_completed, 0U);
         atomic_init(&g_compositor_copy_worker_count, 0U);
         atomic_init(&g_compositor_copy_workers_started, false);
-        g_window_server.last_frame_tsc = 0U;
+        atomic_init(&g_desktop_assets_available, false);
+        atomic_init(&g_desktop_assets_pending, false);
         g_window_server.count = 0U;
         g_window_server.next_identifier = 1U;
         g_window_server.focused_identifier = 0U;
@@ -512,6 +519,7 @@ bool window_server_init(void) {
         g_window_server.title_pressed_client = false;
         g_window_server.title_pressed_event = (input_event_t){0};
         atomic_init(&g_window_server.worker_started, false);
+        atomic_init(&g_window_server.desktop_asset_worker_started, false);
         g_window_server.kernel_ready = false;
         g_window_server.dirty = false;
         g_window_server.composing = false;
@@ -550,19 +558,6 @@ static bool window_server_worker_ready(void *context) {
     return dirty;
 }
 
-typedef struct window_worker_change_context {
-    uint64_t generation;
-} window_worker_change_context_t;
-
-static bool window_server_worker_change_ready(void *context) {
-    window_worker_change_context_t *wait =
-        (window_worker_change_context_t *)context;
-    return input_core_pending() != 0U ||
-           (wait != 0 &&
-            atomic_load_explicit(&g_window_server.worker_generation,
-                                 memory_order_acquire) != wait->generation);
-}
-
 void window_server_notify_worker(void) {
     if (!window_server_init() ||
         !atomic_load_explicit(&g_window_server.worker_started,
@@ -577,9 +572,6 @@ void window_server_notify_worker(void) {
 static void __attribute__((noreturn)) window_server_worker_main(void *argument) {
     (void)argument;
     for (;;) {
-        window_worker_change_context_t wait_context;
-        uint64_t remaining_ns;
-
         /* The worker is woken by both input reports and client
          * WINDOW_UPDATE submissions.  The predicate/blocked handshake in
          * wait_on_queue closes the producer-to-sleep lost-wakeup window. */
@@ -587,19 +579,18 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
                           window_server_worker_ready, 0,
                           UINT64_MAX) != K_OK) continue;
 
-        /* Update pointer/window state as soon as reports arrive, but keep
-         * expensive WB rendering and GOP publication on the frame deadline.
-         * This is the key separation between input latency and composition
-         * frequency required by W2. */
+        /* Update input and publish dirty scene regions immediately.  There
+         * is deliberately no fixed refresh-period sleep here: the display
+         * backend has no vblank/page-flip primitive, so an artificial 60Hz
+         * deadline only adds visible drag and repaint latency. */
         for (;;) {
             if (input_core_pending() != 0U) {
                 window_server_pump_input_mode(false);
 
                 /*
-                 * Pointer state is processed immediately, while normal scene
-                 * composition remains frame-paced.  The retained WB scene is
-                 * cursor-free, so restoring the previous 24x24 cursor and
-                 * overlaying the new one is cheap and safe at HID rate.
+                 * The retained WB scene is cursor-free, so restoring the
+                 * previous 24x24 cursor and overlaying the new one is cheap
+                 * and safe at HID rate.
                  */
                 compositor_present_cursor_direct(false);
             }
@@ -612,31 +603,9 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
                 if (!dirty) break;
             }
 
-            if (g_window_server.last_frame_tsc == 0U) {
-                /* Anchor the deadline at frame start.  Anchoring it after
-                 * composition adds a full period on top of a slow render,
-                 * turning an already expensive drag into visible lag. */
-                g_window_server.last_frame_tsc = x86_read_tsc();
-                window_server_pump_input_mode(true);
-                break;
-            }
-
-            remaining_ns = x86_tsc_to_ns(
-                x86_read_tsc() - g_window_server.last_frame_tsc);
-            remaining_ns = remaining_ns >= WINDOW_COMPOSITOR_FRAME_PERIOD_NS ?
-                           0U :
-                           WINDOW_COMPOSITOR_FRAME_PERIOD_NS - remaining_ns;
-            if (remaining_ns == 0U) {
-                g_window_server.last_frame_tsc = x86_read_tsc();
-                window_server_pump_input_mode(true);
-                break;
-            }
-
-            wait_context.generation = atomic_load_explicit(
-                &g_window_server.worker_generation, memory_order_acquire);
-            (void)wait_on_queue(&g_window_server.worker_waitq,
-                                window_server_worker_change_ready,
-                                &wait_context, remaining_ns);
+            /* Drain the current damage immediately.  New damage generated
+             * while rendering is observed by the next loop iteration. */
+            window_server_pump_input_mode(true);
         }
     }
 }
@@ -715,12 +684,35 @@ bool window_server_start_worker(void) {
     worker->arch.switch_ctx.r14 = stack_top;
     worker->arch.fs_base = 0U;
 
+    /* Root assets are mounted after the early display probe.  Load them before
+     * publishing the compositor worker: otherwise the worker first presents
+     * the fallback desktop and then spends one whole frame replacing it with
+     * the large wallpaper/icon set, starving pointer routing during that
+     * transition. */
+    if (!atomic_load_explicit(&g_desktop_assets_available,
+                              memory_order_acquire) &&
+        desktop_load_assets()) {
+        atomic_store_explicit(&g_desktop_assets_available, true,
+                              memory_order_release);
+    }
+
+    window_lock();
+    window_mark_dirty_locked();
+    window_unlock();
+
     atomic_store_explicit(&g_window_server.worker_started, true,
                           memory_order_release);
     sched_enqueue(worker);
     /* Best effort: one compositor remains the scene owner; only the final
      * disjoint scanline publication is delegated to these helpers. */
     (void)window_server_start_copy_workers(worker_cpu);
+    /* If the files were unavailable during startup, retain the old one-shot
+     * retry worker as a fallback.  The normal path above is synchronous so a
+     * successful asset load never causes a second full-screen repaint. */
+    if (!atomic_load_explicit(&g_desktop_assets_available,
+                              memory_order_acquire)) {
+        (void)window_server_start_desktop_asset_worker(worker_cpu);
+    }
     if (worker_cpu == cpu_id && !sched_try_run_ready()) {
         atomic_store_explicit(&g_window_server.worker_started, false,
                               memory_order_release);
@@ -1355,8 +1347,9 @@ static void window_mark_drag_corner_repair_locked(
 
     uint32_t radius = WINDOW_CORNER_RADIUS;
 
-    if (window_client_decorations(flags) ||
-        outer_width == 0U || outer_height == 0U) {
+    (void)flags;
+
+    if (outer_width == 0U || outer_height == 0U) {
         return;
     }
 
@@ -1732,25 +1725,21 @@ typedef struct desktop_icon_entry {
     uint32_t app;
     int32_t x;
     int32_t y;
-    const char *label;
 } desktop_icon_entry_t;
 
 static const desktop_icon_entry_t g_desktop_icons[] = {
-    { DESKTOP_APP_FILES,    DESKTOP_ICON_START_X, DESKTOP_ICON_START_Y, "Files" },
+    { DESKTOP_APP_FILES,    DESKTOP_ICON_START_X, DESKTOP_ICON_START_Y },
     { DESKTOP_APP_TERMINAL, DESKTOP_ICON_START_X,
-      DESKTOP_ICON_START_Y + (int32_t)(DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y),
-      "Terminal" },
+      DESKTOP_ICON_START_Y + (int32_t)(DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) },
     { DESKTOP_APP_NOTES,    DESKTOP_ICON_START_X,
-      DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 2U),
-      "Notes" },
+      DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 2U) },
     { DESKTOP_APP_NETWORK,  DESKTOP_ICON_START_X,
-      DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 3U),
-      "Network" },
+      DESKTOP_ICON_START_Y + (int32_t)((DESKTOP_ICON_CELL_HEIGHT + DESKTOP_ICON_GAP_Y) * 3U) },
 };
 
 
 /*
- * Modern centered dock layout.
+ * Modern centered bottom-icon layout.
  *
  * g_desktop_icons keeps application metadata, while geometry is calculated
  * from the live display size. Hit testing, damage and rendering therefore
@@ -1830,13 +1819,6 @@ static bool desktop_icon_layout_locked(
 }
 
 
-static uint32_t desktop_text_length(const char *text) {
-    uint32_t length = 0U;
-    if (text == 0) return 0U;
-    while (text[length] != '\0') ++length;
-    return length;
-}
-
 static void desktop_put_pixel_locked(int32_t x, int32_t y, uint32_t color) {
     if (g_window_server.composite_framebuffer == 0 ||
         x < 0 || y < 0 ||
@@ -1872,13 +1854,190 @@ static void desktop_draw_small_glyph_locked(int32_t x, int32_t y,
     }
 }
 
-static void desktop_draw_text_locked(int32_t x, int32_t y,
-                                     const char *text, uint32_t color) {
-    if (text == 0) return;
-    for (uint32_t index = 0U; text[index] != '\0'; ++index) {
-        desktop_draw_small_glyph_locked(
-            x + (int32_t)(index * 8U), y, text[index], color);
+typedef struct desktop_asset_image {
+    uint8_t *storage;
+    const uint8_t *pixels;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+} desktop_asset_image_t;
+
+static desktop_asset_image_t g_desktop_wallpaper_asset;
+static desktop_asset_image_t g_desktop_icons_asset;
+static desktop_asset_image_t g_desktop_file_manager_asset;
+
+static void desktop_blend_asset_pixel_locked(int32_t x, int32_t y,
+                                             uint32_t pixel) {
+    uint32_t alpha;
+    uint32_t background;
+    uint32_t inverse;
+    uint32_t red;
+    uint32_t green;
+    uint32_t blue;
+    uint64_t offset;
+
+    if (x < (int32_t)g_compositor_snapshot.damage_left ||
+        y < (int32_t)g_compositor_snapshot.damage_top ||
+        x >= (int32_t)g_compositor_snapshot.damage_right ||
+        y >= (int32_t)g_compositor_snapshot.damage_bottom ||
+        x < 0 || y < 0 ||
+        x >= (int32_t)g_window_server.display_width ||
+        y >= (int32_t)g_window_server.display_height) {
+        return;
     }
+
+    alpha = pixel >> 24;
+    if (alpha == 0U) return;
+
+    offset = (uint64_t)(uint32_t)y * g_window_server.display_stride +
+             (uint32_t)x;
+    if (alpha >= 255U) {
+        g_window_server.composite_framebuffer[offset] =
+            pixel & 0x00FFFFFFU;
+        return;
+    }
+
+    background = g_window_server.composite_framebuffer[offset];
+    inverse = 255U - alpha;
+    red = ((((background >> 16) & 0xFFU) * inverse) +
+           (((pixel >> 16) & 0xFFU) * alpha) + 127U) / 255U;
+    green = ((((background >> 8) & 0xFFU) * inverse) +
+             (((pixel >> 8) & 0xFFU) * alpha) + 127U) / 255U;
+    blue = (((background & 0xFFU) * inverse) +
+            ((pixel & 0xFFU) * alpha) + 127U) / 255U;
+    g_window_server.composite_framebuffer[offset] =
+        (red << 16) | (green << 8) | blue;
+}
+
+/* Draw a small translucent rounded outline behind a hovered icon. */
+static void desktop_draw_hover_frame_locked(int32_t x, int32_t y,
+                                             uint32_t width,
+                                             uint32_t height) {
+    const uint32_t border = 2U;
+    const uint32_t color = 0x66BFE8FFU;
+
+    if (width <= border * 2U || height <= border * 2U) return;
+
+    for (uint32_t row = 0U; row < height; ++row) {
+        uint32_t outer_inset =
+            compositor_corner_inset(row, width, height);
+        int32_t outer_left = x + (int32_t)outer_inset;
+        int32_t outer_right =
+            x + (int32_t)width - (int32_t)outer_inset;
+
+        if (row < border || row >= height - border) {
+            for (int32_t column = outer_left;
+                 column < outer_right;
+                 ++column) {
+                desktop_blend_asset_pixel_locked(column,
+                                                 y + (int32_t)row,
+                                                 color);
+            }
+            continue;
+        }
+
+        uint32_t inner_row = row - border;
+        uint32_t inner_height = height - border * 2U;
+        uint32_t inner_width = width - border * 2U;
+        uint32_t inner_inset =
+            compositor_corner_inset(inner_row, inner_width, inner_height);
+        int32_t inner_left =
+            x + (int32_t)border + (int32_t)inner_inset;
+        int32_t inner_right =
+            x + (int32_t)width - (int32_t)border -
+            (int32_t)inner_inset;
+
+        for (int32_t column = outer_left;
+             column < inner_left;
+             ++column) {
+            desktop_blend_asset_pixel_locked(column,
+                                             y + (int32_t)row,
+                                             color);
+        }
+        for (int32_t column = inner_right;
+             column < outer_right;
+             ++column) {
+            desktop_blend_asset_pixel_locked(column,
+                                             y + (int32_t)row,
+                                             color);
+        }
+    }
+}
+
+static void desktop_draw_asset_icon_locked(
+    int32_t x, int32_t y, uint32_t width, uint32_t height,
+    const desktop_asset_image_t *asset,
+    uint32_t source_left, uint32_t source_top,
+    uint32_t source_width, uint32_t source_height) {
+    if (asset == 0 || asset->pixels == 0 ||
+        source_width == 0U || source_height == 0U ||
+        source_left >= asset->width || source_top >= asset->height ||
+        source_width > asset->width - source_left ||
+        source_height > asset->height - source_top ||
+        width == 0U || height == 0U) {
+        return;
+    }
+
+    for (uint32_t row = 0U; row < height; ++row) {
+        uint32_t source_y = source_top +
+            (uint32_t)(((uint64_t)row * source_height) / height);
+        const uint8_t *source = asset->pixels +
+            (uint64_t)source_y * asset->stride +
+            (uint64_t)source_left * 4U;
+        for (uint32_t column = 0U; column < width; ++column) {
+            uint32_t source_x =
+                (uint32_t)(((uint64_t)column * source_width) / width);
+            const uint8_t *pixel = source + (uint64_t)source_x * 4U;
+            desktop_blend_asset_pixel_locked(
+                x + (int32_t)column,
+                y + (int32_t)row,
+                ((uint32_t)pixel[3] << 24) |
+                ((uint32_t)pixel[0] << 16) |
+                ((uint32_t)pixel[1] << 8) |
+                pixel[2]);
+        }
+    }
+}
+
+static bool desktop_draw_wallpaper_asset_locked(void) {
+    const desktop_asset_image_t *asset = &g_desktop_wallpaper_asset;
+    int32_t image_left;
+    int32_t image_top;
+
+    if (!atomic_load_explicit(&g_desktop_assets_available,
+                              memory_order_acquire) ||
+        asset->pixels == 0 || asset->width == 0U || asset->height == 0U) {
+        return false;
+    }
+
+    image_left = ((int32_t)g_window_server.display_width -
+                  (int32_t)asset->width) / 2;
+    image_top = ((int32_t)g_window_server.display_height -
+                 (int32_t)asset->height) / 2;
+
+    for (int32_t y = (int32_t)g_compositor_snapshot.damage_top;
+         y < (int32_t)g_compositor_snapshot.damage_bottom; ++y) {
+        int32_t source_y = y - image_top;
+        for (int32_t x = (int32_t)g_compositor_snapshot.damage_left;
+             x < (int32_t)g_compositor_snapshot.damage_right; ++x) {
+            int32_t source_x = x - image_left;
+            uint32_t color = 0x000A1020U;
+            if (source_x >= 0 && source_y >= 0 &&
+                source_x < (int32_t)asset->width &&
+                source_y < (int32_t)asset->height) {
+                const uint8_t *pixel = asset->pixels +
+                    (uint64_t)(uint32_t)source_y * asset->stride +
+                    (uint64_t)(uint32_t)source_x * 4U;
+                color = ((uint32_t)pixel[0] << 16) |
+                        ((uint32_t)pixel[1] << 8) |
+                        pixel[2];
+            }
+            g_window_server.composite_framebuffer[
+                (uint64_t)(uint32_t)y * g_window_server.display_stride +
+                (uint32_t)x] = color;
+        }
+    }
+    return true;
 }
 
 static uint32_t desktop_app_at_locked(
@@ -2010,17 +2169,13 @@ static void desktop_draw_icon_locked(
     uint32_t index,
     const desktop_icon_entry_t *icon) {
 
-    uint32_t text_width;
-
     int32_t cell_x;
     int32_t cell_y;
 
     int32_t image_x;
     int32_t image_y;
-    int32_t text_x;
 
     bool hovered;
-
     if (icon == 0 ||
         !desktop_icon_layout_locked(
             index,
@@ -2033,44 +2188,6 @@ static void desktop_draw_icon_locked(
         g_compositor_snapshot.desktop_hovered_app ==
         icon->app;
 
-    /*
-     * Modern launcher card.
-     *
-     * Static cache stores the normal state. On hover this card is simply
-     * painted over the cached icon and then the icon itself is redrawn.
-     */
-    if (hovered) {
-        compositor_fill_rounded_locked(
-            cell_x,
-            cell_y,
-            DESKTOP_ICON_CELL_WIDTH,
-            DESKTOP_ICON_CELL_HEIGHT,
-            WINDOW_CORNER_RADIUS,
-            0x00263A53U);
-
-        compositor_fill_rounded_locked(
-            cell_x + 1,
-            cell_y + 1,
-            DESKTOP_ICON_CELL_WIDTH - 2U,
-            DESKTOP_ICON_CELL_HEIGHT - 2U,
-            WINDOW_CORNER_RADIUS,
-            0x00203349U);
-
-        /*
-         * Accent indicator.
-         */
-        compositor_fill_rounded_locked(
-            cell_x +
-                (int32_t)
-                    (DESKTOP_ICON_CELL_WIDTH - 24U) /
-                    2,
-            cell_y + 2,
-            24U,
-            2U,
-            WINDOW_CORNER_RADIUS,
-            0x006EA8FEU);
-    }
-
     image_x =
         cell_x +
         (int32_t)(
@@ -2079,67 +2196,82 @@ static void desktop_draw_icon_locked(
         2;
 
     image_y =
-        cell_y + 3;
-
-    if (icon->app == DESKTOP_APP_FILES) {
-        desktop_draw_folder_icon_locked(
-            image_x,
-            image_y);
-
-    } else if (
-        icon->app ==
-        DESKTOP_APP_TERMINAL) {
-
-        desktop_draw_terminal_icon_locked(
-            image_x,
-            image_y);
-
-    } else if (
-        icon->app ==
-        DESKTOP_APP_NOTES) {
-
-        desktop_draw_notes_icon_locked(
-            image_x,
-            image_y);
-
-    } else if (
-        icon->app ==
-        DESKTOP_APP_NETWORK) {
-
-        desktop_draw_network_icon_locked(
-            image_x,
-            image_y);
-    }
-
-    text_width =
-        desktop_text_length(icon->label) *
-        8U;
-
-    text_x =
-        cell_x +
-        (int32_t)(
-            DESKTOP_ICON_CELL_WIDTH -
-            (text_width <
-                     DESKTOP_ICON_CELL_WIDTH ?
-                 text_width :
-                 DESKTOP_ICON_CELL_WIDTH)) /
+        cell_y +
+        (int32_t)(DESKTOP_ICON_CELL_HEIGHT - DESKTOP_ICON_IMAGE_HEIGHT) /
         2;
 
-    desktop_draw_text_locked(
-        text_x,
-        cell_y + 50,
-        icon->label,
-        hovered ?
-            0x00F5F8FCU :
-            0x00B7C5D6U);
+    if (hovered) {
+        desktop_draw_hover_frame_locked(
+            cell_x + 8,
+            cell_y + 2,
+            DESKTOP_ICON_CELL_WIDTH - 16U,
+            DESKTOP_ICON_CELL_HEIGHT - 4U);
+    }
+
+    bool asset_drawn = false;
+    if (atomic_load_explicit(&g_desktop_assets_available,
+                             memory_order_acquire) &&
+        icon->app == DESKTOP_APP_FILES &&
+        g_desktop_file_manager_asset.pixels != 0) {
+        desktop_draw_asset_icon_locked(
+            image_x, image_y,
+            DESKTOP_ICON_IMAGE_WIDTH, DESKTOP_ICON_IMAGE_HEIGHT,
+            &g_desktop_file_manager_asset,
+            0U, 0U,
+            g_desktop_file_manager_asset.width,
+            g_desktop_file_manager_asset.height);
+        asset_drawn = true;
+    } else if (atomic_load_explicit(&g_desktop_assets_available,
+                                    memory_order_acquire) &&
+               g_desktop_icons_asset.pixels != 0) {
+        uint32_t source_left = 0U;
+        uint32_t source_top = 0U;
+        uint32_t source_width = 0U;
+        uint32_t source_height = 0U;
+
+        if (icon->app == DESKTOP_APP_TERMINAL) {
+            source_left = 858U;
+            source_top = 32U;
+            source_width = 418U;
+            source_height = 414U;
+        } else if (icon->app == DESKTOP_APP_NOTES) {
+            source_left = 258U;
+            source_top = 513U;
+            source_width = 420U;
+            source_height = 419U;
+        } else if (icon->app == DESKTOP_APP_NETWORK) {
+            source_left = 858U;
+            source_top = 512U;
+            source_width = 421U;
+            source_height = 420U;
+        }
+
+        if (source_width != 0U) {
+            desktop_draw_asset_icon_locked(
+                image_x, image_y,
+                DESKTOP_ICON_IMAGE_WIDTH, DESKTOP_ICON_IMAGE_HEIGHT,
+                &g_desktop_icons_asset,
+                source_left, source_top,
+                source_width, source_height);
+            asset_drawn = true;
+        }
+    }
+
+    if (!asset_drawn && icon->app == DESKTOP_APP_FILES) {
+        desktop_draw_folder_icon_locked(image_x, image_y);
+    } else if (!asset_drawn && icon->app == DESKTOP_APP_TERMINAL) {
+        desktop_draw_terminal_icon_locked(image_x, image_y);
+    } else if (!asset_drawn && icon->app == DESKTOP_APP_NOTES) {
+        desktop_draw_notes_icon_locked(image_x, image_y);
+    } else if (!asset_drawn && icon->app == DESKTOP_APP_NETWORK) {
+        desktop_draw_network_icon_locked(image_x, image_y);
+    }
+
 }
 
 static void desktop_render_static_locked(void) {
     uint32_t height =
         g_window_server.display_height;
-
-    uint32_t width =
-        g_window_server.display_width;
 
     uint32_t left =
         g_compositor_snapshot.damage_left;
@@ -2153,270 +2285,30 @@ static void desktop_render_static_locked(void) {
     uint32_t bottom =
         g_compositor_snapshot.damage_bottom;
 
-    const uint32_t icon_count =
-        (uint32_t)(
-            sizeof(g_desktop_icons) /
-            sizeof(g_desktop_icons[0]));
-
     if (g_window_server.composite_framebuffer == 0 ||
         left >= right ||
         top >= bottom) {
         return;
     }
 
-    /*
-     * Deep navy modern wallpaper.
-     *
-     * Keep it row-based so the allocation-failure fallback remains cheap.
-     */
-    for (uint32_t row = top;
-         row < bottom;
-         ++row) {
-
-        uint32_t t =
-            height > 1U ?
-            (uint32_t)(
-                ((uint64_t)row * 255U) /
-                (height - 1U)) :
-            0U;
-
-        uint32_t red =
-            6U +
-            (10U * t) /
-            255U;
-
-        uint32_t green =
-            13U +
-            (22U * t) /
-            255U;
-
-        uint32_t blue =
-            27U +
-            (31U * t) /
-            255U;
-
-        /*
-         * Slightly cooler lower third.
-         */
-        if (row >
-            (height * 2U) / 3U) {
-
-            blue += 4U;
-            green += 2U;
-        }
-
-        uint32_t color =
-            (red << 16) |
-            (green << 8) |
-            blue;
-
-        volatile uint32_t *destination =
-            g_window_server.composite_framebuffer +
-            (uint64_t)row *
-                g_window_server.display_stride +
-            left;
-
-        compositor_fill_span_wb(
-            destination,
-            right - left,
-            color);
-    }
-
-    /*
-     * Subtle wallpaper accent bands.
-     */
-    if (width > 800U &&
-        height > 500U) {
-
-        compositor_fill_rounded_locked(
-            (int32_t)width - 620,
-            (int32_t)height / 3,
-            420U,
-            2U,
-            WINDOW_CORNER_RADIUS,
-            0x001C4666U);
-
-        compositor_fill_rounded_locked(
-            (int32_t)width - 540,
-            (int32_t)height / 3 + 24,
-            310U,
-            1U,
-            WINDOW_CORNER_RADIUS,
-            0x00215A78U);
-
-        compositor_fill_rounded_locked(
-            150,
-            (int32_t)height - 220,
-            280U,
-            1U,
-            WINDOW_CORNER_RADIUS,
-            0x001B4968U);
-    }
-
-    /*
-     * Top bar.
-     */
-    compositor_fill_locked(
-        0,
-        0,
-        width,
-        DESKTOP_TOPBAR_HEIGHT,
-        0x000A1220U);
-
-    compositor_fill_locked(
-        0,
-        (int32_t)DESKTOP_TOPBAR_HEIGHT - 1,
-        width,
-        1U,
-        0x00213247U);
-
-    /*
-     * LiteOS logo tile.
-     */
-    compositor_fill_rounded_locked(
-        14,
-        8,
-        24U,
-        22U,
-        WINDOW_CORNER_RADIUS,
-        0x006EA8FEU);
-
-    desktop_draw_text_locked(
-        22,
-        11,
-        "L",
-        0x00FFFFFFU);
-
-    desktop_draw_text_locked(
-        48,
-        11,
-        "LiteOS",
-        0x00F1F5F9U);
-
-    /*
-     * Center workspace pill.
-     */
-    if (width > 400U) {
-        int32_t workspace_x =
-            (int32_t)width / 2 -
-            56;
-
-        compositor_fill_rounded_locked(
-            workspace_x,
-            7,
-            112U,
-            24U,
-            WINDOW_CORNER_RADIUS,
-            0x00131F30U);
-
-        desktop_draw_text_locked(
-            workspace_x + 12,
-            11,
-            "Workspace 1",
-            0x00AFC0D2U);
-    }
-
-    /*
-     * Right-side healthy system indicator.
-     */
-    if (width > 220U) {
-        compositor_fill_rounded_locked(
-            (int32_t)width - 86,
-            15,
-            8U,
-            8U,
-            WINDOW_CORNER_RADIUS,
-            0x004ADE80U);
-
-        desktop_draw_text_locked(
-            (int32_t)width - 70,
-            11,
-            "Ready",
-            0x00AFC0D2U);
-    }
-
-    /*
-     * Floating glass-like dock.
-     *
-     * We do not require alpha blending here: layered solid surfaces provide a
-     * clean glass-panel appearance while keeping desktop caching extremely
-     * cheap.
-     */
-    if (icon_count != 0U) {
-        uint32_t content_width =
-            icon_count *
-                DESKTOP_ICON_CELL_WIDTH +
-            (icon_count - 1U) *
-                DESKTOP_DOCK_ICON_GAP;
-
-        uint32_t dock_width =
-            content_width +
-            DESKTOP_DOCK_PADDING_X * 2U;
-
-        if (width >= dock_width + 16U &&
-            height >
-                DESKTOP_DOCK_HEIGHT +
-                DESKTOP_DOCK_BOTTOM +
-                DESKTOP_TOPBAR_HEIGHT) {
-
-            int32_t dock_x =
-                (int32_t)(
-                    width -
-                    dock_width) /
-                2;
-
-            int32_t dock_y =
-                (int32_t)height -
-                (int32_t)DESKTOP_DOCK_HEIGHT -
-                (int32_t)DESKTOP_DOCK_BOTTOM;
-
-            /*
-             * Shadow.
-             */
-            compositor_fill_rounded_locked(
-                dock_x + 3,
-                dock_y + 5,
-                dock_width,
-                DESKTOP_DOCK_HEIGHT,
-                WINDOW_CORNER_RADIUS,
-                0x0004080FU);
-
-            /*
-             * Outer shell.
-             */
-            compositor_fill_rounded_locked(
-                dock_x,
-                dock_y,
-                dock_width,
-                DESKTOP_DOCK_HEIGHT,
-                WINDOW_CORNER_RADIUS,
-                0x00182738U);
-
-            /*
-             * Inner glass surface.
-             */
-            compositor_fill_rounded_locked(
-                dock_x + 1,
-                dock_y + 1,
-                dock_width - 2U,
-                DESKTOP_DOCK_HEIGHT - 2U,
-                WINDOW_CORNER_RADIUS,
-                0x00111D2CU);
-
-            /*
-             * Highlight along upper edge.
-             */
-            compositor_fill_locked(
-                dock_x + 14,
-                dock_y + 4,
-                dock_width - 28U,
-                1U,
-                0x002A4057U);
+    if (!desktop_draw_wallpaper_asset_locked()) {
+        for (uint32_t row = top; row < bottom; ++row) {
+            uint32_t t = height > 1U ?
+                (uint32_t)(((uint64_t)row * 255U) / (height - 1U)) : 0U;
+            uint32_t red = 6U + (10U * t) / 255U;
+            uint32_t green = 13U + (22U * t) / 255U;
+            uint32_t blue = 27U + (31U * t) / 255U;
+            volatile uint32_t *destination =
+                g_window_server.composite_framebuffer +
+                (uint64_t)row * g_window_server.display_stride + left;
+            compositor_fill_span_wb(destination, right - left,
+                                     (red << 16) | (green << 8) | blue);
         }
     }
 
     /*
-     * App launchers.
+     * App icons. The old dock panel and labels are intentionally omitted:
+     * the launcher is now represented by the icons alone.
      */
     for (uint32_t index = 0U;
          index <
@@ -2432,11 +2324,129 @@ static void desktop_render_static_locked(void) {
 
 
 /*
+ * The boot volume contains the original PNGs for inspection and matching
+ * same-size RGBA companions for the freestanding kernel.  The companion
+ * format is intentionally tiny: "LITEOSRA\1", width, height, channels=4,
+ * followed by unscaled RGBA pixels.  This avoids putting a PNG/zlib decoder
+ * in the kernel while preserving every source pixel on the boot volume.
+ */
+static bool desktop_load_asset(const char *path,
+                               desktop_asset_image_t *asset) {
+    file_t *file = 0;
+    uint8_t *storage;
+    uint64_t bytes_read = 0U;
+    uint64_t file_size;
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;
+    kstatus_t status;
+
+    if (path == 0 || asset == 0) return false;
+    if (asset->storage != 0) return true;
+
+    status = vfs_open_kernel(path, VFS_OPEN_READ, &file);
+    if (status != K_OK || file == 0 || file->vnode == 0) {
+        if (file != 0) vfs_close(file);
+        return false;
+    }
+
+    file_size = file->vnode->size;
+    if (file_size < DESKTOP_ASSET_HEADER_SIZE ||
+        file_size > DESKTOP_ASSET_MAX_BYTES ||
+        file_size > (uint64_t)SIZE_MAX) {
+        vfs_close(file);
+        return false;
+    }
+
+    storage = (uint8_t *)kmalloc((size_t)file_size, 0);
+    if (storage == 0) {
+        vfs_close(file);
+        return false;
+    }
+
+    status = vfs_read_kernel(file, storage, (size_t)file_size, &bytes_read);
+    vfs_close(file);
+    if (status != K_OK || bytes_read != file_size ||
+        storage[0] != 'L' || storage[1] != 'I' ||
+        storage[2] != 'T' || storage[3] != 'E' ||
+        storage[4] != 'O' || storage[5] != 'S' ||
+        storage[6] != 'R' || storage[7] != 'A' ||
+        storage[8] != 1U) {
+        kfree(storage);
+        return false;
+    }
+
+    width = *(const uint32_t *)(const void *)(storage + 8U + 1U);
+    height = *(const uint32_t *)(const void *)(storage + 12U + 1U);
+    channels = *(const uint32_t *)(const void *)(storage + 16U + 1U);
+    if (width == 0U || height == 0U || channels != 4U ||
+        (uint64_t)width * height >
+            (file_size - DESKTOP_ASSET_HEADER_SIZE) / 4U) {
+        kfree(storage);
+        return false;
+    }
+
+    asset->storage = storage;
+    asset->pixels = storage + DESKTOP_ASSET_HEADER_SIZE;
+    asset->width = width;
+    asset->height = height;
+    asset->stride = width * 4U;
+    return true;
+}
+
+static bool desktop_load_assets(void) {
+    bool wallpaper = desktop_load_asset(
+        "/etc/desktop/wall.raw",
+        &g_desktop_wallpaper_asset);
+    bool icons = desktop_load_asset(
+        "/etc/desktop/icons.raw",
+        &g_desktop_icons_asset);
+    bool file_manager = desktop_load_asset(
+        "/etc/desktop/fm.raw",
+        &g_desktop_file_manager_asset);
+    return wallpaper && icons && file_manager;
+}
+
+static bool desktop_asset_worker_never_ready(void *context) {
+    (void)context;
+    return false;
+}
+
+/*
+ * Disk-backed desktop artwork is deliberately loaded outside the compositor
+ * worker.  The raw companions are several megabytes each and a vvfat/NVMe
+ * read can take many scheduler quanta; keeping that I/O on the compositor
+ * CPU was the reason the first frame stayed black until boot timed out.
+ */
+static void __attribute__((noreturn)) desktop_asset_worker_main(void *argument) {
+    bool loaded;
+    (void)argument;
+
+    loaded = desktop_load_assets();
+    if (loaded) {
+        atomic_store_explicit(&g_desktop_assets_available, true,
+                              memory_order_release);
+        atomic_store_explicit(&g_desktop_assets_pending, true,
+                              memory_order_release);
+        window_lock();
+        window_mark_dirty_locked();
+        window_unlock();
+        window_server_notify_worker();
+    }
+
+    /* Keep the scheduler-visible thread blocked after its one-shot job. */
+    for (;;) {
+        (void)wait_on_queue(&g_desktop_asset_waitq,
+                            desktop_asset_worker_never_ready,
+                            0, UINT64_MAX);
+    }
+}
+
+/*
  * Retained desktop backing surface.
  *
- * The wallpaper, top bar, dock and normal icon state are static. Rebuilding
- * them for every exposed window rectangle wastes substantial CPU time during
- * dragging.
+ * The wallpaper and normal icon state are static. Rebuilding them for every
+ * exposed window rectangle wastes substantial CPU time during dragging.
  */
 static uint32_t *g_desktop_cache;
 static uint32_t g_desktop_cache_width;
@@ -2493,9 +2503,9 @@ static inline void desktop_copy_wb_pixels(
 /*
  * Build the static desktop exactly once.
  *
- * desktop_render_static_locked() already knows how to render the wallpaper,
- * topbar, dock and icons. Temporarily redirect its destination into the cache
- * and force the hover state to NONE.
+ * desktop_render_static_locked() already knows how to render the wallpaper
+ * and icons. Temporarily redirect its destination into the cache and
+ * force the hover state to NONE.
  */
 static bool desktop_build_cache(void) {
     volatile uint32_t *saved_framebuffer;
@@ -2513,6 +2523,11 @@ static bool desktop_build_cache(void) {
         g_window_server.display_stride <
             g_window_server.display_width) {
         return false;
+    }
+
+    if (atomic_exchange_explicit(&g_desktop_assets_pending, false,
+                                 memory_order_acq_rel)) {
+        g_desktop_cache_ready = false;
     }
 
     /*
@@ -2626,6 +2641,9 @@ static bool desktop_build_cache(void) {
     g_desktop_cache_stride =
         g_window_server.display_stride;
 
+    /* The fallback is a valid retained frame even while the disk assets are
+     * being loaded by the background asset worker.  Once those assets arrive
+     * the worker invalidates this cache and requests one replacement frame. */
     g_desktop_cache_ready = true;
 
     return true;
@@ -2743,7 +2761,8 @@ static void desktop_draw_hover_locked(void) {
  * Fast desktop composition path.
  */
 static void desktop_draw_wallpaper_locked(void) {
-    if (!desktop_build_cache()) {
+    bool cache_ok = desktop_build_cache();
+    if (!cache_ok) {
         /*
          * Allocation failure fallback preserves the old correct behavior.
          */
@@ -2999,11 +3018,10 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
             relative_y >= (int64_t)window_outer_height(window->height, window->flags)) {
             continue;
         }
-        inset = window_client_decorations(window->flags) ? 0U :
-            compositor_corner_inset(
-                (uint32_t)relative_y,
-                window_outer_width(window->width, window->flags),
-                window_outer_height(window->height, window->flags));
+        inset = compositor_corner_inset(
+            (uint32_t)relative_y,
+            window_outer_width(window->width, window->flags),
+            window_outer_height(window->height, window->flags));
         if (relative_x >= (int64_t)inset &&
             relative_x < (int64_t)window_outer_width(window->width, window->flags) - inset) {
             return window;
@@ -3719,13 +3737,12 @@ static void compositor_surface_locked(
             continue;
         }
 
-        inset = window_client_decorations(window->flags) ? 0U :
-            (frame_row >= 0 && frame_row < frame_height ?
-             compositor_corner_inset(
-                 (uint32_t)frame_row,
-                 (uint32_t)frame_width,
-                 (uint32_t)frame_height) :
-             0U);
+        inset = (frame_row >= 0 && frame_row < frame_height ?
+                 compositor_corner_inset(
+                     (uint32_t)frame_row,
+                     (uint32_t)frame_width,
+                     (uint32_t)frame_height) :
+                 0U);
 
         /*
          * Clip against the display.
@@ -5572,6 +5589,90 @@ static bool window_server_start_copy_workers(uint32_t compositor_cpu) {
             break;
         }
     }
+    return true;
+}
+
+static bool window_server_start_desktop_asset_worker(uint32_t compositor_cpu) {
+    uint32_t current_cpu = x86_current_cpu_index();
+    uint32_t asset_cpu = UINT32_MAX;
+    thread_t *worker;
+    uint8_t *worker_bytes;
+
+    if (atomic_load_explicit(&g_window_server.desktop_asset_worker_started,
+                             memory_order_acquire)) {
+        return true;
+    }
+
+    /* Prefer a third CPU so the potentially long VFS read cannot compete
+     * with either the compositor or the bootstrap CPU. */
+    for (uint32_t candidate = 0U;
+         candidate < x86_smp_discovered_count() && candidate < MAX_CPUS;
+         ++candidate) {
+        if (candidate == current_cpu || candidate == compositor_cpu ||
+            !x86_smp_cpu_online(candidate)) {
+            continue;
+        }
+        asset_cpu = candidate;
+        break;
+    }
+    if (asset_cpu == UINT32_MAX && compositor_cpu != current_cpu &&
+        compositor_cpu < MAX_CPUS && x86_smp_cpu_online(compositor_cpu)) {
+        /* On a two-CPU system the compositor AP is the only safe background
+         * executor; it still remains independent from the bootstrap thread. */
+        asset_cpu = compositor_cpu;
+    }
+    if (asset_cpu == UINT32_MAX) return false;
+
+    worker = &g_window_server.desktop_asset_worker;
+    worker_bytes = (uint8_t *)worker;
+    for (size_t byte = 0U; byte < sizeof(*worker); ++byte) {
+        worker_bytes[byte] = 0U;
+    }
+
+    refcount_init(&worker->object.refs, 1U);
+    worker->object.type = KOBJECT_TYPE_THREAD;
+    worker->object.flags = 0U;
+    worker->object.ops = 0;
+    worker->object.security = 0;
+    worker->tid = UINT64_MAX - 4ULL;
+    worker->process = 0;
+    atomic_init(&worker->state, THREAD_READY);
+    worker->kernel_stack_base = g_desktop_asset_worker_stack;
+    worker->kernel_stack_size = sizeof(g_desktop_asset_worker_stack);
+    worker->kernel_stack_top =
+        ((vaddr_t)(uintptr_t)g_desktop_asset_worker_stack +
+         sizeof(g_desktop_asset_worker_stack)) & ~(vaddr_t)0x0FULL;
+    worker->sched_class = SCHED_CLASS_FAIR;
+    worker->base_sched_class = SCHED_CLASS_FAIR;
+    worker->rt_priority = 0U;
+    worker->base_rt_priority = 0U;
+    worker->sched.weight = 1024U;
+    worker->sched.nice = 0;
+    worker->sched.vruntime = 0U;
+    list_init(&worker->sched.rt_node);
+    list_init(&worker->process_node);
+    list_init(&worker->global_node);
+    list_init(&worker->owned_mutexes);
+    for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
+        worker->affinity.bits[word] = 0U;
+    }
+    worker->affinity.bits[asset_cpu >> 6] = 1ULL << (asset_cpu & 63U);
+    worker->current_cpu = (uint16_t)asset_cpu;
+
+    uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
+    uintptr_t switch_stack = stack_top - sizeof(uint64_t);
+    *(uint64_t *)switch_stack =
+        (uint64_t)(uintptr_t)&x86_kernel_thread_start;
+    worker->arch.switch_ctx.rsp = switch_stack;
+    worker->arch.switch_ctx.r12 =
+        (uint64_t)(uintptr_t)&desktop_asset_worker_main;
+    worker->arch.switch_ctx.r13 = 0U;
+    worker->arch.switch_ctx.r14 = stack_top;
+    worker->arch.fs_base = 0U;
+
+    atomic_store_explicit(&g_window_server.desktop_asset_worker_started, true,
+                          memory_order_release);
+    sched_enqueue(worker);
     return true;
 }
 
