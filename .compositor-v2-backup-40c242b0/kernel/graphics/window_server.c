@@ -32,22 +32,8 @@
  * remains fully serialized by window_lock and falls back to CPU0 on UP. */
 #define WINDOW_COMPOSITOR_PUBLICATION_ROW_CHUNK 16U
 #define WINDOW_COMPOSITOR_ATOMIC_PIXELS (32U * 1024U)
-
-/* LITEOS_COMPOSITOR_RETAINED_DRAG_V2
- *
- * Retained-drag is the primary optimization in v2.  Cross-CPU publication is
- * kept only for large rectangles so small updates do not pay wake/IPI costs.
- */
-#ifndef WINDOW_COMPOSITOR_PARALLEL_PIXELS
-#define WINDOW_COMPOSITOR_PARALLEL_PIXELS (512U * 1024U)
-#endif
-#define WINDOW_COMPOSITOR_COPY_MAX_WORKERS 2U
+#define WINDOW_COMPOSITOR_COPY_MAX_WORKERS 3U
 #define WINDOW_COMPOSITOR_COPY_STACK_SIZE (32U * 1024U)
-
-/* WB desktop-cache -> WB retained-scene copies must stay cached. */
-#ifndef WINDOW_COMPOSITOR_PARALLEL_WB_COPY
-#define WINDOW_COMPOSITOR_PARALLEL_WB_COPY 0U
-#endif
 #ifndef WINDOW_COMPOSITOR_TARGET_HZ
 /* QEMU's GOP is normally 60 Hz; callers can override this at build time
  * (for example -DWINDOW_COMPOSITOR_TARGET_HZ=120). */
@@ -335,15 +321,6 @@ static struct {
     volatile uint32_t *composite_framebuffer;
     uint32_t pointer_x;
     uint32_t pointer_y;
-
-    /* The WB composite buffer is a clean reusable scene and never contains
-     * the software cursor.  These fields track the cursor actually overlaid
-     * on the WC scanout so pointer motion can be presented independently of
-     * the 60Hz scene scheduler. */
-    uint32_t presented_pointer_x;
-    uint32_t presented_pointer_y;
-    bool presented_pointer_valid;
-
     uint32_t desktop_hovered_app;
     uint32_t desktop_pending_launch;
     uint32_t desktop_gui_mask;
@@ -435,7 +412,6 @@ static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
 static void window_coalesce_damage_locked(void);
 static void focus_locked(window_server_window_t *window);
 static void window_server_pump_input_mode(bool compose_now);
-static void compositor_present_cursor_direct(bool force);
 static bool window_server_start_copy_workers(uint32_t compositor_cpu);
 static bool compositor_copy_rect_parallel_buffers(
     volatile uint32_t *destination,
@@ -485,9 +461,6 @@ bool window_server_init(void) {
         g_window_server.composite_framebuffer = 0;
         g_window_server.pointer_x = 0U;
         g_window_server.pointer_y = 0U;
-        g_window_server.presented_pointer_x = 0U;
-        g_window_server.presented_pointer_y = 0U;
-        g_window_server.presented_pointer_valid = false;
         g_window_server.desktop_hovered_app = DESKTOP_APP_NONE;
         g_window_server.desktop_pending_launch = DESKTOP_APP_NONE;
         g_window_server.desktop_gui_mask = 0U;
@@ -594,14 +567,6 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
         for (;;) {
             if (input_core_pending() != 0U) {
                 window_server_pump_input_mode(false);
-
-                /*
-                 * Pointer state is processed immediately, while normal scene
-                 * composition remains frame-paced.  The retained WB scene is
-                 * cursor-free, so restoring the previous 24x24 cursor and
-                 * overlaying the new one is cheap and safe at HID rate.
-                 */
-                compositor_present_cursor_direct(false);
             }
 
             {
@@ -849,19 +814,6 @@ static window_server_window_t *find_window_locked(uint32_t identifier) {
     }
     return 0;
 }
-
-static bool window_drag_reuse_available_locked(
-    const window_server_window_t *window) {
-
-    return window != 0 &&
-           g_window_server.resize_edges == 0U &&
-           g_window_server.composite_framebuffer != 0 &&
-           g_window_server.composite_framebuffer !=
-               g_window_server.framebuffer &&
-           g_window_server.count != 0U &&
-           g_window_server.windows[g_window_server.count - 1U] == window;
-}
-
 
 static uint32_t window_damage_tile_columns_locked(void) {
     uint32_t count = (g_window_server.display_width +
@@ -1346,56 +1298,8 @@ static void window_mark_moved_rect_locked(
     }
 }
 
-static void window_mark_drag_corner_repair_locked(
-    int32_t x,
-    int32_t y,
-    uint32_t outer_width,
-    uint32_t outer_height,
-    uint32_t flags) {
-
-    uint32_t radius = WINDOW_CORNER_RADIUS;
-
-    if (window_client_decorations(flags) ||
-        outer_width == 0U || outer_height == 0U) {
-        return;
-    }
-
-    if (radius > outer_width) radius = outer_width;
-    if (radius > outer_height) radius = outer_height;
-    if (radius == 0U) return;
-
-    window_mark_rect_locked(x, y, radius, radius);
-    window_mark_rect_locked(
-        x + (int32_t)(outer_width - radius),
-        y, radius, radius);
-    window_mark_rect_locked(
-        x,
-        y + (int32_t)(outer_height - radius),
-        radius, radius);
-    window_mark_rect_locked(
-        x + (int32_t)(outer_width - radius),
-        y + (int32_t)(outer_height - radius),
-        radius, radius);
-}
-
-
 static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
                                             uint32_t new_x, uint32_t new_y) {
-    if (old_x == new_x && old_y == new_y) {
-        return;
-    }
-
-    if (g_window_server.composite_framebuffer != 0 &&
-        g_window_server.composite_framebuffer !=
-            g_window_server.framebuffer) {
-        /*
-         * The retained WB scene deliberately excludes the cursor.  Moving
-         * only the pointer does not change scene pixels and must not schedule
-         * a full compositor frame.
-         */
-        return;
-    }
-
     int32_t old_left;
     int32_t old_top;
     int32_t new_left;
@@ -2664,8 +2568,7 @@ static void desktop_copy_cached_region(void) {
         };
         uint64_t pixels = (uint64_t)(right - left) *
                           (uint64_t)(bottom - top);
-        if (WINDOW_COMPOSITOR_PARALLEL_WB_COPY != 0U &&
-            pixels > WINDOW_COMPOSITOR_PARALLEL_PIXELS &&
+        if (pixels > WINDOW_COMPOSITOR_ATOMIC_PIXELS &&
             compositor_copy_rect_parallel_buffers(
                 g_window_server.composite_framebuffer,
                 (const volatile uint32_t *)g_desktop_cache,
@@ -4054,159 +3957,6 @@ static void compositor_cursor_locked(void) {
 }
 
 
-/*
- * Overlay the software cursor directly on the WC scanout while keeping the
- * retained WB compositor buffer clean.
- */
-static void compositor_present_cursor_direct(bool force) {
-    uint32_t pointer_x;
-    uint32_t pointer_y;
-    int64_t old_origin_x;
-    int64_t old_origin_y;
-    int64_t new_origin_x;
-    int64_t new_origin_y;
-
-    if (g_window_server.framebuffer == 0 ||
-        g_window_server.composite_framebuffer == 0 ||
-        g_window_server.composite_framebuffer ==
-            g_window_server.framebuffer ||
-        g_window_server.display_width == 0U ||
-        g_window_server.display_height == 0U) {
-        return;
-    }
-
-    pointer_x = g_window_server.pointer_x;
-    pointer_y = g_window_server.pointer_y;
-
-    if (!force &&
-        g_window_server.presented_pointer_valid &&
-        g_window_server.presented_pointer_x == pointer_x &&
-        g_window_server.presented_pointer_y == pointer_y) {
-        return;
-    }
-
-    sched_preempt_disable();
-
-    if (g_window_server.presented_pointer_valid) {
-        old_origin_x =
-            (int64_t)g_window_server.presented_pointer_x -
-            WINDOW_CURSOR_HOTSPOT_X;
-        old_origin_y =
-            (int64_t)g_window_server.presented_pointer_y -
-            WINDOW_CURSOR_HOTSPOT_Y;
-
-        for (uint32_t row = 0U; row < WINDOW_CURSOR_HEIGHT; ++row) {
-            int64_t y = old_origin_y + (int64_t)row;
-            if (y < 0 ||
-                y >= (int64_t)g_window_server.display_height) {
-                continue;
-            }
-
-            for (uint32_t column = 0U;
-                 column < WINDOW_CURSOR_WIDTH;
-                 ++column) {
-                int64_t x = old_origin_x + (int64_t)column;
-                uint64_t offset;
-
-                if (x < 0 ||
-                    x >= (int64_t)g_window_server.display_width) {
-                    continue;
-                }
-
-                offset =
-                    (uint64_t)y * g_window_server.display_stride +
-                    (uint32_t)x;
-
-                g_window_server.framebuffer[offset] =
-                    g_window_server.composite_framebuffer[offset];
-            }
-        }
-    }
-
-    new_origin_x =
-        (int64_t)pointer_x - WINDOW_CURSOR_HOTSPOT_X;
-    new_origin_y =
-        (int64_t)pointer_y - WINDOW_CURSOR_HOTSPOT_Y;
-
-    for (uint32_t row = 0U; row < WINDOW_CURSOR_HEIGHT; ++row) {
-        int64_t y = new_origin_y + (int64_t)row;
-        if (y < 0 ||
-            y >= (int64_t)g_window_server.display_height) {
-            continue;
-        }
-
-        for (uint32_t column = 0U;
-             column < WINDOW_CURSOR_WIDTH;
-             ++column) {
-            int64_t x = new_origin_x + (int64_t)column;
-            uint32_t cursor;
-            uint32_t alpha;
-            uint32_t background;
-            uint32_t output;
-            uint64_t offset;
-
-            if (x < 0 ||
-                x >= (int64_t)g_window_server.display_width) {
-                continue;
-            }
-
-            offset =
-                (uint64_t)y * g_window_server.display_stride +
-                (uint32_t)x;
-
-            background =
-                g_window_server.composite_framebuffer[offset];
-
-            cursor =
-                g_linux_cursor_argb[
-                    row * WINDOW_CURSOR_WIDTH + column];
-
-            alpha = cursor >> 24;
-
-            if (alpha == 0U) {
-                output = background;
-            } else if (alpha >= 255U) {
-                output = cursor & 0x00FFFFFFU;
-            } else {
-                uint32_t color = cursor & 0x00FFFFFFU;
-                uint32_t inverse = 255U - alpha;
-
-                uint32_t red =
-                    ((((background >> 16) & 0xFFU) * inverse) +
-                     (((color >> 16) & 0xFFU) * alpha) +
-                     127U) / 255U;
-
-                uint32_t green =
-                    ((((background >> 8) & 0xFFU) * inverse) +
-                     (((color >> 8) & 0xFFU) * alpha) +
-                     127U) / 255U;
-
-                uint32_t blue =
-                    (((background & 0xFFU) * inverse) +
-                     ((color & 0xFFU) * alpha) +
-                     127U) / 255U;
-
-                output =
-                    (red << 16) |
-                    (green << 8) |
-                    blue;
-            }
-
-            g_window_server.framebuffer[offset] = output;
-        }
-    }
-
-    __asm__ volatile ("sfence" : : : "memory");
-
-    g_window_server.presented_pointer_x = pointer_x;
-    g_window_server.presented_pointer_y = pointer_y;
-    g_window_server.presented_pointer_valid = true;
-
-    sched_preempt_enable();
-}
-
-
-
 
 /*
  * Return true only when the COMPLETE current damage rectangle lies inside an
@@ -4960,15 +4710,7 @@ static void compositor_region_locked(void) {
         compositor_surface_locked(window);
     }
 
-    /*
-     * Private WB composition must remain cursor-free so its pixels can be
-     * reused by retained drag.  The low-memory direct-framebuffer fallback
-     * cannot retain a clean scene, so keep the legacy in-scene cursor there.
-     */
-    if (g_window_server.composite_framebuffer ==
-        g_window_server.framebuffer) {
-        compositor_cursor_locked();
-    }
+    compositor_cursor_locked();
 
     /*
      * Do not expose this region to the scanout yet.
@@ -5197,9 +4939,7 @@ static bool compositor_snapshot_begin_locked(void) {
             '\0';
     }
 
-    if (!snapshot->drag_blit_valid) {
-        compositor_collapse_drag_damage(snapshot);
-    }
+    compositor_collapse_drag_damage(snapshot);
 
     /*
      * Consume only the damage represented by this snapshot.
@@ -5497,7 +5237,6 @@ static bool window_server_start_copy_workers(uint32_t compositor_cpu) {
          candidate < x86_smp_discovered_count() && candidate < MAX_CPUS;
          ++candidate) {
         if (candidate == compositor_cpu ||
-            candidate == current_cpu ||
             !x86_smp_cpu_online(candidate)) {
             continue;
         }
@@ -5597,7 +5336,7 @@ static bool compositor_copy_rect_parallel_buffers(
 
     pixels = (uint64_t)(rect->right - rect->left) *
              (uint64_t)(rect->bottom - rect->top);
-    if (pixels <= WINDOW_COMPOSITOR_PARALLEL_PIXELS) return false;
+    if (pixels <= WINDOW_COMPOSITOR_ATOMIC_PIXELS) return false;
 
     participants = worker_count + 1U;
     g_compositor_copy_job.destination = destination;
@@ -5730,36 +5469,11 @@ static void compositor_commit_snapshot(void) {
      * path includes per-CPU fences and returns only after every row is visible,
      * so it cannot expose the stale-gap corruption caused by the old bounding
      * box copy. */
-    if (commit_as_move_transaction) {
-        uint32_t left = g_window_server.display_width;
-        uint32_t top = g_window_server.display_height;
-        uint32_t right = 0U;
-        uint32_t bottom = 0U;
-
-        for (uint32_t region = 0U;
-             region < g_compositor_snapshot.damage_count;
-             ++region) {
-            const window_damage_rect_t *rect =
-                &g_compositor_snapshot.damage_rects[region];
-
-            if (rect->left < left) left = rect->left;
-            if (rect->top < top) top = rect->top;
-            if (rect->right > right) right = rect->right;
-            if (rect->bottom > bottom) bottom = rect->bottom;
-        }
-
-        if (left < right && top < bottom) {
-            window_damage_rect_t transaction = {
-                .left = left,
-                .top = top,
-                .right = right,
-                .bottom = bottom,
-            };
-
-            if (compositor_copy_rect_parallel(&transaction)) {
-                return;
-            }
-        }
+    if (commit_as_move_transaction &&
+        g_compositor_snapshot.damage_count == 1U &&
+        compositor_copy_rect_parallel(
+            &g_compositor_snapshot.damage_rects[0])) {
+        return;
     }
 
     /*
@@ -5873,10 +5587,18 @@ static void compositor_commit_snapshot(void) {
  * the client section and repainting every pixel for a one-pixel motion. */
 static void compositor_blit_drag_overlap(void) {
     const compositor_snapshot_t *snapshot = &g_compositor_snapshot;
-    int64_t local_left;
-    int64_t local_top;
-    int64_t local_right;
-    int64_t local_bottom;
+    int64_t old_left;
+    int64_t old_top;
+    int64_t old_right;
+    int64_t old_bottom;
+    int64_t new_left;
+    int64_t new_top;
+    int64_t new_right;
+    int64_t new_bottom;
+    int64_t left;
+    int64_t top;
+    int64_t right;
+    int64_t bottom;
     uint32_t width;
     uint32_t height;
 
@@ -5885,118 +5607,85 @@ static void compositor_blit_drag_overlap(void) {
         snapshot->drag_width == 0U ||
         snapshot->drag_height == 0U ||
         g_window_server.composite_framebuffer == 0 ||
-        g_window_server.composite_framebuffer ==
-            g_window_server.framebuffer ||
         snapshot->window_count == 0U ||
         snapshot->windows[snapshot->window_count - 1U].identifier !=
             snapshot->dragging_identifier) {
         return;
     }
 
-    local_left = 0;
-    local_top = 0;
-    local_right = snapshot->drag_width;
-    local_bottom = snapshot->drag_height;
+    old_left = snapshot->drag_old_x;
+    old_top = snapshot->drag_old_y;
+    old_right = old_left + (int64_t)snapshot->drag_width;
+    old_bottom = old_top + (int64_t)snapshot->drag_height;
+    new_left = snapshot->drag_new_x;
+    new_top = snapshot->drag_new_y;
+    new_right = new_left + (int64_t)snapshot->drag_width;
+    new_bottom = new_top + (int64_t)snapshot->drag_height;
 
-    if (snapshot->drag_old_x < 0 &&
-        local_left < -(int64_t)snapshot->drag_old_x) {
-        local_left = -(int64_t)snapshot->drag_old_x;
-    }
-    if (snapshot->drag_new_x < 0 &&
-        local_left < -(int64_t)snapshot->drag_new_x) {
-        local_left = -(int64_t)snapshot->drag_new_x;
-    }
-    if (snapshot->drag_old_y < 0 &&
-        local_top < -(int64_t)snapshot->drag_old_y) {
-        local_top = -(int64_t)snapshot->drag_old_y;
-    }
-    if (snapshot->drag_new_y < 0 &&
-        local_top < -(int64_t)snapshot->drag_new_y) {
-        local_top = -(int64_t)snapshot->drag_new_y;
-    }
+    left = old_left > new_left ? old_left : new_left;
+    top = old_top > new_top ? old_top : new_top;
+    right = old_right < new_right ? old_right : new_right;
+    bottom = old_bottom < new_bottom ? old_bottom : new_bottom;
 
+    /* The mathematical overlap may contain pixels whose source lies just
+     * outside the physical screen when a window crosses an edge.  Clip the
+     * destination coordinates so both source and destination are valid. */
     {
-        int64_t old_visible_right =
-            (int64_t)g_window_server.display_width -
-            snapshot->drag_old_x;
-        int64_t new_visible_right =
-            (int64_t)g_window_server.display_width -
-            snapshot->drag_new_x;
-        int64_t old_visible_bottom =
-            (int64_t)g_window_server.display_height -
-            snapshot->drag_old_y;
-        int64_t new_visible_bottom =
-            (int64_t)g_window_server.display_height -
-            snapshot->drag_new_y;
-
-        if (local_right > old_visible_right) {
-            local_right = old_visible_right;
-        }
-        if (local_right > new_visible_right) {
-            local_right = new_visible_right;
-        }
-        if (local_bottom > old_visible_bottom) {
-            local_bottom = old_visible_bottom;
-        }
-        if (local_bottom > new_visible_bottom) {
-            local_bottom = new_visible_bottom;
-        }
+        int64_t source_left = new_left - old_left;
+        int64_t source_top = new_top - old_top;
+        int64_t source_right = source_left +
+                               (int64_t)g_window_server.display_width;
+        int64_t source_bottom = source_top +
+                                (int64_t)g_window_server.display_height;
+        if (left < source_left) left = source_left;
+        if (top < source_top) top = source_top;
+        if (right > source_right) right = source_right;
+        if (bottom > source_bottom) bottom = source_bottom;
     }
 
-    if (local_left < 0) local_left = 0;
-    if (local_top < 0) local_top = 0;
-
-    if (local_left >= local_right ||
-        local_top >= local_bottom) {
-        return;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > (int64_t)g_window_server.display_width) {
+        right = g_window_server.display_width;
     }
+    if (bottom > (int64_t)g_window_server.display_height) {
+        bottom = g_window_server.display_height;
+    }
+    if (left >= right || top >= bottom) return;
 
-    width = (uint32_t)(local_right - local_left);
-    height = (uint32_t)(local_bottom - local_top);
+    width = (uint32_t)(right - left);
+    height = (uint32_t)(bottom - top);
 
-    for (uint32_t row_index = 0U;
-         row_index < height;
-         ++row_index) {
-        uint32_t row =
-            snapshot->drag_new_y > snapshot->drag_old_y ?
-                height - 1U - row_index :
-                row_index;
-
-        int64_t local_y = local_top + (int64_t)row;
-        int64_t source_y =
-            (int64_t)snapshot->drag_old_y + local_y;
-        int64_t destination_y =
-            (int64_t)snapshot->drag_new_y + local_y;
-
-        int64_t source_x =
-            (int64_t)snapshot->drag_old_x + local_left;
-        int64_t destination_x =
-            (int64_t)snapshot->drag_new_x + local_left;
-
-        volatile uint32_t *source =
-            g_window_server.composite_framebuffer +
-            (uint64_t)source_y * g_window_server.display_stride +
-            (uint32_t)source_x;
-
+    /* Copy bottom-up when the destination is below the source, otherwise
+     * copy top-down.  Horizontal overlap is handled in the corresponding
+     * direction for the same row, making this a true memmove. */
+    for (uint32_t row_index = 0U; row_index < height; ++row_index) {
+        uint32_t row = snapshot->drag_new_y > snapshot->drag_old_y ?
+                        height - 1U - row_index : row_index;
+        int64_t world_y = top + (int64_t)row;
+        int64_t source_world_y = world_y - snapshot->drag_new_y +
+                                 snapshot->drag_old_y;
         volatile uint32_t *destination =
             g_window_server.composite_framebuffer +
-            (uint64_t)destination_y * g_window_server.display_stride +
-            (uint32_t)destination_x;
+            (uint64_t)(world_y) * g_window_server.display_stride +
+            (uint64_t)(left - snapshot->drag_new_x);
+        volatile uint32_t *source =
+            g_window_server.composite_framebuffer +
+            (uint64_t)(source_world_y) * g_window_server.display_stride +
+            (uint64_t)(left - snapshot->drag_old_x);
 
-        if (source_y == destination_y &&
-            destination_x > source_x) {
-            for (uint32_t column = width;
-                 column != 0U;
-                 --column) {
-                destination[column - 1U] =
-                    source[column - 1U];
+        /* The destination offset in the retained buffer is
+         * (left - new_x), while the source offset is (left - old_x).
+         * Copy backwards only when the destination starts to the right of
+         * the source; this is the usual memmove overlap rule. */
+        if (snapshot->drag_new_y == snapshot->drag_old_y &&
+            snapshot->drag_new_x < snapshot->drag_old_x) {
+            for (uint32_t column = width; column != 0U; --column) {
+                destination[column - 1U] = source[column - 1U];
             }
         } else {
-            for (uint32_t column = 0U;
-                 column < width;
-                 ++column) {
-                destination[column] =
-                    source[column];
+            for (uint32_t column = 0U; column < width; ++column) {
+                destination[column] = source[column];
             }
         }
     }
@@ -6055,7 +5744,6 @@ static void compositor_render_snapshot(void) {
         sched_preempt_enable();
     } else {
         compositor_commit_snapshot();
-        compositor_present_cursor_direct(true);
     }
 }
 
@@ -6090,17 +5778,6 @@ static void compositor_snapshot_finish(void) {
      * frame while the compositor was running.
      */
     window_lock();
-
-    if (g_window_server.dragging_identifier != 0U &&
-        g_window_server.resize_edges == 0U) {
-        window_server_window_t *dragged =
-            find_window_locked(g_window_server.dragging_identifier);
-
-        g_window_server.drag_blit_valid =
-            window_drag_reuse_available_locked(dragged);
-    } else {
-        g_window_server.drag_blit_valid = false;
-    }
 
     g_window_server.composing = false;
 
@@ -7249,43 +6926,15 @@ static void route_input_locked(const input_event_t *event) {
             } else {
                 int32_t old_x = dragged->x;
                 int32_t old_y = dragged->y;
-                int32_t new_x =
-                    (int32_t)g_window_server.pointer_x -
-                    g_window_server.drag_offset_x;
-                int32_t new_y =
-                    (int32_t)g_window_server.pointer_y -
-                    g_window_server.drag_offset_y;
-                uint32_t outer_width =
-                    window_outer_width(dragged->width, dragged->flags);
-                uint32_t outer_height =
-                    window_outer_height(dragged->height, dragged->flags);
-                bool reuse_retained =
-                    g_window_server.drag_blit_valid &&
-                    window_drag_reuse_available_locked(dragged);
-
-                g_window_server.drag_blit_valid = reuse_retained;
-                g_window_server.drag_old_x = old_x;
-                g_window_server.drag_old_y = old_y;
-                g_window_server.drag_new_x = new_x;
-                g_window_server.drag_new_y = new_y;
-                g_window_server.drag_width = outer_width;
-                g_window_server.drag_height = outer_height;
-
-                dragged->x = new_x;
-                dragged->y = new_y;
-
+                dragged->x = (int32_t)g_window_server.pointer_x -
+                             g_window_server.drag_offset_x;
+                dragged->y = (int32_t)g_window_server.pointer_y -
+                             g_window_server.drag_offset_y;
                 window_mark_moved_rect_locked(
-                    old_x, old_y, new_x, new_y,
-                    outer_width, outer_height,
-                    !reuse_retained);
-
-                if (reuse_retained) {
-                    window_mark_drag_corner_repair_locked(
-                        new_x, new_y,
-                        outer_width, outer_height,
-                        dragged->flags);
-                }
-
+                    old_x, old_y, dragged->x, dragged->y,
+                    window_outer_width(dragged->width, dragged->flags),
+                    window_outer_height(dragged->height, dragged->flags),
+                    true);
                 dragged->dirty = true;
                 target = dragged;
                 deliver_input = false;
@@ -7760,9 +7409,7 @@ static bool window_route_drag_motion_batch_locked(
             (int32_t)g_window_server.pointer_y -
             g_window_server.drag_offset_y;
 
-        bool reuse_retained =
-            g_window_server.drag_blit_valid &&
-            window_drag_reuse_available_locked(dragged);
+        g_window_server.drag_blit_valid = false;
 
         /*
          * One old/new damage pair for the complete diagonal move.
@@ -7774,8 +7421,14 @@ static bool window_route_drag_motion_batch_locked(
             uint32_t outer_height =
                 window_outer_height(dragged->height, dragged->flags);
 
-            g_window_server.drag_blit_valid =
-                reuse_retained;
+            /* A captured window is normally raised by focus_locked() on
+             * press.  Only a genuinely topmost surface may reuse composite
+             * pixels; otherwise a window above it could be copied away. */
+            /* Keep the retained-pixel experiment disabled until the source
+             * frame can be proven free of cursor/underlay pixels.  A drag
+             * must prefer a complete, correct composition over a possible
+             * stale-pixel shortcut. */
+            g_window_server.drag_blit_valid = false;
             g_window_server.drag_old_x = old_x;
             g_window_server.drag_old_y = old_y;
             g_window_server.drag_new_x = new_x;
@@ -7797,15 +7450,6 @@ static bool window_route_drag_motion_batch_locked(
                 outer_width,
                 outer_height,
                 !g_window_server.drag_blit_valid);
-
-            if (g_window_server.drag_blit_valid) {
-                window_mark_drag_corner_repair_locked(
-                    new_x,
-                    new_y,
-                    outer_width,
-                    outer_height,
-                    dragged->flags);
-            }
 
             dragged->dirty =
                 true;

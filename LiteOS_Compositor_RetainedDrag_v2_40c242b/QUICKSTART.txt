@@ -1,0 +1,26 @@
+LiteOS Compositor retained-drag v2
+Baseline: 40c242b066fc1a896f0933616cd20f9b749d2ae1
+
+Check:
+  python3 apply_compositor_v2.py ~/LiteOS --check-only
+
+Apply:
+  ./apply.sh ~/LiteOS
+
+Build:
+  cd ~/LiteOS
+  git diff -- kernel/graphics/window_server.c
+  make clean
+  make -j$(nproc)
+  make test
+
+v2:
+  clean retained scene excludes cursor
+  pointer-only movement avoids scene redraw
+  cursor publishes directly at input rate
+  fixed 2-D retained drag memmove
+  first drag frame full, later frames retained
+  exposed strips + rounded corners only
+
+Rollback:
+  ./rollback.sh ~/LiteOS
