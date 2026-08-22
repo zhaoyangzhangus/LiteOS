@@ -973,14 +973,25 @@ static void gop_debug_draw_glyph_locked(UINT8 character) {
         UINT16 bits = (UINT16)(((UINT16)glyph[offset] << 8) | glyph[offset + 1U]);
         bits |= (UINT16)(((UINT16)glyph[offset + 2U] << 8) |
                          glyph[offset + 3U]);
-        volatile UINT32 *destination = g_gop_debug_console.framebuffer +
+        /*
+         * This is a WC framebuffer, not a register block: build the row with
+         * ordinary stores so the compiler can combine the eight pixels.  The
+         * memory clobber keeps the stores ordered before the sfence at the end
+         * of gop_debug_write_locked(), which publishes the WC writes.
+         */
+        UINT32 *destination = (UINT32 *)(uintptr_t)(
+            g_gop_debug_console.framebuffer +
             (UINT64)(g_gop_debug_console.cursor_y + row_index) *
-            g_gop_debug_console.pixels_per_scanline + g_gop_debug_console.cursor_x;
+            g_gop_debug_console.pixels_per_scanline + g_gop_debug_console.cursor_x);
+        UINT32 row_pixels[GOP_DEBUG_GLYPH_WIDTH];
         for (UINT32 column = 0U; column < GOP_DEBUG_GLYPH_WIDTH; ++column) {
-            destination[column] =
+            row_pixels[column] =
                 (bits & (UINT16)(0xC000U >> (column * 2U))) != 0U ?
                 g_gop_debug_console.foreground : g_gop_debug_console.background;
         }
+        __builtin_memcpy(destination, row_pixels, sizeof(row_pixels));
+        __asm__ volatile ("" : : "m"(*(UINT32 (*)[GOP_DEBUG_GLYPH_WIDTH])destination)
+                          : "memory");
     }
     g_gop_debug_console.cursor_x += GOP_DEBUG_GLYPH_WIDTH;
     if (g_gop_debug_console.cursor_x + GOP_DEBUG_GLYPH_WIDTH >
@@ -990,11 +1001,13 @@ static void gop_debug_draw_glyph_locked(UINT8 character) {
 }
 
 static void gop_debug_write_locked(const CHAR8 *text) {
+    BOOLEAN line_complete = 0;
     while (text != 0 && *text != 0) {
         UINT8 character = (UINT8)*text++;
         if (character == '\r') {
             g_gop_debug_console.cursor_x = 0U;
         } else if (character == '\n') {
+            line_complete = 1;
             gop_debug_newline_locked();
         } else if (character == '\t') {
             for (UINT32 i = 0U; i < GOP_DEBUG_TAB_SPACES; ++i) {
@@ -1017,7 +1030,8 @@ static void gop_debug_write_locked(const CHAR8 *text) {
             gop_debug_draw_glyph_locked(character);
         }
     }
-    __asm__ volatile ("sfence" : : : "memory");
+    /* Partial fragments stay in the WC buffer; publish complete log lines. */
+    if (line_complete) __asm__ volatile ("sfence" : : : "memory");
 }
 
 static BOOLEAN gop_debug_lock(BOOLEAN allow_wait) {
@@ -1071,7 +1085,8 @@ static BOOLEAN gop_debug_console_init(const LITEOS_BOOT_INFO *info,
  * The handoff page table identity-maps the first 4 GiB.  Use that mapping for
  * the first few boot markers before the kernel installs its own page tables.
  * This is deliberately limited to the identity-mapped range; after paging is
- * enabled the console is retargeted to the permanent direct-map alias below.
+ * enabled and the allocator is ready, the console is retargeted to the
+ * permanent explicit WC alias below.
  */
 static BOOLEAN gop_debug_console_init_early(const LITEOS_BOOT_INFO *info) {
     if (info == 0 || info->FrameBufferBase > 0xFFFFFFFFULL ||
@@ -1079,16 +1094,6 @@ static BOOLEAN gop_debug_console_init_early(const LITEOS_BOOT_INFO *info) {
         return 0;
     }
     return gop_debug_console_init(info, info->FrameBufferBase);
-}
-
-static BOOLEAN gop_debug_console_retarget_direct(const LITEOS_BOOT_INFO *info) {
-    UINT64 direct_span = X86_64_DIRECT_MAP_END - X86_64_DIRECT_MAP_BASE + 1ULL;
-    if (info == 0 || info->FrameBufferBase >= direct_span ||
-        info->FrameBufferSize > direct_span - info->FrameBufferBase) {
-        return 0;
-    }
-    return gop_debug_console_init(info,
-                                  X86_64_DIRECT_MAP_BASE + info->FrameBufferBase);
 }
 
 /* 用于验证启动交接 ABI 的最小 PE32+ 内核入口。 */
@@ -1133,16 +1138,14 @@ static void serial_write(const CHAR8 *text) {
 }
 
 void liteos_serial_write_u32(uint32_t value) {
-    CHAR8 digits[10];
-    UINT32 count = 0;
+    CHAR8 digits[11];
+    UINT32 index = sizeof(digits) - 1U;
+    digits[index] = 0;
     do {
-        digits[count++] = (CHAR8)('0' + value % 10U);
+        digits[--index] = (CHAR8)('0' + value % 10U);
         value /= 10U;
-    } while (value != 0 && count < sizeof(digits));
-    while (count != 0) {
-        CHAR8 character[2] = {digits[--count], 0};
-        serial_write(character);
-    }
+    } while (value != 0U);
+    liteos_serial_write((const char *)&digits[index]);
 }
 
 static void serial_write_u32(UINT32 value) {
@@ -1150,16 +1153,14 @@ static void serial_write_u32(UINT32 value) {
 }
 
 static void serial_write_u64(UINT64 value) {
-    CHAR8 digits[20];
-    UINT32 count = 0;
+    CHAR8 digits[21];
+    UINT32 index = sizeof(digits) - 1U;
+    digits[index] = 0;
     do {
-        digits[count++] = (CHAR8)('0' + value % 10U);
+        digits[--index] = (CHAR8)('0' + value % 10U);
         value /= 10U;
-    } while (value != 0U && count < sizeof(digits));
-    while (count != 0U) {
-        CHAR8 character[2] = {digits[--count], 0};
-        serial_write(character);
-    }
+    } while (value != 0U);
+    serial_write((const CHAR8 *)&digits[index]);
 }
 
 static void serial_init(void) {
@@ -2882,11 +2883,13 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
         serial_write("LITEOS_PAGING_INIT_FAIL\r\n");
         halt_forever();
     }
-    /* CR3 now points at the kernel page tables; the identity alias is gone. */
-    if (atomic_load_explicit(&g_gop_debug_console_ready, memory_order_acquire) != 0U &&
-        !gop_debug_console_retarget_direct(info)) {
-        atomic_store_explicit(&g_gop_debug_console_ready, 0U, memory_order_release);
-    }
+    /*
+     * Keep the early identity alias until the RAM allocator is online.  Do
+     * not retarget GOP to the firmware-dependent direct map here: its cache
+     * mode may be WB or UC.  After liteos_rebuild_ram_direct_map(), the
+     * explicit WC framebuffer alias is installed below and the console is
+     * reinitialized against that alias before any later boot marker.
+     */
     serial_write("LITEOS_PAGING_OK\r\n");
     if (!canonical_uaccess_self_test()) {
         serial_write("LITEOS_UACCESS_TEST_FAIL\r\n");

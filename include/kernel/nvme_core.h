@@ -1,7 +1,6 @@
 #pragma once
 
 #include <kernel/device.h>
-#include <kernel/device_queue.h>
 #include <kernel/dma.h>
 #include <kernel/mm.h>
 #include <kernel/pci.h>
@@ -34,20 +33,6 @@ typedef struct __attribute__((packed)) nvme_completion {
     uint16_t status;
 } nvme_completion_t;
 
-/*
- * Software-visible completion = immutable copy of the submitted 64-byte
- * command plus the native 16-byte NVMe CQE.  The IRQ path only copies these
- * 80 bytes; request lookup, DMA teardown and io_complete() stay in worker
- * context.
- */
-typedef struct nvme_io_completion_entry {
-    nvme_command_t command;
-    nvme_completion_t completion;
-} nvme_io_completion_entry_t;
-
-_Static_assert(sizeof(nvme_io_completion_entry_t) == 80U,
-               "NVMe software completion ABI");
-
 struct nvme_controller;
 struct nvme_pending_io;
 
@@ -59,18 +44,6 @@ typedef struct nvme_queue {
     dma_mapping_t completion_dma;
     nvme_command_t *submission;
     nvme_completion_t *completion;
-
-    /*
-     * Hardware CQ -> IRQ producer -> software CQ -> deferred consumer.
-     * Command shadow is indexed by the queue-local CID (1..depth) so the IRQ
-     * never scans pending requests or dereferences an I/O object.
-     */
-    device_queue_t software_completion;
-    nvme_io_completion_entry_t software_completion_entries[NVME_IO_QUEUE_DEPTH];
-    nvme_command_t command_shadow[NVME_IO_QUEUE_DEPTH];
-    atomic_uintptr_t pending_by_cid[NVME_IO_QUEUE_DEPTH];
-    uint64_t cid_busy;
-
     uint16_t queue_id;
     uint16_t depth;
     uint16_t submission_tail;

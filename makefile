@@ -548,9 +548,6 @@ $(BUILD)/kernel/iommu-core.o: kernel/drivers/iommu_core.c | $(BUILD)/kernel
 $(BUILD)/kernel/device-core.o: kernel/core/device_core.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/device-queue.o: kernel/core/device_queue.c | $(BUILD)/kernel
-	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
-
 $(BUILD)/kernel/driver.o: kernel/core/driver.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
@@ -695,7 +692,6 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/ascii_font.o \
                                     $(BUILD)/kernel/perf.o \
                                     $(BUILD)/kernel/iommu-core.o \
                                     $(BUILD)/kernel/device-core.o \
-                                    $(BUILD)/kernel/device-queue.o \
                                     $(BUILD)/kernel/driver.o \
                                     $(BUILD)/kernel/pci.o $(BUILD)/kernel/pci-core.o \
                                     $(BUILD)/kernel/nvme.o $(BUILD)/kernel/nvme-core.o \
