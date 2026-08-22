@@ -70,8 +70,6 @@ typedef struct nvme_pending_io {
 
 static void nvme_deferred_complete(void *argument);
 static bool nvme_schedule_queue_completion(nvme_queue_t *queue);
-static uint32_t nvme_irq_collect_completions(nvme_queue_t *queue,
-                                              uint32_t budget);
 static void nvme_abort_queue_pending(nvme_queue_t *queue, kstatus_t status);
 
 static bool nvme_completion_ref_get(nvme_queue_t *queue) {
@@ -158,9 +156,7 @@ static kstatus_t nvme_record_status(kstatus_t status) {
  * threads on other CPUs.  The lock owner must not be involuntarily switched
  * out by the local timer while another CPU spins for the same lock.
  *
- * Hard IRQ handlers never take these locks.  For MSI-X queues they consume
- * the native hardware CQ into the lock-free software completion queue and
- * only then enqueue deferred work.
+ * Hard IRQ handlers never take these locks; they only enqueue deferred work.
  */
 static void nvme_lock(spinlock_t *lock) {
     sched_preempt_disable();
@@ -189,25 +185,18 @@ static void nvme_unlock(spinlock_t *lock) {
 
 static void nvme_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
                               void *context) {
-    nvme_queue_t *queue = (nvme_queue_t *)context;
-    nvme_controller_t *controller;
-    uint32_t collected;
     (void)frame;
-
-    /* One MSI-X vector is registered with exactly one queue as its context. */
-    if (queue == 0 || !queue->active || queue->irq_vector != vector) return;
-    controller = queue->controller;
+    nvme_controller_t *controller = (nvme_controller_t *)context;
     if (controller == 0 || !controller->started) return;
-
-    /*
-     * Hard IRQ contract:
-     *   native NVMe CQE -> copy original command -> software completion CQ.
-     * No queue lock, allocation, request completion or DMA teardown here.
-     */
-    collected = nvme_irq_collect_completions(queue, queue->depth);
-    if (collected != 0U || !device_queue_empty(&queue->software_completion)) {
-        (void)nvme_schedule_queue_completion(queue);
+    /* 硬中断只根据向量找到队列并投递 deferred，不消费 CQ、不分配内存。 */
+    for (uint16_t index = 0; index < controller->io_queue_count; ++index) {
+        nvme_queue_t *queue = &controller->io_queues[index];
+        if (queue->active && queue->irq_vector == vector) {
+            (void)nvme_schedule_queue_completion(queue);
+            return;
+        }
     }
+    /* 硬中断只投递 deferred 工作，CQ 在普通内核上下文中有界消费。 */
 }
 
 static bool nvme_schedule_queue_completion(nvme_queue_t *queue) {
@@ -369,17 +358,14 @@ static bool nvme_free_io_queue(nvme_queue_t *queue) {
         atomic_init(&queue->completion_queued, false);
         atomic_init(&queue->completion_work_refs, 0U);
         atomic_init(&queue->lock.state, 0U);
-        queue->cid_busy = 0U;
-        for (uint32_t cid = 0U; cid < NVME_IO_QUEUE_DEPTH; ++cid) {
-            atomic_init(&queue->pending_by_cid[cid], 0U);
-        }
     }
     /* 调用者必须先停止控制器；这里再撤销队列，确保 DMA 映射最后释放。 */
     queue->active = false;
     nvme_stop_completion_work(queue);
     nvme_abort_queue_pending(queue, K_EDEVREMOVED);
     if (queue->irq_vector != 0 && queue->controller != 0) {
-        (void)irq_unregister(queue->irq_vector, nvme_msix_handler, queue);
+        (void)irq_unregister(queue->irq_vector, nvme_msix_handler,
+                              queue->controller);
         queue->irq_vector = 0;
     }
     submission_released = queue->submission_dma.device == 0;
@@ -403,14 +389,6 @@ static bool nvme_free_io_queue(nvme_queue_t *queue) {
     if (!submission_released || !completion_released) {
         queue->active = false;
         return false;
-    }
-    if (queue->software_completion.capacity != 0U) {
-        device_queue_reset(&queue->software_completion);
-    }
-    queue->cid_busy = 0U;
-    for (uint32_t cid = 0U; cid < NVME_IO_QUEUE_DEPTH; ++cid) {
-        atomic_store_explicit(&queue->pending_by_cid[cid], 0U,
-                              memory_order_release);
     }
     queue->queue_id = 0;
     queue->depth = 0;
@@ -465,17 +443,6 @@ static kstatus_t nvme_alloc_io_queue(nvme_controller_t *controller,
     atomic_init(&queue->completion_queued, false);
     atomic_init(&queue->completion_work_refs, 0U);
     list_init(&queue->pending_ios);
-    queue->cid_busy = 0U;
-    for (uint32_t cid = 0U; cid < NVME_IO_QUEUE_DEPTH; ++cid) {
-        atomic_init(&queue->pending_by_cid[cid], 0U);
-    }
-    kstatus_t software_status = device_queue_init(
-        &queue->software_completion, queue->software_completion_entries,
-        NVME_IO_QUEUE_DEPTH, sizeof(queue->software_completion_entries[0]));
-    if (software_status != K_OK) {
-        nvme_free_io_queue(queue);
-        return software_status;
-    }
     return K_OK;
 }
 
@@ -724,10 +691,10 @@ static void nvme_try_bind_msix(nvme_controller_t *controller,
         queue_index >= entries) return;
     uint8_t vector = (uint8_t)(0x60U + queue_index);
     if (vector > IRQ_VECTOR_LAST ||
-        irq_register(vector, nvme_msix_handler, queue) != K_OK) return;
+        irq_register(vector, nvme_msix_handler, controller) != K_OK) return;
     if (pci_msix_configure(controller->pci, queue_index,
                            x86_current_apic_id(), vector) != K_OK) {
-        (void)irq_unregister(vector, nvme_msix_handler, queue);
+        (void)irq_unregister(vector, nvme_msix_handler, controller);
         return;
     }
     queue->irq_vector = vector;
@@ -747,11 +714,11 @@ static bool nvme_rebind_msix(nvme_controller_t *controller,
 
     /* 先屏蔽设备，再拆除旧路由，避免换绑窗口产生未知中断。 */
     if (pci_msix_mask(controller->pci, msix_entry, true) != K_OK ||
-        irq_unregister(old_vector, nvme_msix_handler, queue) != K_OK) {
+        irq_unregister(old_vector, nvme_msix_handler, controller) != K_OK) {
         (void)pci_msix_mask(controller->pci, msix_entry, false);
         return false;
     }
-    if (irq_register(new_vector, nvme_msix_handler, queue) == K_OK &&
+    if (irq_register(new_vector, nvme_msix_handler, controller) == K_OK &&
         pci_msix_configure(controller->pci, msix_entry, x86_current_apic_id(),
                            new_vector) == K_OK) {
         queue->irq_vector = new_vector;
@@ -759,8 +726,8 @@ static bool nvme_rebind_msix(nvme_controller_t *controller,
     }
 
     /* 新路由失败时恢复旧路由；恢复失败则保持无中断状态，由轮询路径兜底。 */
-    (void)irq_unregister(new_vector, nvme_msix_handler, queue);
-    if (irq_register(old_vector, nvme_msix_handler, queue) == K_OK &&
+    (void)irq_unregister(new_vector, nvme_msix_handler, controller);
+    if (irq_register(old_vector, nvme_msix_handler, controller) == K_OK &&
         pci_msix_configure(controller->pci, msix_entry, x86_current_apic_id(),
                            old_vector) == K_OK) {
         restored = true;
@@ -1023,79 +990,21 @@ static void nvme_ring_io_completion(nvme_controller_t *controller,
     nvme_write32(controller, offset, queue->completion_head);
 }
 
-/*
- * MSI-X producer for the software completion queue.
- *
- * The native CQE supplies a queue-local CID.  Submission publishes the
- * immutable command shadow before ringing the SQ doorbell; acquiring the
- * pending token here therefore makes the 64-byte shadow visible without
- * touching the request object or taking queue->lock.
- */
-static uint32_t nvme_irq_collect_completions(nvme_queue_t *queue,
-                                              uint32_t budget) {
-    nvme_controller_t *controller;
-    uint32_t processed = 0U;
-
-    if (queue == 0 || budget == 0U || !queue->active ||
-        queue->completion == 0) return 0U;
-    controller = queue->controller;
-    if (controller == 0 || !controller->started) return 0U;
-
-    dma_sync_for_cpu(&queue->completion_dma);
-    while (processed < budget) {
-        nvme_completion_t hardware =
-            queue->completion[queue->completion_head];
-        nvme_io_completion_entry_t *software;
-        uint16_t command_id;
-
-        if ((hardware.status & 1U) != queue->phase) break;
-
-        /* Never consume a hardware CQE until its software slot is reserved. */
-        software = (nvme_io_completion_entry_t *)
-            device_queue_producer_reserve(&queue->software_completion);
-        if (software == 0) break;
-
-        command_id = hardware.command_id;
-        if (command_id != 0U && command_id <= queue->depth &&
-            command_id <= NVME_IO_QUEUE_DEPTH &&
-            atomic_load_explicit(&queue->pending_by_cid[command_id - 1U],
-                                 memory_order_acquire) != 0U) {
-            software->command = queue->command_shadow[command_id - 1U];
-        } else {
-            software->command = (nvme_command_t){0};
-        }
-        software->completion = hardware;
-        device_queue_producer_commit(&queue->software_completion);
-
-        queue->completion_head =
-            (uint16_t)((queue->completion_head + 1U) % queue->depth);
-        if (queue->completion_head == 0U) queue->phase ^= 1U;
-        ++processed;
-    }
-
-    /* One MMIO doorbell write acknowledges the whole IRQ batch. */
-    if (processed != 0U) nvme_ring_io_completion(controller, queue);
-    return processed;
-}
-
 static nvme_pending_io_t *nvme_pending_for_id_locked(nvme_queue_t *queue,
                                                        uint16_t command_id) {
-    if (queue == 0 || command_id == 0U || command_id > queue->depth ||
-        command_id > NVME_IO_QUEUE_DEPTH) return 0;
-    return (nvme_pending_io_t *)(uintptr_t)atomic_load_explicit(
-        &queue->pending_by_cid[command_id - 1U], memory_order_acquire);
+    if (queue == 0) return 0;
+    for (list_head_t *node = queue->pending_ios.next;
+         node != &queue->pending_ios; node = node->next) {
+        nvme_pending_io_t *pending = (nvme_pending_io_t *)((uint8_t *)node -
+            __builtin_offsetof(nvme_pending_io_t, node));
+        if (pending->command_id == command_id) return pending;
+    }
+    return 0;
 }
 
 static void nvme_pending_unlink_locked(nvme_queue_t *queue,
                                         nvme_pending_io_t *pending) {
     if (queue == 0 || pending == 0) return;
-    if (pending->command_id != 0U &&
-        pending->command_id <= NVME_IO_QUEUE_DEPTH) {
-        uint32_t cid_index = (uint32_t)pending->command_id - 1U;
-        atomic_store_explicit(&queue->pending_by_cid[cid_index], 0U,
-                              memory_order_release);
-        queue->cid_busy &= ~(1ULL << cid_index);
-    }
     if (pending->node.next != &pending->node && pending->node.prev != &pending->node) {
         pending->node.prev->next = pending->node.next;
         pending->node.next->prev = pending->node.prev;
@@ -1125,61 +1034,11 @@ static void nvme_pending_release(nvme_pending_io_t *pending,
 }
 
 /*
- * MSI-X queues consume only the software CQ here.  The IRQ has already
- * advanced the native CQ head and copied the submitted command snapshot.
- */
-static uint32_t nvme_drain_software_completions(nvme_queue_t *queue,
-                                                 uint32_t budget,
-                                                 bool wait_for_lock) {
-    uint32_t processed = 0U;
-
-    if (queue == 0 || budget == 0U) return 0U;
-    if (wait_for_lock) {
-        nvme_lock(&queue->lock);
-    } else if (!nvme_try_lock(&queue->lock)) {
-        return 0U;
-    }
-
-    while (processed < budget) {
-        const nvme_io_completion_entry_t *source =
-            (const nvme_io_completion_entry_t *)
-                device_queue_consumer_peek(&queue->software_completion);
-        nvme_io_completion_entry_t completed;
-        nvme_pending_io_t *pending;
-
-        if (source == 0) break;
-        completed = *source;
-        pending = nvme_pending_for_id_locked(
-            queue, completed.completion.command_id);
-        if (pending != 0) nvme_pending_unlink_locked(queue, pending);
-        device_queue_consumer_release(&queue->software_completion);
-
-        nvme_unlock(&queue->lock);
-        if (pending != 0) {
-            kstatus_t status =
-                ((completed.completion.status >> 1) & 0x7FFFU) == 0U ?
-                    K_OK : K_EIO;
-            g_nvme_last_completion = completed.completion.status;
-            nvme_pending_release(
-                pending, status, status == K_OK ? pending->bytes : 0U);
-        }
-        ++processed;
-        if (processed >= budget) return processed;
-
-        if (wait_for_lock) {
-            nvme_lock(&queue->lock);
-        } else if (!nvme_try_lock(&queue->lock)) {
-            return processed;
-        }
-    }
-
-    nvme_unlock(&queue->lock);
-    return processed;
-}
-
-/*
- * Legacy polling path is retained only for controllers/queues without MSI-X.
- * MSI-X queues have a single native-CQ consumer: their registered ISR.
+ * CQ 的唯一状态修改入口。
+ *
+ * deferred worker 和同步关键 I/O 都允许调用这里；queue->lock 串行化
+ * completion_head/phase/pending_ios，因此不会发生双完成。pending_release()
+ * 故意在锁外执行，避免 DMA teardown / io_complete 扩大队列锁临界区。
  */
 static uint32_t nvme_poll_queue_completions(nvme_queue_t *queue,
                                              uint32_t budget,
@@ -1191,13 +1050,8 @@ static uint32_t nvme_poll_queue_completions(nvme_queue_t *queue,
     controller = queue->controller;
     if (controller == 0 || !queue->active) return 0U;
 
-    if (queue->irq_vector != 0U) {
-        return nvme_drain_software_completions(queue, budget, wait_for_lock);
-    }
-
     /*
-     * No-MSI-X fallback: deferred completion owns forward progress and may
-     * wait for the short queue critical section.
+     * Deferred completion owns forward progress and may wait for the short
      * queue critical section.  Synchronous direct polling is opportunistic:
      * if another submit/cancel/deferred consumer owns the queue, skip it and
      * let the outer synchronous loop retry instead of burning the CPU here.
@@ -1274,15 +1128,7 @@ static void nvme_deferred_complete(void *argument) {
                           memory_order_release);
     nvme_completion_ref_put(queue);
 
-    /*
-     * Close the ISR/worker hand-off race: after dropping completion_queued,
-     * recheck the software CQ.  An IRQ that raced while the flag was true
-     * could not enqueue another worker, so this worker inherits it.
-     */
-    if (queue->active &&
-        (processed == 32U ||
-         (queue->irq_vector != 0U &&
-          !device_queue_empty(&queue->software_completion)))) {
+    if (processed == 32U && queue->active) {
         (void)nvme_schedule_queue_completion(queue);
     }
 }
@@ -1418,12 +1264,6 @@ static void nvme_publish_pending_locked(nvme_queue_t *queue,
     submission = *command;
     submission.opcode_flags = (submission.opcode_flags & 0x0000FFFFU) |
                               ((uint32_t)pending->command_id << 16);
-
-    /* Publish the immutable software snapshot before hardware can complete. */
-    queue->command_shadow[pending->command_id - 1U] = submission;
-    atomic_store_explicit(&queue->pending_by_cid[pending->command_id - 1U],
-                          (uintptr_t)pending, memory_order_release);
-
     queue->submission[slot] = submission;
     dma_sync_for_device(&queue->submission_dma);
     dma_wmb();
@@ -1438,22 +1278,14 @@ static void nvme_publish_pending_locked(nvme_queue_t *queue,
 
 static uint16_t nvme_allocate_io_command_id_locked(nvme_controller_t *controller,
                                                    nvme_queue_t *queue) {
-    uint32_t depth;
-    uint64_t valid_mask;
-    uint64_t free_mask;
-    uint32_t bit;
-    (void)controller;
-
-    if (queue == 0) return 0U;
-    depth = queue->depth;
-    if (depth == 0U || depth > NVME_IO_QUEUE_DEPTH || depth > 64U) return 0U;
-    valid_mask = depth == 64U ? UINT64_MAX : ((1ULL << depth) - 1ULL);
-    free_mask = valid_mask & ~queue->cid_busy;
-    if (free_mask == 0U) return 0U;
-
-    bit = (uint32_t)__builtin_ctzll(free_mask);
-    queue->cid_busy |= 1ULL << bit;
-    return (uint16_t)(bit + 1U);
+    if (controller == 0 || queue == 0) return 0U;
+    for (uint32_t attempt = 0U; attempt < 0xFFFFU; ++attempt) {
+        uint16_t candidate = nvme_next_command_id(controller);
+        if (candidate != 0U && nvme_pending_for_id_locked(queue, candidate) == 0) {
+            return candidate;
+        }
+    }
+    return 0U;
 }
 
 static kstatus_t nvme_prepare_request_dma(device_t *device,
@@ -1655,12 +1487,8 @@ bool nvme_schedule_deferred_poll(void) {
         for (uint16_t queue_index = 0U;
              queue_index < controller->io_queue_count; ++queue_index) {
             nvme_queue_t *queue = &controller->io_queues[queue_index];
-            bool completion_ready =
-                queue->irq_vector != 0U ?
-                    !device_queue_empty(&queue->software_completion) :
-                    atomic_load_explicit(&queue->pending_count,
-                                         memory_order_acquire) != 0U;
-            if (queue->active && completion_ready &&
+            if (queue->active &&
+                atomic_load_explicit(&queue->pending_count, memory_order_acquire) != 0U &&
                 nvme_schedule_queue_completion(queue)) {
                 scheduled = true;
             }

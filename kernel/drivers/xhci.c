@@ -5,7 +5,6 @@
 
 #include <arch/x86_64/cpu.h>
 #include <kernel/dma.h>
-#include <kernel/device_queue.h>
 #include <kernel/kmem.h>
 #include <kernel/input.h>
 #include <kernel/bluetooth.h>
@@ -167,8 +166,6 @@
 
 
 #define XHCI_DEFERRED_EVENT_COUNT 32U
-#define XHCI_RUNTIME_COMPLETION_COUNT 512U
-#define XHCI_ISR_EVENT_BUDGET 128U
 
 typedef struct __attribute__((packed)) xhci_trb {
     uint64_t parameter;
@@ -415,18 +412,6 @@ typedef struct xhci_state {
     uint32_t deferred_event_head;
     uint32_t deferred_event_tail;
     uint32_t deferred_event_count;
-
-    /*
-     * Runtime hardware completions are copied by the registered xHCI ISR into
-     * this software CQ.  The deferred worker is its sole consumer.  Startup
-     * and synchronous control/MSC transactions keep using the hardware Event
-     * Ring directly until those paths are converted to the same command/CQ
-     * model in later patches.
-     */
-    device_queue_t runtime_completion_queue;
-    xhci_trb_t runtime_completion_entries[XHCI_RUNTIME_COMPLETION_COUNT]
-        __aligned(CACHELINE_SIZE);
-
     spinlock_t event_lock;
     uint8_t irq_vector;
     bool initialized;
@@ -542,9 +527,6 @@ static bool g_xhci_runtime_ready;
 static uint32_t g_xhci_runtime_event_batches;
 static atomic_bool g_xhci_work_queued;
 static atomic_bool g_xhci_irq_pending;
-/* ISR could not drain the hardware ring (event_lock busy or software CQ full).
- * The current owner clears EHB after it releases/drains its protected work. */
-static atomic_bool g_xhci_irq_rearm;
 
 /*
  * FIX11-DIAG: distinguish "Hub completion never happened" from
@@ -601,67 +583,42 @@ static bool xhci_write32(const xhci_state_t *state, uint32_t offset,
 static bool xhci_write64(const xhci_state_t *state, uint32_t offset,
                          uint64_t value);
 static uint64_t xhci_dma_address(const dma_mapping_t *mapping);
-static bool xhci_ring_event_pending(const xhci_state_t *state);
 static bool xhci_event_pending(const xhci_state_t *state);
-static bool xhci_runtime_work_pending(const xhci_state_t *state);
-static uint32_t xhci_ingest_runtime_events(xhci_state_t *state,
-                                           uint32_t budget);
 static void xhci_event_handler_complete(xhci_state_t *state);
 static void xhci_report_hid_completion_milestones(void);
 
 static void xhci_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
                               void *context) {
     xhci_state_t *state = (xhci_state_t *)context;
-    uint32_t queued;
-    bool blocked;
-
     (void)vector;
     (void)frame;
-    if (state == 0 || !state->initialized || state->irq_vector == 0U ||
-        !g_xhci_runtime_ready) return;
-
-    /* Diagnostics are counters only in hard IRQ context. */
-    atomic_store_explicit(&g_xhci_irq_seen, true, memory_order_relaxed);
-    (void)atomic_fetch_add_explicit(&g_xhci_diag_msix_count, 1U,
-                                    memory_order_relaxed);
-
-    /*
-     * event_lock also protects the temporary synchronous Event Ring consumers
-     * (currently MSC/audio).  Never spin in an ISR.  If one owns the ring,
-     * acknowledge IMAN.IP, leave EHB completion to that owner, and request a
-     * re-arm when it releases the lock.
-     */
-    if (atomic_exchange_explicit(&state->event_lock.state, 1U,
-                                 memory_order_acquire) != 0U) {
-        (void)xhci_write32(state,
-                           state->runtime_offset + XHCI_RUNTIME_INTR0,
-                           XHCI_IMAN_IP | XHCI_IMAN_IE);
-        atomic_store_explicit(&g_xhci_irq_rearm, true,
-                              memory_order_release);
-        (void)xhci_schedule_deferred_work();
-        return;
+    if (state == 0 || !state->initialized || state->irq_vector == 0U) return;
+    if (!atomic_exchange_explicit(&g_xhci_irq_seen, true,
+                                  memory_order_acq_rel)) {
+        liteos_serial_write("LITEOS_XHCI_IRQ_FIRED\r\n");
     }
 
-    /* Hard IRQ work is now: hardware CQ -> software CQ, then return. */
-    queued = xhci_ingest_runtime_events(state, XHCI_ISR_EVENT_BUDGET);
-    blocked = device_queue_full(&state->runtime_completion_queue);
+    unsigned diag_irq =
+        atomic_fetch_add_explicit(
+            &g_xhci_diag_msix_count,
+            1U,
+            memory_order_relaxed) +
+        1U;
 
-    atomic_store_explicit(&state->event_lock.state, 0U, memory_order_release);
-
-    if (blocked) {
-        /* Keep the controller's handler busy until the worker makes CQ room. */
-        atomic_store_explicit(&g_xhci_irq_rearm, true,
-                              memory_order_release);
-    } else {
-        xhci_event_handler_complete(state);
+    if(diag_irq <= 16U)
+    {
+        liteos_serial_write(
+            "LITEOS_DIAG_XHCI_MSIX\r\n");
     }
-
-    if (queued != 0U || blocked) {
-        /* If a worker is already queued it will inherit this completion batch. */
-        atomic_store_explicit(&g_xhci_irq_pending, true,
-                              memory_order_release);
-        (void)xhci_schedule_deferred_work();
-    }
+    /* The ISR only acknowledges the interrupter and queues bounded work.  It
+     * never walks the event ring or emits user input at interrupt level. */
+    /* IMAN.IP is RW1C.  Clear the pending bit while retaining IE; leaving IP
+     * set after the first HID completion makes QEMU suppress subsequent
+     * interrupt edges, leaving hid_transfer_pending stuck forever. */
+    (void)xhci_write32(state, state->runtime_offset + XHCI_RUNTIME_INTR0,
+                       XHCI_IMAN_IP | XHCI_IMAN_IE);
+    atomic_store_explicit(&g_xhci_irq_pending, true, memory_order_release);
+    (void)xhci_schedule_deferred_work();
 }
 
 static void xhci_report_msix_metadata(const pci_device_t *device) {
@@ -749,28 +706,16 @@ static void xhci_unbind_msix(xhci_state_t *state) {
     state->irq_vector = 0U;
 }
 
-static bool xhci_ring_event_pending(const xhci_state_t *state) {
+static bool xhci_event_pending(const xhci_state_t *state) {
     const volatile xhci_trb_t *event_ring;
     uint32_t control;
-
     if (state == 0 || !state->initialized) return false;
+    if (state->deferred_event_count != 0U) return true;
     event_ring = (const volatile xhci_trb_t *)state->event_ring.cpu;
     if (event_ring == 0) return false;
     dma_sync_for_cpu((dma_mapping_t *)&state->event_ring.mapping);
     control = event_ring[state->event_index].control;
     return (control & XHCI_TRB_CYCLE) == state->event_cycle;
-}
-
-static bool xhci_runtime_work_pending(const xhci_state_t *state) {
-    return state != 0 &&
-           (state->deferred_event_count != 0U ||
-            !device_queue_empty(&state->runtime_completion_queue));
-}
-
-static bool xhci_event_pending(const xhci_state_t *state) {
-    if (state == 0 || !state->initialized) return false;
-    if (xhci_runtime_work_pending(state)) return true;
-    return xhci_ring_event_pending(state);
 }
 
 static void xhci_event_handler_complete(xhci_state_t *state) {
@@ -2109,59 +2054,42 @@ static bool xhci_setup_rings(xhci_state_t *state) {
     return false;
 }
 
-static bool xhci_pop_ring_event(xhci_state_t *state, xhci_trb_t *event) {
+static bool xhci_next_ring_event(xhci_state_t *state, xhci_trb_t *event) {
     const volatile xhci_trb_t *event_ring;
     uint32_t control;
-
     if (state == 0 || event == 0) return false;
-    /* The controller owns Event TRBs; software only advances its dequeue. */
+    /*
+     * The xHCI event ring is controller-owned.  Software consumes it solely
+     * by advancing ERDP; it must never clear or otherwise rewrite an Event
+     * TRB.  Clearing the cycle bit makes an empty, stale entry look valid
+     * when the consumer cycle state wraps, after which HID completions are
+     * permanently missed.
+     */
     event_ring = (const volatile xhci_trb_t *)state->event_ring.cpu;
     dma_sync_for_cpu(&state->event_ring.mapping);
     control = event_ring[state->event_index].control;
     if ((control & XHCI_TRB_CYCLE) != state->event_cycle) return false;
-
     event->parameter = event_ring[state->event_index].parameter;
     event->status = event_ring[state->event_index].status;
     event->control = control;
     state->event_index = (state->event_index + 1U) % XHCI_RING_TRB_COUNT;
-    if (state->event_index == 0U) state->event_cycle ^= 1U;
-    return true;
-}
-
-static bool xhci_next_ring_event(xhci_state_t *state, xhci_trb_t *event) {
-    uint64_t event_dequeue;
-
-    if (!xhci_pop_ring_event(state, event)) return false;
+    if (state->event_index == 0) state->event_cycle ^= 1U;
+    uint64_t event_dequeue = xhci_dma_address(&state->event_ring.mapping) +
+                             (uint64_t)state->event_index * sizeof(xhci_trb_t);
 
     /*
-     * Preserve the existing synchronous-consumer behavior.  Runtime MSI-X
-     * ingestion uses xhci_pop_ring_event() directly and therefore performs
-     * only one ERDP/EHB MMIO update for the whole interrupt batch.
+     * Advance ERDP for ring-space accounting, but do NOT clear EHB for every
+     * individual Event TRB.
+     *
+     * EHB belongs to the whole event-processing batch.  Clearing it here can
+     * let the controller generate another MSI-X while the current deferred
+     * worker is still draining the same Event Ring.
+     *
+     * xhci_event_handler_complete() clears EHB exactly once after the batch.
      */
-    event_dequeue = xhci_dma_address(&state->event_ring.mapping) +
-                    (uint64_t)state->event_index * sizeof(xhci_trb_t);
     (void)xhci_write64(state, state->runtime_offset + XHCI_RUNTIME_INTR0 +
                        XHCI_RUNTIME_ERDP, event_dequeue | XHCI_ERDP_EHB);
     return true;
-}
-
-static uint32_t xhci_ingest_runtime_events(xhci_state_t *state,
-                                           uint32_t budget) {
-    uint32_t queued = 0U;
-
-    if (state == 0 || !state->initialized || budget == 0U) return 0U;
-
-    while (queued < budget) {
-        xhci_trb_t *destination =
-            (xhci_trb_t *)device_queue_producer_reserve(
-                &state->runtime_completion_queue);
-        if (destination == 0) break;
-        if (!xhci_pop_ring_event(state, destination)) break;
-        device_queue_producer_commit(&state->runtime_completion_queue);
-        ++queued;
-    }
-
-    return queued;
 }
 
 static bool xhci_defer_event(xhci_state_t *state, const xhci_trb_t *event) {
@@ -2177,13 +2105,7 @@ static bool xhci_defer_event(xhci_state_t *state, const xhci_trb_t *event) {
     return true;
 }
 
-/*
- * Startup/synchronous paths still consume the hardware Event Ring directly.
- * Once runtime MSI-X is live, the registered ISR is the sole hardware-ring
- * producer and the deferred worker consumes only the software completion CQ
- * (plus events deferred by a synchronous transaction that temporarily owned
- * event_lock).
- */
+/* 统一事件消费者优先处理同步等待阶段暂存的事件，再读取硬件事件环。 */
 static bool xhci_next_event(xhci_state_t *state, xhci_trb_t *event) {
     if (state == 0 || event == 0) return false;
     if (state->deferred_event_count != 0U) {
@@ -2193,17 +2115,6 @@ static bool xhci_next_event(xhci_state_t *state, xhci_trb_t *event) {
         --state->deferred_event_count;
         return true;
     }
-
-    if (g_xhci_runtime_ready) {
-        const xhci_trb_t *queued =
-            (const xhci_trb_t *)device_queue_consumer_peek(
-                &state->runtime_completion_queue);
-        if (queued == 0) return false;
-        *event = *queued;
-        device_queue_consumer_release(&state->runtime_completion_queue);
-        return true;
-    }
-
     return xhci_next_ring_event(state, event);
 }
 
@@ -8622,13 +8533,6 @@ static bool xhci_initialize(xhci_state_t *state, const pci_device_t *pci) {
     if (state == 0 || pci == 0 || state->initialized) return false;
     for (size_t i = 0; i < sizeof(*state); ++i) ((uint8_t *)state)[i] = 0;
     atomic_init(&state->event_lock.state, 0U);
-    if (device_queue_init(&state->runtime_completion_queue,
-                          state->runtime_completion_entries,
-                          XHCI_RUNTIME_COMPLETION_COUNT,
-                          sizeof(state->runtime_completion_entries[0])) != K_OK) {
-        g_xhci_error = 19U;
-        return false;
-    }
     state->pci = pci;
     if (pci_enable_memory_busmaster((pci_device_t *)pci) != K_OK ||
         !xhci_map_mmio(state)) {
@@ -8859,7 +8763,6 @@ bool xhci_hardware_self_test(void) {
     g_xhci_runtime_ready = false;
     atomic_init(&g_xhci_work_queued, false);
     atomic_init(&g_xhci_irq_pending, false);
-    atomic_init(&g_xhci_irq_rearm, false);
     atomic_init(&g_xhci_diag_msix_count, 0U);
     g_xhci_msix_failure_stage = 0U;
     atomic_init(&g_xhci_diag_hid_event_count, 0U);
@@ -8990,18 +8893,11 @@ bool xhci_hardware_self_test(void) {
                                   memory_order_release);
 
             /*
-             * A completion can land in the bind window before MSI-X is
-             * unmasked.  Runtime software CQ production belongs to the ISR,
-             * so do not let the deferred worker steal that Event TRB.  Clear
-             * EHB/IP once after binding; a pending hardware event then raises
-             * the registered vector and is copied by xhci_msix_handler().
+             * A completion may have landed in the tiny bind window after the
+             * startup drain and before MSI-X was unmasked.  Schedule one
+             * bounded deferred pass so such an event cannot be stranded.
              */
-            if (xhci_ring_event_pending(&g_xhci)) {
-                xhci_event_handler_complete(&g_xhci);
-            }
-            if (xhci_runtime_work_pending(&g_xhci)) {
-                (void)xhci_schedule_deferred_work();
-            }
+            (void)xhci_schedule_deferred_work();
         }
     }
     if (slot != 0U && !keep_controller &&
@@ -9081,20 +8977,10 @@ kstatus_t xhci_usb_bulk_session_begin(uint8_t slot) {
 }
 
 void xhci_usb_bulk_session_end(uint8_t slot) {
-    bool rearm;
     (void)slot;
     atomic_store_explicit(&g_xhci.event_lock.state, 0U,
                           memory_order_release);
-
-    rearm = atomic_exchange_explicit(&g_xhci_irq_rearm, false,
-                                     memory_order_acq_rel);
-    if (rearm || xhci_ring_event_pending(&g_xhci)) {
-        /* Let the registered ISR become the hardware-ring consumer again. */
-        xhci_event_handler_complete(&g_xhci);
-    }
-    if (xhci_runtime_work_pending(&g_xhci)) {
-        (void)xhci_schedule_deferred_work();
-    }
+    if (xhci_event_pending(&g_xhci)) (void)xhci_schedule_deferred_work();
 }
 
 kstatus_t xhci_usb_bulk_transfer_locked(uint8_t slot, uint8_t endpoint,
@@ -9311,23 +9197,10 @@ xhci_audio_lock(void)
 static void
 xhci_audio_unlock(void)
 {
-    bool rearm;
-
     atomic_store_explicit(
         &g_xhci.event_lock.state,
         0U,
         memory_order_release);
-
-    rearm = atomic_exchange_explicit(
-        &g_xhci_irq_rearm,
-        false,
-        memory_order_acq_rel);
-    if (rearm || xhci_ring_event_pending(&g_xhci)) {
-        xhci_event_handler_complete(&g_xhci);
-    }
-    if (xhci_runtime_work_pending(&g_xhci)) {
-        (void)xhci_schedule_deferred_work();
-    }
 }
 
 
@@ -9851,35 +9724,29 @@ xhci_audio_stream_disconnect(
 
 bool xhci_process_events(uint32_t budget) {
     bool consumed;
-    bool rearm;
-
     if (budget == 0U) budget = 1U;
     if (!g_xhci_runtime_ready) return false;
     ++g_xhci_runtime_event_batches;
     if (g_xhci_runtime_event_batches == 1U) {
         liteos_serial_write("LITEOS_USB_RUNTIME_IRQ_OK\r\n");
-        if (atomic_load_explicit(&g_xhci_irq_seen, memory_order_acquire)) {
-            liteos_serial_write("LITEOS_XHCI_IRQ_FIRED\r\n");
-        }
     }
-
-    /* The deferred worker is the sole software-CQ consumer. */
+    /* 该函数会在 LAPIC 定时器中断中调用；抢不到锁时直接延后本轮。 */
+    /*
+     * Runtime callers are the coalesced MSI-X worker, never a LAPIC timer
+     * polling path.  If another worker is already draining the ring it owns
+     * the pending completions and this invocation can simply return.
+     */
     if (atomic_exchange_explicit(&g_xhci.event_lock.state, 1U,
                                  memory_order_acquire) != 0U) return false;
     consumed = xhci_process_event_ring(&g_xhci, budget);
-
-    /*
-     * If an IRQ arrived while this worker/synchronous owner held event_lock,
-     * clear EHB only after the protected consumer is finished.  The remaining
-     * hardware Event TRB will then generate a fresh MSI-X and be copied by the
-     * ISR instead of being consumed here.
-     */
-    rearm = atomic_exchange_explicit(&g_xhci_irq_rearm, false,
-                                     memory_order_acq_rel);
-    if (rearm) xhci_event_handler_complete(&g_xhci);
-
+    xhci_event_handler_complete(&g_xhci);
     xhci_diag_interrupter_state_after_first_runtime_event(
         &g_xhci);
+    /*
+     * 根口状态由事件环每轮处理；Hub 没有使用中断状态端点时才做周期
+     * GET_STATUS。每 32 轮查询一次，避免一次 deferred work 同步等待
+     * Hub 的全部端口而长期占用用户态系统调用返回路径。
+     */
     atomic_store_explicit(&g_xhci.event_lock.state, 0U, memory_order_release);
     return consumed;
 }
@@ -9956,12 +9823,7 @@ void xhci_deferred_work(void *argument) {
      * it cannot form the old endless loop because the IRQ bit is consumed
      * once at worker entry/tail and must be set again by a real ISR.
      */
-    /*
-     * Do not poll/consume the hardware Event Ring from the worker.  A hardware
-     * event becomes work only after the registered ISR copies it to the
-     * software completion queue.  This preserves one producer / one consumer.
-     */
-    pending = xhci_runtime_work_pending(&g_xhci);
+    pending = xhci_event_pending(&g_xhci);
 
     raced_irq =
         atomic_exchange_explicit(
