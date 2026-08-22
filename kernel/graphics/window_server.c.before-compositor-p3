@@ -3432,7 +3432,8 @@ static inline void compositor_prefetch_surface_page(
     __asm__ volatile (
         "prefetcht0 (%0)"
         :
-        : "r"(next));
+        : "r"(next)
+        : "memory");
 }
 
 
@@ -6145,152 +6146,6 @@ static void compositor_commit_snapshot(void) {
 }
 
 
-/*
- * WB retained-scene qword store.
- *
- * The private composite framebuffer is ordinary cacheable RAM on this path.
- * MOVQ is used explicitly so unaligned source/destination X coordinates remain
- * valid without relying on C alignment rules.
- */
-static inline void compositor_wb_store64(
-    uint32_t *destination,
-    uint64_t value) {
-
-    __asm__ volatile (
-        "movq %1, %0"
-        : "=m"(*(uint64_t *)(void *)destination)
-        : "r"(value));
-}
-
-
-/*
- * Copy an overlapping WB span from high addresses toward low addresses.
- *
- * This is the only direction REP MOVSQ cannot safely provide while keeping
- * DF=0.  The kernel never sets the direction flag here: an interrupt/exception
- * may run at any instruction, and the normal x86-64 kernel ABI expects DF to
- * remain clear.
- *
- * Load a complete 64-byte block before storing any part of it.  That makes
- * even a one-pixel right shift safe when source/destination overlap inside the
- * same block.
- */
-static inline void compositor_move_wb_pixels_backward(
-    uint32_t *destination,
-    const uint32_t *source,
-    uint32_t pixels) {
-
-    if (destination == 0 ||
-        source == 0 ||
-        pixels == 0U) {
-        return;
-    }
-
-    if ((pixels & 1U) != 0U) {
-        --pixels;
-        destination[pixels] =
-            source[pixels];
-    }
-
-    while (pixels >= 16U) {
-        uint64_t v0;
-        uint64_t v1;
-        uint64_t v2;
-        uint64_t v3;
-        uint64_t v4;
-        uint64_t v5;
-        uint64_t v6;
-        uint64_t v7;
-
-        pixels -= 16U;
-
-        v0 = compositor_wb_load64(source + pixels + 0U);
-        v1 = compositor_wb_load64(source + pixels + 2U);
-        v2 = compositor_wb_load64(source + pixels + 4U);
-        v3 = compositor_wb_load64(source + pixels + 6U);
-        v4 = compositor_wb_load64(source + pixels + 8U);
-        v5 = compositor_wb_load64(source + pixels + 10U);
-        v6 = compositor_wb_load64(source + pixels + 12U);
-        v7 = compositor_wb_load64(source + pixels + 14U);
-
-        __asm__ volatile ("" : : : "memory");
-
-        compositor_wb_store64(destination + pixels + 14U, v7);
-        compositor_wb_store64(destination + pixels + 12U, v6);
-        compositor_wb_store64(destination + pixels + 10U, v5);
-        compositor_wb_store64(destination + pixels + 8U, v4);
-        compositor_wb_store64(destination + pixels + 6U, v3);
-        compositor_wb_store64(destination + pixels + 4U, v2);
-        compositor_wb_store64(destination + pixels + 2U, v1);
-        compositor_wb_store64(destination + pixels + 0U, v0);
-    }
-
-    while (pixels >= 2U) {
-        uint64_t value;
-
-        pixels -= 2U;
-
-        value =
-            compositor_wb_load64(
-                source + pixels);
-
-        compositor_wb_store64(
-            destination + pixels,
-            value);
-    }
-}
-
-
-/*
- * memmove semantics for one XRGB8888 WB scanline span.
- *
- * Forward/non-overlapping copies use the existing REP MOVSQ fast path.
- * Only an overlapping right shift needs the high->low helper above.
- */
-static inline void compositor_move_wb_pixels(
-    uint32_t *destination,
-    const uint32_t *source,
-    uint32_t pixels) {
-
-    uintptr_t destination_address;
-    uintptr_t source_address;
-    uintptr_t bytes;
-
-    if (destination == 0 ||
-        source == 0 ||
-        pixels == 0U ||
-        destination == source) {
-        return;
-    }
-
-    destination_address =
-        (uintptr_t)destination;
-
-    source_address =
-        (uintptr_t)source;
-
-    bytes =
-        (uintptr_t)pixels *
-        sizeof(uint32_t);
-
-    if (destination_address < source_address ||
-        destination_address >= source_address + bytes) {
-
-        compositor_copy_wb_pixels(
-            (volatile uint32_t *)destination,
-            source,
-            pixels);
-
-        return;
-    }
-
-    compositor_move_wb_pixels_backward(
-        destination,
-        source,
-        pixels);
-}
-
-
 /* Move the overlap of a topmost dragged window inside the retained compose
  * buffer.  The source is the last committed frame, so this avoids rereading
  * the client section and repainting every pixel for a one-pixel motion. */
@@ -6396,33 +6251,32 @@ static void compositor_blit_drag_overlap(void) {
         int64_t destination_x =
             (int64_t)snapshot->drag_new_x + local_left;
 
-        /*
-         * This function is unreachable for the low-memory direct-framebuffer
-         * fallback, so composite_framebuffer is guaranteed to be private WB
-         * RAM here.  Cast away the global volatile qualifier and use bulk
-         * memmove semantics instead of one volatile 32-bit load/store per
-         * pixel.
-         */
-        uint32_t *scene =
-            (uint32_t *)(uintptr_t)
-                g_window_server.composite_framebuffer;
-
-        const uint32_t *source =
-            scene +
-            (uint64_t)source_y *
-                g_window_server.display_stride +
+        volatile uint32_t *source =
+            g_window_server.composite_framebuffer +
+            (uint64_t)source_y * g_window_server.display_stride +
             (uint32_t)source_x;
 
-        uint32_t *destination =
-            scene +
-            (uint64_t)destination_y *
-                g_window_server.display_stride +
+        volatile uint32_t *destination =
+            g_window_server.composite_framebuffer +
+            (uint64_t)destination_y * g_window_server.display_stride +
             (uint32_t)destination_x;
 
-        compositor_move_wb_pixels(
-            destination,
-            source,
-            width);
+        if (source_y == destination_y &&
+            destination_x > source_x) {
+            for (uint32_t column = width;
+                 column != 0U;
+                 --column) {
+                destination[column - 1U] =
+                    source[column - 1U];
+            }
+        } else {
+            for (uint32_t column = 0U;
+                 column < width;
+                 ++column) {
+                destination[column] =
+                    source[column];
+            }
+        }
     }
 }
 
