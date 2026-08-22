@@ -30,8 +30,8 @@
  * run queue makes a frame copy delay the next mouse report by one or more
  * scheduler quanta.  A private CPU is only a placement hint: the worker
  * remains fully serialized by window_lock and falls back to CPU0 on UP. */
-#define WINDOW_COMPOSITOR_PUBLICATION_YIELD_PIXELS (128U * 1024U)
-#define WINDOW_COMPOSITOR_ATOMIC_PIXELS (128U * 1024U)
+#define WINDOW_COMPOSITOR_PUBLICATION_ROW_CHUNK 16U
+#define WINDOW_COMPOSITOR_ATOMIC_PIXELS (32U * 1024U)
 
 /* LITEOS_COMPOSITOR_RETAINED_DRAG_V2
  *
@@ -290,7 +290,7 @@ static compositor_snapshot_t g_compositor_snapshot;
  */
 typedef struct compositor_copy_job {
     volatile uint32_t *destination;
-    const uint32_t *source;
+    const volatile uint32_t *source;
     uint32_t destination_stride;
     uint32_t source_stride;
     window_damage_rect_t rect;
@@ -455,7 +455,7 @@ static void __attribute__((noreturn)) desktop_asset_worker_main(void *argument);
 static bool desktop_load_assets(void);
 static bool compositor_copy_rect_parallel_buffers(
     volatile uint32_t *destination,
-    const uint32_t *source,
+    const volatile uint32_t *source,
     uint32_t destination_stride,
     uint32_t source_stride,
     const window_damage_rect_t *rect);
@@ -2735,7 +2735,7 @@ static void desktop_copy_cached_region(void) {
             pixels > WINDOW_COMPOSITOR_PARALLEL_PIXELS &&
             compositor_copy_rect_parallel_buffers(
                 g_window_server.composite_framebuffer,
-                g_desktop_cache,
+                (const volatile uint32_t *)g_desktop_cache,
                 g_window_server.display_stride,
                 g_desktop_cache_stride,
                 &cached_rect)) {
@@ -3736,10 +3736,6 @@ static void compositor_surface_locked(
     int64_t frame_height;
     int64_t surface_x;
     int64_t surface_y;
-    int64_t first_row;
-    int64_t last_row;
-    int64_t base_first_column;
-    int64_t base_last_column;
 
     if (window == 0) {
         return;
@@ -3762,95 +3758,8 @@ static void compositor_surface_locked(
         (int64_t)window->y +
         window_client_offset_y(window->flags);
 
-    /*
-     * Compute the display/damage intersection once.
-     *
-     * The old path iterated row=0..window->height for every damage rectangle
-     * and rejected unrelated rows inside the loop.  A 20-pixel-high update on
-     * a 1000-pixel-tall window therefore still executed ~1000 row tests.
-     */
-    first_row = 0;
-    last_row = window->height;
-
-    if (surface_y + first_row < 0) {
-        first_row = -surface_y;
-    }
-
-    if (surface_y + last_row >
-        (int64_t)g_window_server.display_height) {
-        last_row =
-            (int64_t)g_window_server.display_height -
-            surface_y;
-    }
-
-    if (surface_y + first_row <
-        (int64_t)g_compositor_snapshot.damage_top) {
-        first_row =
-            (int64_t)g_compositor_snapshot.damage_top -
-            surface_y;
-    }
-
-    if (surface_y + last_row >
-        (int64_t)g_compositor_snapshot.damage_bottom) {
-        last_row =
-            (int64_t)g_compositor_snapshot.damage_bottom -
-            surface_y;
-    }
-
-    if (first_row < 0) {
-        first_row = 0;
-    }
-
-    if (last_row > (int64_t)window->height) {
-        last_row = window->height;
-    }
-
-    if (first_row >= last_row) {
-        return;
-    }
-
-    base_first_column = 0;
-    base_last_column = window->width;
-
-    if (surface_x + base_first_column < 0) {
-        base_first_column = -surface_x;
-    }
-
-    if (surface_x + base_last_column >
-        (int64_t)g_window_server.display_width) {
-        base_last_column =
-            (int64_t)g_window_server.display_width -
-            surface_x;
-    }
-
-    if (surface_x + base_first_column <
-        (int64_t)g_compositor_snapshot.damage_left) {
-        base_first_column =
-            (int64_t)g_compositor_snapshot.damage_left -
-            surface_x;
-    }
-
-    if (surface_x + base_last_column >
-        (int64_t)g_compositor_snapshot.damage_right) {
-        base_last_column =
-            (int64_t)g_compositor_snapshot.damage_right -
-            surface_x;
-    }
-
-    if (base_first_column < 0) {
-        base_first_column = 0;
-    }
-
-    if (base_last_column > (int64_t)window->width) {
-        base_last_column = window->width;
-    }
-
-    if (base_first_column >= base_last_column) {
-        return;
-    }
-
-    for (uint32_t row = (uint32_t)first_row;
-         row < (uint32_t)last_row;
+    for (uint32_t row = 0U;
+         row < window->height;
          ++row) {
 
         int64_t destination_y =
@@ -3860,15 +3769,22 @@ static void compositor_surface_locked(
             destination_y -
             window->y;
 
-        int64_t first_column =
-            base_first_column;
-
+        int64_t first_column = 0;
         int64_t last_column =
-            base_last_column;
+            window->width;
 
         uint32_t inset;
 
         volatile uint32_t *destination;
+
+        if (destination_y <
+                (int64_t)
+                    g_compositor_snapshot.damage_top ||
+            destination_y >=
+                (int64_t)
+                    g_compositor_snapshot.damage_bottom) {
+            continue;
+        }
 
         inset = (frame_row >= 0 && frame_row < frame_height ?
                  compositor_corner_inset(
@@ -3878,20 +3794,74 @@ static void compositor_surface_locked(
                  0U);
 
         /*
+         * Clip against the display.
+         */
+        if (surface_x + first_column < 0) {
+            first_column =
+                -surface_x;
+        }
+
+        if (surface_x + last_column >
+            (int64_t)
+                g_window_server.display_width) {
+
+            last_column =
+                (int64_t)
+                    g_window_server.display_width -
+                surface_x;
+        }
+
+        /*
+         * Clip against current damage.
+         */
+        if (surface_x + first_column <
+            (int64_t)
+                g_compositor_snapshot.damage_left) {
+
+            first_column =
+                (int64_t)
+                    g_compositor_snapshot.damage_left -
+                surface_x;
+        }
+
+        if (surface_x + last_column >
+            (int64_t)
+                g_compositor_snapshot.damage_right) {
+
+            last_column =
+                (int64_t)
+                    g_compositor_snapshot.damage_right -
+                surface_x;
+        }
+
+        /*
          * Preserve the one-pixel decoration border around rounded windows.
-         * This is the only row-dependent clipping left in the hot loop.
          */
         if (first_column <
             (int64_t)inset) {
-            first_column = inset;
+
+            first_column =
+                inset;
         }
 
         if (last_column >
             (int64_t)window->width -
                 inset) {
+
             last_column =
                 (int64_t)window->width -
                 inset;
+        }
+
+        if (first_column < 0) {
+            first_column = 0;
+        }
+
+        if (last_column >
+            (int64_t)window->width) {
+
+            last_column =
+                window->width;
         }
 
         if (first_column >= last_column) {
@@ -5334,7 +5304,8 @@ static inline void compositor_wc_store64(volatile uint64_t *destination,
     __asm__ volatile (
         "movnti %1, %0"
         : "=m"(*destination)
-        : "r"(value));
+        : "r"(value)
+        : "memory");
 }
 
 /*
@@ -5345,14 +5316,15 @@ static inline void compositor_wc_store64(volatile uint64_t *destination,
  * are naturally aligned and this becomes one MOVQ.
  */
 static inline uint64_t compositor_wb_load64(
-    const uint32_t *source) {
+    const volatile uint32_t *source) {
 
     uint64_t value;
 
-    __asm__ (
+    __asm__ volatile (
         "movq %1, %0"
         : "=r"(value)
-        : "m"(*(const uint64_t *)(const void *)source));
+        : "m"(*(const volatile uint64_t *)(const void *)source)
+        : "memory");
 
     return value;
 }
@@ -5360,8 +5332,8 @@ static inline uint64_t compositor_wb_load64(
 
 
 static void compositor_copy_wc_scanline(
-    volatile uint32_t *__restrict destination,
-    const uint32_t *__restrict source,
+    volatile uint32_t *destination,
+    const volatile uint32_t *source,
     uint32_t pixels) {
 
     if (destination == 0 ||
@@ -5524,57 +5496,22 @@ static bool compositor_copy_worker_ready(void *context) {
 static void compositor_copy_rows(const compositor_copy_job_t *job,
                                  uint32_t participant,
                                  uint32_t participants) {
-    uint64_t height;
-    uint64_t rows_per_participant;
-    uint64_t first_row;
-    uint64_t last_row;
+    uint64_t row;
 
     if (job == 0 || participants == 0U ||
         job->destination == 0 || job->source == 0 ||
         job->rect.left >= job->rect.right ||
-        job->rect.top >= job->rect.bottom ||
-        participant >= participants) {
+        job->rect.top >= job->rect.bottom) {
         return;
     }
 
-    /*
-     * Give each CPU one contiguous scanline range.
-     *
-     * The old participant, participant+N, ... interleave makes every CPU jump
-     * through the source and WC destination with an N-row stride.  Equal
-     * contiguous slices preserve sequential WB reads and WC write combining.
-     */
-    height =
-        (uint64_t)job->rect.bottom -
-        job->rect.top;
-
-    rows_per_participant =
-        (height + participants - 1U) /
-        participants;
-
-    first_row =
-        (uint64_t)job->rect.top +
-        rows_per_participant * participant;
-
-    if (first_row >= job->rect.bottom) {
-        return;
-    }
-
-    last_row =
-        first_row +
-        rows_per_participant;
-
-    if (last_row > job->rect.bottom) {
-        last_row = job->rect.bottom;
-    }
-
-    for (uint64_t row = first_row;
-         row < last_row;
-         ++row) {
+    for (row = (uint64_t)job->rect.top + participant;
+         row < job->rect.bottom;
+         row += participants) {
         volatile uint32_t *destination =
             job->destination + row * job->destination_stride +
             job->rect.left;
-        const uint32_t *source =
+        const volatile uint32_t *source =
             job->source + row * job->source_stride + job->rect.left;
         compositor_copy_wc_scanline(destination, source,
                                      job->rect.right - job->rect.left);
@@ -5605,8 +5542,8 @@ static void __attribute__((noreturn)) compositor_copy_worker_main(void *argument
             &g_compositor_copy_worker_count, memory_order_acquire);
         if (worker_count == 0U || worker_index >= worker_count) continue;
 
-        /* Participant zero is the compositor itself; every participant owns
-         * one disjoint contiguous row slice. */
+        /* Participant zero is the compositor itself; worker indices start at
+         * one so no scanline is ever written by two CPUs. */
         compositor_copy_rows(&g_compositor_copy_job,
                              worker_index + 1U,
                              worker_count + 1U);
@@ -5794,7 +5731,7 @@ static bool window_server_start_desktop_asset_worker(uint32_t compositor_cpu) {
 
 static bool compositor_copy_rect_parallel_buffers(
     volatile uint32_t *destination,
-    const uint32_t *source,
+    const volatile uint32_t *source,
     uint32_t destination_stride,
     uint32_t source_stride,
     const window_damage_rect_t *rect) {
@@ -5841,21 +5778,14 @@ static bool compositor_copy_rect_parallel_buffers(
          * drain the rows.  No framebuffer lock is held here. */
         schedule();
     }
-
-    /*
-     * Participant zero fenced before waiting.  Every helper fences before its
-     * release-completion increment, so the acquire above already observes a
-     * completed WC transaction; another local SFENCE cannot order remote
-     * stores any further.
-     */
+    __asm__ volatile ("sfence" : : : "memory");
     return true;
 }
 
 static bool compositor_copy_rect_parallel(const window_damage_rect_t *rect) {
     return compositor_copy_rect_parallel_buffers(
         g_window_server.framebuffer,
-        (const uint32_t *)(uintptr_t)
-            g_window_server.composite_framebuffer,
+        g_window_server.composite_framebuffer,
         g_window_server.display_stride,
         g_window_server.display_stride,
         rect);
@@ -5889,64 +5819,39 @@ static uint64_t compositor_damage_pixels(void) {
  * the single atomic transaction by passing allow_yield=false. */
 static void compositor_publish_rect(const window_damage_rect_t *rect,
                                     bool allow_yield) {
-    uint32_t width;
-    uint64_t pixels_since_yield = 0U;
+    uint32_t rows_since_yield = 0U;
 
     if (rect == 0 || rect->left >= rect->right || rect->top >= rect->bottom) {
         return;
     }
-
-    width =
-        rect->right -
-        rect->left;
 
     for (uint32_t row = rect->top; row < rect->bottom; ++row) {
         volatile uint32_t *destination =
             g_window_server.framebuffer +
             (uint64_t)row * g_window_server.display_stride +
             rect->left;
+        const volatile uint32_t *source =
+            g_window_server.composite_framebuffer +
+            (uint64_t)row * g_window_server.display_stride +
+            rect->left;
 
-        /*
-         * composite_framebuffer is guaranteed to be the private retained WB
-         * scene on this path; the direct-framebuffer fallback never calls
-         * compositor_commit_snapshot().
-         */
-        const uint32_t *source =
-            (const uint32_t *)(uintptr_t)(
-                g_window_server.composite_framebuffer +
-                (uint64_t)row * g_window_server.display_stride +
-                rect->left);
+        compositor_copy_wc_scanline(destination, source,
+                                     rect->right - rect->left);
 
-        compositor_copy_wc_scanline(
-            destination,
-            source,
-            width);
-
-        if (!allow_yield) {
-            continue;
-        }
-
-        pixels_since_yield +=
-            width;
-
-        if (pixels_since_yield <
-                WINDOW_COMPOSITOR_PUBLICATION_YIELD_PIXELS ||
+        if (!allow_yield) continue;
+        ++rows_since_yield;
+        if (rows_since_yield < WINDOW_COMPOSITOR_PUBLICATION_ROW_CHUNK ||
             row + 1U >= rect->bottom) {
             continue;
         }
 
-        /*
-         * Yield by copied work, not by row count.  A narrow 64-pixel damage
-         * rectangle no longer calls schedule() every 16 rows while a full
-         * 2560-pixel row gets a proportionally shorter quantum.
-         *
-         * WC stores remain ordered by the final frame fence.
-         */
+        /* WC stores remain ordered by the final fence.  Releasing the local
+         * preemption guard here is safe because no other compositor can run
+         * while snapshot.composing is true. */
         sched_preempt_enable();
         schedule();
         sched_preempt_disable();
-
-        pixels_since_yield = 0U;
+        rows_since_yield = 0U;
     }
 }
 
