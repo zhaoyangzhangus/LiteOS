@@ -14,7 +14,16 @@
  * GNOME-Files-like client UI.
  */
 #define FM4_SIDEBAR_WIDTH          198U
-#define FM4_HEADER_HEIGHT           56U
+#define FM4_HEADER_HEIGHT           40U
+#define FM4_HEADER_CONTROL_Y        3U
+#define FM4_HEADER_ICON_Y           12U
+#define FM4_HEADER_CLOSE_Y          8U
+#define FM4_HEADER_MENU_Y           13U
+/* The 12x24 font has two pixels more descent than visible ink.  Moving the
+ * cell down one pixel puts the actual title strokes on the same centerline as
+ * the 16px header icons. */
+#define FM4_HEADER_TEXT_Y           9U
+#define FM4_WINDOW_BORDER_COLOR     0x00D2D2D5U
 
 #define FM4_GRID_MARGIN_X           24U
 #define FM4_GRID_MARGIN_Y           20U
@@ -32,7 +41,7 @@
  * devices, which is the useful information in a small LiteOS desktop. */
 #define FM4_VOLUME_CAPACITY         16U
 #define FM4_VOLUME_ROW_HEIGHT       39U
-#define FM4_VOLUME_FIRST_Y          58U
+#define FM4_VOLUME_FIRST_Y          50U
 
 #define FM4_HISTORY_CAPACITY        16U
 /*
@@ -982,6 +991,28 @@ static void fm4_close_icon(uint32_t x, uint32_t y) {
                          0x00484D53U);
 }
 
+/* Client decorations own the complete surface, including the outer frame.
+ * Keep this as four thin damage-aware spans so a hover or selection update
+ * never forces a full-frame repaint. */
+static void fm4_window_frame(void) {
+    if (g_target_width < 2U || g_target_height < 2U) return;
+
+    fill_rect(0U, 0U, g_target_width, 1U,
+              FM4_WINDOW_BORDER_COLOR);
+    fill_rect(0U, g_target_height - 1U, g_target_width, 1U,
+              FM4_WINDOW_BORDER_COLOR);
+    fill_rect(0U, 0U, 1U, g_target_height,
+              FM4_WINDOW_BORDER_COLOR);
+    fill_rect(g_target_width - 1U, 0U, 1U, g_target_height,
+              FM4_WINDOW_BORDER_COLOR);
+
+    /* The header separator is part of the same client-owned frame. */
+    if (g_target_height > FM4_HEADER_HEIGHT) {
+        fill_rect(0U, FM4_HEADER_HEIGHT - 1U, g_target_width, 1U,
+                  FM4_WINDOW_BORDER_COLOR);
+    }
+}
+
 
 /*
  * ASCII case-insensitive ordering.
@@ -1372,7 +1403,7 @@ static void fm4_damage_status(void) {
 
 static void fm4_damage_control(uint32_t control) {
     uint32_t x;
-    uint32_t y = 4U;
+    uint32_t y = FM4_HEADER_CONTROL_Y;
     uint32_t width = 34U;
     uint32_t height = 34U;
 
@@ -1400,7 +1431,7 @@ static void fm4_damage_control(uint32_t control) {
         break;
     case FM4_CONTROL_CLOSE:
         x = g_window.width > 30U ? g_window.width - 30U : 0U;
-        y = 8U;
+        y = FM4_HEADER_CLOSE_Y;
         width = 24U;
         height = 24U;
         break;
@@ -1778,7 +1809,7 @@ static uint32_t fm4_control_at(
     if (fm4_inside(
             px, py,
             FM4_SIDEBAR_WIDTH + 14U,
-            4U,
+            FM4_HEADER_CONTROL_Y,
             34U,
             34U)) {
 
@@ -1788,7 +1819,7 @@ static uint32_t fm4_control_at(
     if (fm4_inside(
             px, py,
             FM4_SIDEBAR_WIDTH + 54U,
-            4U,
+            FM4_HEADER_CONTROL_Y,
             34U,
             34U)) {
 
@@ -1796,24 +1827,28 @@ static uint32_t fm4_control_at(
     }
 
     if (g_window.width > 140U &&
-        fm4_inside(px, py, g_window.width - 140U, 4U, 32U, 32U)) {
+        fm4_inside(px, py, g_window.width - 140U,
+                   FM4_HEADER_CONTROL_Y, 32U, 32U)) {
 
         return FM4_CONTROL_SEARCH;
     }
 
     if (g_window.width > 106U &&
-        fm4_inside(px, py, g_window.width - 106U, 4U, 32U, 32U)) {
+        fm4_inside(px, py, g_window.width - 106U,
+                   FM4_HEADER_CONTROL_Y, 32U, 32U)) {
 
         return FM4_CONTROL_VIEW;
     }
 
     if (g_window.width > 74U &&
-        fm4_inside(px, py, g_window.width - 74U, 4U, 32U, 32U)) {
+        fm4_inside(px, py, g_window.width - 74U,
+                   FM4_HEADER_CONTROL_Y, 32U, 32U)) {
         return FM4_CONTROL_SORT;
     }
 
     if (g_window.width > 40U &&
-        fm4_inside(px, py, g_window.width - 40U, 4U, 36U, 32U)) {
+        fm4_inside(px, py, g_window.width - 40U,
+                   FM4_HEADER_CONTROL_Y, 36U, 32U)) {
         return FM4_CONTROL_CLOSE;
     }
 
@@ -2217,10 +2252,11 @@ static void render(void) {
     /*
      * Sidebar title.
      */
-    fm4_search_icon(12U, 20U, 0x00585E64U);
-    draw_text(80U, fm4_text_y_centered(0U, FM4_HEADER_HEIGHT),
+    fm4_search_icon(12U, FM4_HEADER_ICON_Y, 0x00585E64U);
+    draw_text(80U, FM4_HEADER_TEXT_Y,
               "Files", 0x00303438U);
-    fm4_menu_icon(FM4_SIDEBAR_WIDTH - 29U, 21U, 0x00585E64U);
+    fm4_menu_icon(FM4_SIDEBAR_WIDTH - 29U, FM4_HEADER_MENU_Y,
+                  0x00585E64U);
 
     /*
      * Volumes only.  A selected volume gets the same soft pill used by the
@@ -2259,13 +2295,13 @@ static void render(void) {
 
         fm4_round_rect(
             FM4_SIDEBAR_WIDTH + 14U,
-            4U,
+            FM4_HEADER_CONTROL_Y,
             34U,
             34U,
             0x00ECECECU);
     }
 
-    fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 20U, 13U, false,
+    fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 20U, FM4_HEADER_ICON_Y, false,
                      g_history_index != 0U ? 0x0031373CU : 0x00BFC1C3U);
 
     /*
@@ -2276,13 +2312,13 @@ static void render(void) {
 
         fm4_round_rect(
             FM4_SIDEBAR_WIDTH + 54U,
-            4U,
+            FM4_HEADER_CONTROL_Y,
             34U,
             34U,
             0x00ECECECU);
     }
 
-    fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 60U, 13U, true,
+    fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 60U, FM4_HEADER_ICON_Y, true,
                      g_history_index + 1U < g_history_count ?
                      0x0031373CU : 0x00BFC1C3U);
 
@@ -2306,7 +2342,7 @@ static void render(void) {
 
         fm4_round_rect(
             x,
-            4U,
+            FM4_HEADER_CONTROL_Y,
             width,
             34U,
             0x00E9E9E9U);
@@ -2320,7 +2356,7 @@ static void render(void) {
                          (width - 22U) / FONT12X24_WIDTH);
         }
 
-        fm4_text(x + 14U, fm4_text_y_centered(4U, 34U),
+        fm4_text(x + 14U, FM4_HEADER_TEXT_Y,
                  breadcrumb, 0x0043484DU);
     }
 
@@ -2329,24 +2365,30 @@ static void render(void) {
      */
     if (g_target_width > 140U) {
         if (g_hover_control == FM4_CONTROL_SEARCH) {
-            fm4_round_rect(g_target_width - 140U, 4U, 32U, 32U,
+            fm4_round_rect(g_target_width - 140U, FM4_HEADER_CONTROL_Y,
+                           32U, 32U,
                            0x00ECECECU);
         }
-        fm4_search_icon(g_target_width - 132U, 12U, 0x003E444AU);
+        fm4_search_icon(g_target_width - 132U, FM4_HEADER_ICON_Y,
+                        0x003E444AU);
 
         if (g_hover_control == FM4_CONTROL_VIEW) {
-            fm4_round_rect(g_target_width - 106U, 4U, 32U, 32U,
+            fm4_round_rect(g_target_width - 106U, FM4_HEADER_CONTROL_Y,
+                           32U, 32U,
                            0x00ECECECU);
         }
-        fm4_list_icon(g_target_width - 98U, 12U, 0x003E444AU);
+        fm4_list_icon(g_target_width - 98U, FM4_HEADER_ICON_Y,
+                      0x003E444AU);
 
         if (g_hover_control == FM4_CONTROL_SORT) {
-            fm4_round_rect(g_target_width - 74U, 4U, 32U, 32U,
+            fm4_round_rect(g_target_width - 74U, FM4_HEADER_CONTROL_Y,
+                           32U, 32U,
                            0x00ECECECU);
         }
-        fm4_sort_icon(g_target_width - 66U, 12U, 0x003E444AU);
+        fm4_sort_icon(g_target_width - 66U, FM4_HEADER_ICON_Y,
+                      0x003E444AU);
 
-        fm4_close_icon(g_target_width - 30U, 8U);
+        fm4_close_icon(g_target_width - 30U, FM4_HEADER_CLOSE_Y);
     }
 
     /*
@@ -2640,6 +2682,8 @@ static void render(void) {
                      g_status, 0x0052585EU);
         }
     }
+
+    fm4_window_frame();
 
     update_window();
 }

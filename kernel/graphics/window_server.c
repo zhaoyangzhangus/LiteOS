@@ -41,6 +41,14 @@
 #ifndef WINDOW_COMPOSITOR_PARALLEL_PIXELS
 #define WINDOW_COMPOSITOR_PARALLEL_PIXELS (512U * 1024U)
 #endif
+
+/*
+ * Correctness baseline for GOP: do not publish one drag transaction from
+ * several CPUs at once.  Without a real page-flip/vblank contract the WC
+ * framebuffer should have one writer for a visible move.
+ */
+#define WINDOW_COMPOSITOR_PARALLEL_DRAG 0U
+
 #define WINDOW_COMPOSITOR_COPY_MAX_WORKERS 2U
 #define WINDOW_COMPOSITOR_COPY_STACK_SIZE (32U * 1024U)
 #define WINDOW_DESKTOP_ASSET_WORKER_STACK_SIZE (32U * 1024U)
@@ -98,7 +106,10 @@ enum {
     DESKTOP_APP_NOTES = 3U,
     DESKTOP_APP_NETWORK = 4U,
 };
-#define WINDOW_RESIZE_GRAB 6U
+/* Keep resize detection close to the visible client frame.  Three pixels is
+ * large enough to acquire with a mouse without stealing the title/content
+ * hit area; one-pixel borders remain visual only. */
+#define WINDOW_RESIZE_GRAB 3U
 #define WINDOW_MIN_WIDTH 160U
 #define WINDOW_MIN_HEIGHT 96U
 #define WINDOW_CLIENT_DRAG_REGION_HEIGHT 56U
@@ -852,6 +863,44 @@ static bool window_drag_reuse_available_locked(
                g_window_server.framebuffer &&
            g_window_server.count != 0U &&
            g_window_server.windows[g_window_server.count - 1U] == window;
+}
+
+/*
+ * Retained dragging is valid only when old_x/old_y still describes the
+ * pixels currently stored in composite_framebuffer.
+ *
+ * More than one HID report can be consumed before a frame is composed.  Once
+ * one move has marked damage, dragged->x/y may already be an intermediate
+ * position that has never existed in the retained scene.  Reusing pixels from
+ * that position copies unrelated background into the window.
+ *
+ * Off-screen moves are also kept on the normal compositor path because the
+ * retained scene cannot provide local window pixels that were clipped outside
+ * the display at the old position.
+ */
+static bool window_drag_reuse_safe_locked(
+    const window_server_window_t *window,
+    int32_t old_x, int32_t old_y,
+    int32_t new_x, int32_t new_y,
+    uint32_t width, uint32_t height) {
+
+    if (!window_drag_reuse_available_locked(window) ||
+        g_window_server.dirty ||
+        g_window_server.composing ||
+        width == 0U || height == 0U ||
+        old_x < 0 || old_y < 0 ||
+        new_x < 0 || new_y < 0) {
+        return false;
+    }
+
+    return (uint64_t)(uint32_t)old_x + width <=
+               g_window_server.display_width &&
+           (uint64_t)(uint32_t)new_x + width <=
+               g_window_server.display_width &&
+           (uint64_t)(uint32_t)old_y + height <=
+               g_window_server.display_height &&
+           (uint64_t)(uint32_t)new_y + height <=
+               g_window_server.display_height;
 }
 
 
@@ -5082,8 +5131,12 @@ static bool compositor_snapshot_begin_locked(void) {
     snapshot->dragging_identifier =
         g_window_server.dragging_identifier;
 
-    snapshot->drag_blit_valid =
-        g_window_server.drag_blit_valid;
+    /*
+     * Do not mutate the retained scene with an in-place window memmove.
+     * A drag is recomposed from desktop + windows into one complete damage
+     * transaction.  This keeps composite_framebuffer a trustworthy scene.
+     */
+    snapshot->drag_blit_valid = false;
     snapshot->drag_old_x =
         g_window_server.drag_old_x;
     snapshot->drag_old_y =
@@ -5831,7 +5884,8 @@ static void compositor_commit_snapshot(void) {
      * path includes per-CPU fences and returns only after every row is visible,
      * so it cannot expose the stale-gap corruption caused by the old bounding
      * box copy. */
-    if (commit_as_move_transaction) {
+    if (WINDOW_COMPOSITOR_PARALLEL_DRAG != 0U &&
+        commit_as_move_transaction) {
         uint32_t left = g_window_server.display_width;
         uint32_t top = g_window_server.display_height;
         uint32_t right = 0U;
@@ -6192,16 +6246,13 @@ static void compositor_snapshot_finish(void) {
      */
     window_lock();
 
-    if (g_window_server.dragging_identifier != 0U &&
-        g_window_server.resize_edges == 0U) {
-        window_server_window_t *dragged =
-            find_window_locked(g_window_server.dragging_identifier);
-
-        g_window_server.drag_blit_valid =
-            window_drag_reuse_available_locked(dragged);
-    } else {
-        g_window_server.drag_blit_valid = false;
-    }
+    /*
+     * Keep retained drag disabled until it can use an immutable previous-frame
+     * source instead of moving pixels inside the live retained scene.
+     * Every move therefore marks/renders the complete new position and the
+     * snapshot collapses old/new damage into one correctness-first rectangle.
+     */
+    g_window_server.drag_blit_valid = false;
 
     g_window_server.composing = false;
 
@@ -7362,7 +7413,11 @@ static void route_input_locked(const input_event_t *event) {
                     window_outer_height(dragged->height, dragged->flags);
                 bool reuse_retained =
                     g_window_server.drag_blit_valid &&
-                    window_drag_reuse_available_locked(dragged);
+                    window_drag_reuse_safe_locked(
+                        dragged,
+                        old_x, old_y,
+                        new_x, new_y,
+                        outer_width, outer_height);
 
                 g_window_server.drag_blit_valid = reuse_retained;
                 g_window_server.drag_old_x = old_x;
@@ -7861,10 +7916,6 @@ static bool window_route_drag_motion_batch_locked(
             (int32_t)g_window_server.pointer_y -
             g_window_server.drag_offset_y;
 
-        bool reuse_retained =
-            g_window_server.drag_blit_valid &&
-            window_drag_reuse_available_locked(dragged);
-
         /*
          * One old/new damage pair for the complete diagonal move.
          */
@@ -7874,6 +7925,13 @@ static bool window_route_drag_motion_batch_locked(
                 window_outer_width(dragged->width, dragged->flags);
             uint32_t outer_height =
                 window_outer_height(dragged->height, dragged->flags);
+            bool reuse_retained =
+                g_window_server.drag_blit_valid &&
+                window_drag_reuse_safe_locked(
+                    dragged,
+                    old_x, old_y,
+                    new_x, new_y,
+                    outer_width, outer_height);
 
             g_window_server.drag_blit_valid =
                 reuse_retained;

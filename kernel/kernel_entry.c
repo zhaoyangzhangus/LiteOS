@@ -68,6 +68,7 @@
 #include <kernel/console.h>
 #include <kernel/irq.h>
 #include <kernel/nvme_core.h>
+#include <ascii_font.h>
 #include "nvme.h"
 #include "object.h"
 #include "page.h"
@@ -82,6 +83,10 @@
 #include "vfs.h"
 #include "window.h"
 #include <kernel/sched.h>
+
+#ifndef LITEOS_DEBUG_SERIAL
+#define LITEOS_DEBUG_SERIAL 0
+#endif
 
 #define FAT32_TEST_SECTOR_COUNT 128U
 #define FRAMEBUFFER_KERNEL_VIRTUAL_BASE X86_64_MMIO_BASE
@@ -853,7 +858,215 @@ static BOOLEAN map_framebuffer_wc(const LITEOS_BOOT_INFO *info, UINT64 *virtual_
     return 1;
 }
 
+/*
+ * GOP debug console
+ *
+ * The boot log is rendered directly into the GOP buffer.  COM1 is an optional
+ * build-time mirror for QEMU/CI, but a hardware build does not touch the UART
+ * at all.  The console is deliberately independent of the window compositor:
+ * it is enabled after the framebuffer has a stable WC mapping and is
+ * overwritten by the first desktop frame later in boot.
+ */
+#define GOP_DEBUG_GLYPH_WIDTH  8U
+#define GOP_DEBUG_GLYPH_HEIGHT 16U
+#define GOP_DEBUG_TAB_SPACES   4U
+
+typedef struct gop_debug_console {
+    volatile UINT32 *framebuffer;
+    UINT32 width;
+    UINT32 height;
+    UINT32 pixels_per_scanline;
+    UINT32 format;
+    UINT32 masks[4];
+    UINT32 cursor_x;
+    UINT32 cursor_y;
+    UINT32 foreground;
+    UINT32 background;
+} gop_debug_console_t;
+
+static gop_debug_console_t g_gop_debug_console;
+static atomic_uint g_gop_debug_console_ready;
+static atomic_flag g_gop_debug_console_lock = ATOMIC_FLAG_INIT;
+
+static UINT32 gop_debug_component(UINT8 value, UINT32 mask) {
+    UINT32 shift = 0U;
+    UINT32 width = 0U;
+    UINT32 maximum;
+    if (mask == 0U) return 0U;
+    while (shift < 32U && ((mask >> shift) & 1U) == 0U) ++shift;
+    while (shift + width < 32U && ((mask >> (shift + width)) & 1U) != 0U) {
+        ++width;
+    }
+    if (width == 0U || width >= 32U) return mask;
+    maximum = (1U << width) - 1U;
+    return ((((UINT32)value * maximum + 127U) / 255U) << shift) & mask;
+}
+
+static UINT32 gop_debug_color(UINT32 pixel) {
+    UINT8 red = (UINT8)(pixel >> 16);
+    UINT8 green = (UINT8)(pixel >> 8);
+    UINT8 blue = (UINT8)pixel;
+    if (g_gop_debug_console.format == LITEOS_PIXEL_BGRR) {
+        return (UINT32)blue | ((UINT32)green << 8) | ((UINT32)red << 16);
+    }
+    if (g_gop_debug_console.format == LITEOS_PIXEL_BITMASK) {
+        return gop_debug_component(red, g_gop_debug_console.masks[0]) |
+               gop_debug_component(green, g_gop_debug_console.masks[1]) |
+               gop_debug_component(blue, g_gop_debug_console.masks[2]);
+    }
+    return pixel & 0x00FFFFFFU;
+}
+
+static void gop_debug_fill_rows_locked(UINT32 first_row, UINT32 last_row) {
+    if (last_row > g_gop_debug_console.height) last_row = g_gop_debug_console.height;
+    UINT32 color = g_gop_debug_console.background;
+    for (UINT32 y = first_row; y < last_row; ++y) {
+        volatile UINT32 *row = g_gop_debug_console.framebuffer +
+                               (UINT64)y * g_gop_debug_console.pixels_per_scanline;
+        for (UINT32 x = 0U; x < g_gop_debug_console.width; ++x) row[x] = color;
+    }
+}
+
+static void gop_debug_clear_locked(void) {
+    gop_debug_fill_rows_locked(0U, g_gop_debug_console.height);
+    g_gop_debug_console.cursor_x = 0U;
+    g_gop_debug_console.cursor_y = 0U;
+}
+
+static void gop_debug_scroll_locked(void) {
+    UINT32 row_height = GOP_DEBUG_GLYPH_HEIGHT;
+    if (g_gop_debug_console.height <= row_height) {
+        gop_debug_clear_locked();
+        return;
+    }
+    for (UINT32 y = 0U; y + row_height < g_gop_debug_console.height; ++y) {
+        volatile UINT32 *destination = g_gop_debug_console.framebuffer +
+            (UINT64)y * g_gop_debug_console.pixels_per_scanline;
+        volatile UINT32 *source = g_gop_debug_console.framebuffer +
+            (UINT64)(y + row_height) * g_gop_debug_console.pixels_per_scanline;
+        for (UINT32 x = 0U; x < g_gop_debug_console.width; ++x) {
+            destination[x] = source[x];
+        }
+    }
+    gop_debug_fill_rows_locked(g_gop_debug_console.height - row_height,
+                               g_gop_debug_console.height);
+    g_gop_debug_console.cursor_y = g_gop_debug_console.height - row_height;
+}
+
+static void gop_debug_newline_locked(void) {
+    g_gop_debug_console.cursor_x = 0U;
+    if (g_gop_debug_console.cursor_y + GOP_DEBUG_GLYPH_HEIGHT >=
+        g_gop_debug_console.height) {
+        gop_debug_scroll_locked();
+    } else {
+        g_gop_debug_console.cursor_y += GOP_DEBUG_GLYPH_HEIGHT;
+    }
+}
+
+static void gop_debug_draw_glyph_locked(UINT8 character) {
+    const UINT8 *glyph = ascii_font_glyph(character);
+    if (glyph == 0) return;
+    for (UINT32 row_index = 0U; row_index < GOP_DEBUG_GLYPH_HEIGHT; ++row_index) {
+        UINT32 offset = row_index * 4U;
+        UINT16 bits = (UINT16)(((UINT16)glyph[offset] << 8) | glyph[offset + 1U]);
+        bits |= (UINT16)(((UINT16)glyph[offset + 2U] << 8) |
+                         glyph[offset + 3U]);
+        volatile UINT32 *destination = g_gop_debug_console.framebuffer +
+            (UINT64)(g_gop_debug_console.cursor_y + row_index) *
+            g_gop_debug_console.pixels_per_scanline + g_gop_debug_console.cursor_x;
+        for (UINT32 column = 0U; column < GOP_DEBUG_GLYPH_WIDTH; ++column) {
+            destination[column] =
+                (bits & (UINT16)(0xC000U >> (column * 2U))) != 0U ?
+                g_gop_debug_console.foreground : g_gop_debug_console.background;
+        }
+    }
+    g_gop_debug_console.cursor_x += GOP_DEBUG_GLYPH_WIDTH;
+    if (g_gop_debug_console.cursor_x + GOP_DEBUG_GLYPH_WIDTH >
+        g_gop_debug_console.width) {
+        gop_debug_newline_locked();
+    }
+}
+
+static void gop_debug_write_locked(const CHAR8 *text) {
+    while (text != 0 && *text != 0) {
+        UINT8 character = (UINT8)*text++;
+        if (character == '\r') {
+            g_gop_debug_console.cursor_x = 0U;
+        } else if (character == '\n') {
+            gop_debug_newline_locked();
+        } else if (character == '\t') {
+            for (UINT32 i = 0U; i < GOP_DEBUG_TAB_SPACES; ++i) {
+                gop_debug_draw_glyph_locked(' ');
+            }
+        } else if (character == '\b') {
+            if (g_gop_debug_console.cursor_x >= GOP_DEBUG_GLYPH_WIDTH) {
+                g_gop_debug_console.cursor_x -= GOP_DEBUG_GLYPH_WIDTH;
+                gop_debug_draw_glyph_locked(' ');
+                if (g_gop_debug_console.cursor_x >= GOP_DEBUG_GLYPH_WIDTH) {
+                    g_gop_debug_console.cursor_x -= GOP_DEBUG_GLYPH_WIDTH;
+                } else {
+                    g_gop_debug_console.cursor_x = 0U;
+                }
+            }
+        } else {
+            if (character < ASCII_FONT_FIRST || character > ASCII_FONT_LAST) {
+                character = '?';
+            }
+            gop_debug_draw_glyph_locked(character);
+        }
+    }
+    __asm__ volatile ("sfence" : : : "memory");
+}
+
+static BOOLEAN gop_debug_lock(BOOLEAN allow_wait) {
+    if (!allow_wait) {
+        return atomic_flag_test_and_set_explicit(&g_gop_debug_console_lock,
+                                                 memory_order_acquire) == 0;
+    }
+    while (atomic_flag_test_and_set_explicit(&g_gop_debug_console_lock,
+                                             memory_order_acquire)) {
+        __asm__ volatile ("pause");
+    }
+    return 1;
+}
+
+static void gop_debug_unlock(void) {
+    atomic_flag_clear_explicit(&g_gop_debug_console_lock, memory_order_release);
+}
+
+static BOOLEAN gop_debug_console_init(const LITEOS_BOOT_INFO *info,
+                                      UINT64 framebuffer_virtual) {
+    UINT64 required_pixels;
+    if (info == 0 || framebuffer_virtual == 0U || info->FrameBufferWidth == 0U ||
+        info->FrameBufferHeight == 0U ||
+        info->FrameBufferPixelsPerScanLine < info->FrameBufferWidth ||
+        info->FrameBufferFormat > LITEOS_PIXEL_BITMASK ||
+        info->FrameBufferWidth < GOP_DEBUG_GLYPH_WIDTH ||
+        info->FrameBufferHeight < GOP_DEBUG_GLYPH_HEIGHT) {
+        return 0;
+    }
+    required_pixels = (UINT64)info->FrameBufferPixelsPerScanLine * info->FrameBufferHeight;
+    if (required_pixels > UINT64_MAX / sizeof(UINT32) ||
+        required_pixels * sizeof(UINT32) > info->FrameBufferSize) {
+        return 0;
+    }
+
+    g_gop_debug_console.framebuffer =
+        (volatile UINT32 *)(uintptr_t)framebuffer_virtual;
+    g_gop_debug_console.width = info->FrameBufferWidth;
+    g_gop_debug_console.height = info->FrameBufferHeight;
+    g_gop_debug_console.pixels_per_scanline = info->FrameBufferPixelsPerScanLine;
+    g_gop_debug_console.format = info->FrameBufferFormat;
+    for (UINT32 i = 0U; i < 4U; ++i) g_gop_debug_console.masks[i] = info->FrameBufferMask[i];
+    g_gop_debug_console.foreground = gop_debug_color(0x00F2F5F7U);
+    g_gop_debug_console.background = gop_debug_color(0x00081018U);
+    gop_debug_clear_locked();
+    atomic_store_explicit(&g_gop_debug_console_ready, 1U, memory_order_release);
+    return 1;
+}
+
 /* 用于验证启动交接 ABI 的最小 PE32+ 内核入口。 */
+#if LITEOS_DEBUG_SERIAL
 static void serial_out(UINT16 port, UINT8 value) {
     __asm__ volatile ("outb %0, %1" : : "a"(value), "Nd"(port));
 }
@@ -863,12 +1076,29 @@ static UINT8 serial_in(UINT16 port) {
     __asm__ volatile ("inb %1, %0" : "=a"(value) : "Nd"(port));
     return value;
 }
+#endif
 
 void liteos_serial_write(const char *text) {
-    while (*text != 0) {
-        for (UINTN tries = 0; tries < 100000U && (serial_in(0x3FD) & 0x20U) == 0; ++tries) { }
-        serial_out(0x3F8, (UINT8)*text++);
+    if (text == 0) return;
+    BOOLEAN gop_ready = atomic_load_explicit(&g_gop_debug_console_ready,
+                                             memory_order_acquire) != 0U;
+    BOOLEAN gop_lock_held = 0;
+    if (gop_ready) {
+        UINT64 flags;
+        __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
+        /* An interrupt handler must never wait for a lock owned by the
+         * interrupted context; the optional COM1 path remains non-blocking. */
+        gop_lock_held = gop_debug_lock((flags & (1ULL << 9)) != 0U);
     }
+#if LITEOS_DEBUG_SERIAL
+    const char *serial_text = text;
+    while (*serial_text != 0) {
+        for (UINTN tries = 0; tries < 100000U && (serial_in(0x3FD) & 0x20U) == 0; ++tries) { }
+        serial_out(0x3F8, (UINT8)*serial_text++);
+    }
+#endif
+    if (gop_lock_held) gop_debug_write_locked((const CHAR8 *)text);
+    if (gop_lock_held) gop_debug_unlock();
 }
 
 /* 保留启动代码内部的短名称，同时向驱动导出稳定的串口接口。 */
@@ -907,6 +1137,7 @@ static void serial_write_u64(UINT64 value) {
 }
 
 static void serial_init(void) {
+#if LITEOS_DEBUG_SERIAL
     serial_out(0x3F9, 0x00);
     serial_out(0x3FB, 0x80);
     serial_out(0x3F8, 0x01);
@@ -914,6 +1145,7 @@ static void serial_init(void) {
     serial_out(0x3FB, 0x03);
     serial_out(0x3FA, 0xC7);
     serial_out(0x3FC, 0x0B);
+#endif
 }
 
 static void __attribute__((noreturn)) halt_forever(void) {
@@ -2370,10 +2602,15 @@ static void __attribute__((noreturn)) kernel_main(void *context) {
         halt_forever();
     }
 
-    UINT64 framebuffer_virtual = 0;
+    UINT64 framebuffer_virtual = 0U;
     if (!map_framebuffer_wc(info, &framebuffer_virtual)) {
         serial_write("LITEOS_FRAMEBUFFER_MAP_FAIL\r\n");
         halt_forever();
+    }
+    if (gop_debug_console_init(info, framebuffer_virtual)) {
+        serial_write("LITEOS_GOP_CONSOLE_OK\r\n");
+    } else {
+        serial_write("LITEOS_GOP_CONSOLE_ABSENT\r\n");
     }
     LITEOS_BOOT_INFO display_info;
     for (UINTN byte = 0; byte < sizeof(display_info); ++byte) {

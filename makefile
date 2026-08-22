@@ -9,6 +9,8 @@ OBJDUMP = $(TOOLPREFIX)objdump
 HOSTCC ?= gcc
 
 DEBUG ?= 0
+LITEOS_DEBUG_SERIAL ?= 0
+.DEFAULT_GOAL := all
 ifeq ($(DEBUG),1)
 DEBUG_CFLAGS = -O0 -g3 -fno-omit-frame-pointer
 else ifeq ($(DEBUG),2)
@@ -23,7 +25,8 @@ endif
 COMMON_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -Werror -ffreestanding -fno-builtin \
                 -fno-stack-protector -fno-stack-check -fno-pic -mno-red-zone \
                 -mno-sse -mno-mmx -mno-stack-arg-probe -fshort-wchar -Iinclude -MMD -MP
-KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DLITEOS_KERNEL_BUILD
+KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DLITEOS_KERNEL_BUILD \
+                -DLITEOS_DEBUG_SERIAL=$(LITEOS_DEBUG_SERIAL)
 USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -Iuser/audiod -I$(BUILD)/generated
 LOADER_LDFLAGS = -nostdlib -Wl,--entry,efi_main -Wl,--subsystem,10 \
                  -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
@@ -34,6 +37,7 @@ KERNEL_LDFLAGS = -nostdlib -Wl,--entry,kernel_entry -Wl,--subsystem,0 \
                  -Wl,-Map,$(BUILD)/kernel/kernel.map
 
 BUILD ?= build
+DEBUG_SERIAL_STAMP = $(BUILD)/kernel/.debug-serial
 
 FONT_TTF ?= /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
 FONT_RASTER_HEIGHT ?= 19
@@ -95,11 +99,17 @@ USER_NETD_LDFLAGS = -nostdlib -Wl,--entry,netd_entry -Wl,--subsystem,0 \
                     -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                     -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
-.PHONY: all clean esp loader kernel test header-sanity abi-sanity rsa-test bluetooth-test firmware-test audiod-test release-metadata \
+.PHONY: all clean esp loader kernel test header-sanity abi-sanity rsa-test bluetooth-test firmware-test audiod-test release-metadata FORCE \
         $(BUILD)/build-id.exe $(BUILD)/sha256-test.exe $(BUILD)/buddy-test.exe \
         $(BUILD)/memory-map-test.exe $(BUILD)/fat32-test.exe $(BUILD)/cache-test.exe \
         $(BUILD)/rsa-test.exe $(BUILD)/bluetooth-test.exe $(BUILD)/firmware-test.exe \
         $(BUILD)/audiod-test.exe $(BUILD)/header-sanity.exe $(BUILD)/abi-sanity.exe
+
+FORCE:
+
+$(DEBUG_SERIAL_STAMP): FORCE | $(BUILD)/kernel
+	@printf '%s\n' '$(LITEOS_DEBUG_SERIAL)' > $@.tmp
+	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
 all: esp
 
@@ -295,7 +305,7 @@ $(USER_WGET_PE): $(USER_WGET_OBJECTS) $(BEARSSL_LIB) | $(BUILD)/user
 $(USER_WGET_ELF): $(USER_WGET_PE) | $(BUILD)/user
 	$(OBJCOPY) -O elf64-x86-64 $< $@
 
-$(BUILD)/kernel/entry.o: kernel/kernel_entry.c | $(BUILD)/kernel
+$(BUILD)/kernel/entry.o: kernel/kernel_entry.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/ascii_font.o: kernel/graphics/ascii_font.c | $(BUILD)/kernel

@@ -15,6 +15,12 @@
 #define SHELL_HISTORY_LINES 16U
 #define SHELL_MAX_ARGUMENTS 8U
 #define SHELL_PATH_CAPACITY 256U
+#define SHELL_WINDOW_BACKGROUND 0x00F7F8FAU
+#define SHELL_INPUT_BACKGROUND  0x00E9EDF1U
+#define SHELL_INPUT_BORDER      0x00D2D8DFU
+#define SHELL_OUTPUT_TEXT       0x003A4752U
+#define SHELL_INPUT_TEXT        0x00506D9FU
+#define SHELL_CURSOR             0x005B86D6U
 
 typedef struct shell_window {
     os_handle_t handle;
@@ -82,7 +88,7 @@ static const uint8_t g_symbol_font[32][7] = {
 static const char g_symbol_chars[] = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 
 static shell_window_t g_shell = {
-    OS_INVALID_HANDLE, 0U, 0U, 0U, 0, "SHELL", 0x00192B3DU,
+    OS_INVALID_HANDLE, 0U, 0U, 0U, 0, "SHELL", SHELL_WINDOW_BACKGROUND,
 };
 static char g_command[SHELL_LINE_CAPACITY];
 static size_t g_command_length;
@@ -323,12 +329,20 @@ static void draw_input_line(void) {
     if (line_length > visible_characters) view_start = line_length - visible_characters;
     input_y = g_target_height > FONT12X24_HEIGHT + 4U ?
         g_target_height - FONT12X24_HEIGHT - 4U : 0U;
-    draw_text(10U, input_y, g_display_line + view_start, 0x007FE0AEU);
+    if (input_y >= 4U) {
+        fill_rect(6U, input_y - 4U,
+                  g_target_width > 12U ? g_target_width - 12U : g_target_width,
+                  32U, SHELL_INPUT_BACKGROUND);
+        fill_rect(6U, input_y - 4U,
+                  g_target_width > 12U ? g_target_width - 12U : g_target_width,
+                  1U, SHELL_INPUT_BORDER);
+    }
+    draw_text(10U, input_y, g_display_line + view_start, SHELL_INPUT_TEXT);
 
     cursor_position = prompt_length + (uint32_t)g_command_cursor;
     if (cursor_position >= view_start && cursor_position - view_start < visible_characters) {
         fill_rect(10U + (cursor_position - view_start) * FONT12X24_WIDTH,
-                  input_y, 2U, FONT12X24_HEIGHT, 0x00E8FFF4U);
+                  input_y, 2U, FONT12X24_HEIGHT, SHELL_CURSOR);
     }
 }
 
@@ -344,12 +358,16 @@ static void draw_terminal(void) {
               USER_CLIENT_CHROME_BACKGROUND);
     fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
               USER_CLIENT_CHROME_SEPARATOR);
-    draw_text(64U, 16U, "LITEOS GRAPHICAL SHELL",
+    user_client_chrome_app_icon(g_target, g_target_width,
+                                g_target_width, g_target_height,
+                                16U, USER_CLIENT_CHROME_TITLE_Y,
+                                USER_CLIENT_CHROME_ICON_TERMINAL);
+    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "SHELL",
               USER_CLIENT_CHROME_TEXT);
     for (uint32_t index = first;
          index < g_output_count && y + FONT12X24_HEIGHT + 32U <= g_target_height;
          ++index, y += FONT12X24_HEIGHT) {
-        draw_text(10U, y, g_output[index], 0x00C5EAF4U);
+        draw_text(10U, y, g_output[index], SHELL_OUTPUT_TEXT);
     }
     if (g_target_height >= FONT12X24_HEIGHT + 4U) draw_input_line();
     user_client_chrome_close(g_target, g_target_width,
@@ -357,6 +375,9 @@ static void draw_terminal(void) {
                              USER_CLIENT_CHROME_HEIGHT,
                              USER_CLIENT_CHROME_CLOSE_BG,
                              USER_CLIENT_CHROME_CLOSE_FG);
+    user_client_chrome_frame(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             USER_CLIENT_CHROME_HEIGHT);
 }
 
 static void update_window(void) {

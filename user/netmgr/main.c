@@ -11,6 +11,17 @@
 #define NETMGR_REFRESH_TICKS     5U
 #define NETMGR_MIN_WIDTH         520U
 #define NETMGR_MIN_HEIGHT        320U
+#define NETMGR_CONTENT_BACKGROUND 0x00F7F8FAU
+#define NETMGR_CARD_BACKGROUND    0x00FFFFFFU
+#define NETMGR_CARD_BORDER        0x00E1E5E9U
+#define NETMGR_SECTION_TEXT       0x005B6C7AU
+#define NETMGR_VALUE_TEXT         0x003D4852U
+#define NETMGR_HINT_TEXT          0x006B7782U
+#define NETMGR_COMMAND_TEXT       0x005B6670U
+#define NETMGR_CONNECTED_TEXT     0x002D8A63U
+#define NETMGR_DISCONNECTED_TEXT  0x00B56A28U
+#define NETMGR_FOOTER_BACKGROUND  0x00E9EDF1U
+#define NETMGR_ERROR_TEXT         0x00B24F3EU
 
 typedef struct netmgr_window {
     os_handle_t handle;
@@ -238,12 +249,16 @@ static void draw_text(uint32_t x, uint32_t y,
 
 static void draw_card(uint32_t x, uint32_t y,
                       uint32_t width, uint32_t height) {
-    fill_rect(x, y, width, height, 0x001B2A36U);
+    user_client_chrome_round_rect(g_window.pixels, g_window.width,
+                                  g_window.width, g_window.height,
+                                  x, y, width, height,
+                                  NETMGR_CARD_BORDER);
     if (width > 2U && height > 2U) {
-        fill_rect(x, y, width, 1U, 0x00334E60U);
-        fill_rect(x, y + height - 1U, width, 1U, 0x000E1820U);
-        fill_rect(x, y, 1U, height, 0x00334E60U);
-        fill_rect(x + width - 1U, y, 1U, height, 0x000E1820U);
+        user_client_chrome_round_rect(g_window.pixels, g_window.width,
+                                      g_window.width, g_window.height,
+                                      x + 1U, y + 1U,
+                                      width - 2U, height - 2U,
+                                      NETMGR_CARD_BACKGROUND);
     }
 }
 
@@ -292,14 +307,18 @@ static void render(void) {
     ipv6 = g_status_valid &&
         (g_status.flags & OS_NET_STATUS_IPV6_CONFIGURED) != 0U;
 
-    fill_rect(0U, 0U, g_window.width, g_window.height, 0x00121D26U);
+    fill_rect(0U, 0U, g_window.width, g_window.height,
+              NETMGR_CONTENT_BACKGROUND);
 
     fill_rect(0U, 0U, g_window.width, USER_CLIENT_CHROME_HEIGHT,
               USER_CLIENT_CHROME_BACKGROUND);
     fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_window.width, 1U,
               USER_CLIENT_CHROME_SEPARATOR);
-    draw_text(64U, 4U, "NETWORK", USER_CLIENT_CHROME_TEXT);
-    draw_text(64U, 29U, "Network status and configuration",
+    user_client_chrome_app_icon(g_window.pixels, g_window.width,
+                                g_window.width, g_window.height,
+                                16U, USER_CLIENT_CHROME_TITLE_Y,
+                                USER_CLIENT_CHROME_ICON_NETWORK);
+    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "NETWORK",
               USER_CLIENT_CHROME_TEXT);
 
     content_width = g_window.width > 36U ? g_window.width - 36U :
@@ -316,16 +335,16 @@ static void render(void) {
     }
 
     draw_card(18U, 68U, left_width, 86U);
-    draw_text(34U, 82U, "CONNECTION", 0x008FD6C4U);
+    draw_text(34U, 82U, "CONNECTION", NETMGR_SECTION_TEXT);
     draw_text(34U, 110U,
               !g_status_valid ? "Status unavailable" :
               !hardware ? "No network hardware" :
               link_up ? "Connected" : "Disconnected",
-              link_up ? 0x007FE0AEU : 0x00E7A36AU);
-    draw_text(34U, 132U, "DHCP service: netd", 0x008FAEBDU);
+              link_up ? NETMGR_CONNECTED_TEXT : NETMGR_DISCONNECTED_TEXT);
+    draw_text(34U, 132U, "DHCP service: netd", NETMGR_HINT_TEXT);
 
     draw_card(18U, 166U, left_width, 138U);
-    draw_text(34U, 180U, "IP CONFIGURATION", 0x008FD6C4U);
+    draw_text(34U, 180U, "IP CONFIGURATION", NETMGR_SECTION_TEXT);
 
     line[0] = '\0';
     append_text(line, sizeof(line), "IPv4   ");
@@ -338,7 +357,7 @@ static void render(void) {
         append_text(value, sizeof(value), "Unavailable");
     }
     append_text(line, sizeof(line), value);
-    draw_text(34U, 208U, line, 0x00D8E8EEU);
+    draw_text(34U, 208U, line, NETMGR_VALUE_TEXT);
 
     line[0] = '\0';
     append_text(line, sizeof(line), "Gateway ");
@@ -349,7 +368,7 @@ static void render(void) {
         append_text(value, sizeof(value), "Unavailable");
     }
     append_text(line, sizeof(line), value);
-    draw_text(34U, 234U, line, 0x00D8E8EEU);
+    draw_text(34U, 234U, line, NETMGR_VALUE_TEXT);
 
     line[0] = '\0';
     append_text(line, sizeof(line), "IPv6   ");
@@ -360,11 +379,11 @@ static void render(void) {
         append_text(value, sizeof(value), "Unavailable");
     }
     append_text(line, sizeof(line), value);
-    draw_text(34U, 260U, line, 0x00D8E8EEU);
+    draw_text(34U, 260U, line, NETMGR_VALUE_TEXT);
 
     if (content_width >= 640U) {
         draw_card(right_x, 68U, right_width, 236U);
-        draw_text(right_x + 16U, 82U, "ADAPTER", 0x008FD6C4U);
+        draw_text(right_x + 16U, 82U, "ADAPTER", NETMGR_SECTION_TEXT);
 
         line[0] = '\0';
         append_text(line, sizeof(line), "MAC ");
@@ -375,40 +394,47 @@ static void render(void) {
             append_text(value, sizeof(value), "--:--:--:--:--:--");
         }
         append_text(line, sizeof(line), value);
-        draw_text(right_x + 16U, 112U, line, 0x00D8E8EEU);
+        draw_text(right_x + 16U, 112U, line, NETMGR_VALUE_TEXT);
 
         line[0] = '\0';
         append_text(line, sizeof(line), "Link changes ");
         append_decimal(line, sizeof(line),
                        g_status_valid ? g_status.link_transitions : 0U);
-        draw_text(right_x + 16U, 142U, line, 0x00D8E8EEU);
+        draw_text(right_x + 16U, 142U, line, NETMGR_VALUE_TEXT);
 
         line[0] = '\0';
         append_text(line, sizeof(line), "Reset count  ");
         append_decimal(line, sizeof(line),
                        g_status_valid ? g_status.reset_count : 0U);
-        draw_text(right_x + 16U, 172U, line, 0x00D8E8EEU);
+        draw_text(right_x + 16U, 172U, line, NETMGR_VALUE_TEXT);
 
         draw_text(right_x + 16U, 218U,
-                  "R        Refresh now", 0x009FB8C5U);
+                  "R        Refresh now", NETMGR_COMMAND_TEXT);
         draw_text(right_x + 16U, 244U,
-                  "Ctrl+Q   Close", 0x009FB8C5U);
+                  "Ctrl+Q   Close", NETMGR_COMMAND_TEXT);
         draw_text(right_x + 16U, 270U,
-                  "Auto refresh: 500 ms", 0x006F8F9FU);
+                  "Auto refresh: 500 ms", NETMGR_HINT_TEXT);
     } else if (g_window.height >= 390U) {
         draw_card(18U, 316U, left_width, 62U);
         draw_text(34U, 330U, "R Refresh    Ctrl+Q Close",
-                  0x009FB8C5U);
+                  NETMGR_COMMAND_TEXT);
     }
 
     if (g_window.height > 42U) {
-        fill_rect(0U, g_window.height - 34U,
-                  g_window.width, 34U, 0x000D171EU);
-        draw_text(18U, g_window.height - 29U,
+        uint32_t footer_y = g_window.height - 34U;
+        fill_rect(0U, footer_y, g_window.width, 34U,
+                  NETMGR_CONTENT_BACKGROUND);
+        user_client_chrome_round_rect(g_window.pixels, g_window.width,
+                                      g_window.width, g_window.height,
+                                      12U, footer_y + 3U,
+                                      g_window.width > 24U ?
+                                      g_window.width - 24U : g_window.width,
+                                      28U, NETMGR_FOOTER_BACKGROUND);
+        draw_text(24U, g_window.height - 29U,
                   g_status_valid ?
                   "Live kernel network status" :
                   "Network status read failed",
-                  g_status_valid ? 0x007FAFC3U : 0x00DE8C75U);
+                  g_status_valid ? NETMGR_COMMAND_TEXT : NETMGR_ERROR_TEXT);
     }
 
     user_client_chrome_close(g_window.pixels, g_window.width,
@@ -416,6 +442,9 @@ static void render(void) {
                              USER_CLIENT_CHROME_HEIGHT,
                              USER_CLIENT_CHROME_CLOSE_BG,
                              USER_CLIENT_CHROME_CLOSE_FG);
+    user_client_chrome_frame(g_window.pixels, g_window.width,
+                             g_window.width, g_window.height,
+                             USER_CLIENT_CHROME_HEIGHT);
 
     update_window();
 }
@@ -472,7 +501,7 @@ static bool create_window(void) {
     request.flags = OS_WINDOW_VISIBLE |
                     OS_WINDOW_RESIZABLE |
                     OS_WINDOW_CLIENT_DECORATIONS;
-    request.background = 0x00121D26U;
+    request.background = NETMGR_CONTENT_BACKGROUND;
     request.title[0] = 'N';
     request.title[1] = 'E';
     request.title[2] = 'T';

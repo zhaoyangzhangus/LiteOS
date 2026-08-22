@@ -9,12 +9,23 @@
 /* Shared Files-like client chrome metrics and palette.  Each application
  * still owns its content canvas, but its title strip and controls line up
  * with the same 56px light header. */
-#define USER_CLIENT_CHROME_HEIGHT       56U
+#define USER_CLIENT_CHROME_HEIGHT       40U
+#define USER_CLIENT_CHROME_TITLE_Y      8U
 #define USER_CLIENT_CHROME_BACKGROUND   0x00FAFAFAU
 #define USER_CLIENT_CHROME_SEPARATOR    0x00D2D2D5U
+#define USER_CLIENT_CHROME_BORDER      0x00D2D2D5U
 #define USER_CLIENT_CHROME_TEXT         0x00303438U
 #define USER_CLIENT_CHROME_CLOSE_BG     0x00E2E2E4U
 #define USER_CLIENT_CHROME_CLOSE_FG     0x00484D53U
+#define USER_CLIENT_CHROME_ICON_BG      0x00E7E9ECU
+#define USER_CLIENT_CHROME_ICON_FG      0x00464E57U
+#define USER_CLIENT_CHROME_ICON_ACCENT  0x005B86D6U
+#define USER_CLIENT_CHROME_CARD         0x00FFFFFFU
+#define USER_CLIENT_CHROME_CARD_BORDER  0x00E1E5E9U
+
+#define USER_CLIENT_CHROME_ICON_TERMINAL 1U
+#define USER_CLIENT_CHROME_ICON_NOTE     2U
+#define USER_CLIENT_CHROME_ICON_NETWORK  3U
 
 /* The same 16x16 alpha raster used by Fileman for the client close action. */
 static const char user_client_close_alpha[16][17] = {
@@ -41,6 +52,136 @@ static inline void user_client_chrome_pixel(uint32_t *pixels,
         *destination = color;
     } else {
         *destination = font12x24_blend_xrgb8888(*destination, color, alpha);
+    }
+}
+
+static inline void user_client_chrome_fill_rect(uint32_t *pixels,
+                                                uint32_t stride,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                uint32_t x, uint32_t y,
+                                                uint32_t rect_width,
+                                                uint32_t rect_height,
+                                                uint32_t color) {
+    if (pixels == 0 || x >= width || y >= height || rect_width == 0U ||
+        rect_height == 0U) return;
+    if (rect_width > width - x) rect_width = width - x;
+    if (rect_height > height - y) rect_height = height - y;
+    for (uint32_t row = 0U; row < rect_height; ++row) {
+        uint32_t *destination = pixels + (uint64_t)(y + row) * stride + x;
+        for (uint32_t column = 0U; column < rect_width; ++column) {
+            destination[column] = color;
+        }
+    }
+}
+
+/* Small shared rounded primitives keep the non-Files clients visually aligned
+ * without making them depend on Fileman's renderer. */
+static inline void user_client_chrome_round_rect(uint32_t *pixels,
+                                                 uint32_t stride,
+                                                 uint32_t width,
+                                                 uint32_t height,
+                                                 uint32_t x, uint32_t y,
+                                                 uint32_t rect_width,
+                                                 uint32_t rect_height,
+                                                 uint32_t color) {
+    static const uint8_t inset[8] = {5U, 3U, 2U, 1U, 1U, 0U, 0U, 0U};
+    if (rect_width == 0U || rect_height == 0U) return;
+    if (rect_width < 12U || rect_height < 12U) {
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x, y, rect_width, rect_height, color);
+        return;
+    }
+    for (uint32_t row = 0U; row < rect_height; ++row) {
+        uint32_t edge = row < 8U ? row : rect_height - 1U - row;
+        uint32_t cut = edge < 8U ? inset[edge] : 0U;
+        if (cut * 2U >= rect_width) continue;
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + cut, y + row,
+                                     rect_width - cut * 2U, 1U, color);
+    }
+}
+
+/* Client-decorated windows do not receive a compositor frame.  Paint the
+ * shared one-pixel outline and title/content separator in the client surface
+ * so every application has the same visible boundary. */
+static inline void user_client_chrome_frame(uint32_t *pixels,
+                                            uint32_t stride,
+                                            uint32_t width,
+                                            uint32_t height,
+                                            uint32_t header_height) {
+    if (pixels == 0 || width < 2U || height < 2U) return;
+
+    user_client_chrome_fill_rect(pixels, stride, width, height,
+                                 0U, 0U, width, 1U,
+                                 USER_CLIENT_CHROME_BORDER);
+    user_client_chrome_fill_rect(pixels, stride, width, height,
+                                 0U, height - 1U, width, 1U,
+                                 USER_CLIENT_CHROME_BORDER);
+    user_client_chrome_fill_rect(pixels, stride, width, height,
+                                 0U, 0U, 1U, height,
+                                 USER_CLIENT_CHROME_BORDER);
+    user_client_chrome_fill_rect(pixels, stride, width, height,
+                                 width - 1U, 0U, 1U, height,
+                                 USER_CLIENT_CHROME_BORDER);
+    if (header_height > 0U && header_height < height) {
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     0U, header_height - 1U, width, 1U,
+                                     USER_CLIENT_CHROME_SEPARATOR);
+    }
+}
+
+static inline void user_client_chrome_app_icon(uint32_t *pixels,
+                                               uint32_t stride,
+                                               uint32_t width,
+                                               uint32_t height,
+                                               uint32_t x, uint32_t y,
+                                               uint32_t kind) {
+    user_client_chrome_round_rect(pixels, stride, width, height,
+                                  x, y, 24U, 24U,
+                                  USER_CLIENT_CHROME_ICON_BG);
+    if (kind == USER_CLIENT_CHROME_ICON_TERMINAL) {
+        user_client_chrome_round_rect(pixels, stride, width, height,
+                                      x + 5U, y + 6U, 14U, 12U,
+                                      USER_CLIENT_CHROME_ICON_FG);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 8U, y + 9U, 3U, 2U,
+                                     USER_CLIENT_CHROME_ICON_BG);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 10U, y + 11U, 2U, 2U,
+                                     USER_CLIENT_CHROME_ICON_BG);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 13U, y + 15U, 4U, 1U,
+                                     USER_CLIENT_CHROME_ICON_BG);
+    } else if (kind == USER_CLIENT_CHROME_ICON_NOTE) {
+        user_client_chrome_round_rect(pixels, stride, width, height,
+                                      x + 6U, y + 4U, 12U, 16U,
+                                      0x00FFFFFFU);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 9U, y + 9U, 6U, 1U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 9U, y + 12U, 6U, 1U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 9U, y + 15U, 4U, 1U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
+    } else if (kind == USER_CLIENT_CHROME_ICON_NETWORK) {
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 11U, y + 8U, 2U, 9U,
+                                     USER_CLIENT_CHROME_ICON_FG);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 7U, y + 13U, 10U, 2U,
+                                     USER_CLIENT_CHROME_ICON_FG);
+        user_client_chrome_pixel(pixels, stride, width, height,
+                                 x + 10U, y + 5U,
+                                 USER_CLIENT_CHROME_ICON_ACCENT, 255U);
+        user_client_chrome_pixel(pixels, stride, width, height,
+                                 x + 5U, y + 16U,
+                                 USER_CLIENT_CHROME_ICON_ACCENT, 255U);
+        user_client_chrome_pixel(pixels, stride, width, height,
+                                 x + 17U, y + 16U,
+                                 USER_CLIENT_CHROME_ICON_ACCENT, 255U);
     }
 }
 

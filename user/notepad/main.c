@@ -12,6 +12,11 @@
 #define NOTEPAD_FILE_PATH     "/notes.txt"
 #define NOTEPAD_UNDO_DEPTH    8U
 #define NOTEPAD_PATH_CAPACITY 256U
+#define NOTEPAD_CONTENT_BACKGROUND 0x00F7F8FAU
+#define NOTEPAD_CONTENT_TEXT       0x00353B43U
+#define NOTEPAD_CURSOR             0x005B86D6U
+#define NOTEPAD_STATUS_BACKGROUND  0x00E9EDF1U
+#define NOTEPAD_STATUS_TEXT        0x00545D66U
 
 typedef struct notepad_window {
     os_handle_t handle;
@@ -443,21 +448,29 @@ static void draw_editor(void) {
     uint32_t cursor_column;
     if (g_follow_cursor) ensure_cursor_visible(columns, visible_lines);
     cursor_position(columns, &cursor_line, &cursor_column);
-    fill_rect(0U, 0U, g_target_width, g_target_height, 0x0015222AU);
+    fill_rect(0U, 0U, g_target_width, g_target_height,
+              NOTEPAD_CONTENT_BACKGROUND);
     fill_rect(0U, 0U, g_target_width, USER_CLIENT_CHROME_HEIGHT,
               USER_CLIENT_CHROME_BACKGROUND);
     fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
               USER_CLIENT_CHROME_SEPARATOR);
-    draw_text(64U, 16U, "NOTEPAD", USER_CLIENT_CHROME_TEXT);
-    draw_text(160U, 16U, g_dirty ? "*" : " ", USER_CLIENT_CHROME_TEXT);
-    draw_text(178U, 16U, g_file_path, USER_CLIENT_CHROME_TEXT);
+    user_client_chrome_app_icon(g_target, g_target_width,
+                                g_target_width, g_target_height,
+                                16U, USER_CLIENT_CHROME_TITLE_Y,
+                                USER_CLIENT_CHROME_ICON_NOTE);
+    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "NOTEPAD",
+              USER_CLIENT_CHROME_TEXT);
+    draw_text(160U, USER_CLIENT_CHROME_TITLE_Y, g_dirty ? "*" : " ",
+              USER_CLIENT_CHROME_TEXT);
+    draw_text(178U, USER_CLIENT_CHROME_TITLE_Y, g_file_path,
+              USER_CLIENT_CHROME_TEXT);
     for (size_t index = 0U; index < g_text_length; ++index) {
         char character = g_text[index];
         if (character != '\n' && character != '\t' && line >= g_scroll_line &&
             line < g_scroll_line + visible_lines) {
             draw_character(10U + column * FONT12X24_WIDTH,
                            text_top + (line - g_scroll_line) * FONT12X24_HEIGHT,
-                           character, 0x00D9EEF2U);
+                           character, NOTEPAD_CONTENT_TEXT);
         }
         if (character == '\t' && line >= g_scroll_line &&
             line < g_scroll_line + visible_lines) {
@@ -465,7 +478,7 @@ static void draw_editor(void) {
             for (uint32_t space = 0U; space < spaces && column + space < columns; ++space) {
                 draw_character(10U + (column + space) * FONT12X24_WIDTH,
                                text_top + (line - g_scroll_line) * FONT12X24_HEIGHT,
-                               ' ', 0x00D9EEF2U);
+                               ' ', NOTEPAD_CONTENT_TEXT);
             }
         }
         advance_position(character, columns, &line, &column);
@@ -474,16 +487,19 @@ static void draw_editor(void) {
         cursor_column < columns) {
         fill_rect(10U + cursor_column * FONT12X24_WIDTH,
                   text_top + (cursor_line - g_scroll_line) * FONT12X24_HEIGHT,
-                  2U, FONT12X24_HEIGHT, 0x00F2FFF9U);
+                  2U, FONT12X24_HEIGHT, NOTEPAD_CURSOR);
     }
     fill_rect(0U, g_target_height - status_height, g_target_width,
-              status_height, 0x00102028U);
-    draw_text(10U, g_target_height - 28U, g_status, 0x008FD6C4U);
+              status_height, NOTEPAD_STATUS_BACKGROUND);
+    draw_text(10U, g_target_height - 28U, g_status, NOTEPAD_STATUS_TEXT);
     user_client_chrome_close(g_target, g_target_width,
                              g_target_width, g_target_height,
                              USER_CLIENT_CHROME_HEIGHT,
                              USER_CLIENT_CHROME_CLOSE_BG,
                              USER_CLIENT_CHROME_CLOSE_FG);
+    user_client_chrome_frame(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             USER_CLIENT_CHROME_HEIGHT);
 }
 
 static bool create_window(void) {
@@ -508,7 +524,7 @@ static bool create_window(void) {
     request.flags = OS_WINDOW_VISIBLE |
                     OS_WINDOW_RESIZABLE |
                     OS_WINDOW_CLIENT_DECORATIONS;
-    request.background = 0x0015222AU;
+    request.background = NOTEPAD_CONTENT_BACKGROUND;
     request.title[0] = 'N'; request.title[1] = 'O'; request.title[2] = 'T';
     request.title[3] = 'E'; request.title[4] = 'P'; request.title[5] = 'A';
     request.title[6] = 'D';

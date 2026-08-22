@@ -13,7 +13,10 @@ debug=0
 no_build=0
 headless=0
 usb_nested=0
-usb_storage=0
+# Boot from the removable FAT volume by default.  The USB-root kernel path
+# already validates /init and /init-runtime before selecting it as /.  Keep an
+# explicit NVMe switch for diagnostics and for comparing the old path.
+usb_storage=1
 monitor_socket=""
 keep_open=0
 no_kvm=0
@@ -32,7 +35,8 @@ usage() {
   --gdb-port N        修改 GDB 端口
   --headless          不显示图形窗口
   --usb-nested        测试 xHCI -> Hub -> Hub -> Mouse
-  --usb-storage       测试 xHCI USB Mass Storage U盘
+  --usb-storage       使用 xHCI USB Mass Storage U盘启动（默认）
+  --nvme-root         使用原来的 NVMe 根盘启动（诊断/回退）
   --monitor-socket P  在 Unix socket P 开启 HMP monitor
   --keep-open         普通运行模式下持续运行，Ctrl-C 退出
   --seconds N         普通运行模式最多运行 N 秒（默认 10）
@@ -54,8 +58,12 @@ while (($# > 0)); do
             (($# >= 2)) || { echo "--gdb-port 需要参数" >&2; exit 2; }
             gdb_port="$2"; shift 2 ;;
         --headless) headless=1; shift ;;
-        --usb-nested) usb_nested=1; shift ;;
+        # The nested-device test needs the xHCI topology without a storage
+        # device occupying the direct root port, so retain its NVMe-root test
+        # semantics even though normal boots default to USB.
+        --usb-nested) usb_nested=1; usb_storage=0; shift ;;
         --usb-storage) usb_storage=1; shift ;;
+        --nvme-root) usb_storage=0; shift ;;
         --monitor-socket)
             (($# >= 2)) || {
                 echo "--monitor-socket 需要参数" >&2
@@ -122,7 +130,10 @@ fi
 }
 
 if ((no_build == 0)); then
-    "$make_cmd" -f GNUmakefile esp DEBUG="$debug_level"
+    # QEMU keeps the COM1 mirror enabled so this script can expose boot
+    # markers in qemu-serial.log.  A normal hardware build uses the makefile
+    # default LITEOS_DEBUG_SERIAL=0 and is GOP-only.
+    "$make_cmd" -f GNUmakefile esp DEBUG="$debug_level" LITEOS_DEBUG_SERIAL=1
 fi
 [[ -f "$build_dir/esp/EFI/LITEOS/kernel.elf" ]] || {
     echo "找不到 $build_dir/esp/EFI/LITEOS/kernel.elf，请先构建镜像" >&2
@@ -155,8 +166,6 @@ qemu_args=(
     -cpu qemu64
     -smp "$cpu_count"
     -drive "if=pflash,format=raw,readonly=on,file=$firmware"
-    -drive "if=none,id=liteos-nvme0,format=raw,file=fat:rw:$build_dir/esp"
-    -device "nvme,drive=liteos-nvme0,serial=liteos-system,bootindex=1"
     -boot order=c
     -serial "file:$build_dir/qemu-serial.log"
     -no-reboot
@@ -164,6 +173,22 @@ qemu_args=(
     -d guest_errors
     -D "$build_dir/qemu.log"
 )
+
+if ((usb_storage)); then
+    # QEMU's FAT directory backend exposes build/esp as a removable FAT
+    # volume.  This is deliberately the only boot disk in USB mode, so both
+    # OVMF and LiteOS exercise the same U盘 filesystem and write path.
+    qemu_args+=(
+        -drive "if=none,id=liteos-usb-stick,format=raw,file=fat:rw:$build_dir/esp"
+        -device "qemu-xhci,id=liteos-xhci,msix=on"
+        -device "usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
+    )
+else
+    qemu_args+=(
+        -drive "if=none,id=liteos-nvme0,format=raw,file=fat:rw:$build_dir/esp"
+        -device "nvme,drive=liteos-nvme0,serial=liteos-system,bootindex=1"
+    )
+fi
 
 if [[ -n "$monitor_socket" ]]; then
     mkdir -p "$(dirname -- "$monitor_socket")"
@@ -226,23 +251,16 @@ else
             -device "usb-kbd,bus=liteos-xhci.0"
             -device "usb-mouse,bus=liteos-xhci.0"
         )
+    else
+        # USB boot already created the xHCI controller for the storage device;
+        # add the input devices to that same controller in GUI mode.
+        qemu_args+=(
+            -device "usb-kbd,bus=liteos-xhci.0"
+            -device "usb-mouse,bus=liteos-xhci.0"
+        )
     fi
 fi
 
-if ((usb_storage)); then
-    usb_storage_image="$build_dir/usb-storage.img"
-    if [[ ! -f "$usb_storage_image" ]]; then
-        truncate -s 64M "$usb_storage_image"
-        if command -v mkfs.fat >/dev/null 2>&1; then
-            mkfs.fat -F 32 -n LITEOSUSB "$usb_storage_image" >/dev/null
-        fi
-    fi
-    qemu_args+=(
-        -drive "if=none,id=liteos-usb-stick,format=raw,file=$usb_storage_image"
-        -device "qemu-xhci,id=liteos-xhci,msix=on"
-        -device "usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
-    )
-fi
 if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" ); fi
 if [[ -n "$net_dump" ]]; then
     # Give the diagnostic filter a named user-net backend.  `-net dump` was

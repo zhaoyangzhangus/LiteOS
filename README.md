@@ -79,6 +79,10 @@ WSLg 会显示 Linux QEMU 的图形窗口。无 KVM 权限时脚本会自动退�
 ./run-qemu.sh --headless --seconds 5
 ```
 
+`run-qemu.sh` 默认把 `build/esp` 作为可启动的 USB Mass Storage FAT 卷，固件和
+LiteOS 内核都会从 USB 盘启动，内核串口应显示 `LITEOS_ROOT_SOURCE=USB`。需要对照
+旧路径时可使用 `./run-qemu.sh --nvme-root`。
+
 脚本使用 `/usr/bin/qemu-system-x86_64` 和 `/usr/share/OVMF/OVMF_CODE_4M.fd`。串口日志保存在
 `build/qemu-serial.log`，QEMU guest error
 日志保存在 `build/qemu.log`。
