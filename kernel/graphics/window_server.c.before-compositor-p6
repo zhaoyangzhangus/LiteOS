@@ -43,6 +43,15 @@
 #endif
 
 /*
+ * MOVDIR64B is ideal for the aligned 64-byte body of WB -> device-memory
+ * publication: one instruction transfers one complete cache line without
+ * touching XMM/YMM state.  Runtime CPUID still gates every use.
+ */
+#ifndef WINDOW_COMPOSITOR_MOVDIR64B
+#define WINDOW_COMPOSITOR_MOVDIR64B 1U
+#endif
+
+/*
  * Ordinary client/full-screen repaints have no move-transaction atomicity
  * requirement.  For one sufficiently large rectangle, let the compositor and
  * its two persistent helpers publish disjoint contiguous row ranges.
@@ -5372,22 +5381,240 @@ static bool compositor_snapshot_begin_locked(void) {
 
 
 /*
- * Device-memory publication belongs to display core.
+ * Copy one XRGB8888 scanline from normal WB RAM into the GOP WC mapping.
  *
- * P5 still owns damage selection, row partitioning and transaction policy;
- * this leaf call only performs the architecture/output-specific WB -> scanout
- * span write.  That keeps the compositor independent from MOVDIR64B/MOVNTI
- * details and gives DISPLAY_COMMIT the same optimized GOP path.
+ * The framebuffer destination is write-combining memory.  Use integer
+ * non-temporal stores so the copy does not pollute the normal CPU caches.
+ *
+ * No XMM/YMM state is touched: MOVNTI uses general-purpose registers.
+ * Ordering is provided once for the complete frame by the sfence in
+ * compositor_commit_snapshot().
  */
-static inline void compositor_copy_wc_scanline(
+static inline void compositor_wc_store64(volatile uint64_t *destination,
+                                         uint64_t value) {
+    __asm__ volatile (
+        "movnti %1, %0"
+        : "=m"(*destination)
+        : "r"(value));
+}
+
+/*
+ * WB composite framebuffer -> GPR.
+ *
+ * x86-64 supports unaligned 64-bit loads, so this remains correct even for
+ * an unusual framebuffer/base alignment.  In the normal case both buffers
+ * are naturally aligned and this becomes one MOVQ.
+ */
+static inline uint64_t compositor_wb_load64(
+    const uint32_t *source) {
+
+    uint64_t value;
+
+    __asm__ (
+        "movq %1, %0"
+        : "=r"(value)
+        : "m"(*(const uint64_t *)(const void *)source));
+
+    return value;
+}
+
+
+/*
+ * One 64-byte direct store from normal WB RAM to the aligned scanout
+ * destination.
+ *
+ * Architectural requirements:
+ *   - CPUID.07H.0H:ECX[28] == 1
+ *   - destination linear address is 64-byte aligned
+ *
+ * Source alignment is unrestricted.  The final compositor SFENCE orders the
+ * direct stores with the rest of the visible transaction.
+ */
+static inline void compositor_wc_store64b_direct(
+    volatile uint32_t *destination,
+    const uint32_t *source) {
+
+    __asm__ volatile (
+        "movdir64b (%1), %0"
+        :
+        : "r"((uintptr_t)destination),
+          "r"(source)
+        : "memory");
+}
+
+
+
+static void compositor_copy_wc_scanline(
     volatile uint32_t *__restrict destination,
     const uint32_t *__restrict source,
     uint32_t pixels) {
 
-    display_core_publish_xrgb8888_span(
-        destination,
-        source,
-        pixels);
+    if (destination == 0 ||
+        source == 0 ||
+        pixels == 0U) {
+        return;
+    }
+
+    /*
+     * First obtain natural qword alignment.
+     *
+     * destination/source advance together, and both framebuffers use the
+     * same 32-bit pixel layout, so after this point pair loads/stores are
+     * naturally aligned whenever the starting parity differed.
+     */
+    if (((uintptr_t)destination & 7U) != 0U &&
+        pixels != 0U) {
+        *destination++ = *source++;
+        --pixels;
+    }
+
+    /*
+     * Align the WC destination to a 64-byte cache-line boundary before the
+     * main loop.  MOVNTI is still used here, so we do not introduce cached
+     * stores into the WC bulk path.
+     */
+    while (pixels >= 2U &&
+           ((uintptr_t)destination & 63U) != 0U) {
+
+        uint64_t value =
+            compositor_wb_load64(source);
+
+        compositor_wc_store64(
+            (volatile uint64_t *)(void *)destination,
+            value);
+
+        destination += 2;
+        source += 2;
+        pixels -= 2U;
+    }
+
+    /*
+     * Main 64-byte path.
+     *
+     * MOVDIR64B reduces one cache line from:
+     *
+     *     8 x MOVQ load
+     *     8 x MOVNTI store
+     *
+     * to one direct 64-byte transfer on CPUs that enumerate the instruction.
+     * QEMU/older CPUs simply fall through to the existing MOVNTI loop below.
+     */
+    if (WINDOW_COMPOSITOR_MOVDIR64B != 0U &&
+        x86_boot_cpu_features.movdir64b) {
+
+        while (pixels >= 16U) {
+            compositor_wc_store64b_direct(
+                destination,
+                source);
+
+            destination += 16U;
+            source += 16U;
+            pixels -= 16U;
+        }
+    }
+
+    /*
+     * Generic 64-byte fallback:
+     *
+     *     16 XRGB8888 pixels
+     *       = 64 bytes
+     *       = 8 MOVNTI qword stores
+     */
+    while (pixels >= 16U) {
+        uint64_t v0 =
+            compositor_wb_load64(source + 0U);
+
+        uint64_t v1 =
+            compositor_wb_load64(source + 2U);
+
+        uint64_t v2 =
+            compositor_wb_load64(source + 4U);
+
+        uint64_t v3 =
+            compositor_wb_load64(source + 6U);
+
+        uint64_t v4 =
+            compositor_wb_load64(source + 8U);
+
+        uint64_t v5 =
+            compositor_wb_load64(source + 10U);
+
+        uint64_t v6 =
+            compositor_wb_load64(source + 12U);
+
+        uint64_t v7 =
+            compositor_wb_load64(source + 14U);
+
+        volatile uint64_t *out =
+            (volatile uint64_t *)(void *)destination;
+
+        compositor_wc_store64(out + 0, v0);
+        compositor_wc_store64(out + 1, v1);
+        compositor_wc_store64(out + 2, v2);
+        compositor_wc_store64(out + 3, v3);
+        compositor_wc_store64(out + 4, v4);
+        compositor_wc_store64(out + 5, v5);
+        compositor_wc_store64(out + 6, v6);
+        compositor_wc_store64(out + 7, v7);
+
+        destination += 16;
+        source += 16;
+        pixels -= 16U;
+    }
+
+    /*
+     * 32-byte remainder.
+     */
+    if (pixels >= 8U) {
+        uint64_t v0 =
+            compositor_wb_load64(source + 0U);
+
+        uint64_t v1 =
+            compositor_wb_load64(source + 2U);
+
+        uint64_t v2 =
+            compositor_wb_load64(source + 4U);
+
+        uint64_t v3 =
+            compositor_wb_load64(source + 6U);
+
+        volatile uint64_t *out =
+            (volatile uint64_t *)(void *)destination;
+
+        compositor_wc_store64(out + 0, v0);
+        compositor_wc_store64(out + 1, v1);
+        compositor_wc_store64(out + 2, v2);
+        compositor_wc_store64(out + 3, v3);
+
+        destination += 8;
+        source += 8;
+        pixels -= 8U;
+    }
+
+    /*
+     * Remaining qwords.
+     */
+    while (pixels >= 2U) {
+        uint64_t value =
+            compositor_wb_load64(source);
+
+        compositor_wc_store64(
+            (volatile uint64_t *)(void *)destination,
+            value);
+
+        destination += 2;
+        source += 2;
+        pixels -= 2U;
+    }
+
+    /*
+     * At most one final XRGB8888 pixel remains.
+     *
+     * sfence deliberately remains at frame/commit level rather than here.
+     */
+    if (pixels != 0U) {
+        *destination = *source;
+    }
 }
 
 typedef struct compositor_copy_wait_context {
@@ -6063,28 +6290,6 @@ static inline void compositor_wb_store64(
         "movq %1, %0"
         : "=m"(*(uint64_t *)(void *)destination)
         : "r"(value));
-}
-
-
-/*
- * WB retained-scene qword load.
- *
- * P6 centralizes WB -> GOP publication in display core, but the compositor
- * still needs a WB load for the overlap-safe backward memmove used while
- * moving retained-scene pixels.  Keep this read-only helper local; it does
- * not duplicate the display-memory writer that P6 removes from this module.
- */
-static inline uint64_t compositor_wb_load64(
-    const uint32_t *source) {
-
-    uint64_t value;
-
-    __asm__ (
-        "movq %1, %0"
-        : "=r"(value)
-        : "m"(*(const uint64_t *)(const void *)source));
-
-    return value;
 }
 
 

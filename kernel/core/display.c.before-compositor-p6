@@ -1,5 +1,4 @@
 #include <kernel/display.h>
-#include <arch/x86_64/cpu.h>
 #include <kernel/deferred.h>
 #include <kernel/kmem.h>
 #include <kernel/mm.h>
@@ -102,201 +101,6 @@ static uint32_t display_convert_pixel(uint32_t pixel, uint32_t format,
     return pixel & 0x00FFFFFFU;
 }
 
-
-/*
- * GOP WB -> WC publication primitive shared by every kernel display producer.
- *
- * The compositor used to own a private copy of this code.  Keeping the actual
- * device-memory writer in display core has two advantages:
- *
- *   1. window_server and DISPLAY_COMMIT use exactly the same tuned path;
- *   2. a future native scanout/page-flip backend has one display-layer point
- *      to replace instead of architecture-specific stores embedded in the
- *      compositor.
- *
- * XRGB8888 source pixels are native when the GOP framebuffer format is 1.
- * Other GOP layouts preserve the existing conversion path.
- */
-#ifndef DISPLAY_GOP_MOVDIR64B
-#define DISPLAY_GOP_MOVDIR64B 1U
-#endif
-
-static inline void display_wc_store64(volatile uint64_t *destination,
-                                      uint64_t value) {
-    __asm__ volatile (
-        "movnti %1, %0"
-        : "=m"(*destination)
-        : "r"(value));
-}
-
-static inline uint64_t display_wb_load64(const uint32_t *source) {
-    uint64_t value;
-
-    __asm__ (
-        "movq %1, %0"
-        : "=r"(value)
-        : "m"(*(const uint64_t *)(const void *)source));
-
-    return value;
-}
-
-static inline void display_wc_store64b_direct(
-    volatile uint32_t *destination,
-    const uint32_t *source) {
-
-    __asm__ volatile (
-        "movdir64b (%1), %0"
-        :
-        : "r"((uintptr_t)destination),
-          "r"(source)
-        : "memory");
-}
-
-static void display_copy_native_xrgb8888_span(
-    volatile uint32_t *__restrict destination,
-    const uint32_t *__restrict source,
-    uint32_t pixels) {
-
-    if (destination == 0 || source == 0 || pixels == 0U) {
-        return;
-    }
-
-    /*
-     * Reach qword alignment first.  Both buffers advance together.
-     */
-    if (((uintptr_t)destination & 7U) != 0U) {
-        *destination++ = *source++;
-        --pixels;
-    }
-
-    /*
-     * MOVDIR64B requires a 64-byte-aligned destination.  The short prefix is
-     * still non-temporal so the WC path does not mix cached stores into the
-     * bulk transaction.
-     */
-    while (pixels >= 2U &&
-           ((uintptr_t)destination & 63U) != 0U) {
-
-        uint64_t value = display_wb_load64(source);
-
-        display_wc_store64(
-            (volatile uint64_t *)(void *)destination,
-            value);
-
-        destination += 2U;
-        source += 2U;
-        pixels -= 2U;
-    }
-
-    if (DISPLAY_GOP_MOVDIR64B != 0U &&
-        x86_boot_cpu_features.movdir64b) {
-
-        while (pixels >= 16U) {
-            display_wc_store64b_direct(destination, source);
-
-            destination += 16U;
-            source += 16U;
-            pixels -= 16U;
-        }
-    }
-
-    /*
-     * Generic 64-byte fallback: 16 XRGB pixels = eight MOVNTI qwords.
-     */
-    while (pixels >= 16U) {
-        uint64_t v0 = display_wb_load64(source + 0U);
-        uint64_t v1 = display_wb_load64(source + 2U);
-        uint64_t v2 = display_wb_load64(source + 4U);
-        uint64_t v3 = display_wb_load64(source + 6U);
-        uint64_t v4 = display_wb_load64(source + 8U);
-        uint64_t v5 = display_wb_load64(source + 10U);
-        uint64_t v6 = display_wb_load64(source + 12U);
-        uint64_t v7 = display_wb_load64(source + 14U);
-
-        volatile uint64_t *out =
-            (volatile uint64_t *)(void *)destination;
-
-        display_wc_store64(out + 0U, v0);
-        display_wc_store64(out + 1U, v1);
-        display_wc_store64(out + 2U, v2);
-        display_wc_store64(out + 3U, v3);
-        display_wc_store64(out + 4U, v4);
-        display_wc_store64(out + 5U, v5);
-        display_wc_store64(out + 6U, v6);
-        display_wc_store64(out + 7U, v7);
-
-        destination += 16U;
-        source += 16U;
-        pixels -= 16U;
-    }
-
-    if (pixels >= 8U) {
-        uint64_t v0 = display_wb_load64(source + 0U);
-        uint64_t v1 = display_wb_load64(source + 2U);
-        uint64_t v2 = display_wb_load64(source + 4U);
-        uint64_t v3 = display_wb_load64(source + 6U);
-
-        volatile uint64_t *out =
-            (volatile uint64_t *)(void *)destination;
-
-        display_wc_store64(out + 0U, v0);
-        display_wc_store64(out + 1U, v1);
-        display_wc_store64(out + 2U, v2);
-        display_wc_store64(out + 3U, v3);
-
-        destination += 8U;
-        source += 8U;
-        pixels -= 8U;
-    }
-
-    while (pixels >= 2U) {
-        uint64_t value = display_wb_load64(source);
-
-        display_wc_store64(
-            (volatile uint64_t *)(void *)destination,
-            value);
-
-        destination += 2U;
-        source += 2U;
-        pixels -= 2U;
-    }
-
-    if (pixels != 0U) {
-        *destination = *source;
-    }
-}
-
-void display_core_publish_xrgb8888_span(
-    volatile uint32_t *destination,
-    const uint32_t *source,
-    uint32_t pixels) {
-
-    if (destination == 0 || source == 0 || pixels == 0U) {
-        return;
-    }
-
-    /*
-     * The framebuffer geometry/format is immutable after display_core_init()
-     * in the current boot model.  No display lock is taken here: compositor
-     * copy workers deliberately publish disjoint spans in parallel.
-     */
-    if (g_display.format == 1U) {
-        display_copy_native_xrgb8888_span(
-            destination,
-            source,
-            pixels);
-        return;
-    }
-
-    for (uint32_t x = 0U; x < pixels; ++x) {
-        destination[x] =
-            display_convert_pixel(
-                source[x],
-                g_display.format,
-                g_display.masks);
-    }
-}
-
 static bool display_commit_shape_valid(const gpu_allocation_t *buffer,
                                        uint64_t offset, uint64_t stride,
                                        uint32_t width, uint32_t height) {
@@ -374,28 +178,13 @@ static void display_complete_commit(void *argument) {
         volatile uint32_t *destination =
             (volatile uint32_t *)(uintptr_t)g_display.framebuffer;
         for (uint32_t y = first_row; y < last_row; ++y) {
-            const uint32_t *row =
-                (const uint32_t *)(const void *)(
-                    source + (uint64_t)y * pending->stride);
-
-            volatile uint32_t *out =
-                destination +
-                (uint64_t)y *
-                    g_display.pixels_per_scanline;
-
-            display_core_publish_xrgb8888_span(
-                out,
-                row,
-                pending->width);
+            const uint32_t *row = (const uint32_t *)(const void *)
+                (source + (uint64_t)y * pending->stride);
+            for (uint32_t x = 0U; x < pending->width; ++x) {
+                destination[(uint64_t)y * g_display.pixels_per_scanline + x] =
+                    display_convert_pixel(row[x], g_display.format, g_display.masks);
+            }
         }
-
-        /*
-         * A deferred continuation is allowed to run on another CPU.  MOVNTI /
-         * MOVDIR64B ordering is CPU-local, so finish this chunk's WC stores
-         * before dropping the display lock and scheduling the next chunk.
-         */
-        __asm__ volatile ("sfence" : : : "memory");
-
         copied = true;
     }
     display_unlock();
