@@ -53,6 +53,12 @@
 #define XHCI_USBSTS_HCH        (1U << 0)
 #define XHCI_USBSTS_CNR        (1U << 11)
 
+#define XHCI_EXT_CAP_ID_MASK   0xFFU
+#define XHCI_EXT_CAP_NEXT_SHIFT 8U
+#define XHCI_EXT_CAP_LEGACY    1U
+#define XHCI_LEGACY_BIOS_OWNED (1U << 16)
+#define XHCI_LEGACY_OS_OWNED  (1U << 24)
+
 #define XHCI_RUNTIME_IMAN      0x00U
 #define XHCI_RUNTIME_ERSTSZ    0x08U
 #define XHCI_RUNTIME_ERSTBA    0x10U
@@ -84,6 +90,8 @@
 #define XHCI_PORTSC_CCS        (1U << 0)
 #define XHCI_PORTSC_PED        (1U << 1)
 #define XHCI_PORTSC_PR         (1U << 4)
+#define XHCI_PORTSC_PLS_MASK   (0x0FU << 5)
+#define XHCI_PORTSC_PP         (1U << 9)
 #define XHCI_PORTSC_SPEED_SHIFT 10U
 #define XHCI_PORTSC_SPEED_MASK 0x0FU
 #define XHCI_PORTSC_PRC        (1U << 21)
@@ -525,6 +533,7 @@ static atomic_bool g_xhci_irq_pending;
  * "completion happened but no second MSI-X/deferred drain".
  */
 static atomic_uint g_xhci_diag_msix_count;
+static uint32_t g_xhci_msix_failure_stage;
 static atomic_uint g_xhci_diag_hid_event_count;
 static atomic_bool g_xhci_input_seen;
 static atomic_bool g_xhci_mouse_input_seen;
@@ -562,6 +571,7 @@ static bool xhci_remove_device_subtree(
 static void xhci_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
                               void *context);
 static bool xhci_bind_msix(xhci_state_t *state);
+static void xhci_report_msix_metadata(const pci_device_t *device);
 static void xhci_unbind_msix(xhci_state_t *state);
 static void xhci_init_ring_link(xhci_dma_page_t *ring);
 static void xhci_init_endpoint_context(xhci_state_t *state, uint32_t *endpoint,
@@ -611,24 +621,77 @@ static void xhci_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
     (void)xhci_schedule_deferred_work();
 }
 
+static void xhci_report_msix_metadata(const pci_device_t *device) {
+    if (device == 0) return;
+    liteos_serial_write("LITEOS_XHCI_MSIX_DETAIL CAP=");
+    liteos_serial_write_u32(device->msix_capability);
+    liteos_serial_write(" BAR=");
+    liteos_serial_write_u32(device->msix_table_bar);
+    liteos_serial_write(" OFF=");
+    liteos_serial_write_u32(device->msix_table_offset);
+    liteos_serial_write(" ENTRIES=");
+    liteos_serial_write_u32(device->msix_table_size);
+    if (device->msix_table_bar < PCI_MAX_BARS) {
+        const pci_bar_t *bar = &device->bars[device->msix_table_bar];
+        liteos_serial_write(" ADDR_LO=");
+        liteos_serial_write_u32((uint32_t)bar->address);
+        liteos_serial_write(" ADDR_HI=");
+        liteos_serial_write_u32((uint32_t)(bar->address >> 32));
+        liteos_serial_write(" LEN_LO=");
+        liteos_serial_write_u32((uint32_t)bar->length);
+        liteos_serial_write(" LEN_HI=");
+        liteos_serial_write_u32((uint32_t)(bar->length >> 32));
+    }
+    liteos_serial_write("\r\n");
+}
+
 static bool xhci_bind_msix(xhci_state_t *state) {
     paddr_t table;
     uint16_t entries;
     uint8_t vector = 0x58U;
-    if (state == 0 || state->pci == 0 ||
-        pci_msix_table(state->pci, &table, &entries) != K_OK ||
-        entries == 0U || vector > IRQ_VECTOR_LAST) return false;
+    g_xhci_msix_failure_stage = 0U;
+    if (state == 0 || state->pci == 0 || vector > IRQ_VECTOR_LAST) {
+        g_xhci_msix_failure_stage = 1U;
+        return false;
+    }
+    if (pci_msix_table(state->pci, &table, &entries) != K_OK || entries == 0U) {
+        g_xhci_msix_failure_stage = 2U;
+        xhci_report_msix_metadata(state->pci);
+        return false;
+    }
     /* Enumeration may have left the interrupter pending while MSI-X was
      * disabled.  Clear that stale edge before enabling the PCI vector; new
      * transfer completions will then generate a fresh interrupt. */
     xhci_event_handler_complete(state);
     if (!xhci_write32(state, state->runtime_offset + XHCI_RUNTIME_INTR0,
-                      XHCI_IMAN_IP | XHCI_IMAN_IE)) return false;
-    if (irq_register(vector, xhci_msix_handler, state) != K_OK) return false;
+                      XHCI_IMAN_IP | XHCI_IMAN_IE)) {
+        g_xhci_msix_failure_stage = 3U;
+        return false;
+    }
+    if (irq_register(vector, xhci_msix_handler, state) != K_OK) {
+        g_xhci_msix_failure_stage = 4U;
+        return false;
+    }
     state->irq_vector = vector;
-    if (pci_msix_configure((pci_device_t *)state->pci, 0U,
-                           x86_current_apic_id(), vector) != K_OK ||
-        pci_msix_mask((pci_device_t *)state->pci, 0U, false) != K_OK) {
+    kstatus_t status = pci_msix_configure((pci_device_t *)state->pci, 0U,
+                                           x86_current_apic_id(), vector);
+    if (status != K_OK) {
+        g_xhci_msix_failure_stage = 5U;
+        xhci_report_msix_metadata(state->pci);
+        liteos_serial_write("LITEOS_XHCI_MSIX_CONFIG_STATUS=");
+        liteos_serial_write_u32((uint32_t)(-status));
+        liteos_serial_write("\r\n");
+        (void)irq_unregister(vector, xhci_msix_handler, state);
+        state->irq_vector = 0U;
+        return false;
+    }
+    status = pci_msix_mask((pci_device_t *)state->pci, 0U, false);
+    if (status != K_OK) {
+        g_xhci_msix_failure_stage = 6U;
+        xhci_report_msix_metadata(state->pci);
+        liteos_serial_write("LITEOS_XHCI_MSIX_MASK_STATUS=");
+        liteos_serial_write_u32((uint32_t)(-status));
+        liteos_serial_write("\r\n");
         (void)irq_unregister(vector, xhci_msix_handler, state);
         state->irq_vector = 0U;
         return false;
@@ -786,6 +849,29 @@ static uint32_t xhci_read32(const xhci_state_t *state, uint32_t offset) {
         return UINT32_MAX;
     }
     return *(volatile const uint32_t *)(state->mmio + offset);
+}
+
+static uint64_t xhci_timeout_deadline(uint64_t timeout_ns) {
+    if (x86_boot_cpu_features.tsc_hz == 0U) return UINT64_MAX;
+    uint64_t ticks = x86_timeout_ns_to_tsc(timeout_ns);
+    uint64_t now = x86_read_tsc();
+    return ticks > UINT64_MAX - now ? UINT64_MAX : now + ticks;
+}
+
+static bool xhci_timeout_reached(uint64_t deadline) {
+    return deadline != UINT64_MAX &&
+           (int64_t)(x86_read_tsc() - deadline) >= 0;
+}
+
+static void xhci_delay_ns(uint64_t delay_ns) {
+    if (x86_boot_cpu_features.tsc_hz == 0U) {
+        for (uint32_t spin = 0; spin < 100000U; ++spin) {
+            __asm__ volatile ("pause");
+        }
+        return;
+    }
+    uint64_t deadline = xhci_timeout_deadline(delay_ns);
+    while (!xhci_timeout_reached(deadline)) __asm__ volatile ("pause");
 }
 
 static bool xhci_write32(const xhci_state_t *state, uint32_t offset, uint32_t value) {
@@ -1875,6 +1961,55 @@ static bool xhci_reset(xhci_state_t *state) {
     return false;
 }
 
+/*
+ * UEFI normally leaves the xHCI legacy-support capability owned by the BIOS.
+ * A controller reset does not transfer that ownership.  On real machines
+ * the firmware SMI handler can therefore consume/hold the first EP0 request:
+ * Enable Slot and Address Device complete, but the device control transfer
+ * never reaches the event ring.  Claim OS ownership before programming the
+ * rings and disable legacy SMI sources after the handoff.
+ */
+static bool xhci_handoff_legacy(xhci_state_t *state, uint32_t hcc_params1) {
+    if (state == 0) return false;
+    uint32_t offset = ((hcc_params1 >> 16) & 0xFFFFU) << 2;
+    for (uint32_t count = 0U; offset != 0U && count < 256U; ++count) {
+        if (offset > state->mmio_span - sizeof(uint32_t)) return false;
+        uint32_t capability = xhci_read32(state, offset);
+        if ((capability & XHCI_EXT_CAP_ID_MASK) == XHCI_EXT_CAP_LEGACY) {
+            if ((capability & XHCI_LEGACY_OS_OWNED) == 0U) {
+                if (!xhci_write32(state, offset,
+                                  capability | XHCI_LEGACY_OS_OWNED)) {
+                    return false;
+                }
+            }
+            if ((capability & XHCI_LEGACY_BIOS_OWNED) != 0U) {
+                uint64_t deadline = xhci_timeout_deadline(1000000000ULL);
+                while ((xhci_read32(state, offset) &
+                        XHCI_LEGACY_BIOS_OWNED) != 0U &&
+                       !xhci_timeout_reached(deadline)) {
+                    __asm__ volatile ("pause");
+                }
+            }
+            uint32_t after = xhci_read32(state, offset);
+            if ((after & XHCI_LEGACY_BIOS_OWNED) != 0U) {
+                liteos_serial_write("LITEOS_XHCI_LEGACY_HANDOFF_TIMEOUT BIOS=");
+                liteos_serial_write_u32(after);
+                liteos_serial_write("\r\n");
+            }
+            /* USBLEGSUPCTL lower bits are legacy SMI enables. */
+            if (offset <= state->mmio_span - 2U * sizeof(uint32_t)) {
+                uint32_t control = xhci_read32(state, offset + sizeof(uint32_t));
+                (void)xhci_write32(state, offset + sizeof(uint32_t),
+                                   control & ~0xFFFFU);
+            }
+            return true;
+        }
+        uint32_t next = (capability >> XHCI_EXT_CAP_NEXT_SHIFT) & 0xFFU;
+        offset = next == 0U ? 0U : offset + (next << 2);
+    }
+    return true;
+}
+
 static bool xhci_setup_rings(xhci_state_t *state) {
     if (!xhci_alloc_page(state, &state->dcbaa, DMA_BIDIRECTIONAL) ||
         !xhci_alloc_page(state, &state->command_ring, DMA_BIDIRECTIONAL) ||
@@ -2569,27 +2704,41 @@ static bool xhci_prepare_connected_port(xhci_state_t *state, uint8_t port,
              (uint32_t)(port - 1U) * XHCI_PORT_REGISTER_STRIDE;
     portsc = xhci_read32(state, offset);
     if (portsc == UINT32_MAX || (portsc & XHCI_PORTSC_CCS) == 0U) return false;
-    if ((portsc & XHCI_PORTSC_PED) == 0U) {
-        if (!xhci_write32(state, offset, XHCI_PORTSC_PR)) {
-            g_xhci_error = 50U;
-            return false;
-        }
-        bool enabled = false;
-        for (uint32_t spin = 0; spin < 100000U; ++spin) {
-            portsc = xhci_read32(state, offset);
-            if ((portsc & XHCI_PORTSC_PED) != 0U &&
-                (portsc & XHCI_PORTSC_PR) == 0U) {
-                enabled = true;
-                break;
-            }
-            __asm__ volatile ("pause");
-        }
-        if (!enabled) {
-            g_xhci_error = 51U;
-            return false;
-        }
+    /*
+     * A firmware-owned controller can leave a connected port enabled before
+     * LiteOS takes ownership.  A controller reset does not guarantee that
+     * the device returned to the Default USB state, so accepting PED here
+     * makes Address Device fail only on real machines.  Reset every newly
+     * attached root-port device, while preserving PP/PLS as required by the
+     * PORTSC read/write semantics.
+     */
+    uint32_t reset_value = (portsc & (XHCI_PORTSC_PLS_MASK | XHCI_PORTSC_PP)) |
+                           XHCI_PORTSC_PR;
+    if (!xhci_write32(state, offset, reset_value)) {
+        g_xhci_error = 50U;
+        return false;
     }
-    (void)xhci_write32(state, offset, XHCI_PORTSC_PRC);
+    bool enabled = false;
+    for (uint32_t spin = 0; spin < 100000U; ++spin) {
+        portsc = xhci_read32(state, offset);
+        if ((portsc & XHCI_PORTSC_PED) != 0U &&
+            (portsc & XHCI_PORTSC_PR) == 0U) {
+            enabled = true;
+            break;
+        }
+        __asm__ volatile ("pause");
+    }
+    if (!enabled) {
+        g_xhci_error = 51U;
+        return false;
+    }
+    (void)xhci_write32(state, offset,
+                       (portsc & (XHCI_PORTSC_PLS_MASK | XHCI_PORTSC_PP)) |
+                       XHCI_PORTSC_PRC);
+    /* USB 3.x tRecovery: do not issue the first EP0 request in the reset
+     * completion window. Firmware/QEMU often hides this race, hardware does
+     * not. */
+    xhci_delay_ns(50000000ULL);
     uint32_t speed = (portsc >> XHCI_PORTSC_SPEED_SHIFT) & XHCI_PORTSC_SPEED_MASK;
     if (speed == 0U) {
         g_xhci_error = 52U;
@@ -3479,6 +3628,9 @@ static bool xhci_probe_connected_ports(
         uint8_t slot =
             0U;
 
+        uint32_t enumeration_error =
+            0U;
+
 
         if(portsc == UINT32_MAX ||
            (portsc & XHCI_PORTSC_CCS) == 0U ||
@@ -3520,6 +3672,10 @@ static bool xhci_probe_connected_ports(
             }
         }
 
+        /* Save this before Disable Slot: successful cleanup clears the
+         * controller error and used to hide every real failure as code 70. */
+        enumeration_error = g_xhci_error;
+
 
         if(slot != 0U)
         {
@@ -3539,8 +3695,18 @@ static bool xhci_probe_connected_ports(
 
         xhci_clear_device_flags();
 
-        g_xhci_error =
-            70U;
+        g_xhci_error = enumeration_error != 0U ? enumeration_error : 70U;
+        liteos_serial_write("LITEOS_XHCI_ENUM_FAIL PORT=");
+        liteos_serial_write_u32(port);
+        liteos_serial_write(" SLOT=");
+        liteos_serial_write_u32(slot);
+        liteos_serial_write(" PORTSC=");
+        liteos_serial_write_u32(xhci_read32(state, offset));
+        liteos_serial_write(" SPEED=");
+        liteos_serial_write_u32(speed);
+        liteos_serial_write(" ERROR=");
+        liteos_serial_write_u32(g_xhci_error);
+        liteos_serial_write("\r\n");
 
         return false;
     }
@@ -4268,9 +4434,11 @@ static bool xhci_submit_command_ex(xhci_state_t *state, uint32_t type,
     dma_wmb();
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset) = 0;
     __asm__ volatile ("mfence" : : : "memory");
-    for (uint32_t spin = 0; spin < 200000U; ++spin) {
+    uint64_t deadline = xhci_timeout_deadline(5000000000ULL);
+    for (;;) {
         xhci_trb_t event;
         if (!xhci_next_ring_event(state, &event)) {
+            if (xhci_timeout_reached(deadline)) break;
             __asm__ volatile ("pause");
             continue;
         }
@@ -4286,11 +4454,14 @@ static bool xhci_submit_command_ex(xhci_state_t *state, uint32_t type,
             if (result_slot != 0) *result_slot = completed_slot;
             if (completion != XHCI_COMPLETION_SUCCESS) {
                 g_xhci_error = 32U + completion;
+                xhci_event_handler_complete(state);
                 return false;
             }
             g_xhci_error = 0U;
+            xhci_event_handler_complete(state);
             return true;
         }
+        if (xhci_timeout_reached(deadline)) break;
         __asm__ volatile ("pause");
     }
     if ((xhci_read32(state, state->operational_offset + XHCI_USBSTS) &
@@ -4464,7 +4635,10 @@ static bool xhci_prepare_device_resources(xhci_state_t *state, uint8_t slot,
     ep0_context[1] = (3U << 1) | (4U << 3) | (max_packet << 16);
     ep0_context[2] = (uint32_t)xhci_dma_address(&state->ep0_ring.mapping) | 1U;
     ep0_context[3] = (uint32_t)(xhci_dma_address(&state->ep0_ring.mapping) >> 32);
-    ep0_context[4] = 0U;
+    /* Endpoint Context DW4: Average TRB Length.  A control TD always
+     * contains an eight-byte Setup TRB; zero is tolerated by QEMU but causes
+     * some physical xHCI implementations to leave EP0 unscheduled. */
+    ep0_context[4] = 8U;
 
     xhci_trb_t *ring = (xhci_trb_t *)state->ep0_ring.cpu;
     ring[XHCI_RING_TRB_COUNT - 1U].parameter =
@@ -4554,9 +4728,11 @@ static bool xhci_submit_control_transfer_device(
     *(volatile uint32_t *)(state->mmio + state->doorbell_offset +
                            (uint32_t)device->device_slot * sizeof(uint32_t)) = 1U;
     __asm__ volatile ("mfence" : : : "memory");
-    for (uint32_t spin = 0; spin < 200000U; ++spin) {
+    uint64_t deadline = xhci_timeout_deadline(5000000000ULL);
+    for (;;) {
         xhci_trb_t event;
         if (!xhci_next_ring_event(state, &event)) {
+            if (xhci_timeout_reached(deadline)) break;
             __asm__ volatile ("pause");
             continue;
         }
@@ -4574,12 +4750,42 @@ static bool xhci_submit_control_transfer_device(
         uint32_t completion = event.status >> XHCI_COMPLETION_SHIFT;
         if (completion != XHCI_COMPLETION_SUCCESS) {
             g_xhci_error = 54U + completion;
+            liteos_serial_write("LITEOS_XHCI_EP0_COMPLETION SLOT=");
+            liteos_serial_write_u32(device->device_slot);
+            liteos_serial_write(" PORT=");
+            liteos_serial_write_u32(device->device_port);
+            liteos_serial_write(" LEN=");
+            liteos_serial_write_u32(length);
+            liteos_serial_write(" CODE=");
+            liteos_serial_write_u32(completion);
+            liteos_serial_write(" EVENT_STATUS=");
+            liteos_serial_write_u32(event.status);
+            liteos_serial_write("\r\n");
+            xhci_event_handler_complete(state);
             return false;
         }
         dma_sync_for_cpu(&device->descriptor_buffer.mapping);
+        xhci_event_handler_complete(state);
         return true;
     }
     g_xhci_error = 54U;
+    liteos_serial_write("LITEOS_XHCI_EP0_TIMEOUT SLOT=");
+    liteos_serial_write_u32(device->device_slot);
+    liteos_serial_write(" PORT=");
+    liteos_serial_write_u32(device->device_port);
+    liteos_serial_write(" LEN=");
+    liteos_serial_write_u32(length);
+    liteos_serial_write(" EVENT_INDEX=");
+    liteos_serial_write_u32(state->event_index);
+    liteos_serial_write(" EVENT_CYCLE=");
+    liteos_serial_write_u32(state->event_cycle);
+    liteos_serial_write(" USBSTS=");
+    liteos_serial_write_u32(xhci_read32(state, state->operational_offset + XHCI_USBSTS));
+    liteos_serial_write(" IMAN=");
+    liteos_serial_write_u32(xhci_read32(state, state->runtime_offset +
+                                        XHCI_RUNTIME_INTR0 + XHCI_RUNTIME_IMAN));
+    liteos_serial_write("\r\n");
+    xhci_event_handler_complete(state);
     return false;
 }
 
@@ -8083,6 +8289,10 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     }
 
 
+    static const uint8_t get_device_descriptor_header[8] = {
+        0x80U, XHCI_SETUP_GET_DESCRIPTOR, 0x00U, XHCI_DESCRIPTOR_DEVICE,
+        0x00U, 0x00U, 0x08U, 0x00U
+    };
     static const uint8_t get_device_descriptor[8] = {
         0x80U, XHCI_SETUP_GET_DESCRIPTOR, 0x00U, XHCI_DESCRIPTOR_DEVICE,
         0x00U, 0x00U, XHCI_DESCRIPTOR_DEVICE_LENGTH, 0x00U
@@ -8112,7 +8322,13 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
         return false;
     } while (0);
     }
-    if (!xhci_submit_control_transfer_device(state, &state->device,  get_device_descriptor,
+    /* USB enumeration first probes the fixed eight-byte header.  Besides
+     * being required for USB 2 devices, this gives SuperSpeed hardware a
+     * separate EP0 transaction after reset recovery before the full request.
+     */
+    if (!xhci_submit_control_transfer_device(state, &state->device,
+                                      get_device_descriptor_header, 8U, true) ||
+        !xhci_submit_control_transfer_device(state, &state->device,  get_device_descriptor,
                                       XHCI_DESCRIPTOR_DEVICE_LENGTH, true)) {
         do {
         xhci_unpublish_slot_device(
@@ -8135,10 +8351,16 @@ static bool xhci_enumerate_device(xhci_state_t *state, uint8_t slot,
     } while (0);
     }
     g_xhci_usb_enumerated = true;
+    uint32_t configuration_error = g_xhci_error;
     if (!xhci_submit_control_transfer_device(state, &state->device,  get_configuration_descriptor,
                                       0xFFU, true) ||
         !xhci_parse_configuration(state)) {
-        g_xhci_error = 57U;
+        /* Keep the EP0 completion/timeout code.  Replacing it with the
+         * generic parser code made real hardware failures look identical and
+         * hid whether the controller ever completed the request. */
+        if (g_xhci_error == 0U || configuration_error != 0U) {
+            g_xhci_error = configuration_error != 0U ? configuration_error : 57U;
+        }
         do {
         xhci_unpublish_slot_device(
             slot,
@@ -8340,6 +8562,11 @@ static bool xhci_initialize(xhci_state_t *state, const pci_device_t *pci) {
         xhci_unmap_mmio(state);
         return false;
     }
+    if (!xhci_handoff_legacy(state, hcc_params1)) {
+        g_xhci_error = 23U;
+        xhci_unmap_mmio(state);
+        return false;
+    }
     if (state->max_slots > 255U) state->max_slots = 255U;
     if (!xhci_reset(state) || !xhci_setup_rings(state)) {
         g_xhci_error = 22U;
@@ -8537,6 +8764,7 @@ bool xhci_hardware_self_test(void) {
     atomic_init(&g_xhci_work_queued, false);
     atomic_init(&g_xhci_irq_pending, false);
     atomic_init(&g_xhci_diag_msix_count, 0U);
+    g_xhci_msix_failure_stage = 0U;
     atomic_init(&g_xhci_diag_hid_event_count, 0U);
     atomic_init(&g_xhci_input_seen, false);
     atomic_init(&g_xhci_mouse_input_seen, false);
@@ -8648,7 +8876,9 @@ bool xhci_hardware_self_test(void) {
         if (success && !xhci_bind_msix(&g_xhci)) {
             g_xhci_runtime_ready = false;
             g_xhci_error = 70U;
-            liteos_serial_write("LITEOS_XHCI_MSIX_FAIL\r\n");
+            liteos_serial_write("LITEOS_XHCI_MSIX_FAIL_STAGE=");
+            liteos_serial_write_u32(g_xhci_msix_failure_stage);
+            liteos_serial_write("\r\n");
             success = false;
             keep_controller = false;
         } else if(success) {

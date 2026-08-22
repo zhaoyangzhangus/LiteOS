@@ -103,9 +103,22 @@ static bool bar_is_memory64(uint32_t low) {
 static bool read_bar(const x86_acpi_ecam_t *segment, pci_device_t *device,
                      uint32_t index) {
     uint16_t offset = (uint16_t)(0x10U + index * 4U);
+    uint32_t saved_command = 0U;
+    bool command_disabled = false;
     uint32_t low = pci_config_read32(segment, device->bus, device->slot,
                                      device->function, offset);
     if (low == UINT32_MAX || low == 0U) return true;
+
+    /* PCI BAR sizing is only defined while I/O and memory decoding are off.
+     * Firmware often leaves xHCI enabled for boot-media access; probing an
+     * active BAR can otherwise return its live address instead of the mask. */
+    saved_command = pci_config_read32(segment, device->bus, device->slot,
+                                      device->function, 4U);
+    if (saved_command != UINT32_MAX &&
+        pci_config_write32(segment, device->bus, device->slot, device->function,
+                           4U, saved_command & ~0x3U) == K_OK) {
+        command_disabled = true;
+    }
 
     uint32_t original_high = 0;
     bool memory = (low & 1U) == 0;
@@ -134,6 +147,10 @@ static bool read_bar(const x86_acpi_ecam_t *segment, pci_device_t *device,
                                  device->function, (uint16_t)(offset + 4U),
                                  original_high);
     }
+    if (command_disabled) {
+        (void)pci_config_write32(segment, device->bus, device->slot,
+                                 device->function, 4U, saved_command);
+    }
 
     pci_bar_t *bar = &device->bars[index];
     bar->flags = memory ? PCI_RESOURCE_MEMORY : PCI_RESOURCE_IO;
@@ -145,8 +162,16 @@ static bool read_bar(const x86_acpi_ecam_t *segment, pci_device_t *device,
         address |= (uint64_t)original_high << 32;
         mask |= (uint64_t)mask_high << 32;
     }
+    uint64_t length = mask != 0 ? (~mask + 1ULL) : 0;
+    /* Some firmware leaves an unassigned 64-bit BAR at the top of the
+     * physical address space. Treat that BAR as absent instead of allowing
+     * its wrapped range to abort enumeration of unrelated devices. */
+    if (length != 0 && address > UINT64_MAX - (length - 1ULL)) {
+        address = 0;
+        length = 0;
+    }
     bar->address = address;
-    bar->length = mask != 0 ? (~mask + 1ULL) : 0;
+    bar->length = length;
     return true;
 }
 
@@ -530,22 +555,46 @@ const pci_host_t *pci_current_host(void) {
 
 bool pci_ecam_self_test(void) {
     if (pci_ecam_init(&g_pci_host) != K_OK || !g_pci_host.initialized ||
-        g_pci_host.ecam_count == 0) return false;
+        g_pci_host.ecam_count == 0) {
+        if (g_pci_last_error == 0U) g_pci_last_error = 0x200U;
+        return false;
+    }
     for (uint32_t i = 0; i < g_pci_host.device_count; ++i) {
         const pci_device_t *device = &g_pci_host.devices[i];
         if (device->vendor_id == PCI_VENDOR_INVALID ||
             device->device.resources != device->resources ||
-            device->device.resource_count != PCI_MAX_BARS) return false;
+            device->device.resource_count != PCI_MAX_BARS) {
+            g_pci_last_error = 0x300U | (i & 0xFFU);
+            return false;
+        }
         for (uint32_t bar = 0; bar < PCI_MAX_BARS; ++bar) {
             if (device->bars[bar].length != 0 &&
-                device->bars[bar].address + device->bars[bar].length <
-                device->bars[bar].address) return false;
+                device->bars[bar].address > UINT64_MAX -
+                (device->bars[bar].length - 1ULL)) {
+                g_pci_last_error = 0x400U | ((i & 0x1FU) << 3) | bar;
+                return false;
+            }
         }
         if (device->msix_capability != 0) {
             paddr_t table;
             uint16_t entries;
             if (pci_msix_table(device, &table, &entries) != K_OK ||
-                table.value == 0 || entries != device->msix_table_size) return false;
+                table.value == 0 || entries != device->msix_table_size) {
+                /* MSI-X is optional. Some firmware exposes a stale capability
+                 * on an otherwise usable device; keep the device enumerable
+                 * and let its driver choose another interrupt path. */
+                g_pci_last_error = 0x500U | (i & 0xFFU);
+                /* Keep xHCI's raw capability for the dedicated MSI-X
+                 * diagnostic; its controller must not be silently downgraded
+                 * before we know whether the table or the config write fails. */
+                if (device->class_code != 0x0CU || device->subclass != 0x03U ||
+                    device->prog_if != 0x30U) {
+                    ((pci_device_t *)device)->msix_capability = 0U;
+                    ((pci_device_t *)device)->msix_table_size = 0U;
+                    ((pci_device_t *)device)->msix_table_bar = 0U;
+                    ((pci_device_t *)device)->msix_table_offset = 0U;
+                }
+            }
         }
     }
     return true;

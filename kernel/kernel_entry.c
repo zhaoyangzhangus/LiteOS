@@ -89,7 +89,8 @@
 #endif
 
 #define FAT32_TEST_SECTOR_COUNT 128U
-#define FRAMEBUFFER_KERNEL_VIRTUAL_BASE X86_64_MMIO_BASE
+/* Keep the framebuffer out of the low MMIO windows used by PCI and devices. */
+#define FRAMEBUFFER_KERNEL_VIRTUAL_BASE (X86_64_MMIO_BASE + 0x20000000ULL)
 
 static UINT8 g_fat32_test_disk[FAT32_TEST_SECTOR_COUNT * 512U];
 static LITEOS_RUN_QUEUE g_kernel_run_queue;
@@ -887,6 +888,7 @@ typedef struct gop_debug_console {
 static gop_debug_console_t g_gop_debug_console;
 static atomic_uint g_gop_debug_console_ready;
 static atomic_flag g_gop_debug_console_lock = ATOMIC_FLAG_INIT;
+static UINT64 g_framebuffer_virtual_base;
 
 static UINT32 gop_debug_component(UINT8 value, UINT32 mask) {
     UINT32 shift = 0U;
@@ -1063,6 +1065,30 @@ static BOOLEAN gop_debug_console_init(const LITEOS_BOOT_INFO *info,
     gop_debug_clear_locked();
     atomic_store_explicit(&g_gop_debug_console_ready, 1U, memory_order_release);
     return 1;
+}
+
+/*
+ * The handoff page table identity-maps the first 4 GiB.  Use that mapping for
+ * the first few boot markers before the kernel installs its own page tables.
+ * This is deliberately limited to the identity-mapped range; after paging is
+ * enabled the console is retargeted to the permanent direct-map alias below.
+ */
+static BOOLEAN gop_debug_console_init_early(const LITEOS_BOOT_INFO *info) {
+    if (info == 0 || info->FrameBufferBase > 0xFFFFFFFFULL ||
+        info->FrameBufferSize > 0x100000000ULL - info->FrameBufferBase) {
+        return 0;
+    }
+    return gop_debug_console_init(info, info->FrameBufferBase);
+}
+
+static BOOLEAN gop_debug_console_retarget_direct(const LITEOS_BOOT_INFO *info) {
+    UINT64 direct_span = X86_64_DIRECT_MAP_END - X86_64_DIRECT_MAP_BASE + 1ULL;
+    if (info == 0 || info->FrameBufferBase >= direct_span ||
+        info->FrameBufferSize > direct_span - info->FrameBufferBase) {
+        return 0;
+    }
+    return gop_debug_console_init(info,
+                                  X86_64_DIRECT_MAP_BASE + info->FrameBufferBase);
 }
 
 /* 用于验证启动交接 ABI 的最小 PE32+ 内核入口。 */
@@ -2602,8 +2628,8 @@ static void __attribute__((noreturn)) kernel_main(void *context) {
         halt_forever();
     }
 
-    UINT64 framebuffer_virtual = 0U;
-    if (!map_framebuffer_wc(info, &framebuffer_virtual)) {
+    UINT64 framebuffer_virtual = g_framebuffer_virtual_base;
+    if (framebuffer_virtual == 0U && !map_framebuffer_wc(info, &framebuffer_virtual)) {
         serial_write("LITEOS_FRAMEBUFFER_MAP_FAIL\r\n");
         halt_forever();
     }
@@ -2764,6 +2790,9 @@ static void __attribute__((noreturn)) kernel_main(void *context) {
 /* 内核使用 SysV AMD64 ABI 编译。 */
 void kernel_entry(LITEOS_BOOT_INFO *info) {
     serial_init();
+    if (gop_debug_console_init_early(info)) {
+        serial_write("LITEOS_EARLY_GOP_OK\r\n");
+    }
     if (info == 0 || info->Magic != LITEOS_BOOTINFO_MAGIC ||
         info->Version < LITEOS_BOOTINFO_VERSION || info->Size < sizeof(*info)) {
         serial_write("LITEOS_KERNEL_BAD_BOOTINFO\r\n");
@@ -2853,6 +2882,11 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
         serial_write("LITEOS_PAGING_INIT_FAIL\r\n");
         halt_forever();
     }
+    /* CR3 now points at the kernel page tables; the identity alias is gone. */
+    if (atomic_load_explicit(&g_gop_debug_console_ready, memory_order_acquire) != 0U &&
+        !gop_debug_console_retarget_direct(info)) {
+        atomic_store_explicit(&g_gop_debug_console_ready, 0U, memory_order_release);
+    }
     serial_write("LITEOS_PAGING_OK\r\n");
     if (!canonical_uaccess_self_test()) {
         serial_write("LITEOS_UACCESS_TEST_FAIL\r\n");
@@ -2863,7 +2897,21 @@ void kernel_entry(LITEOS_BOOT_INFO *info) {
         serial_write("LITEOS_MM_INIT_FAIL\r\n");
         halt_forever();
     }
-    if (!liteos_rebuild_ram_direct_map(info) || !direct_map_self_test(info)) {
+    if (!liteos_rebuild_ram_direct_map(info)) {
+        serial_write("LITEOS_DIRECT_MAP_FAIL\r\n");
+        halt_forever();
+    }
+    /* The RAM-map rebuild removes the framebuffer from the direct map.  Install
+     * its permanent WC alias before any later boot marker can touch the GOP. */
+    if (!map_framebuffer_wc(info, &g_framebuffer_virtual_base)) {
+        atomic_store_explicit(&g_gop_debug_console_ready, 0U, memory_order_release);
+        serial_write("LITEOS_FRAMEBUFFER_MAP_FAIL\r\n");
+        halt_forever();
+    }
+    if (!gop_debug_console_init(info, g_framebuffer_virtual_base)) {
+        atomic_store_explicit(&g_gop_debug_console_ready, 0U, memory_order_release);
+    }
+    if (!direct_map_self_test(info)) {
         serial_write("LITEOS_DIRECT_MAP_FAIL\r\n");
         halt_forever();
     }
