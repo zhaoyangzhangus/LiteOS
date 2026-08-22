@@ -1,0 +1,9 @@
+P7 exact base
+
+kernel/core/display.c
+e0673de76be150792fb779dc06e21e866a130852
+
+OS_Implementation_Specification_COMPLETE/include/kernel/display.h
+693ebfde10ed78741a1b33dd7b741b0b9a5f0e2d
+
+These source blobs already contain P6.

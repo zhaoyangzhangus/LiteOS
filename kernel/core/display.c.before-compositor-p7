@@ -17,18 +17,7 @@ typedef struct display_state {
     uint32_t pixels_per_scanline;
     uint32_t format;
     uint32_t masks[4];
-
-    /*
-     * Optional native scanout backend.
-     *
-     * current_scanout owns exactly one object reference and one pin while the
-     * display engine may still fetch from that allocation.
-     */
-    display_scanout_backend_t scanout_backend;
-    gpu_allocation_t *current_scanout;
-    bool scanout_backend_registered;
-
-    /* 同一输出只允许一个未完成的提交，GOP copy 与 native flip 共用此门。 */
+    /* 同一输出只允许一个未完成的异步拷贝，避免提交突发耗尽 deferred 队列。 */
     bool initialized;
     bool pending_commit;
 } display_state_t;
@@ -314,7 +303,7 @@ static bool display_commit_shape_valid(const gpu_allocation_t *buffer,
     uint64_t row_bytes;
     uint64_t required;
     if (buffer == 0 || buffer->object.type != KOBJECT_TYPE_GPU_ALLOCATION ||
-        width == 0U || height == 0U ||
+        buffer->backing == 0 || width == 0U || height == 0U ||
         stride < (uint64_t)width * sizeof(uint32_t) || offset > buffer->size) {
         return false;
     }
@@ -350,190 +339,6 @@ static void display_release_pending(display_pending_commit_t *pending) {
     kfree(pending);
 }
 
-
-/*
- * Native atomic scanout ownership
- * -------------------------------
- *
- * pending->buffer owns one object reference and one pin from
- * display_commit_submit().
- *
- * GOP fallback:
- *     release them when the copy/fence completes.
- *
- * Native success:
- *     transfer that exact reference+pin into g_display.current_scanout.
- *     Only after flip-done/vblank releases the previous current_scanout.
- *
- * Native failure:
- *     keep the old current_scanout and release pending normally.
- *
- * This makes the release fence a real scanout-lifetime fence rather than a
- * "page-flip command queued" fence.
- */
-static void display_release_scanout_buffer(gpu_allocation_t *buffer) {
-    if (buffer == 0) return;
-
-    atomic_fetch_sub_explicit(
-        &buffer->pin_count,
-        1U,
-        memory_order_acq_rel);
-
-    object_put(buffer);
-}
-
-
-static bool display_scanout_backend_snapshot(
-    display_scanout_backend_t *backend) {
-
-    bool registered;
-
-    if (backend == 0) {
-        return false;
-    }
-
-    display_lock();
-
-    registered =
-        g_display.scanout_backend_registered;
-
-    if (registered) {
-        *backend =
-            g_display.scanout_backend;
-    }
-
-    display_unlock();
-    return registered;
-}
-
-
-static void display_native_scanout_complete(
-    void *completion_context,
-    kstatus_t status) {
-
-    display_pending_commit_t *pending =
-        (display_pending_commit_t *)completion_context;
-
-    gpu_allocation_t *old_scanout = 0;
-    uint64_t gpu_va = 0U;
-
-    if (pending == 0) {
-        return;
-    }
-
-    if (pending->buffer != 0) {
-        gpu_va =
-            pending->buffer->gpu_va.value;
-    }
-
-    if (status == K_OK) {
-        /*
-         * K_OK means the new scanout is latched and the old one is no longer
-         * fetched by the display engine.
-         *
-         * Move, do not duplicate, pending's reference+pin into current_scanout.
-         */
-        display_lock();
-
-        old_scanout =
-            g_display.current_scanout;
-
-        g_display.current_scanout =
-            pending->buffer;
-
-        pending->buffer = 0;
-        g_display.pending_commit = false;
-
-        display_unlock();
-
-        display_release_scanout_buffer(
-            old_scanout);
-
-        (void)gpu_fence_signal(
-            pending->signal_fence,
-            pending->signal_value);
-
-        (void)telemetry_record_latency(
-            TELEMETRY_CATEGORY_GPU_SUBMIT,
-            gpu_va,
-            pending->start_tsc);
-    } else {
-        /*
-         * Failed atomic flip: keep the current scanout untouched.  The new
-         * buffer is still owned by pending and is released below.
-         */
-        display_clear_pending();
-
-        (void)gpu_fence_fail(
-            pending->signal_fence,
-            status);
-    }
-
-    display_release_pending(pending);
-}
-
-
-static void display_submit_native_scanout(
-    display_pending_commit_t *pending,
-    const display_scanout_backend_t *backend) {
-
-    display_scanout_request_t request;
-    kstatus_t status;
-
-    if (pending == 0 ||
-        backend == 0 ||
-        backend->atomic_commit == 0) {
-
-        if (pending != 0) {
-            display_clear_pending();
-
-            (void)gpu_fence_fail(
-                pending->signal_fence,
-                K_EIO);
-
-            display_release_pending(pending);
-        }
-
-        return;
-    }
-
-    request.output = 0U;
-    request.buffer = pending->buffer;
-    request.offset = pending->offset;
-    request.stride = pending->stride;
-    request.width = pending->width;
-    request.height = pending->height;
-    request.format = 1U;
-
-    /*
-     * Never hold display_lock across a GPU driver call.  A synchronous
-     * completion is legal and may already have freed pending before the call
-     * returns, so the K_OK path must not touch pending again.
-     */
-    status =
-        backend->atomic_commit(
-            backend->context,
-            &request,
-            display_native_scanout_complete,
-            pending);
-
-    if (status == K_OK) {
-        return;
-    }
-
-    /*
-     * Non-K_OK means the backend did not take asynchronous ownership and must
-     * not invoke the completion callback.
-     */
-    display_clear_pending();
-
-    (void)gpu_fence_fail(
-        pending->signal_fence,
-        status);
-
-    display_release_pending(pending);
-}
-
 static void display_complete_commit(void *argument) {
     display_pending_commit_t *pending = (display_pending_commit_t *)argument;
     bool copied = false;
@@ -556,22 +361,6 @@ static void display_complete_commit(void *argument) {
         (void)gpu_fence_fail(pending->signal_fence, wait_status);
         display_release_pending(pending);
         return;
-    }
-
-    /*
-     * Acquire-fence completion is the common dispatch point.  Registration is
-     * one-shot and forbidden while a commit is pending, so a submission cannot
-     * change backend underneath this decision.
-     */
-    {
-        display_scanout_backend_t backend;
-
-        if (display_scanout_backend_snapshot(&backend)) {
-            display_submit_native_scanout(
-                pending,
-                &backend);
-            return;
-        }
     }
 
     first_row = pending->next_row;
@@ -637,64 +426,6 @@ static void display_complete_commit(void *argument) {
                                    pending->start_tsc);
     display_release_pending(pending);
 }
-
-
-kstatus_t display_core_register_scanout_backend(
-    uint32_t output,
-    const display_scanout_backend_t *backend) {
-
-    kstatus_t status = K_OK;
-
-    if (output != 0U ||
-        backend == 0 ||
-        backend->atomic_commit == 0 ||
-        !display_initialize()) {
-
-        return K_EINVAL;
-    }
-
-    display_lock();
-
-    if (g_display.scanout_backend_registered) {
-        status = K_EEXIST;
-    } else if (g_display.pending_commit) {
-        /*
-         * Do not switch a commit from GOP copy to native scanout after it has
-         * already been accepted. Registration is normally a one-time GPU
-         * bring-up operation.
-         */
-        status = K_EBUSY;
-    } else {
-        g_display.scanout_backend =
-            *backend;
-
-        g_display.scanout_backend_registered =
-            true;
-    }
-
-    display_unlock();
-    return status;
-}
-
-
-bool display_core_has_native_scanout(uint32_t output) {
-    bool registered;
-
-    if (output != 0U ||
-        !display_initialize()) {
-
-        return false;
-    }
-
-    display_lock();
-
-    registered =
-        g_display.scanout_backend_registered;
-
-    display_unlock();
-    return registered;
-}
-
 
 bool display_core_init(uint64_t framebuffer_virtual, uint64_t framebuffer_size,
                        uint32_t width, uint32_t height,
@@ -779,10 +510,9 @@ kstatus_t display_commit_submit(uint32_t output, gpu_allocation_t *buffer,
     }
     display_lock();
     /*
-     * DISPLAY_COMMIT 是异步的；GOP copy 和 native page-flip 共用一个
-     * pending 槽。这样 fence / buffer ownership 始终只有一个明确的状态
-     * 转移点，也避免高频提交把 deferred 队列或 GPU flip queue 填满。
-     * 收到 K_EBUSY 的调用者稍后重试即可。
+     * DISPLAY_COMMIT 是异步的；如果允许同一缓冲区无限叠加 pending copy，
+     * 高频输入会把 deferred 队列填满，进而让显示和输入互相拖住。收到
+     * K_EBUSY 的调用者稍后重试即可，最后一个提交仍由 fence 完成通知。
      */
     busy = g_display.pending_commit;
     valid = g_display.initialized && !busy &&
