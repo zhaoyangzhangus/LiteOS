@@ -168,7 +168,6 @@ void x86_cpu_detect_features(void) {
         x86_boot_cpu_features.smep = (ebx & (1U << 7)) != 0;
         x86_boot_cpu_features.invpcid = (ebx & (1U << 10)) != 0;
         x86_boot_cpu_features.smap = (ebx & (1U << 20)) != 0;
-        x86_boot_cpu_features.movdir64b = (ecx & (1U << 28)) != 0;
     }
     if (maximum_basic >= 0x15U) {
         uint32_t denominator;

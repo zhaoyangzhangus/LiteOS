@@ -43,15 +43,6 @@
 #endif
 
 /*
- * MOVDIR64B is ideal for the aligned 64-byte body of WB -> device-memory
- * publication: one instruction transfers one complete cache line without
- * touching XMM/YMM state.  Runtime CPUID still gates every use.
- */
-#ifndef WINDOW_COMPOSITOR_MOVDIR64B
-#define WINDOW_COMPOSITOR_MOVDIR64B 1U
-#endif
-
-/*
  * Correctness baseline for GOP: do not publish one drag transaction from
  * several CPUs at once.  Without a real page-flip/vblank contract the WC
  * framebuffer should have one writer for a visible move.
@@ -5394,30 +5385,6 @@ static inline uint64_t compositor_wb_load64(
 }
 
 
-/*
- * One 64-byte direct store from normal WB RAM to the aligned scanout
- * destination.
- *
- * Architectural requirements:
- *   - CPUID.07H.0H:ECX[28] == 1
- *   - destination linear address is 64-byte aligned
- *
- * Source alignment is unrestricted.  The final compositor SFENCE orders the
- * direct stores with the rest of the visible transaction.
- */
-static inline void compositor_wc_store64b_direct(
-    volatile uint32_t *destination,
-    const uint32_t *source) {
-
-    __asm__ volatile (
-        "movdir64b (%1), %0"
-        :
-        : "r"((uintptr_t)destination),
-          "r"(source)
-        : "memory");
-}
-
-
 
 static void compositor_copy_wc_scanline(
     volatile uint32_t *__restrict destination,
@@ -5464,36 +5431,13 @@ static void compositor_copy_wc_scanline(
     }
 
     /*
-     * Main 64-byte path.
-     *
-     * MOVDIR64B reduces one cache line from:
-     *
-     *     8 x MOVQ load
-     *     8 x MOVNTI store
-     *
-     * to one direct 64-byte transfer on CPUs that enumerate the instruction.
-     * QEMU/older CPUs simply fall through to the existing MOVNTI loop below.
-     */
-    if (WINDOW_COMPOSITOR_MOVDIR64B != 0U &&
-        x86_boot_cpu_features.movdir64b) {
-
-        while (pixels >= 16U) {
-            compositor_wc_store64b_direct(
-                destination,
-                source);
-
-            destination += 16U;
-            source += 16U;
-            pixels -= 16U;
-        }
-    }
-
-    /*
-     * Generic 64-byte fallback:
+     * Main 64-byte path:
      *
      *     16 XRGB8888 pixels
      *       = 64 bytes
      *       = 8 MOVNTI qword stores
+     *
+     * One loop iteration now consumes one complete cache line.
      */
     while (pixels >= 16U) {
         uint64_t v0 =
