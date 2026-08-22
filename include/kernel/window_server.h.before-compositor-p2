@@ -41,22 +41,6 @@ typedef struct window_server_window {
      */
     void *compositor_cache;
 
-    /*
-     * Geometry of this window in the last frame that actually reached the
-     * retained WB scene / scanout.
-     *
-     * Logical x/y may run ahead while HID reports are being coalesced.  A
-     * retained drag must copy from these committed coordinates, never from an
-     * intermediate logical position that was not rendered.
-     *
-     * width/height here are OUTER dimensions, including Ring0 decorations.
-     */
-    int32_t compositor_presented_x;
-    int32_t compositor_presented_y;
-    uint32_t compositor_presented_width;
-    uint32_t compositor_presented_height;
-    bool compositor_presented_valid;
-
     bool dirty;
     bool resize_pending;
 

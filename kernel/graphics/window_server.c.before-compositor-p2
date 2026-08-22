@@ -462,28 +462,9 @@ static bool compositor_copy_rect_parallel_buffers(
 
 static void window_lock(void) {
     sched_preempt_disable();
-
-    for (;;) {
-        if (atomic_exchange_explicit(
-                &g_window_server.lock.state,
-                1U,
-                memory_order_acquire) == 0U) {
-            return;
-        }
-
-        /*
-         * Test-test-and-set:
-         *
-         * once another CPU owns the lock, spin with cacheable shared loads.
-         * Repeating atomic_exchange() would request exclusive ownership of
-         * the lock cache line on every iteration and bounce it between the
-         * compositor/input CPUs.
-         */
-        while (atomic_load_explicit(
-                   &g_window_server.lock.state,
-                   memory_order_relaxed) != 0U) {
-            __asm__ volatile ("pause");
-        }
+    while (atomic_exchange_explicit(&g_window_server.lock.state, 1U,
+                                    memory_order_acquire) != 0U) {
+        __asm__ volatile ("pause");
     }
 }
 
@@ -908,12 +889,7 @@ static bool window_drag_reuse_safe_locked(
         g_window_server.composing ||
         width == 0U || height == 0U ||
         old_x < 0 || old_y < 0 ||
-        new_x < 0 || new_y < 0 ||
-        !window->compositor_presented_valid ||
-        window->compositor_presented_x != old_x ||
-        window->compositor_presented_y != old_y ||
-        window->compositor_presented_width != width ||
-        window->compositor_presented_height != height) {
+        new_x < 0 || new_y < 0) {
         return false;
     }
 
@@ -5186,15 +5162,11 @@ static bool compositor_snapshot_begin_locked(void) {
         g_window_server.dragging_identifier;
 
     /*
-     * The producer sets drag_blit_valid only when drag_old_x/y names geometry
-     * that was actually committed to the retained scene and no scene damage
-     * is pending/in flight.  Preserve that proof in the immutable snapshot.
-     *
-     * If the proof is absent, the existing correctness-first full-new-position
-     * path is retained unchanged.
+     * Do not mutate the retained scene with an in-place window memmove.
+     * A drag is recomposed from desktop + windows into one complete damage
+     * transaction.  This keeps composite_framebuffer a trustworthy scene.
      */
-    snapshot->drag_blit_valid =
-        g_window_server.drag_blit_valid;
+    snapshot->drag_blit_valid = false;
     snapshot->drag_old_x =
         g_window_server.drag_old_x;
     snapshot->drag_old_y =
@@ -6339,64 +6311,9 @@ static void compositor_render_snapshot(void) {
 
 static void compositor_snapshot_finish(void) {
     /*
-     * This snapshot has finished scene rendering and publication.
+     * Release the unlocked compositor's lifetime references.
      *
-     * Record the exact geometry that is now visually committed before
-     * allowing a future HID drag to consider retained reuse.  Logical window
-     * state may already have advanced on another CPU; only these snapshot
-     * coordinates are safe as a memmove source.
-     */
-    window_lock();
-
-    for (uint32_t index = 0U;
-         index < g_compositor_snapshot.window_count;
-         ++index) {
-
-        compositor_window_view_t *view =
-            &g_compositor_snapshot.windows[index];
-
-        window_server_window_t *reference =
-            view->reference;
-
-        if (reference == 0) {
-            continue;
-        }
-
-        reference->compositor_presented_x =
-            view->x;
-
-        reference->compositor_presented_y =
-            view->y;
-
-        reference->compositor_presented_width =
-            window_outer_width(
-                view->width,
-                view->flags);
-
-        reference->compositor_presented_height =
-            window_outer_height(
-                view->height,
-                view->flags);
-
-        reference->compositor_presented_valid =
-            true;
-    }
-
-    /*
-     * drag_blit_valid describes only the pending snapshot transaction.  Clear
-     * it after commit; the next motion independently derives reuse eligibility
-     * from compositor_presented_* plus dirty/composing state.
-     */
-    g_window_server.drag_blit_valid = false;
-
-    g_window_server.composing = false;
-
-    window_unlock();
-
-    /*
-     * Release the unlocked compositor's lifetime references only after the
-     * committed-geometry bookkeeping above.  object_put() remains outside
-     * window_lock so destruction cannot lengthen the scene critical section.
+     * No window_server fields are read through these objects after this loop.
      */
     for (uint32_t index = 0U;
          index < g_compositor_snapshot.window_count;
@@ -6417,11 +6334,24 @@ static void compositor_snapshot_finish(void) {
     g_compositor_snapshot.damage_count = 0U;
 
     /*
-     * Do not clear producer dirty/damage here.
+     * Do not clear dirty/damage here.
      *
      * Input, resize, WINDOW_UPDATE or process exit may have generated another
-     * frame while this snapshot was rendering.
+     * frame while the compositor was running.
      */
+    window_lock();
+
+    /*
+     * Keep retained drag disabled until it can use an immutable previous-frame
+     * source instead of moving pixels inside the live retained scene.
+     * Every move therefore marks/renders the complete new position and the
+     * snapshot collapses old/new damage into one correctness-first rectangle.
+     */
+    g_window_server.drag_blit_valid = false;
+
+    g_window_server.composing = false;
+
+    window_unlock();
 }
 
 
@@ -6716,11 +6646,6 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->buffer_size = bytes;
     window->owner_address = 0U;
     window->compositor_cache = 0;
-    window->compositor_presented_x = x;
-    window->compositor_presented_y = y;
-    window->compositor_presented_width = 0U;
-    window->compositor_presented_height = 0U;
-    window->compositor_presented_valid = false;
     window->dirty = true;
     window->resize_pending = false;
     window->maximized = false;
@@ -8095,41 +8020,18 @@ static bool window_route_drag_motion_batch_locked(
                 window_outer_width(dragged->width, dragged->flags);
             uint32_t outer_height =
                 window_outer_height(dragged->height, dragged->flags);
-
-            int32_t retained_old_x =
-                dragged->compositor_presented_x;
-            int32_t retained_old_y =
-                dragged->compositor_presented_y;
-
             bool reuse_retained =
+                g_window_server.drag_blit_valid &&
                 window_drag_reuse_safe_locked(
                     dragged,
-                    retained_old_x,
-                    retained_old_y,
-                    new_x,
-                    new_y,
-                    outer_width,
-                    outer_height);
-
-            /*
-             * If retained reuse is valid, the WB source is the last visually
-             * committed geometry.  Otherwise preserve the old logical damage
-             * path and repaint the complete destination.
-             */
-            int32_t damage_old_x =
-                reuse_retained ?
-                    retained_old_x :
-                    old_x;
-
-            int32_t damage_old_y =
-                reuse_retained ?
-                    retained_old_y :
-                    old_y;
+                    old_x, old_y,
+                    new_x, new_y,
+                    outer_width, outer_height);
 
             g_window_server.drag_blit_valid =
                 reuse_retained;
-            g_window_server.drag_old_x = damage_old_x;
-            g_window_server.drag_old_y = damage_old_y;
+            g_window_server.drag_old_x = old_x;
+            g_window_server.drag_old_y = old_y;
             g_window_server.drag_new_x = new_x;
             g_window_server.drag_new_y = new_y;
             g_window_server.drag_width = outer_width;
@@ -8142,20 +8044,15 @@ static bool window_route_drag_motion_batch_locked(
                 new_y;
 
             window_mark_moved_rect_locked(
-                damage_old_x,
-                damage_old_y,
+                old_x,
+                old_y,
                 new_x,
                 new_y,
                 outer_width,
                 outer_height,
-                !reuse_retained);
+                !g_window_server.drag_blit_valid);
 
-            if (reuse_retained) {
-                /*
-                 * The copied outer rectangle also moves the old background
-                 * stored in transparent rounded-corner cells.  Recompose the
-                 * four tiny destination corner squares after the blit.
-                 */
+            if (g_window_server.drag_blit_valid) {
                 window_mark_drag_corner_repair_locked(
                     new_x,
                     new_y,
