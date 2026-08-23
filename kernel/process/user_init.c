@@ -18,6 +18,8 @@
 #define INIT_DEVICE_CLASS      0x0600U
 #define INIT_RUNTIME_RESTART_LIMIT 3U
 
+#define INIT_BOOTSTRAP_EXIT_TIMEOUT_NS 15000000000ULL
+
 static uint32_t g_user_init_stage;
 static int64_t g_user_init_result;
 static device_t g_user_init_device;
@@ -233,7 +235,8 @@ static bool init_wait_for_exit(process_t *process, thread_t *thread,
     g_user_init_stage = stage;
 
     uint64_t deadline = x86_read_tsc();
-    uint64_t budget = x86_timeout_ns_to_tsc(5000000000ULL);
+    uint64_t budget =
+        x86_timeout_ns_to_tsc(INIT_BOOTSTRAP_EXIT_TIMEOUT_NS);
     deadline = budget > UINT64_MAX - deadline ? UINT64_MAX : deadline + budget;
     for (;;) {
         __asm__ volatile ("sti" : : : "memory");

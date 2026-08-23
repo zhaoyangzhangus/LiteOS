@@ -1,0 +1,86 @@
+diff --git a/kernel/process/init_blob.S b/kernel/process/init_blob.S
+--- a/kernel/process/init_blob.S
++++ b/kernel/process/init_blob.S
+@@
+     .set SYS_AUDIO_OPEN,       0x0720
+     .set SYS_AUDIO_CONTROL,    0x0721
+
++    .set K_ETIMEDOUT,          -110
++    .set INIT_WAIT_SLICE_NS,   1000000000
++    .set INIT_WAIT_RETRIES,    4
++
+@@
+ .Linit_service_wait\@:
+
++    movl $INIT_WAIT_RETRIES, %r14d
++.Linit_service_thread_wait_retry\@:
+     movl $SYS_WAIT_ONE, %eax
+     movq %r13, %rdi
+-    movq $1000000000, %rsi
++    movq $INIT_WAIT_SLICE_NS, %rsi
+     movq $INIT_WAIT_RESULT, %rdx
+     syscall
+     testq %rax, %rax
+-    js .Linit_service_fail\@
++    jns .Linit_service_thread_wait_ok\@
++    cmpq $K_ETIMEDOUT, %rax
++    jne .Linit_service_fail\@
++    decl %r14d
++    jnz .Linit_service_thread_wait_retry\@
++    jmp .Linit_service_fail\@
++.Linit_service_thread_wait_ok\@:
+     cmpq $0, INIT_WAIT_RESULT+8
+     movq INIT_WAIT_RESULT+8, %rax
+     jne .Linit_service_fail\@
+@@
+     syscall
+     testq %rax, %rax
+     js .Linit_service_fail\@
+
++    movl $INIT_WAIT_RETRIES, %r14d
++.Linit_service_process_wait_retry\@:
+     movl $SYS_WAIT_ONE, %eax
+     movq %r12, %rdi
+-    movq $1000000000, %rsi
++    movq $INIT_WAIT_SLICE_NS, %rsi
+     movq $INIT_WAIT_RESULT, %rdx
+     syscall
+     testq %rax, %rax
+-    js .Linit_service_fail\@
++    jns .Linit_service_process_wait_ok\@
++    cmpq $K_ETIMEDOUT, %rax
++    jne .Linit_service_fail\@
++    decl %r14d
++    jnz .Linit_service_process_wait_retry\@
++    jmp .Linit_service_fail\@
++.Linit_service_process_wait_ok\@:
+     cmpq $0, INIT_WAIT_RESULT+8
+     movq INIT_WAIT_RESULT+8, %rax
+     jne .Linit_service_fail\@
+@@
+ .Linit_service_crashd:
+     cmpb $0, INIT_PERSISTENT
+-    je .Linit_service_audio_exec_now
++    je .Linit_service_exit
+     jmp .Linit_service_block
+
+ .Linit_service_audio_exec:
+     cmpb $0, INIT_PERSISTENT
+-    je .Linit_service_exit
++    je .Linit_service_audio_exec_now
+     jmp .Linit_service_block
+
+diff --git a/kernel/process/user_init.c b/kernel/process/user_init.c
+--- a/kernel/process/user_init.c
++++ b/kernel/process/user_init.c
+@@
+ #define INIT_RUNTIME_RESTART_LIMIT 3U
+
++#define INIT_BOOTSTRAP_EXIT_TIMEOUT_NS 15000000000ULL
++
+@@
+     uint64_t deadline = x86_read_tsc();
+-    uint64_t budget = x86_timeout_ns_to_tsc(5000000000ULL);
++    uint64_t budget =
++        x86_timeout_ns_to_tsc(INIT_BOOTSTRAP_EXIT_TIMEOUT_NS);
+     deadline = budget > UINT64_MAX - deadline ? UINT64_MAX : deadline + budget;

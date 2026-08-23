@@ -24,6 +24,10 @@
     .set SYS_AUDIO_OPEN,       0x0720
     .set SYS_AUDIO_CONTROL,    0x0721
 
+    .set K_ETIMEDOUT,          -110
+    .set INIT_WAIT_SLICE_NS,   1000000000
+    .set INIT_WAIT_RETRIES,    4
+
     .set INIT_STAGE,           0x00401000
     .set INIT_RESULT,          0x00401008
     .set INIT_SERVICE_OK,      0x00401010
@@ -122,13 +126,21 @@
 
 .Linit_service_wait\@:
 
+    movl $INIT_WAIT_RETRIES, %r14d
+.Linit_service_thread_wait_retry\@:
     movl $SYS_WAIT_ONE, %eax
     movq %r13, %rdi
-    movq $1000000000, %rsi
+    movq $INIT_WAIT_SLICE_NS, %rsi
     movq $INIT_WAIT_RESULT, %rdx
     syscall
     testq %rax, %rax
-    js .Linit_service_fail\@
+    jns .Linit_service_thread_wait_ok\@
+    cmpq $K_ETIMEDOUT, %rax
+    jne .Linit_service_fail\@
+    decl %r14d
+    jnz .Linit_service_thread_wait_retry\@
+    jmp .Linit_service_fail\@
+.Linit_service_thread_wait_ok\@:
     cmpq $0, INIT_WAIT_RESULT+8
     movq INIT_WAIT_RESULT+8, %rax
     jne .Linit_service_fail\@
@@ -138,13 +150,21 @@
     testq %rax, %rax
     js .Linit_service_fail\@
 
+    movl $INIT_WAIT_RETRIES, %r14d
+.Linit_service_process_wait_retry\@:
     movl $SYS_WAIT_ONE, %eax
     movq %r12, %rdi
-    movq $1000000000, %rsi
+    movq $INIT_WAIT_SLICE_NS, %rsi
     movq $INIT_WAIT_RESULT, %rdx
     syscall
     testq %rax, %rax
-    js .Linit_service_fail\@
+    jns .Linit_service_process_wait_ok\@
+    cmpq $K_ETIMEDOUT, %rax
+    jne .Linit_service_fail\@
+    decl %r14d
+    jnz .Linit_service_process_wait_retry\@
+    jmp .Linit_service_fail\@
+.Linit_service_process_wait_ok\@:
     cmpq $0, INIT_WAIT_RESULT+8
     movq INIT_WAIT_RESULT+8, %rax
     jne .Linit_service_fail\@
@@ -308,12 +328,12 @@ liteos_init_service:
 
 .Linit_service_crashd:
     cmpb $0, INIT_PERSISTENT
-    je .Linit_service_audio_exec_now
+    je .Linit_service_exit
     jmp .Linit_service_block
 
 .Linit_service_audio_exec:
     cmpb $0, INIT_PERSISTENT
-    je .Linit_service_exit
+    je .Linit_service_audio_exec_now
     jmp .Linit_service_block
 
 .Linit_service_audio_exec_now:
