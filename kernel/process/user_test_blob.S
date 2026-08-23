@@ -446,6 +446,7 @@ liteos_user_runtime_blob_start:
     js .Lruntime_failure
 
     /* 并发 usercopy/munmap：copy_from_user 必须只返回成功或受控错误。 */
+    movb $0xA3, STAGE_MARK_ADDRESS
     movb $0, UACCESS_START_ADDRESS
     movb $0, UACCESS_PASS_ADDRESS
     movl $SYS_PORT_CREATE, %eax
@@ -470,6 +471,7 @@ liteos_user_runtime_blob_start:
     movq $0, UACCESS_THREAD_ARGS_ADDRESS+32
     movl $0, UACCESS_THREAD_ARGS_ADDRESS+40
     movl $0, UACCESS_THREAD_ARGS_ADDRESS+44
+    movb $0xA4, STAGE_MARK_ADDRESS
     movl $SYS_THREAD_CREATE, %eax
     xorl %edi, %edi
     movq $UACCESS_THREAD_ARGS_ADDRESS, %rsi
@@ -481,6 +483,7 @@ liteos_user_runtime_blob_start:
     testq %r15, %r15
     jz .Lruntime_failure
     movb $1, UACCESS_START_ADDRESS
+    movb $0xA5, STAGE_MARK_ADDRESS
     movl $128, %r13d
 .Luaccess_send_loop:
     movl $SYS_PORT_SEND, %eax
@@ -497,6 +500,7 @@ liteos_user_runtime_blob_start:
 .Luaccess_send_ok:
     decl %r13d
     jnz .Luaccess_send_loop
+    movb $0xA6, STAGE_MARK_ADDRESS
     movl $SYS_WAIT_ONE, %eax
     movq %r15, %rdi
     movl $1000000000, %esi
@@ -508,11 +512,13 @@ liteos_user_runtime_blob_start:
     jne .Lruntime_failure
     cmpb $0xA7, UACCESS_PASS_ADDRESS
     jne .Lruntime_failure
+    movb $0xA7, STAGE_MARK_ADDRESS
     movl $SYS_HANDLE_CLOSE, %eax
     movq %r15, %rdi
     syscall
     testq %rax, %rax
     js .Lruntime_failure
+    movb $0xA8, STAGE_MARK_ADDRESS
     movl $SYS_HANDLE_CLOSE, %eax
     movq UACCESS_PORT_HANDLE_ADDRESS, %rdi
     syscall
@@ -520,6 +526,7 @@ liteos_user_runtime_blob_start:
     js .Lruntime_failure
 
     /* 等待/超时竞争：worker 与主线程重复制造 futex 唤醒和短超时竞态。 */
+    movb $0xA9, STAGE_MARK_ADDRESS
     movb $0, WAIT_RACE_PASS_ADDRESS
     movb $0, WAIT_RACE_START_ADDRESS
     movb $0, WAIT_RACE_GO_ADDRESS
@@ -536,6 +543,7 @@ liteos_user_runtime_blob_start:
     movq $0, WAIT_RACE_THREAD_ARGS_ADDRESS+32
     movl $0, WAIT_RACE_THREAD_ARGS_ADDRESS+40
     movl $0, WAIT_RACE_THREAD_ARGS_ADDRESS+44
+    movb $0xAA, STAGE_MARK_ADDRESS
     movl $SYS_THREAD_CREATE, %eax
     xorl %edi, %edi
     movq $WAIT_RACE_THREAD_ARGS_ADDRESS, %rsi
@@ -547,6 +555,7 @@ liteos_user_runtime_blob_start:
     testq %r14, %r14
     jz .Lruntime_failure
     movb $1, WAIT_RACE_START_ADDRESS
+    movb $0xAB, STAGE_MARK_ADDRESS
     movl $1, %r13d
 .Lwait_race_loop:
     movl $0, FUTEX_WORD_ADDRESS
@@ -569,6 +578,7 @@ liteos_user_runtime_blob_start:
     incl %r13d
     cmpl $65, %r13d
     jne .Lwait_race_loop
+    movb $0xAC, STAGE_MARK_ADDRESS
     movl $SYS_WAIT_ONE, %eax
     movq %r14, %rdi
     movl $1000000000, %esi
@@ -580,6 +590,7 @@ liteos_user_runtime_blob_start:
     jne .Lruntime_failure
     cmpb $0xB7, WAIT_RACE_PASS_ADDRESS
     jne .Lruntime_failure
+    movb $0xAD, STAGE_MARK_ADDRESS
     movl $SYS_HANDLE_CLOSE, %eax
     movq %r14, %rdi
     syscall

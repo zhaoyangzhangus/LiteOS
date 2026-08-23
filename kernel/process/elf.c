@@ -6,6 +6,7 @@
 #include <kernel/elf_loader.h>
 #include <kernel/console.h>
 #include <kernel/futex.h>
+#include <kernel/wait.h>
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
 #include <kernel/vfs.h>
@@ -1011,6 +1012,43 @@ bool user_elf_runtime_self_test(void) {
             break;
         }
     }
+    /*
+     * Runtime wait diagnostic:
+     * 如果辅助线程已经退出，复用 CHILD_* 输出 main thread 本身。
+     *
+     * CHILD_STATE:
+     *   0 NEW
+     *   1 READY
+     *   2 RUNNING
+     *   3 BLOCKED
+     *   4 STOPPED
+     *   5 DEAD
+     *
+     * CHILD_FLAGS:
+     *   bit0      = SCHED_ENTITY_ENQUEUED
+     *   bit16     = blocked_waiter != NULL
+     *   bits24-31 = waiter_state
+     *               0 WAITING
+     *               1 WOKEN
+     *               2 TIMED_OUT
+     *               3 CANCELLED
+     */
+    if (g_user_runtime_child_state == UINT32_MAX && thread != 0) {
+        g_user_runtime_child_state =
+            atomic_load_explicit(&thread->state, memory_order_acquire);
+        g_user_runtime_child_cpu = thread->current_cpu;
+
+        uint32_t diag_flags = thread->sched.flags;
+        waiter_t *diag_waiter = thread->blocked_waiter;
+        if (diag_waiter != 0) {
+            diag_flags |= (1U << 16);
+            diag_flags |=
+                (atomic_load_explicit(&diag_waiter->state,
+                                      memory_order_acquire) & 0xFFU) << 24;
+        }
+        g_user_runtime_child_flags = diag_flags;
+    }
+
     if (g_user_runtime_child_cpu != UINT32_MAX) {
         (void)sched_debug_cpu(g_user_runtime_child_cpu,
                               &g_user_runtime_cpu_current_state,
