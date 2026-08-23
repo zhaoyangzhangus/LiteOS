@@ -911,7 +911,7 @@ bool user_elf_runtime_self_test(void) {
      * DEAD，或达到自测的硬截止时间。
      */
     uint64_t runtime_deadline = x86_read_tsc();
-    uint64_t runtime_budget = x86_timeout_ns_to_tsc(15000000000ULL);
+    uint64_t runtime_budget = x86_timeout_ns_to_tsc(5000000000ULL);
     runtime_deadline = runtime_budget > UINT64_MAX - runtime_deadline ?
                        UINT64_MAX : runtime_deadline + runtime_budget;
     for (;;) {

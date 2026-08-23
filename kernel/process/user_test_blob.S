@@ -374,6 +374,7 @@ liteos_user_runtime_blob_start:
     /* A2 progress: CHILD_MARK high bytes; low byte remains the 0xA5 ABI marker. */
     movb $0, CHILD_MARK_ADDRESS+1
     movb $0, CHILD_MARK_ADDRESS+2
+    movb $0, CHILD_MARK_ADDRESS+3
     movq THREAD_ARGS_ADDRESS+8, %rax
     movq %rax, VM_WORKER_ENTRY_ADDRESS+8
     movq VM_WORKER_ENTRY_ADDRESS, %rax
@@ -1422,11 +1423,25 @@ liteos_user_runtime_vm_worker:
     incb CHILD_MARK_ADDRESS+2
     decl %r15d
     jnz .Lvm_worker_loop
+
+    /* A2 worker exit-path diagnostic:
+     * 1 = 64/64 loops finished
+     * 2 = VM_CONCURRENT_PASS written + mfence finished
+     * 3 = immediately before SYS_THREAD_EXIT
+     * 4 = SYS_THREAD_EXIT unexpectedly returned
+     */
+    movb $1, CHILD_MARK_ADDRESS+3
     movb $0xD2, VM_CONCURRENT_PASS_ADDRESS
     mfence
+
+    movb $2, CHILD_MARK_ADDRESS+3
     xorl %edi, %edi
     xorl %eax, %eax
+
+    movb $3, CHILD_MARK_ADDRESS+3
     syscall
+
+    movb $4, CHILD_MARK_ADDRESS+3
     ud2
 .Lvm_worker_failure:
     movl $4, %edi
