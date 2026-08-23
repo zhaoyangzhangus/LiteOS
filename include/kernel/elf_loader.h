@@ -36,3 +36,6 @@ uint32_t user_elf_runtime_child_flags(void);
 uint32_t user_elf_runtime_cpu_current_state(void);
 uint32_t user_elf_runtime_cpu_runnable(void);
 uint64_t user_elf_runtime_cpu_current_tid(void);
+uint32_t user_elf_runtime_thread_flags(void);
+uint32_t user_elf_runtime_process_flags(void);
+uint32_t user_elf_runtime_vm_live(void);

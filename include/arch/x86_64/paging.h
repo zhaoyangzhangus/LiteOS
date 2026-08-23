@@ -29,5 +29,6 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address);
 bool x86_tlb_shootdown_self_test(void);
 void x86_tlb_ipi_interrupt(void);
 bool x86_tlb_shootdown_active(void);
+bool x86_tlb_cpu_waiting(uint32_t cpu_index);
 void x86_tlb_wait_begin(void);
 void x86_tlb_wait_end(void);

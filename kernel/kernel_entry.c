@@ -2573,6 +2573,16 @@ static void run_user_elf_runtime_self_test(void) {
         serial_write_u32(user_elf_runtime_cpu_runnable());
         serial_write(" CPU_CUR_TID_LOW=");
         serial_write_u32((UINT32)user_elf_runtime_cpu_current_tid());
+
+        serial_write(" THREAD_FLAGS=");
+        serial_write_u32(user_elf_runtime_thread_flags());
+
+        serial_write(" PROCESS_FLAGS=");
+        serial_write_u32(user_elf_runtime_process_flags());
+
+        serial_write(" VM_LIVE=");
+        serial_write_u32(user_elf_runtime_vm_live());
+
         serial_write("\r\n");
         /*
          * QEMU's vvfat-backed exec target can return through the old runtime

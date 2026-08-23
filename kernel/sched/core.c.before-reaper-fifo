@@ -4,7 +4,6 @@
 #include <arch/x86_64/smp.h>
 #include <kernel/process.h>
 #include <kernel/wait.h>
-#include <kernel/deferred.h>
 #include "syscall.h"
 
 #define SCHED_ENTITY_ENQUEUED (1U << 0)
@@ -13,22 +12,7 @@
 
 typedef struct {
     run_queue_t queue;
-
-    /*
-     * 已经离开其执行栈、等待 sched_finish_switch() 回收的 DEAD 线程。
-     *
-     * 不能只保存一个指针：同一 CPU 上连续线程退出时，前一个 reaper
-     * 尚未完成就可能再次发生 context switch。
-     */
-    thread_t *reap_head;
-    thread_t *reap_tail;
-
-    /*
-     * IF=0 的 post-switch 不能直接做 VM/TLB teardown。
-     * 此位保证每 CPU 最多只有一个 deferred drain 请求。
-     */
-    atomic_bool reap_deferred_queued;
-
+    thread_t *reap_pending;
     vaddr_t idle_stack_top;
 } scheduler_cpu_t;
 
@@ -555,7 +539,6 @@ void sched_cpu_init(uint32_t cpu_id) {
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
     scheduler_zero(cpu, sizeof(*cpu));
     atomic_init(&cpu->queue.lock.state, 0U);
-    atomic_init(&cpu->reap_deferred_queued, false);
     cpu->queue.fair_root.root = 0;
     for (uint32_t priority = 0; priority < RT_PRIORITY_LEVELS; ++priority) {
         list_init(&cpu->queue.rt_queues[priority]);
@@ -664,37 +647,6 @@ void sched_wake(thread_t *thread) {
     }
 }
 
-static void scheduler_reap_enqueue_locked(scheduler_cpu_t *cpu,
-                                           thread_t *thread) {
-    if (cpu == 0 || thread == 0) return;
-
-    uint32_t flags =
-        __atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE);
-
-    /*
-     * 没有 execution ref 的线程不需要 deferred reap。
-     * QUEUED 防止异常的重复 schedule 把同一线程加入两次。
-     */
-    if ((flags & THREAD_FLAG_EXECUTION_REF) == 0U ||
-        (flags & THREAD_FLAG_EXECUTION_REAP_QUEUED) != 0U) {
-        return;
-    }
-
-    __atomic_fetch_or(&thread->flags,
-                      THREAD_FLAG_EXECUTION_REAP_QUEUED,
-                      __ATOMIC_RELEASE);
-
-    thread->reap_next = 0;
-
-    if (cpu->reap_tail != 0) {
-        cpu->reap_tail->reap_next = thread;
-    } else {
-        cpu->reap_head = thread;
-    }
-
-    cpu->reap_tail = thread;
-}
-
 void schedule(void) {
     uint64_t irq_flags = scheduler_irq_save();
     if (sched_preempt_disabled()) {
@@ -728,21 +680,10 @@ void schedule(void) {
         cpu->queue.current = next;
     }
     scheduler_accounting_transition(&cpu->queue, current, next);
-    /*
-     * DEAD current 的 execution ref 只能在真正离开它的栈/CR3 后释放。
-     *
-     * 使用 FIFO，不能因为前一个待回收线程尚未处理就丢掉当前线程。
-     */
-    if (current != 0 &&
-        current != cpu->queue.idle &&
-        atomic_load_explicit(&current->state,
-                             memory_order_relaxed) == THREAD_DEAD &&
-        next != 0 &&
-        next != current &&
-        current->arch.switch_ctx.rsp != 0 &&
-        next->arch.switch_ctx.rsp != 0) {
-
-        scheduler_reap_enqueue_locked(cpu, current);
+    if (current != 0 && current != cpu->queue.idle &&
+        atomic_load_explicit(&current->state, memory_order_relaxed) == THREAD_DEAD &&
+        cpu->reap_pending == 0) {
+        cpu->reap_pending = current;
     }
     scheduler_unlock(&cpu->queue.lock, queue_flags);
 
@@ -811,201 +752,18 @@ bool sched_preempt_disabled(void) {
     return x86_preempt_disabled_fast();
 }
 
-/*
- * Pop one thread whose CPU has already switched away from its old stack/CR3.
- *
- * This helper intentionally accepts an explicit CPU id: once the originating
- * CPU has reached its post-switch continuation, the actual object/VM teardown
- * may safely execute on the global deferred worker.
- */
-static thread_t *scheduler_reap_pop_cpu(uint32_t cpu_id) {
-    if (cpu_id >= g_cpu_count) return 0;
-
-    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-
-    uint64_t queue_flags =
-        scheduler_lock(&cpu->queue.lock);
-
-    thread_t *thread = cpu->reap_head;
-
-    if (thread != 0) {
-        cpu->reap_head = thread->reap_next;
-
-        if (cpu->reap_head == 0) {
-            cpu->reap_tail = 0;
-        }
-
-        thread->reap_next = 0;
-
-        /*
-         * From this point the FIFO no longer owns the entry.
-         * EXECUTION_REF itself continues to protect thread lifetime until
-         * thread_release_execution_ref() finishes.
-         */
-        __atomic_fetch_and(
-            &thread->flags,
-            ~THREAD_FLAG_EXECUTION_REAP_QUEUED,
-            __ATOMIC_RELEASE);
-    }
-
-    scheduler_unlock(&cpu->queue.lock,
-                     queue_flags);
-
-    return thread;
-}
-
-static bool scheduler_reap_cpu_pending(uint32_t cpu_id) {
-    if (cpu_id >= g_cpu_count) return false;
-
-    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-
-    uint64_t queue_flags =
-        scheduler_lock(&cpu->queue.lock);
-
-    bool pending = cpu->reap_head != 0;
-
-    scheduler_unlock(&cpu->queue.lock,
-                     queue_flags);
-
-    return pending;
-}
-
-static void scheduler_reap_drain_cpu(uint32_t cpu_id) {
-    for (;;) {
-        thread_t *thread =
-            scheduler_reap_pop_cpu(cpu_id);
-
-        if (thread == 0) {
-            break;
-        }
-
-        /*
-         * No scheduler/runqueue lock is held here.
-         *
-         * This may destroy process VM objects and issue TLB shootdowns.
-         */
-        thread_release_execution_ref(thread);
-    }
-}
-
-static void scheduler_reap_deferred_work(void *argument);
-
-static void scheduler_reap_schedule_deferred(uint32_t cpu_id) {
-    if (cpu_id >= g_cpu_count) return;
-
-    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-
-    if (!scheduler_reap_cpu_pending(cpu_id)) {
-        return;
-    }
-
-    bool expected = false;
-
-    if (!atomic_compare_exchange_strong_explicit(
-            &cpu->reap_deferred_queued,
-            &expected,
-            true,
-            memory_order_acq_rel,
-            memory_order_acquire)) {
-        return;
-    }
-
-    /*
-     * This function can be reached from LAPIC hard IRQ context, therefore
-     * only the IRQ-safe deferred producer is legal here.
-     */
-    if (!deferred_try_schedule(
-            scheduler_reap_deferred_work,
-            (void *)(uintptr_t)cpu_id)) {
-
-        /*
-         * Queue full: keep the reaper entries intact and permit the next
-         * timer/schedule boundary to retry.
-         */
-        atomic_store_explicit(
-            &cpu->reap_deferred_queued,
-            false,
-            memory_order_release);
-    }
-}
-
-static void scheduler_reap_deferred_work(void *argument) {
-    uint32_t cpu_id =
-        (uint32_t)(uintptr_t)argument;
-
-    if (cpu_id >= g_cpu_count) return;
-
-    scheduler_cpu_t *cpu =
-        &g_cpus[cpu_id];
-
-    /*
-     * We are now in ordinary Ring0 worker context with interrupts enabled.
-     * The originating CPU had already completed the actual context switch
-     * before this item was published.
-     */
-    scheduler_reap_drain_cpu(cpu_id);
-
-    /*
-     * Drop the coalescing ownership only after the current drain completes.
-     */
-    atomic_store_explicit(
-        &cpu->reap_deferred_queued,
-        false,
-        memory_order_release);
-
-    /*
-     * Close:
-     *
-     * drain sees empty
-     *       ↓
-     * CPU queues another DEAD thread while queued==true
-     *       ↓
-     * worker clears queued
-     *
-     * race.
-     */
-    if (scheduler_reap_cpu_pending(cpu_id)) {
-        scheduler_reap_schedule_deferred(cpu_id);
-    }
-}
-
 void sched_finish_switch(void) {
     uint64_t flags;
-
-    __asm__ volatile (
-        "pushfq; popq %0"
-        : "=r"(flags)
-        :
-        : "memory");
-
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
+    if ((flags & (1ULL << 9)) == 0) return;
     uint32_t cpu_id;
-
-    if (!scheduler_current_cpu(&cpu_id)) {
-        return;
-    }
-
-    if ((flags & (1ULL << 9)) == 0) {
-        /*
-         * Typical case:
-         *
-         * timer IRQ
-         *   -> sched_tick()
-         *   -> schedule()
-         *   -> context switch
-         *
-         * The old stack/CR3 is already inactive, but we are still inside the
-         * restored interrupt call chain.  VM/TLB teardown must therefore be
-         * deferred rather than simply discarded.
-         */
-        scheduler_reap_schedule_deferred(cpu_id);
-        return;
-    }
-
-    /*
-     * Normal process/kernel scheduling boundary: teardown can execute
-     * synchronously.
-     */
-    scheduler_reap_drain_cpu(cpu_id);
+    if (!scheduler_current_cpu(&cpu_id)) return;
+    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
+    thread_t *thread = cpu->reap_pending;
+    cpu->reap_pending = 0;
+    scheduler_unlock(&cpu->queue.lock, queue_flags);
+    if (thread != 0) thread_release_execution_ref(thread);
 }
 
 void sched_block_current(void) {

@@ -128,3 +128,6 @@ kstatus_t window_server_event_read(process_t *process, uint32_t identifier,
                                    os_window_event_t *event, uint64_t timeout_ns);
 /* Ring0 主循环调用：消费统一输入队列并在需要时刷新合成结果。 */
 void window_server_pump_input(void);
+
+/* Runtime scheduler-stall diagnostic. */
+uint32_t window_server_preempt_phase(uint32_t cpu_id);

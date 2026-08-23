@@ -541,6 +541,15 @@ bool x86_smp_take_reschedule_request(void) {
                                     memory_order_acq_rel);
 }
 
+bool x86_smp_reschedule_pending(uint32_t cpu_index) {
+    if (cpu_index >= g_discovered_count || cpu_index >= MAX_CPUS) {
+        return false;
+    }
+
+    return atomic_load_explicit(&g_reschedule_pending[cpu_index],
+                                memory_order_acquire);
+}
+
 bool x86_smp_remote_user_self_test(void) {
     if (g_discovered_count <= 1U) return true;
     uint32_t current_cpu = x86_current_cpu_index();

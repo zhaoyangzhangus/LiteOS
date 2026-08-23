@@ -66,14 +66,6 @@ typedef struct thread {
     list_head_t process_node;
     list_head_t global_node;
 
-    /*
-     * Per-CPU post-context-switch reaper FIFO.
-     *
-     * 线程进入 DEAD 后仍由 EXECUTION_REF 保证结构和内核栈存活，
-     * 所以在真正 release execution ref 前可以安全地用这个字段链接。
-     */
-    struct thread *reap_next;
-
     struct waiter *blocked_waiter;
     int64_t exit_code;
 

@@ -26,21 +26,6 @@
 x86_kernel_thread_start:
     sti
     xorq %rbp, %rbp
-
-    /*
-     * First-entry kernel threads do not resume through schedule()'s
-     * post-context-switch continuation.  Therefore they must explicitly
-     * finish the previous thread's deferred execution-ref teardown here.
-     *
-     * We are already executing on the new kernel stack and IF=1, so it is
-     * safe for sched_finish_switch() to release the old thread, process VM,
-     * and perform any resulting TLB teardown.
-     *
-     * R12/R13 are SysV callee-saved, so the worker entry and argument survive
-     * this call.
-     */
-    call sched_finish_switch
-
     movq %r13, %rdi
     call *%r12
 

@@ -21,6 +21,7 @@ bool x86_smp_release_aps(void);
 bool x86_smp_ipi_self_test(void);
 bool x86_smp_request_reschedule(uint32_t cpu_index);
 bool x86_smp_take_reschedule_request(void);
+bool x86_smp_reschedule_pending(uint32_t cpu_index);
 bool x86_smp_remote_user_self_test(void);
 uint32_t x86_smp_started_count(void);
 uint32_t x86_smp_discovered_count(void);

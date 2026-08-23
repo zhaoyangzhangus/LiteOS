@@ -96,6 +96,12 @@ bool x86_tlb_shootdown_active(void) {
            atomic_load_explicit(&g_tlb_waiting[cpu_index], memory_order_acquire);
 }
 
+bool x86_tlb_cpu_waiting(uint32_t cpu_index) {
+    return cpu_index < MAX_CPUS &&
+           atomic_load_explicit(&g_tlb_waiting[cpu_index],
+                                memory_order_acquire);
+}
+
 void x86_tlb_wait_begin(void) {
     uint32_t cpu_index = x86_current_cpu_index();
     if (cpu_index < MAX_CPUS) {

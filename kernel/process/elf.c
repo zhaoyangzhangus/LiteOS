@@ -7,6 +7,7 @@
 #include <kernel/console.h>
 #include <kernel/futex.h>
 #include <kernel/wait.h>
+#include <kernel/window_server.h>
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
 #include <kernel/vfs.h>
@@ -64,6 +65,13 @@ static uint32_t g_user_runtime_child_flags;
 static uint32_t g_user_runtime_cpu_current_state;
 static uint32_t g_user_runtime_cpu_runnable;
 static uint64_t g_user_runtime_cpu_current_tid;
+
+/*
+ * Final execution-ref / process-resource teardown diagnostics.
+ */
+static uint32_t g_user_runtime_thread_flags;
+static uint32_t g_user_runtime_process_flags;
+static uint32_t g_user_runtime_vm_live;
 
 /*
  * Exec diagnostics are deliberately failure-only so the successful runtime
@@ -1054,6 +1062,43 @@ bool user_elf_runtime_self_test(void) {
                               &g_user_runtime_cpu_current_state,
                               &g_user_runtime_cpu_current_tid,
                               &g_user_runtime_cpu_runnable);
+
+        /*
+         * Runtime CPU scheduler-stall diagnostic.
+         *
+         * CHILD_FLAGS:
+         *   bit0      = main is enqueued
+         *   bits8-15  = target CPU PreemptDisable
+         *   bit16     = main blocked_waiter != NULL
+         *   bit17     = target CPU g_tlb_waiting
+         *   bit18     = target CPU reschedule pending
+         *   bits24-31 = waiter state
+         */
+        uint32_t preempt_count =
+            x86_cpu_preempt_disable_count(g_user_runtime_child_cpu);
+
+        g_user_runtime_child_flags |=
+            (preempt_count & 0xFFU) << 8;
+
+        if (x86_tlb_cpu_waiting(g_user_runtime_child_cpu)) {
+            g_user_runtime_child_flags |= (1U << 17);
+        }
+
+        if (x86_smp_reschedule_pending(g_user_runtime_child_cpu)) {
+            g_user_runtime_child_flags |= (1U << 18);
+        }
+
+        /*
+         * bits20..23:
+         *   0 none
+         *   1 window_lock
+         *   2 cursor publication
+         *   3 GOP publication
+         *   4 direct framebuffer rendering
+         */
+        g_user_runtime_child_flags |=
+            (window_server_preempt_phase(
+                 g_user_runtime_child_cpu) & 0xFU) << 20;
     }
     uint8_t marker = 0;
     if (x86_translate_page(runtime_space->root_table, 0x402000ULL,
@@ -1072,6 +1117,21 @@ bool user_elf_runtime_self_test(void) {
             g_user_runtime_wait_race_pass = page[0x1F3U];
         }
     }
+    /*
+     * Snapshot the actual lifetime/resource flags.
+     *
+     * Important: CHILD_FLAGS is based primarily on thread->sched.flags and
+     * therefore cannot tell us whether EXECUTION_REF is still owned.
+     */
+    g_user_runtime_thread_flags =
+        __atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE);
+
+    g_user_runtime_process_flags =
+        __atomic_load_n(&process->flags, __ATOMIC_ACQUIRE);
+
+    g_user_runtime_vm_live =
+        process->vm != 0 ? 1U : 0U;
+
     bool thread_dead = atomic_load_explicit(&thread->state, memory_order_acquire) == THREAD_DEAD;
     bool process_dead = atomic_load_explicit(&process->state, memory_order_acquire) == PROCESS_DEAD;
     bool tick_seen = liteos_lapic_tick_count() > timer_ticks_before;
@@ -1164,4 +1224,16 @@ uint32_t user_elf_runtime_cpu_runnable(void) {
 
 uint64_t user_elf_runtime_cpu_current_tid(void) {
     return g_user_runtime_cpu_current_tid;
+}
+
+uint32_t user_elf_runtime_thread_flags(void) {
+    return g_user_runtime_thread_flags;
+}
+
+uint32_t user_elf_runtime_process_flags(void) {
+    return g_user_runtime_process_flags;
+}
+
+uint32_t user_elf_runtime_vm_live(void) {
+    return g_user_runtime_vm_live;
 }

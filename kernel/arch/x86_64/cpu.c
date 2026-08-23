@@ -144,6 +144,18 @@ uint64_t x86_cpu_user_entry_count(uint32_t cpu_index) {
     return __atomic_load_n(&g_cpu_arch[cpu_index]->local->UserEntries, __ATOMIC_ACQUIRE);
 }
 
+uint32_t x86_cpu_preempt_disable_count(uint32_t cpu_index) {
+    if (cpu_index >= MAX_CPUS ||
+        g_cpu_arch[cpu_index] == 0 ||
+        g_cpu_arch[cpu_index]->local == 0) {
+        return UINT32_MAX;
+    }
+
+    return __atomic_load_n(
+        &g_cpu_arch[cpu_index]->local->PreemptDisable,
+        __ATOMIC_ACQUIRE);
+}
+
 void x86_cpu_detect_features(void) {
     uint32_t eax;
     uint32_t ebx;

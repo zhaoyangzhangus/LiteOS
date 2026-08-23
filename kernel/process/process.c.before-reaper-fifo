@@ -404,8 +404,7 @@ void thread_release_execution_ref(thread_t *thread) {
      */
     __atomic_fetch_and(&thread->flags,
                        ~(THREAD_FLAG_EXECUTION_REF |
-                         THREAD_FLAG_EXECUTION_REAPING |
-                         THREAD_FLAG_EXECUTION_REAP_QUEUED),
+                         THREAD_FLAG_EXECUTION_REAPING),
                        __ATOMIC_RELEASE);
     object_put(thread);
 }

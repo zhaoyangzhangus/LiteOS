@@ -101,6 +101,7 @@ uint32_t x86_current_apic_id(void);
 vaddr_t x86_cpu_kernel_stack(uint32_t cpu_index);
 void x86_cpu_note_user_entry(void);
 uint64_t x86_cpu_user_entry_count(uint32_t cpu_index);
+uint32_t x86_cpu_preempt_disable_count(uint32_t cpu_index);
 void x86_tss_set_rsp0(vaddr_t stack_top);
 vaddr_t x86_tss_get_rsp0(void);
 void x86_set_user_fs_base(vaddr_t fs_base);

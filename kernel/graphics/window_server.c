@@ -107,6 +107,50 @@
 #define WINDOW_TITLEBAR_HEIGHT 30U
 
 /*
+ * Runtime compositor preemption diagnostic.
+ *
+ * 0 = none
+ * 1 = window_lock
+ * 2 = direct cursor publication
+ * 3 = GOP compositor publication
+ * 4 = direct-framebuffer rendering fallback
+ */
+enum {
+    WINDOW_PREEMPT_PHASE_NONE   = 0U,
+    WINDOW_PREEMPT_PHASE_LOCK   = 1U,
+    WINDOW_PREEMPT_PHASE_CURSOR = 2U,
+    WINDOW_PREEMPT_PHASE_COMMIT = 3U,
+    WINDOW_PREEMPT_PHASE_DIRECT = 4U,
+};
+
+static uint32_t g_window_preempt_phase[MAX_CPUS];
+
+static inline void window_preempt_phase_set(uint32_t phase) {
+    uint32_t cpu = x86_current_cpu_index();
+    if (cpu < MAX_CPUS) {
+        __atomic_store_n(&g_window_preempt_phase[cpu],
+                         phase, __ATOMIC_RELEASE);
+    }
+}
+
+static inline void window_preempt_phase_clear(void) {
+    uint32_t cpu = x86_current_cpu_index();
+    if (cpu < MAX_CPUS) {
+        __atomic_store_n(&g_window_preempt_phase[cpu],
+                         WINDOW_PREEMPT_PHASE_NONE,
+                         __ATOMIC_RELEASE);
+    }
+}
+
+uint32_t window_server_preempt_phase(uint32_t cpu_id) {
+    if (cpu_id >= MAX_CPUS) return UINT32_MAX;
+
+    return __atomic_load_n(&g_window_preempt_phase[cpu_id],
+                           __ATOMIC_ACQUIRE);
+}
+
+
+/*
  * Flat modern Ring0 window controls.
  *
  * Buttons live completely inside the titlebar and stay clear of the
@@ -512,6 +556,7 @@ static bool compositor_copy_rect_parallel_buffers(
     const window_damage_rect_t *rect);
 
 static void window_lock(void) {
+    window_preempt_phase_set(WINDOW_PREEMPT_PHASE_LOCK);
     sched_preempt_disable();
 
     for (;;) {
@@ -541,6 +586,7 @@ static void window_lock(void) {
 static void window_unlock(void) {
     atomic_store_explicit(&g_window_server.lock.state, 0U, memory_order_release);
     sched_preempt_enable();
+    window_preempt_phase_clear();
 }
 
 bool window_server_init(void) {
@@ -4288,6 +4334,7 @@ static void compositor_present_cursor_direct(bool force) {
         return;
     }
 
+    window_preempt_phase_set(WINDOW_PREEMPT_PHASE_CURSOR);
     sched_preempt_disable();
 
     if (g_window_server.presented_pointer_valid) {
@@ -4406,6 +4453,7 @@ static void compositor_present_cursor_direct(bool force) {
     g_window_server.presented_pointer_valid = true;
 
     sched_preempt_enable();
+    window_preempt_phase_clear();
 }
 
 
@@ -6558,6 +6606,7 @@ static void compositor_commit_snapshot(void) {
      * Only GOP publication is non-preemptible.  All expensive scene
      * composition has already completed in normal WB memory.
      */
+    window_preempt_phase_set(WINDOW_PREEMPT_PHASE_COMMIT);
     sched_preempt_disable();
 
     if (commit_as_move_transaction) {
@@ -6664,6 +6713,7 @@ static void compositor_commit_snapshot(void) {
         : "memory");
 
     sched_preempt_enable();
+    window_preempt_phase_clear();
 }
 
 
@@ -7069,6 +7119,7 @@ static void compositor_render_snapshot(void) {
      * rendering there rather than expose intermediate drawing operations.
      */
     if (direct_framebuffer) {
+        window_preempt_phase_set(WINDOW_PREEMPT_PHASE_DIRECT);
         sched_preempt_disable();
     }
 
@@ -7106,6 +7157,7 @@ static void compositor_render_snapshot(void) {
             : "memory");
 
         sched_preempt_enable();
+        window_preempt_phase_clear();
     } else {
         g_compositor_scanout_flipped = false;
         compositor_commit_snapshot();
