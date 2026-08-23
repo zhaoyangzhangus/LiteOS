@@ -71,7 +71,9 @@ cd /home/zzy/LiteOS
 WSLg 会显示 Linux QEMU 的图形窗口。无 KVM 权限时脚本会自动退回 TCG 软件模拟；获得
 `/dev/kvm` 权限后会自动使用 KVM。
 
-调试统一通过 VS Code 的 F5 启动；F5 会自动使用 WSL 中的 QEMU、GDB 和 OVMF。
+运行统一通过 VS Code 的 F5 启动；`LiteOS: QEMU (F5 auto detect)` 会按当前环境优先选择
+Windows 原生 QEMU，缺少原生 QEMU 时回退到 WSL QEMU。内核源码调试仍可选择旁边的
+`LiteOS: Kernel debug (WSL QEMU)` 配置。
 
 无图形模式运行固定时间并查看串口日志：
 
@@ -116,11 +118,14 @@ verify=required
 
 ## VS Code 一键调试
 
-安装 Microsoft C/C++ 扩展后，在“运行和调试”中选择 `LiteOS: Kernel only (WSL QEMU)` 并按 F5。配置会：
+安装 Microsoft C/C++ 扩展后，在“运行和调试”中选择 `LiteOS: QEMU (F5 auto detect)` 并按 F5。配置会：
 
-1. 使用 WSL 的 `/usr/bin/make` 编译工程；
-2. 启动带 USB 键盘、USB 鼠标和 GDB stub 的 Linux QEMU；
-3. 使用 WSL 的 `/usr/bin/gdb` 连接并加载 `kernel.elf` 符号。
+1. 自动检测 Windows 原生 QEMU 或 WSL QEMU；
+2. 在 Windows 原生 QEMU 模式下使用 WSL 自动编译工程；
+3. 启动带 USB 键盘和 USB 鼠标的 LiteOS 图形环境。
+
+如需断点调试，再选择 `LiteOS: Kernel debug (WSL QEMU)`，它会使用 WSL 的 QEMU/GDB
+连接并加载 `kernel.elf` 符号。
 
 ## 已知限制与后续工作
 

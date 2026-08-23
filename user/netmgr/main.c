@@ -171,6 +171,20 @@ static void append_hex_byte(char *destination, uint32_t capacity, uint8_t value)
     append_character(destination, capacity, hex_digit(value));
 }
 
+static void append_hex_group(char *destination, uint32_t capacity,
+                             uint16_t value) {
+    char digits[4];
+    uint32_t first = 0U;
+    for (uint32_t index = 0U; index < 4U; ++index) {
+        digits[3U - index] = hex_digit((uint8_t)value);
+        value >>= 4U;
+    }
+    while (first < 3U && digits[first] == '0') ++first;
+    for (uint32_t index = first; index < 4U; ++index) {
+        append_character(destination, capacity, digits[index]);
+    }
+}
+
 static void format_ipv4(char *output, uint32_t capacity, uint32_t address) {
     if (output == 0 || capacity == 0U) return;
     output[0] = '\0';
@@ -207,6 +221,9 @@ static void format_mac(char *output, uint32_t capacity, const uint8_t mac[6]) {
 
 static void format_ipv6(char *output, uint32_t capacity,
                         const uint8_t address[16], bool configured) {
+    uint16_t groups[8];
+    uint32_t best_start = 8U;
+    uint32_t best_length = 0U;
     if (output == 0 || capacity == 0U) return;
     output[0] = '\0';
     if (!configured) {
@@ -214,9 +231,31 @@ static void format_ipv6(char *output, uint32_t capacity,
         return;
     }
     for (uint32_t group = 0U; group < 8U; ++group) {
-        if (group != 0U) append_character(output, capacity, ':');
-        append_hex_byte(output, capacity, address[group * 2U]);
-        append_hex_byte(output, capacity, address[group * 2U + 1U]);
+        groups[group] = (uint16_t)(((uint16_t)address[group * 2U] << 8U) |
+                                   address[group * 2U + 1U]);
+    }
+    for (uint32_t start = 0U; start < 8U;) {
+        uint32_t length = 0U;
+        while (start + length < 8U && groups[start + length] == 0U) ++length;
+        if (length >= 2U && length > best_length) {
+            best_start = start;
+            best_length = length;
+        }
+        start += length != 0U ? length : 1U;
+    }
+    for (uint32_t group = 0U; group < 8U;) {
+        if (group == best_start) {
+            append_character(output, capacity, ':');
+            append_character(output, capacity, ':');
+            group += best_length;
+            continue;
+        }
+        if (text_length(output) != 0U &&
+            output[text_length(output) - 1U] != ':') {
+            append_character(output, capacity, ':');
+        }
+        append_hex_group(output, capacity, groups[group]);
+        ++group;
     }
 }
 
@@ -239,6 +278,24 @@ static void draw_text(uint32_t x, uint32_t y,
                       const char *text, uint32_t color) {
     if (text == 0) return;
     for (uint32_t index = 0U; text[index] != '\0'; ++index) {
+        font12x24_draw_glyph(
+            g_window.pixels, g_window.width,
+            g_window.width, g_window.height,
+            (int32_t)(x + index * FONT12X24_WIDTH),
+            (int32_t)y, text[index], color);
+    }
+}
+
+static void draw_text_clipped(uint32_t x, uint32_t y, uint32_t right,
+                              const char *text, uint32_t color) {
+    uint32_t max_right;
+    uint32_t visible;
+    if (text == 0 || x >= g_window.width || y >= g_window.height) return;
+    max_right = right < g_window.width ? right : g_window.width;
+    if (max_right <= x) return;
+    visible = (max_right - x) / FONT12X24_WIDTH;
+    for (uint32_t index = 0U;
+         text[index] != '\0' && index < visible; ++index) {
         font12x24_draw_glyph(
             g_window.pixels, g_window.width,
             g_window.width, g_window.height,
@@ -292,6 +349,8 @@ static void render(void) {
     uint32_t left_width;
     uint32_t right_x;
     uint32_t right_width;
+    uint32_t left_right;
+    uint32_t right_right;
     bool hardware;
     bool link_up;
     bool ipv6;
@@ -333,18 +392,23 @@ static void render(void) {
         right_x = 18U;
         right_width = content_width;
     }
+    left_right = 18U + left_width;
+    right_right = right_x + right_width;
 
     draw_card(18U, 68U, left_width, 86U);
-    draw_text(34U, 82U, "CONNECTION", NETMGR_SECTION_TEXT);
-    draw_text(34U, 110U,
-              !g_status_valid ? "Status unavailable" :
-              !hardware ? "No network hardware" :
-              link_up ? "Connected" : "Disconnected",
-              link_up ? NETMGR_CONNECTED_TEXT : NETMGR_DISCONNECTED_TEXT);
-    draw_text(34U, 132U, "DHCP service: netd", NETMGR_HINT_TEXT);
+    draw_text_clipped(34U, 82U, left_right - 10U,
+                      "CONNECTION", NETMGR_SECTION_TEXT);
+    draw_text_clipped(34U, 110U, left_right - 10U,
+                      !g_status_valid ? "Status unavailable" :
+                      !hardware ? "No network hardware" :
+                      link_up ? "Connected" : "Disconnected",
+                      link_up ? NETMGR_CONNECTED_TEXT : NETMGR_DISCONNECTED_TEXT);
+    draw_text_clipped(34U, 132U, left_right - 10U,
+                      "DHCP service: netd", NETMGR_HINT_TEXT);
 
     draw_card(18U, 166U, left_width, 138U);
-    draw_text(34U, 180U, "IP CONFIGURATION", NETMGR_SECTION_TEXT);
+    draw_text_clipped(34U, 180U, left_right - 10U,
+                      "IP CONFIGURATION", NETMGR_SECTION_TEXT);
 
     line[0] = '\0';
     append_text(line, sizeof(line), "IPv4   ");
@@ -357,7 +421,8 @@ static void render(void) {
         append_text(value, sizeof(value), "Unavailable");
     }
     append_text(line, sizeof(line), value);
-    draw_text(34U, 208U, line, NETMGR_VALUE_TEXT);
+    draw_text_clipped(34U, 208U, left_right - 10U,
+                      line, NETMGR_VALUE_TEXT);
 
     line[0] = '\0';
     append_text(line, sizeof(line), "Gateway ");
@@ -368,7 +433,8 @@ static void render(void) {
         append_text(value, sizeof(value), "Unavailable");
     }
     append_text(line, sizeof(line), value);
-    draw_text(34U, 234U, line, NETMGR_VALUE_TEXT);
+    draw_text_clipped(34U, 234U, left_right - 10U,
+                      line, NETMGR_VALUE_TEXT);
 
     line[0] = '\0';
     append_text(line, sizeof(line), "IPv6   ");
@@ -379,11 +445,13 @@ static void render(void) {
         append_text(value, sizeof(value), "Unavailable");
     }
     append_text(line, sizeof(line), value);
-    draw_text(34U, 260U, line, NETMGR_VALUE_TEXT);
+    draw_text_clipped(34U, 260U, left_right - 10U,
+                      line, NETMGR_VALUE_TEXT);
 
     if (content_width >= 640U) {
         draw_card(right_x, 68U, right_width, 236U);
-        draw_text(right_x + 16U, 82U, "ADAPTER", NETMGR_SECTION_TEXT);
+        draw_text_clipped(right_x + 16U, 82U, right_right - 10U,
+                          "ADAPTER", NETMGR_SECTION_TEXT);
 
         line[0] = '\0';
         append_text(line, sizeof(line), "MAC ");
@@ -394,30 +462,33 @@ static void render(void) {
             append_text(value, sizeof(value), "--:--:--:--:--:--");
         }
         append_text(line, sizeof(line), value);
-        draw_text(right_x + 16U, 112U, line, NETMGR_VALUE_TEXT);
+        draw_text_clipped(right_x + 16U, 112U, right_right - 10U,
+                          line, NETMGR_VALUE_TEXT);
 
         line[0] = '\0';
         append_text(line, sizeof(line), "Link changes ");
         append_decimal(line, sizeof(line),
                        g_status_valid ? g_status.link_transitions : 0U);
-        draw_text(right_x + 16U, 142U, line, NETMGR_VALUE_TEXT);
+        draw_text_clipped(right_x + 16U, 142U, right_right - 10U,
+                          line, NETMGR_VALUE_TEXT);
 
         line[0] = '\0';
         append_text(line, sizeof(line), "Reset count  ");
         append_decimal(line, sizeof(line),
                        g_status_valid ? g_status.reset_count : 0U);
-        draw_text(right_x + 16U, 172U, line, NETMGR_VALUE_TEXT);
+        draw_text_clipped(right_x + 16U, 172U, right_right - 10U,
+                          line, NETMGR_VALUE_TEXT);
 
-        draw_text(right_x + 16U, 218U,
-                  "R        Refresh now", NETMGR_COMMAND_TEXT);
-        draw_text(right_x + 16U, 244U,
-                  "Ctrl+Q   Close", NETMGR_COMMAND_TEXT);
-        draw_text(right_x + 16U, 270U,
-                  "Auto refresh: 500 ms", NETMGR_HINT_TEXT);
+        draw_text_clipped(right_x + 16U, 218U, right_right - 10U,
+                          "R        Refresh now", NETMGR_COMMAND_TEXT);
+        draw_text_clipped(right_x + 16U, 244U, right_right - 10U,
+                          "Ctrl+Q   Close", NETMGR_COMMAND_TEXT);
+        draw_text_clipped(right_x + 16U, 270U, right_right - 10U,
+                          "Auto refresh: 500 ms", NETMGR_HINT_TEXT);
     } else if (g_window.height >= 390U) {
         draw_card(18U, 316U, left_width, 62U);
-        draw_text(34U, 330U, "R Refresh    Ctrl+Q Close",
-                  NETMGR_COMMAND_TEXT);
+        draw_text_clipped(34U, 330U, left_right - 10U,
+                          "R Refresh    Ctrl+Q Close", NETMGR_COMMAND_TEXT);
     }
 
     if (g_window.height > 42U) {
@@ -430,11 +501,13 @@ static void render(void) {
                                       g_window.width > 24U ?
                                       g_window.width - 24U : g_window.width,
                                       28U, NETMGR_FOOTER_BACKGROUND);
-        draw_text(24U, g_window.height - 29U,
-                  g_status_valid ?
-                  "Live kernel network status" :
-                  "Network status read failed",
-                  g_status_valid ? NETMGR_COMMAND_TEXT : NETMGR_ERROR_TEXT);
+        draw_text_clipped(24U, g_window.height - 29U,
+                          g_window.width > 24U ? g_window.width - 24U :
+                          g_window.width,
+                          g_status_valid ?
+                          "Live kernel network status" :
+                          "Network status read failed",
+                          g_status_valid ? NETMGR_COMMAND_TEXT : NETMGR_ERROR_TEXT);
     }
 
     user_client_chrome_close(g_window.pixels, g_window.width,
@@ -590,6 +663,10 @@ static void handle_event(const os_window_event_t *event) {
 
 static int netmgr_main(void) {
     if (!create_window()) return 1;
+    /* The first status refresh only dirties the content area.  Paint and
+     * publish the complete client chrome once so the close button is visible
+     * immediately when the window opens. */
+    netmgr_damage_all();
     (void)refresh_status();
 
     for (;;) {

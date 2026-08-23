@@ -134,12 +134,24 @@ _Static_assert(WINDOW_SERVER_MAX_WINDOWS <= 64U,
 #endif
 
 /*
- * The retained overlap blit is an optimization, not a correctness
- * requirement.  Keep drag moves on the complete compositor redraw path until
- * the shared-surface/client-update interaction is fully proven safe.
+ * LITEOS_COMPOSITOR_DRAG_FRAME_PACING_V1
+ *
+ * The producer can consume a 1000 Hz mouse, but scanout should not publish a
+ * complete software-drag layer 1000 times per second.
+ *
+ * 144 Hz is deliberately a compile-time policy until display_core exposes a
+ * real mode refresh/vblank period. Set to 0 to disable pacing or override
+ * from the build for 120/165/240 Hz displays.
  */
-#ifndef WINDOW_COMPOSITOR_RETAINED_DRAG
-#define WINDOW_COMPOSITOR_RETAINED_DRAG 0U
+#ifndef WINDOW_COMPOSITOR_DRAG_MAX_FPS
+#define WINDOW_COMPOSITOR_DRAG_MAX_FPS 144U
+#endif
+
+#if WINDOW_COMPOSITOR_DRAG_MAX_FPS != 0U
+#define WINDOW_COMPOSITOR_DRAG_FRAME_NS \
+    (1000000000ULL / WINDOW_COMPOSITOR_DRAG_MAX_FPS)
+#else
+#define WINDOW_COMPOSITOR_DRAG_FRAME_NS 0ULL
 #endif
 
 /* WB desktop-cache -> WB retained-scene copies must stay cached. */
@@ -216,25 +228,18 @@ uint32_t window_server_preempt_phase(uint32_t cpu_id) {
  * taking window_lock, while all authoritative damage state remains protected
  * by window_lock.
  */
-/*
- * LITEOS_WINDOW_DIRTY_EDGE_GENERATION_V1
- *
- * dirty_hint is a level:
- *
- *     false = producer has no scene generation waiting
- *     true  = at least one damage belongs to the next snapshot
- *
- * dirty_generation changes only on clean -> dirty.
- * dirty_notified_generation records the last scene generation for which a
- * post-lock producer actually woke the compositor.
- */
 static atomic_bool g_window_dirty_hint __attribute__((aligned(64)));
 
-static atomic_uint_fast64_t g_window_dirty_generation
+/*
+ * Timestamp of the most recently completed drag/resize scene publication.
+ *
+ * Only the compositor normally writes this, but keep it atomic because the
+ * initial/compatibility compose entry points are not required to execute on
+ * the dedicated worker CPU.
+ */
+static atomic_uint_fast64_t g_window_drag_last_present_tsc
     __attribute__((aligned(64)));
 
-static atomic_uint_fast64_t g_window_dirty_notified_generation
-    __attribute__((aligned(64)));
 
 /*
  * Flat modern Ring0 window controls.
@@ -290,9 +295,8 @@ enum {
 #define WINDOW_MIN_WIDTH 160U
 #define WINDOW_MIN_HEIGHT 96U
 #define WINDOW_CLIENT_DRAG_REGION_HEIGHT 56U
-/* A click may be held for any length of time.  Only real pointer movement
- * beyond this small slop region turns a title/client-header press into drag. */
-#define WINDOW_TITLE_DRAG_DISTANCE 6U
+/* input timestamps are raw TSC ticks; at a 3GHz guest this is about 150ms. */
+#define WINDOW_TITLE_DRAG_DELAY_TSC_TICKS 450000000ULL
 
 enum {
     WINDOW_RESIZE_LEFT   = 1U << 0,
@@ -656,20 +660,17 @@ static void window_clear_title_capture_locked(void) {
     g_window_server.title_pressed_event = (input_event_t){0};
 }
 
-static bool window_title_capture_moved_locked(void) {
-    uint32_t dx;
-    uint32_t dy;
-    if (g_window_server.title_pressed_identifier == 0U) {
+static bool window_title_capture_elapsed_locked(const input_event_t *event) {
+    uint64_t pressed_timestamp;
+    if (event == 0 || g_window_server.title_pressed_identifier == 0U) {
         return false;
     }
-    dx = g_window_server.pointer_x >= g_window_server.title_pressed_pointer_x ?
-         g_window_server.pointer_x - g_window_server.title_pressed_pointer_x :
-         g_window_server.title_pressed_pointer_x - g_window_server.pointer_x;
-    dy = g_window_server.pointer_y >= g_window_server.title_pressed_pointer_y ?
-         g_window_server.pointer_y - g_window_server.title_pressed_pointer_y :
-         g_window_server.title_pressed_pointer_y - g_window_server.pointer_y;
-    return dx >= WINDOW_TITLE_DRAG_DISTANCE ||
-           dy >= WINDOW_TITLE_DRAG_DISTANCE;
+    pressed_timestamp = g_window_server.title_pressed_event.timestamp;
+    if (pressed_timestamp == 0U || event->timestamp < pressed_timestamp) {
+        return false;
+    }
+    return event->timestamp - pressed_timestamp >=
+           WINDOW_TITLE_DRAG_DELAY_TSC_TICKS;
 }
 
 static void window_mark_dirty_locked(void);
@@ -748,8 +749,7 @@ bool window_server_init(void) {
         wait_queue_init(&g_desktop_asset_waitq);
         atomic_init(&g_window_server.worker_generation, 0U);
         atomic_init(&g_window_dirty_hint, false);
-        atomic_init(&g_window_dirty_generation, 0U);
-        atomic_init(&g_window_dirty_notified_generation, 0U);
+        atomic_init(&g_window_drag_last_present_tsc, 0U);
         atomic_init(&g_compositor_copy_generation, 0U);
         atomic_init(&g_compositor_copy_completed, 0U);
         atomic_init(&g_compositor_copy_worker_count, 0U);
@@ -842,68 +842,14 @@ static bool window_server_worker_ready(void *context) {
 }
 
 void window_server_notify_worker(void) {
-    bool input_pending;
-
     if (!window_server_init() ||
-        !atomic_load_explicit(
-            &g_window_server.worker_started,
-            memory_order_acquire)) {
+        !atomic_load_explicit(&g_window_server.worker_started,
+                              memory_order_acquire)) {
         return;
     }
-
-    input_pending =
-        input_core_pending() != 0U;
-
-    /*
-     * Input is independent from scene dirty:
-     * cursor-only HID motion must still wake immediately.
-     */
-    if (!input_pending &&
-        atomic_load_explicit(
-            &g_window_dirty_hint,
-            memory_order_acquire)) {
-
-        uint64_t generation =
-            atomic_load_explicit(
-                &g_window_dirty_generation,
-                memory_order_acquire);
-
-        uint64_t notified =
-            atomic_load_explicit(
-                &g_window_dirty_notified_generation,
-                memory_order_relaxed);
-
-        /*
-         * Exactly one post-lock notifier wins for this scene generation.
-         * Rendering is NOT delayed: the first clean->dirty producer still
-         * wakes immediately.
-         */
-        for (;;) {
-            if (notified == generation) {
-                return;
-            }
-
-            if (atomic_compare_exchange_weak_explicit(
-                    &g_window_dirty_notified_generation,
-                    &notified,
-                    generation,
-                    memory_order_acq_rel,
-                    memory_order_relaxed)) {
-                break;
-            }
-        }
-    }
-
-    /*
-     * Keep the existing counter as an actual-notification diagnostic.
-     */
-    atomic_fetch_add_explicit(
-        &g_window_server.worker_generation,
-        1U,
-        memory_order_release);
-
-    (void)wake_one(
-        &g_window_server.worker_waitq);
+    atomic_fetch_add_explicit(&g_window_server.worker_generation, 1U,
+                              memory_order_release);
+    (void)wake_one(&g_window_server.worker_waitq);
 }
 
 /*
@@ -916,6 +862,140 @@ void window_server_notify_worker(void) {
  * This is preferable to PAUSE/RDTSC spinning and does not consume a compositor
  * CPU while waiting for the next useful scanout time.
  */
+static bool window_server_drag_frame_deadline_wait(void *context) {
+    (void)context;
+    return false;
+}
+
+
+/*
+ * Return true only for a normal decoration move.
+ *
+ * Resize is intentionally excluded: resizing may require application-facing
+ * size events and complete surface rerasterization, so it keeps the existing
+ * low-latency immediate path.
+ */
+static bool window_server_move_drag_active(void) {
+    bool active;
+
+    window_lock();
+
+    active =
+        g_window_server.dragging_identifier != 0U &&
+        g_window_server.resize_edges == 0U;
+
+    window_unlock();
+
+    return active;
+}
+
+
+/*
+ * Block the compositor worker until the next useful drag publication slot.
+ *
+ * IMPORTANT ordering:
+ *
+ *     previous frame committed
+ *             |
+ *             v
+ *     mouse wakes worker
+ *             |
+ *             v
+ *     WAIT HERE
+ *             |
+ *        HID queue grows
+ *             |
+ *             v
+ *     one window_server_pump_input_mode(false)
+ *
+ * We deliberately pace BEFORE consuming the next pure-motion run. Therefore
+ * all reports accumulated inside one display interval still enter the existing
+ * P13 window_motion_batch_t as ONE geometry transition. No intermediate
+ * dirty=1 state is created and retained/P22 reuse remains valid.
+ */
+static void window_server_pace_move_drag(void) {
+#if WINDOW_COMPOSITOR_DRAG_MAX_FPS != 0U
+    uint64_t last;
+    uint64_t interval;
+    uint64_t deadline;
+    uint64_t now;
+    uint64_t remaining_ticks;
+    uint64_t remaining_ns;
+
+    /*
+     * P22/P21 currently obtain their main bandwidth win only on the QEMU
+     * hidden-page path. Do not impose an arbitrary 144 Hz policy on future
+     * native GPU/vblank backends.
+     */
+    if (!qemu_stdvga_flip_available()) {
+        return;
+    }
+
+    if (!window_server_move_drag_active()) {
+        return;
+    }
+
+    last =
+        atomic_load_explicit(
+            &g_window_drag_last_present_tsc,
+            memory_order_acquire);
+
+    if (last == 0U) {
+        return;
+    }
+
+    interval =
+        x86_timeout_ns_to_tsc(
+            WINDOW_COMPOSITOR_DRAG_FRAME_NS);
+
+    if (interval == 0U) {
+        return;
+    }
+
+    if (last > UINT64_MAX - interval) {
+        return;
+    }
+
+    deadline =
+        last + interval;
+
+    now =
+        x86_read_tsc();
+
+    if ((int64_t)(now - deadline) >= 0) {
+        return;
+    }
+
+    remaining_ticks =
+        deadline - now;
+
+    remaining_ns =
+        x86_tsc_to_ns(
+            remaining_ticks);
+
+    /*
+     * Integer conversion can round a tiny positive remainder to zero.
+     */
+    if (remaining_ns == 0U) {
+        remaining_ns = 1U;
+    }
+
+    /*
+     * K_ETIMEDOUT is the normal result. New HID reports may wake us early,
+     * but the false predicate causes wait_on_queue() to re-block using its
+     * original absolute deadline.
+     */
+    (void)wait_on_queue(
+        &g_window_server.worker_waitq,
+        window_server_drag_frame_deadline_wait,
+        0,
+        remaining_ns);
+#else
+    return;
+#endif
+}
+
+
 static void __attribute__((noreturn)) window_server_worker_main(void *argument) {
     (void)argument;
     for (;;) {
@@ -943,10 +1023,12 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
 
             if (input_core_pending() != 0U) {
                 /*
-                 * No FPS policy: consume currently queued input immediately.
-                 * The existing motion batch coalesces only what is already
-                 * pending; scene publication remains purely dirty-driven.
+                 * P23: leave reports in input_core until the next display
+                 * deadline, then let the existing P13 pump merge all of them
+                 * into one final X/Y transition.
                  */
+                window_server_pace_move_drag();
+
                 window_server_pump_input_mode(false);
 
                 window_lock();
@@ -1252,17 +1334,6 @@ static bool window_drag_reuse_safe_locked(
     int32_t new_x, int32_t new_y,
     uint32_t width, uint32_t height) {
 
-#if WINDOW_COMPOSITOR_RETAINED_DRAG == 0U
-    (void)window;
-    (void)old_x;
-    (void)old_y;
-    (void)new_x;
-    (void)new_y;
-    (void)width;
-    (void)height;
-    return false;
-#else
-
     if (!window_drag_reuse_available_locked(window) ||
         g_window_server.dirty ||
         g_window_server.composing ||
@@ -1285,7 +1356,6 @@ static bool window_drag_reuse_safe_locked(
                g_window_server.display_height &&
            (uint64_t)(uint32_t)new_y + height <=
                g_window_server.display_height;
-#endif
 }
 
 
@@ -1405,37 +1475,6 @@ static void window_damage_mark_tiles_locked(const window_damage_rect_t *rect) {
     }
 }
 
-/*
- * Publish one NEW producer generation.
- *
- * window_lock is held, so g_window_server.dirty is the edge detector.
- * Return true only for clean -> dirty.
- */
-static inline bool window_dirty_edge_locked(void) {
-    if (g_window_server.dirty) {
-        return false;
-    }
-
-    g_window_server.dirty = true;
-
-    /*
-     * Generation metadata is read outside window_lock. dirty_hint release is
-     * the publication point for the new pending scene generation.
-     */
-    (void)atomic_fetch_add_explicit(
-        &g_window_dirty_generation,
-        1U,
-        memory_order_relaxed);
-
-    atomic_store_explicit(
-        &g_window_dirty_hint,
-        true,
-        memory_order_release);
-
-    return true;
-}
-
-
 static void window_mark_dirty_locked(void);
 
 static void window_damage_enable_tiles_locked(void) {
@@ -1461,12 +1500,9 @@ static void window_damage_enable_tiles_locked(void) {
 }
 
 static void window_mark_dirty_locked(void) {
-    /*
-     * Escalating an already-dirty generation to full damage does not create a
-     * second scheduling edge.
-     */
-    (void)window_dirty_edge_locked();
-
+    atomic_store_explicit(&g_window_dirty_hint, true,
+                          memory_order_release);
+    g_window_server.dirty = true;
     g_window_server.damage_full = true;
     g_window_server.damage_tiles_active = false;
     g_window_server.damage_count = 0U;
@@ -1494,11 +1530,13 @@ static void window_mark_rect_locked(int32_t x, int32_t y,
     if (bottom > (int64_t)g_window_server.display_height) {
         bottom = g_window_server.display_height;
     }
+    atomic_store_explicit(&g_window_dirty_hint, true,
+                          memory_order_release);
     bool first_damage =
         !g_window_server.dirty;
 
     if (first_damage) {
-        (void)window_dirty_edge_locked();
+        g_window_server.dirty = true;
     }
 
     if (g_window_server.damage_full) {
@@ -7327,12 +7365,6 @@ static bool compositor_snapshot_begin_locked(void) {
 
     if (region_count == 0U) {
         g_window_server.dirty = false;
-
-        atomic_store_explicit(
-            &g_window_dirty_hint,
-            false,
-            memory_order_release);
-
         return false;
     }
 
@@ -7490,17 +7522,7 @@ static bool compositor_snapshot_begin_locked(void) {
     g_window_server.damage_count = 0U;
     g_window_server.damage_full = false;
     g_window_server.damage_tiles_active = false;
-
-    /*
-     * This generation now belongs exclusively to the immutable snapshot.
-     * Any producer after unlock sees clean state and publishes a new edge.
-     */
     g_window_server.dirty = false;
-
-    atomic_store_explicit(
-        &g_window_dirty_hint,
-        false,
-        memory_order_release);
 
     g_window_server.damage_left =
         g_window_server.display_width;
@@ -9244,6 +9266,26 @@ static void compositor_render_snapshot(void) {
 
 static void compositor_snapshot_finish(void) {
     /*
+     * P23 frame clock.
+     *
+     * Record after compositor_render_snapshot()/scanout publication returned,
+     * not when input was consumed. The pacing interval is therefore measured
+     * from actually completed visible work and cannot build an ever-growing
+     * queue if one frame itself takes longer than the target period.
+     */
+    if (g_compositor_snapshot.dragging_identifier != 0U) {
+        atomic_store_explicit(
+            &g_window_drag_last_present_tsc,
+            x86_read_tsc(),
+            memory_order_release);
+    } else {
+        atomic_store_explicit(
+            &g_window_drag_last_present_tsc,
+            0U,
+            memory_order_release);
+    }
+
+    /*
      * This snapshot has finished scene rendering and publication.
      *
      * Record the exact geometry that is now visually committed before
@@ -10556,17 +10598,18 @@ static void route_input_locked(const input_event_t *event) {
         }
 
         /*
-         * A title control is a click candidate until the pointer moves beyond
-         * the drag slop.  This applies to both legacy compositor controls and
-         * client-drawn header buttons; holding a still mouse never cancels a
-         * click based on elapsed time.
+         * A title control is a click candidate for a short time, then becomes
+         * a drag capture.  This applies to both legacy compositor controls
+         * and client-drawn header buttons.  The decision is timestamp-based,
+         * so a small pointer movement does not accidentally turn a click into
+         * a drag.
          */
         if (g_window_server.dragging_identifier == 0U &&
             g_window_server.title_pressed_identifier != 0U) {
             window_server_window_t *pressed =
                 find_window_locked(
                     g_window_server.title_pressed_identifier);
-            if (window_title_capture_moved_locked()) {
+            if (window_title_capture_elapsed_locked(event)) {
                 if (pressed != 0 &&
                     (pressed->flags & OS_WINDOW_VISIBLE) != 0U &&
                     !pressed->maximized) {
@@ -10617,7 +10660,6 @@ static void route_input_locked(const input_event_t *event) {
                     window_outer_width(dragged->width, dragged->flags);
                 uint32_t outer_height =
                     window_outer_height(dragged->height, dragged->flags);
-
                 bool reuse_retained =
                     g_window_server.drag_blit_valid &&
                     window_drag_reuse_safe_locked(
@@ -10730,7 +10772,7 @@ static void route_input_locked(const input_event_t *event) {
                         target->identifier &&
                     g_window_server.title_pressed_button ==
                         title_button &&
-                    !window_title_capture_moved_locked()) {
+                    !window_title_capture_elapsed_locked(event)) {
 
                     if (title_button ==
                         WINDOW_TITLE_BUTTON_CLOSE) {
@@ -10847,7 +10889,7 @@ static void route_input_locked(const input_event_t *event) {
 
                 if (pressed != 0 && target != 0 &&
                     pressed->identifier == target->identifier &&
-                    !window_title_capture_moved_locked()) {
+                    !window_title_capture_elapsed_locked(event)) {
                     press_event.value = INPUT_VALUE_PRESS;
                     window_enqueue_event_locked(pressed, &press_event);
                     window_enqueue_event_locked(pressed, event);

@@ -103,6 +103,28 @@ static void memory_zero(void *address, size_t size) {
     while (size-- != 0) *bytes++ = 0;
 }
 
+/*
+ * Per-CPU page pools are protected from preemption, but preemption masking
+ * alone does not exclude a local interrupt handler.  A HID completion can
+ * interrupt a pool operation and re-enter page_alloc/page_free on the same
+ * CPU, leaving free_mask and base observed as an impossible pair.  Keep the
+ * small-pool critical sections interrupt-safe as well, while preserving the
+ * caller's original IF state.
+ */
+static inline uint64_t page_pool_irq_save(void) {
+    uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void page_pool_irq_restore(uint64_t flags) {
+    if ((flags & (1ULL << 9)) != 0) {
+        __asm__ volatile ("sti" : : : "memory");
+    } else {
+        __asm__ volatile ("cli" : : : "memory");
+    }
+}
+
 static bool range_end(uint64_t start, uint64_t size, uint64_t *end) {
     if (size == 0) {
         *end = start;
@@ -565,13 +587,14 @@ static PAGE_NOINLINE page_t *pool_alloc_slow(uint8_t zone, uint8_t order,
 static inline page_t *pool_alloc_small(uint8_t zone, uint8_t order, uint32_t cpu) {
     page_local_pool_t *pool = pool_for_cpu(cpu, zone, order);
     uint64_t mask = pool->free_mask;
-    if (mask != 0) {
+    if (mask != 0 && pool->base != 0) {
         unsigned bit = (unsigned)__builtin_ctzll(mask);
         pool->free_mask = mask & (mask - 1ULL);
         page_t *page = pool->base + ((size_t)bit << order);
         atomic_store_explicit(&page->refs, 1U, memory_order_relaxed);
         return page;
     }
+    if (mask != 0) pool->free_mask = 0;
     return pool_alloc_slow(zone, order, cpu);
 }
 
@@ -582,9 +605,15 @@ static PAGE_HOT_NOINLINE page_t *pool_alloc_o0_normal(uint32_t cpu) {
     uint64_t bit;
     bool empty;
     __asm__ ("tzcnt %2, %0" : "=r"(bit), "=@ccc"(empty) : "r"(mask));
-    if (PAGE_UNLIKELY(empty)) return pool_alloc_slow(PAGE_ZONE_NORMAL, 0, cpu);
+    if (PAGE_UNLIKELY(empty || pool->base == 0)) {
+        if (pool->base == 0) pool->free_mask = 0;
+        return pool_alloc_slow(PAGE_ZONE_NORMAL, 0, cpu);
+    }
 #else
-    if (PAGE_UNLIKELY(mask == 0)) return pool_alloc_slow(PAGE_ZONE_NORMAL, 0, cpu);
+    if (PAGE_UNLIKELY(mask == 0 || pool->base == 0)) {
+        if (pool->base == 0) pool->free_mask = 0;
+        return pool_alloc_slow(PAGE_ZONE_NORMAL, 0, cpu);
+    }
     uint64_t bit = (uint64_t)__builtin_ctzll(mask);
 #endif
     pool->free_mask = mask & (mask - 1ULL);
@@ -905,6 +934,7 @@ static PAGE_NOINLINE page_t *page_alloc_slow(uint8_t order, page_alloc_flags_t f
 
     page_t *page = 0;
     if (order <= PAGE_POOL_SMALL_MAX_ORDER) {
+        uint64_t irq_flags = page_pool_irq_save();
         x86_preempt_disable_fast();
         uint32_t cpu = x86_current_cpu_index_fast();
         if ((flags & PAGE_ALLOC_DMA32) != 0) {
@@ -914,6 +944,7 @@ static PAGE_NOINLINE page_t *page_alloc_slow(uint8_t order, page_alloc_flags_t f
             if (page == 0) page = pool_alloc_small(PAGE_ZONE_DMA32, order, cpu);
         }
         x86_preempt_enable_fast();
+        page_pool_irq_restore(irq_flags);
     } else {
         lock_pages();
         if ((flags & PAGE_ALLOC_DMA32) != 0) {
@@ -954,10 +985,12 @@ static PAGE_NOINLINE page_t *page_alloc_slow(uint8_t order, page_alloc_flags_t f
 page_t *page_alloc(uint8_t order, page_alloc_flags_t flags) {
     /* Boot ordering guarantees allocator initialization before this API is used. */
     if (PAGE_LIKELY(order == 0 && flags == 0)) {
+        uint64_t irq_flags = page_pool_irq_save();
         x86_preempt_disable_fast();
         uint32_t cpu = x86_current_cpu_index_fast();
         page_t *page = pool_alloc_o0_normal(cpu);
         x86_preempt_enable_fast();
+        page_pool_irq_restore(irq_flags);
         return page;
     }
     return page_alloc_slow(order, flags);
@@ -980,10 +1013,12 @@ void page_free(page_t *head) {
 
     uint8_t order = head->order;
     if (PAGE_LIKELY(order == 0)) {
+        uint64_t irq_flags = page_pool_irq_save();
         x86_preempt_disable_fast();
         uint32_t cpu = x86_current_cpu_index_fast();
         pool_free_o0(head, cpu);
         x86_preempt_enable_fast();
+        page_pool_irq_restore(irq_flags);
         return;
     }
     page_free_non_o0(head, order);

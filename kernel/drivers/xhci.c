@@ -537,6 +537,7 @@ static uint32_t g_xhci_msix_failure_stage;
 static atomic_uint g_xhci_diag_hid_event_count;
 static atomic_bool g_xhci_input_seen;
 static atomic_bool g_xhci_mouse_input_seen;
+static atomic_bool g_xhci_keyboard_input_seen;
 static atomic_bool g_xhci_irq_seen;
 static atomic_bool g_xhci_hid_transfer_seen;
 /* Runtime-only completion counter used by the wrap regression test. */
@@ -2186,8 +2187,22 @@ static void xhci_hid_emit_key(const xhci_device_context_t *context,
 static void xhci_hid_consume_keyboard_report(xhci_device_context_t *state,
                                               const uint8_t *report) {
     uint8_t modifier;
+    bool changed;
     if (state == 0 || report == 0) return;
     modifier = report[0];
+    changed = modifier != state->hid_previous_modifier;
+    if (!changed) {
+        for (uint32_t i = 2U; i < 8U; ++i) {
+            if (report[i] != state->hid_previous_keys[i - 2U]) {
+                changed = true;
+                break;
+            }
+        }
+    }
+    if (changed && !atomic_exchange_explicit(&g_xhci_keyboard_input_seen, true,
+                                             memory_order_acq_rel)) {
+        liteos_serial_write("LITEOS_USB_KEYBOARD_EVENT_OK\r\n");
+    }
     for (uint8_t bit = 0U; bit < 8U; ++bit) {
         uint8_t mask = (uint8_t)(1U << bit);
         if ((modifier & mask) != (state->hid_previous_modifier & mask)) {
@@ -8768,6 +8783,7 @@ bool xhci_hardware_self_test(void) {
     atomic_init(&g_xhci_diag_hid_event_count, 0U);
     atomic_init(&g_xhci_input_seen, false);
     atomic_init(&g_xhci_mouse_input_seen, false);
+    atomic_init(&g_xhci_keyboard_input_seen, false);
     atomic_init(&g_xhci_irq_seen, false);
     atomic_init(&g_xhci_hid_transfer_seen, false);
     atomic_init(&g_xhci_hid_completion_count, 0U);

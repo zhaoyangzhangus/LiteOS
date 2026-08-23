@@ -1097,6 +1097,19 @@ static BOOLEAN gop_debug_console_init_early(const LITEOS_BOOT_INFO *info) {
     return gop_debug_console_init(info, info->FrameBufferBase);
 }
 
+/* Stop painting diagnostics into the scanout once the desktop is starting.
+ * The COM1 serial path remains enabled for QEMU logs and debugging. */
+static void gop_debug_console_disable(void) {
+    if (atomic_load_explicit(&g_gop_debug_console_ready,
+                             memory_order_acquire) == 0U) {
+        return;
+    }
+    (void)gop_debug_lock(1);
+    atomic_store_explicit(&g_gop_debug_console_ready, 0U,
+                          memory_order_release);
+    gop_debug_unlock();
+}
+
 /* 用于验证启动交接 ABI 的最小 PE32+ 内核入口。 */
 #if LITEOS_DEBUG_SERIAL
 static void serial_out(UINT16 port, UINT8 value) {
@@ -2770,6 +2783,7 @@ static void __attribute__((noreturn)) kernel_main(void *context) {
         halt_forever();
     }
     serial_write("LITEOS_WINDOW_SERVER_KERNEL_OK\r\n");
+    gop_debug_console_disable();
     /*
      * 启动自测完成后，BSP 仍需保留一个真正的 Ring0 普通上下文。
      * LAPIC 中断只投递 deferred work；这里在可抢占的内核上下文中消费

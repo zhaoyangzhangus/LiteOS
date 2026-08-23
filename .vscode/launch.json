@@ -2,7 +2,17 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "LiteOS: Kernel only (WSL QEMU)",
+            "name": "LiteOS: QEMU (F5 auto detect)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "bash -lc './run-qemu.sh --keep-open --cpu 4'",
+            "cwd": "${workspaceFolder}",
+            "windows": {
+                "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\run-qemu-auto.ps1\""
+            }
+        },
+        {
+            "name": "LiteOS: Kernel debug (WSL QEMU)",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/esp/EFI/LITEOS/kernel.elf",
