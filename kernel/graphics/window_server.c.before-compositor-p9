@@ -8392,67 +8392,6 @@ static void window_server_pump_input_mode(bool compose_now) {
         wake = true;
 
         if (event.type == INPUT_EVENT_POINTER) {
-            /*
-             * High-rate xHCI mice submit one INPUT_EVENT_POINTER transaction
-             * per HID report. Pure motion reports are equivalent to a pair of
-             * relative X/Y events, so fold a consecutive run into the same
-             * local motion batch used by the REL_X/REL_Y path.
-             *
-             * Applying every pointer report immediately makes the first report
-             * mark scene damage; the second report in the same compositor pump
-             * then sees g_window_server.dirty and cannot prove retained-scene
-             * reuse. Batch the whole run into one final geometry transition.
-             *
-             * Button changes and wheel motion remain strict ordering barriers.
-             */
-            bool pure_pointer_motion =
-                event.code == 0U &&
-                event.value4 == 0;
-
-            if (pure_pointer_motion) {
-                if (event.value2 == 0 &&
-                    event.value3 == 0) {
-                    continue;
-                }
-
-                /*
-                 * Never combine different physical devices or backend flag
-                 * domains. Flush the previous run before changing identity.
-                 */
-                if (motion.active &&
-                    (motion.device_id != event.device_id ||
-                     motion.flags != event.flags)) {
-
-                    window_lock();
-                    window_flush_motion_batch_locked(&motion);
-                    window_unlock();
-                }
-
-                if (!motion.active) {
-                    motion.active = true;
-                    motion.device_id = event.device_id;
-                    motion.flags = event.flags;
-                    motion.timestamp = event.timestamp;
-                    motion.delta_x = 0;
-                    motion.delta_y = 0;
-                }
-
-                /*
-                 * Keep the newest timestamp. WINDOW_EVENT_CAPACITY bounds one
-                 * pump to 64 reports, so int64_t accumulation cannot overflow
-                 * even if every HID delta is an extreme int32_t value.
-                 */
-                motion.timestamp = event.timestamp;
-                motion.delta_x += event.value2;
-                motion.delta_y += event.value3;
-                continue;
-            }
-
-            /*
-             * A transaction containing a button edge or wheel delta must see
-             * all preceding motion and must not be merged with anything after
-             * it. Preserve the existing transaction ordering exactly.
-             */
             window_lock();
             window_flush_motion_batch_locked(&motion);
             window_route_pointer_transaction_locked(&event);
