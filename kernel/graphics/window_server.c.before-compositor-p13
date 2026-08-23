@@ -79,24 +79,15 @@
 #define WINDOW_DESKTOP_ASSET_WORKER_STACK_SIZE (32U * 1024U)
 
 /*
- * Keep one active drag inside ONE input pump.
+ * One input pump consumes at most WINDOW_EVENT_CAPACITY reports. During a
+ * drag, consume a few already-queued batches before committing a GOP frame so
+ * the expensive visible copy targets the newest available pointer position
+ * instead of replaying stale positions one frame at a time.
  *
- * P12 drained up to four independent WINDOW_EVENT_CAPACITY-sized pumps.
- * The first pump marks g_window_server.dirty; the second therefore fails
- * window_drag_reuse_safe_locked(), because retained reuse correctly requires
- * the producer scene to still match compositor_presented_*.
- *
- * P13 raises the input budget while a Ring0 drag is active. The existing
- * window_motion_batch_t survives across the whole budget, so one pure-motion
- * burst becomes exactly one:
- *
- *     last visually committed geometry -> newest queued geometry
- *
- * transition before any scene damage is created.
+ * This is bounded: continuously arriving input can never starve composition.
  */
-#ifndef WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS
-#define WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS \
-    (WINDOW_EVENT_CAPACITY * 4U)
+#ifndef WINDOW_COMPOSITOR_DRAG_INPUT_DRAIN_PASSES
+#define WINDOW_COMPOSITOR_DRAG_INPUT_DRAIN_PASSES 4U
 #endif
 
 /* WB desktop-cache -> WB retained-scene copies must stay cached. */
@@ -494,7 +485,6 @@ static void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
 static void window_coalesce_damage_locked(void);
 static void focus_locked(window_server_window_t *window);
 static void window_server_pump_input_mode(bool compose_now);
-static void window_server_compose_pending(void);
 static void compositor_present_cursor_direct(bool force);
 static bool window_server_start_copy_workers(uint32_t compositor_cpu);
 static bool window_server_start_desktop_asset_worker(uint32_t compositor_cpu);
@@ -659,20 +649,39 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
         /*
          * Normal pointer-only motion keeps the direct cursor HID-rate path.
          *
-         * Active drag uses ONE input pump with a larger budget. Keeping the
-         * whole queued pure-motion run inside one window_motion_batch_t means
-         * no intermediate dirty geometry is created before retained reuse is
-         * decided.
+         * Active window drag is different: drawing the cursor immediately on
+         * scanout while the window is still at its previous committed position
+         * makes the cursor visibly run ahead of the window. It also means the
+         * following multi-megabyte GOP transaction can overwrite that cursor.
          *
-         * Compose the already-routed state directly. Calling another input
-         * pump here would create a second geometry transition while dirty=1
-         * and would invalidate the retained-scene proof.
+         * During drag, drain a bounded number of queued input batches first,
+         * defer cursor publication, then commit scene + cursor together.
          */
         for (;;) {
             bool defer_cursor_for_drag = false;
 
             if (input_core_pending() != 0U) {
                 window_server_pump_input_mode(false);
+
+                for (uint32_t pass = 1U;
+                     pass < WINDOW_COMPOSITOR_DRAG_INPUT_DRAIN_PASSES;
+                     ++pass) {
+
+                    bool drag_dirty;
+
+                    window_lock();
+                    drag_dirty =
+                        g_window_server.dragging_identifier != 0U &&
+                        g_window_server.dirty;
+                    window_unlock();
+
+                    if (!drag_dirty ||
+                        input_core_pending() == 0U) {
+                        break;
+                    }
+
+                    window_server_pump_input_mode(false);
+                }
 
                 window_lock();
                 defer_cursor_for_drag =
@@ -694,11 +703,13 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
             }
 
             /*
-             * Reports arriving during rendering stay queued for the next
-             * frame, whose retained source will be this frame's committed
-             * compositor_presented_* geometry.
+             * window_server_pump_input_mode(true) performs one final bounded
+             * input drain before taking the immutable scene snapshot. Any
+             * reports arriving during rendering remain queued for the next
+             * frame; they can no longer move the cursor ahead of this drag
+             * transaction because the direct cursor was deferred above.
              */
-            window_server_compose_pending();
+            window_server_pump_input_mode(true);
         }
     }
 }
@@ -8969,21 +8980,10 @@ static void window_server_pump_input_mode(bool compose_now) {
     input_event_t event;
     window_motion_batch_t motion = {0};
     bool wake = false;
+    bool compose = false;
     uint32_t consumed = 0U;
-    uint32_t input_budget = WINDOW_EVENT_CAPACITY;
 
     if (!window_server_kernel_ready()) return;
-
-    /*
-     * If a Ring0 drag already exists, keep a larger pure-motion burst inside
-     * this ONE local window_motion_batch_t. Do not invoke several complete
-     * pumps: the first batch flush intentionally makes the producer dirty.
-     */
-    window_lock();
-    if (g_window_server.dragging_identifier != 0U) {
-        input_budget = WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS;
-    }
-    window_unlock();
 
     /*
      * Raw HID/PS2 backends commonly enqueue X and Y as separate events.
@@ -8993,7 +8993,7 @@ static void window_server_pump_input_mode(bool compose_now) {
      * Any non-X/Y event is an ordering barrier.  Therefore button presses,
      * wheel events and keys always observe all preceding pointer movement.
      */
-    while (consumed < input_budget &&
+    while (consumed < WINDOW_EVENT_CAPACITY &&
            input_core_pop(&event) == K_OK) {
         bool is_motion =
             event.type == INPUT_EVENT_RELATIVE &&
@@ -9068,15 +9068,6 @@ static void window_server_pump_input_mode(bool compose_now) {
             window_lock();
             window_flush_motion_batch_locked(&motion);
             window_route_pointer_transaction_locked(&event);
-
-            /*
-             * A button transaction may start the drag inside this same pump.
-             * Expand the remaining budget before consuming following motion.
-             */
-            if (g_window_server.dragging_identifier != 0U) {
-                input_budget = WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS;
-            }
-
             window_unlock();
             continue;
         }
@@ -9125,13 +9116,6 @@ static void window_server_pump_input_mode(bool compose_now) {
 
         window_flush_motion_batch_locked(&motion);
         route_input_locked(&event);
-
-        /*
-         * Legacy INPUT_EVENT_BUTTON can also begin a decoration drag.
-         */
-        if (g_window_server.dragging_identifier != 0U) {
-            input_budget = WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS;
-        }
 
         window_unlock();
     }
@@ -9182,24 +9166,10 @@ static void window_server_pump_input_mode(bool compose_now) {
 
     if (!compose_now) return;
 
-    window_server_compose_pending();
-}
-
-
-/*
- * Compose producer state that has already been routed.
- *
- * Separating composition from input draining is required for retained drag:
- * once the first motion batch creates damage, another input pump would observe
- * dirty=1 and correctly refuse to treat its logical intermediate position as
- * pixels that already exist in the retained WB scene.
- */
-static void window_server_compose_pending(void) {
-    bool compose;
-
     /*
-     * Only the immutable scene snapshot is taken while holding window_lock.
-     * Rendering and GOP publication remain outside the lock.
+     * Only the scene snapshot is taken while holding window_lock.
+     *
+     * The expensive desktop/window/framebuffer work below is preemptible.
      */
     window_lock();
 
@@ -9213,7 +9183,6 @@ static void window_server_compose_pending(void) {
         compositor_snapshot_finish();
     }
 }
-
 
 void window_server_pump_input(void) {
     window_server_pump_input_mode(true);
