@@ -580,9 +580,18 @@ void sched_enqueue(thread_t *thread) {
     uint32_t cpu_id = scheduler_cpu_available(thread->current_cpu) ?
                       thread->current_cpu : current_cpu;
     /* 只有具备真实内核保存栈的线程才参与跨 CPU 分配；纯结构自检固定在指定队列。 */
-    /* 新建用户线程先留在创建者 CPU，避免首个阻塞点与远端入队形成窗口。 */
+    /*
+     * 新建用户线程优先留在创建者 CPU，避免首次运行/首次阻塞与远端入队形成窗口。
+     * 只有 affinity 不允许创建者 CPU 时才做初始跨 CPU 放置；这仍允许显式绑定
+     * 到远端 CPU 的线程（例如 SMP runtime self-test 主线程）按 affinity 启动。
+     */
     if ((thread->flags & THREAD_FLAG_INITIAL_PLACEMENT) != 0) {
-        cpu_id = scheduler_choose_cpu(thread, current_cpu);
+        if (scheduler_cpu_available(current_cpu) &&
+            scheduler_affinity_allows(thread, current_cpu)) {
+            cpu_id = current_cpu;
+        } else {
+            cpu_id = scheduler_choose_cpu(thread, current_cpu);
+        }
         thread->flags &= ~THREAD_FLAG_INITIAL_PLACEMENT;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
