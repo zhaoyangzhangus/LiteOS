@@ -7,3 +7,8 @@ liteos-device-queue-patch3-v2/
 LiteOS_Compositor_P1_3c6a3886/
 LiteOS_Compositor_P2_RetainedDrag_76647a44/
 LiteOS_Compositor_P4_MOVDIR64B_9d204d44/
+LiteOS_Compositor_P5_AdaptiveParallel_722f1479/
+LiteOS_Compositor_P6_DisplayCorePublisher_2a85fc24/
+LiteOS_Compositor_P7_AtomicScanout_e0673de7/
+LiteOS_Compositor_P8_SurfaceHotCache_8c64a5c9/
+LiteOS_stage48_timeout_fix.patch*
