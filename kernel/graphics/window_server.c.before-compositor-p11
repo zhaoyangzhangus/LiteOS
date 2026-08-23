@@ -5232,202 +5232,11 @@ static bool compositor_window_intersects_snapshot_damage_locked(
 }
 
 
-/*
- * Collapse the immutable damage set to one conservative bounding rectangle.
- *
- * This is used only for snapshot admission.  The real damage rectangles remain
- * unchanged for raster/publication, so P11 never increases the number of
- * pixels actually rendered or copied to scanout.
- */
-static bool compositor_snapshot_damage_bounds(
-    const compositor_snapshot_t *snapshot,
-    window_damage_rect_t *bounds) {
-
-    bool have_bounds = false;
-
-    if (snapshot == 0 || bounds == 0) {
-        return false;
-    }
-
-    for (uint32_t index = 0U;
-         index < snapshot->damage_count;
-         ++index) {
-
-        const window_damage_rect_t *rect =
-            &snapshot->damage_rects[index];
-
-        if (rect->left >= rect->right ||
-            rect->top >= rect->bottom) {
-            continue;
-        }
-
-        if (!have_bounds) {
-            *bounds = *rect;
-            have_bounds = true;
-            continue;
-        }
-
-        if (rect->left < bounds->left) {
-            bounds->left = rect->left;
-        }
-
-        if (rect->top < bounds->top) {
-            bounds->top = rect->top;
-        }
-
-        if (rect->right > bounds->right) {
-            bounds->right = rect->right;
-        }
-
-        if (rect->bottom > bounds->bottom) {
-            bounds->bottom = rect->bottom;
-        }
-    }
-
-    return have_bounds;
-}
-
-
-/*
- * Raw-registry equivalent of compositor_window_fully_covers_damage().
- *
- * The guaranteed opaque rectangle excludes WINDOW_CORNER_RADIUS from every
- * outer edge.  If this rectangle contains the complete snapshot damage bounds,
- * every lower Z-order window is irrelevant to every damage rectangle in the
- * frame.
- */
-static bool compositor_window_fully_covers_snapshot_bounds_locked(
-    const window_server_window_t *window,
-    const window_damage_rect_t *bounds) {
-
-    int64_t frame_left;
-    int64_t frame_top;
-    int64_t frame_right;
-    int64_t frame_bottom;
-
-    int64_t opaque_left;
-    int64_t opaque_top;
-    int64_t opaque_right;
-    int64_t opaque_bottom;
-
-    uint64_t frame_width;
-    uint64_t frame_height;
-
-    if (window == 0 ||
-        bounds == 0 ||
-        window->minimized ||
-        (window->flags & OS_WINDOW_VISIBLE) == 0U) {
-        return false;
-    }
-
-    frame_width =
-        (uint64_t)window_outer_width(
-            window->width,
-            window->flags);
-
-    frame_height =
-        (uint64_t)window_outer_height(
-            window->height,
-            window->flags);
-
-    if (frame_width <= WINDOW_CORNER_RADIUS * 2U ||
-        frame_height <= WINDOW_CORNER_RADIUS * 2U) {
-        return false;
-    }
-
-    frame_left = window->x;
-    frame_top = window->y;
-    frame_right = frame_left + (int64_t)frame_width;
-    frame_bottom = frame_top + (int64_t)frame_height;
-
-    opaque_left =
-        frame_left + WINDOW_CORNER_RADIUS;
-
-    opaque_top =
-        frame_top + WINDOW_CORNER_RADIUS;
-
-    opaque_right =
-        frame_right - WINDOW_CORNER_RADIUS;
-
-    opaque_bottom =
-        frame_bottom - WINDOW_CORNER_RADIUS;
-
-    return
-        (int64_t)bounds->left >= opaque_left &&
-        (int64_t)bounds->top >= opaque_top &&
-        (int64_t)bounds->right <= opaque_right &&
-        (int64_t)bounds->bottom <= opaque_bottom;
-}
-
-
-/*
- * Find the highest registry window that makes everything below it irrelevant
- * to the complete snapshot damage set.
- *
- * g_window_server.windows[] is bottom -> top, so the first opaque cover found
- * while scanning backwards is the strongest possible floor.
- *
- * The active dragged window is never cut out by this optimization.  Its
- * snapshot view is also used to advance compositor_presented_* after commit.
- */
-static uint32_t compositor_snapshot_occlusion_floor_locked(
-    const compositor_snapshot_t *snapshot) {
-
-    window_damage_rect_t bounds;
-    uint32_t floor = 0U;
-
-    if (snapshot == 0 ||
-        !compositor_snapshot_damage_bounds(
-            snapshot,
-            &bounds)) {
-        return 0U;
-    }
-
-    for (uint32_t count = g_window_server.count;
-         count != 0U;
-         --count) {
-
-        uint32_t index = count - 1U;
-
-        if (compositor_window_fully_covers_snapshot_bounds_locked(
-                g_window_server.windows[index],
-                &bounds)) {
-
-            floor = index;
-            break;
-        }
-    }
-
-    if (snapshot->dragging_identifier != 0U &&
-        floor != 0U) {
-
-        for (uint32_t index = 0U;
-             index < floor;
-             ++index) {
-
-            window_server_window_t *window =
-                g_window_server.windows[index];
-
-            if (window != 0 &&
-                window->identifier ==
-                    snapshot->dragging_identifier) {
-
-                floor = index;
-                break;
-            }
-        }
-    }
-
-    return floor;
-}
-
-
 static bool compositor_snapshot_begin_locked(void) {
     compositor_snapshot_t *snapshot =
         &g_compositor_snapshot;
 
     uint32_t region_count;
-    uint32_t first_window_index;
 
     if (!g_window_server.kernel_ready ||
         !g_window_server.dirty ||
@@ -5539,18 +5348,6 @@ static bool compositor_snapshot_begin_locked(void) {
     }
 
     /*
-     * If one upper window's guaranteed opaque interior contains the complete
-     * snapshot damage bounds, no lower window can contribute to this frame.
-     *
-     * P10 already skips non-intersecting windows individually.  P11 adds this
-     * Z-order floor so lower windows do not even pay that intersection test,
-     * object_get(), view copy or title copy.
-     */
-    first_window_index =
-        compositor_snapshot_occlusion_floor_locked(
-            snapshot);
-
-    /*
      * Snapshot only windows that can contribute to this frame.
      *
      * The registry already owns a reference while window_lock is held.
@@ -5558,7 +5355,7 @@ static bool compositor_snapshot_begin_locked(void) {
      * window->section and its VM_OBJECT_SHARED alive even if the process
      * closes the window during this frame.
      */
-    for (uint32_t index = first_window_index;
+    for (uint32_t index = 0U;
          index < g_window_server.count;
          ++index) {
 
@@ -6652,65 +6449,6 @@ static void compositor_blit_drag_overlap(void) {
     }
 }
 
-/*
- * Return true only when this scene publication can overwrite pixels belonging
- * to the software cursor that is currently visible on scanout.
- *
- * If the pointer moves while/after composition, compositor_present_cursor_direct
- * already notices the coordinate change even with force=false.  Therefore the
- * force path is needed only when scene damage intersects the old presented
- * cursor rectangle.
- */
-static bool compositor_snapshot_overwrites_presented_cursor(void) {
-    int64_t cursor_left;
-    int64_t cursor_top;
-    int64_t cursor_right;
-    int64_t cursor_bottom;
-
-    if (!g_window_server.presented_pointer_valid) {
-        return false;
-    }
-
-    cursor_left =
-        (int64_t)g_window_server.presented_pointer_x -
-        WINDOW_CURSOR_HOTSPOT_X;
-
-    cursor_top =
-        (int64_t)g_window_server.presented_pointer_y -
-        WINDOW_CURSOR_HOTSPOT_Y;
-
-    cursor_right =
-        cursor_left + WINDOW_CURSOR_WIDTH;
-
-    cursor_bottom =
-        cursor_top + WINDOW_CURSOR_HEIGHT;
-
-    for (uint32_t index = 0U;
-         index < g_compositor_snapshot.damage_count;
-         ++index) {
-
-        const window_damage_rect_t *damage =
-            &g_compositor_snapshot.damage_rects[index];
-
-        if (damage->left >= damage->right ||
-            damage->top >= damage->bottom) {
-            continue;
-        }
-
-        if (cursor_right <= (int64_t)damage->left ||
-            cursor_bottom <= (int64_t)damage->top ||
-            cursor_left >= (int64_t)damage->right ||
-            cursor_top >= (int64_t)damage->bottom) {
-            continue;
-        }
-
-        return true;
-    }
-
-    return false;
-}
-
-
 static void compositor_render_snapshot(void) {
     bool direct_framebuffer =
         g_window_server.composite_framebuffer ==
@@ -6764,15 +6502,7 @@ static void compositor_render_snapshot(void) {
         sched_preempt_enable();
     } else {
         compositor_commit_snapshot();
-
-        /*
-         * Do not restore/reblend 24x24 cursor pixels after every unrelated
-         * client update.  A coordinate change still presents immediately;
-         * force only when this scene transaction actually overwrote the
-         * currently visible cursor rectangle.
-         */
-        compositor_present_cursor_direct(
-            compositor_snapshot_overwrites_presented_cursor());
+        compositor_present_cursor_direct(true);
     }
 }
 
