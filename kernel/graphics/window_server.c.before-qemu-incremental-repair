@@ -4677,291 +4677,6 @@ static void compositor_cursor_locked(void) {
 
 
 /*
- * LITEOS_QEMU_INCREMENTAL_REPAIR_V1
- *
- * Each QEMU hidden-VRAM page is a retained scanout cache.
- *
- * A page can be one frame behind while it is hidden, so damage produced by a
- * completed scene transaction is accumulated for BOTH pages.  Only the page
- * selected as the current back page is repaired before the Y_OFFSET flip.
- *
- * The software cursor is not part of composite_framebuffer.  It is drawn
- * directly into the visible WC page, therefore the current front page also
- * records the cursor rectangle as damage which must be removed the next time
- * that physical page becomes the back page.
- *
- * Keep a small rectangle set instead of one global bounding rectangle.  This
- * prevents a tiny cursor update in one corner plus unrelated client damage in
- * another corner from degenerating into a near-full-screen copy.
- */
-#define WINDOW_QEMU_REPAIR_MAX_RECTS 32U
-
-typedef struct compositor_qemu_repair_set {
-    window_damage_rect_t rects[WINDOW_QEMU_REPAIR_MAX_RECTS];
-    uint32_t count;
-} compositor_qemu_repair_set_t;
-
-typedef struct compositor_qemu_repair_state {
-    compositor_qemu_repair_set_t sets[2];
-
-    /*
-     * These are logical front/back ownership slots.  They are swapped only
-     * after qemu_stdvga_flip() succeeds, matching the driver's front_page^1
-     * transition without requiring the page index to escape the driver.
-     */
-    uint32_t front_slot;
-    uint32_t back_slot;
-
-    uint32_t width;
-    uint32_t height;
-    uint32_t stride;
-
-    bool initialized;
-} compositor_qemu_repair_state_t;
-
-static compositor_qemu_repair_state_t
-    g_compositor_qemu_repair;
-
-static inline bool compositor_qemu_repair_mergeable(
-    const window_damage_rect_t *a,
-    const window_damage_rect_t *b) {
-
-    /*
-     * Half-open rectangles.  Treat touching edges as mergeable so sequential
-     * drag strips collapse into one transaction instead of exhausting the
-     * small repair list.
-     */
-    return
-        a->left <= b->right &&
-        b->left <= a->right &&
-        a->top <= b->bottom &&
-        b->top <= a->bottom;
-}
-
-static inline void compositor_qemu_repair_union(
-    window_damage_rect_t *destination,
-    const window_damage_rect_t *source) {
-
-    if (source->left < destination->left)
-        destination->left = source->left;
-
-    if (source->top < destination->top)
-        destination->top = source->top;
-
-    if (source->right > destination->right)
-        destination->right = source->right;
-
-    if (source->bottom > destination->bottom)
-        destination->bottom = source->bottom;
-}
-
-static void compositor_qemu_repair_add(
-    compositor_qemu_repair_set_t *set,
-    const window_damage_rect_t *input) {
-
-    window_damage_rect_t merged;
-
-    if (set == 0 || input == 0)
-        return;
-
-    merged = *input;
-
-    if (merged.right > g_window_server.display_width)
-        merged.right = g_window_server.display_width;
-
-    if (merged.bottom > g_window_server.display_height)
-        merged.bottom = g_window_server.display_height;
-
-    if (merged.left >= merged.right ||
-        merged.top >= merged.bottom) {
-        return;
-    }
-
-    /*
-     * Remove every rectangle touching the new one, expanding merged as we go.
-     * Restart after every merge because the enlarged rectangle may now touch
-     * an earlier entry.
-     */
-    for (;;) {
-        bool changed = false;
-
-        for (uint32_t index = 0U;
-             index < set->count;
-             ++index) {
-
-            if (!compositor_qemu_repair_mergeable(
-                    &merged,
-                    &set->rects[index])) {
-                continue;
-            }
-
-            compositor_qemu_repair_union(
-                &merged,
-                &set->rects[index]);
-
-            --set->count;
-
-            if (index != set->count) {
-                set->rects[index] =
-                    set->rects[set->count];
-            }
-
-            changed = true;
-            break;
-        }
-
-        if (!changed)
-            break;
-    }
-
-    if (set->count < WINDOW_QEMU_REPAIR_MAX_RECTS) {
-        set->rects[set->count++] = merged;
-        return;
-    }
-
-    /*
-     * Pathological fragmentation.  Collapse to one bounding rectangle rather
-     * than fall back to the old unconditional full-screen publication.
-     */
-    for (uint32_t index = 0U;
-         index < set->count;
-         ++index) {
-
-        compositor_qemu_repair_union(
-            &merged,
-            &set->rects[index]);
-    }
-
-    set->rects[0] = merged;
-    set->count = 1U;
-}
-
-static void compositor_qemu_repair_add_i64(
-    compositor_qemu_repair_set_t *set,
-    int64_t left,
-    int64_t top,
-    int64_t right,
-    int64_t bottom) {
-
-    window_damage_rect_t rect;
-
-    if (left < 0)
-        left = 0;
-
-    if (top < 0)
-        top = 0;
-
-    if (right >
-        (int64_t)g_window_server.display_width) {
-        right = g_window_server.display_width;
-    }
-
-    if (bottom >
-        (int64_t)g_window_server.display_height) {
-        bottom = g_window_server.display_height;
-    }
-
-    if (left >= right ||
-        top >= bottom) {
-        return;
-    }
-
-    rect.left = (uint32_t)left;
-    rect.top = (uint32_t)top;
-    rect.right = (uint32_t)right;
-    rect.bottom = (uint32_t)bottom;
-
-    compositor_qemu_repair_add(
-        set,
-        &rect);
-}
-
-static void compositor_qemu_repair_reset(void) {
-    window_damage_rect_t full = {
-        .left = 0U,
-        .top = 0U,
-        .right = g_window_server.display_width,
-        .bottom = g_window_server.display_height,
-    };
-
-    g_compositor_qemu_repair =
-        (compositor_qemu_repair_state_t){0};
-
-    g_compositor_qemu_repair.front_slot = 0U;
-    g_compositor_qemu_repair.back_slot = 1U;
-
-    g_compositor_qemu_repair.width =
-        g_window_server.display_width;
-
-    g_compositor_qemu_repair.height =
-        g_window_server.display_height;
-
-    g_compositor_qemu_repair.stride =
-        g_window_server.display_stride;
-
-    g_compositor_qemu_repair.initialized = true;
-
-    /*
-     * We do not know the historical contents of either VRAM page at the point
-     * incremental tracking starts.  The first use of each physical page must
-     * therefore establish one complete clean baseline.
-     *
-     * Result:
-     *   first flip  = full repair
-     *   second flip = full repair
-     *   later flips = incremental only
-     */
-    compositor_qemu_repair_add(
-        &g_compositor_qemu_repair.sets[0],
-        &full);
-
-    compositor_qemu_repair_add(
-        &g_compositor_qemu_repair.sets[1],
-        &full);
-}
-
-static void compositor_qemu_repair_ensure(void) {
-    if (!g_compositor_qemu_repair.initialized ||
-        g_compositor_qemu_repair.width !=
-            g_window_server.display_width ||
-        g_compositor_qemu_repair.height !=
-            g_window_server.display_height ||
-        g_compositor_qemu_repair.stride !=
-            g_window_server.display_stride) {
-
-        compositor_qemu_repair_reset();
-    }
-}
-
-/*
- * Mark pixels dirtied by the direct software-cursor overlay.
- *
- * Only the current front page was modified.  When roles flip this repair set
- * follows that physical page into the back role and removes the stale cursor
- * before it can become visible again.
- */
-static void compositor_qemu_repair_mark_front_cursor(
-    int64_t left,
-    int64_t top,
-    int64_t right,
-    int64_t bottom) {
-
-    if (!qemu_stdvga_flip_available())
-        return;
-
-    compositor_qemu_repair_ensure();
-
-    compositor_qemu_repair_add_i64(
-        &g_compositor_qemu_repair.sets[
-            g_compositor_qemu_repair.front_slot],
-        left,
-        top,
-        right,
-        bottom);
-}
-
-
-/*
  * Overlay the software cursor directly on the WC scanout while keeping the
  * retained WB compositor buffer clean.
  */
@@ -5103,17 +4818,6 @@ static void compositor_present_cursor_direct(bool force) {
             g_window_server.framebuffer[offset] = output;
         }
     }
-
-    /*
-     * The clean WB scene deliberately does not contain the software cursor.
-     * Remember the overlay carried by this physical front page so it is
-     * repaired when this same page becomes hidden on a later flip.
-     */
-    compositor_qemu_repair_mark_front_cursor(
-        new_origin_x,
-        new_origin_y,
-        new_origin_x + (int64_t)WINDOW_CURSOR_WIDTH,
-        new_origin_y + (int64_t)WINDOW_CURSOR_HEIGHT);
 
     __asm__ volatile ("sfence" : : : "memory");
 
@@ -8115,176 +7819,19 @@ static void compositor_publish_drag_old_exposure(void) {
 
 
 /*
- * P21-MOVE QEMU StdVGA incremental hidden-frame publication.
+ * P14 QEMU StdVGA hidden-frame publication.
  *
- * Old P14:
- *
- *     retained WB scene
- *            |
- *            +---- FULL SCREEN ----> hidden WC page
- *                                     |
- *                                    flip
- *
- * New path:
- *
- *     scene damage ----+--> pending physical page A
- *                      |
- *                      +--> pending physical page B
- *
- *     current back page:
- *         repair only its pending rectangles
- *         clear repaired state
- *         flip
- *
- * Each page therefore catches up directly from the authoritative retained
- * scene instead of being copied from the other VRAM page.
+ * The destination is not currently scanned out, so a complete retained scene
+ * can be copied there without exposing intermediate rows. The first P14
+ * version intentionally refreshes the full hidden frame: a page that was
+ * previously visible can contain a software-cursor overlay, and full refresh
+ * gives a simple correctness baseline before later incremental page tracking.
  */
-static void compositor_qemu_repair_accumulate_scene(void) {
-    compositor_qemu_repair_set_t *front;
-    compositor_qemu_repair_set_t *back;
-
-    compositor_qemu_repair_ensure();
-
-    front =
-        &g_compositor_qemu_repair.sets[
-            g_compositor_qemu_repair.front_slot];
-
-    back =
-        &g_compositor_qemu_repair.sets[
-            g_compositor_qemu_repair.back_slot];
-
-    if (g_compositor_snapshot.dragging_identifier != 0U) {
-        window_damage_rect_t transaction;
-        bool valid = false;
-
-        /*
-         * Retained drag uses memmove for the large OLD/NEW overlap and then
-         * rerenders only sparse exposed strips.  Those sparse rectangles alone
-         * are NOT enough to synchronize a VRAM page which is one frame behind.
-         *
-         * Use the same complete move transaction that scanout publication
-         * logically represents.
-         */
-        for (uint32_t index = 0U;
-             index < g_compositor_snapshot.damage_count;
-             ++index) {
-
-            const window_damage_rect_t *rect =
-                &g_compositor_snapshot.damage_rects[index];
-
-            if (rect->left >= rect->right ||
-                rect->top >= rect->bottom) {
-                continue;
-            }
-
-            if (!valid) {
-                transaction = *rect;
-                valid = true;
-            } else {
-                compositor_qemu_repair_union(
-                    &transaction,
-                    rect);
-            }
-        }
-
-        if (valid) {
-            compositor_qemu_repair_add(
-                front,
-                &transaction);
-
-            compositor_qemu_repair_add(
-                back,
-                &transaction);
-        }
-
-        return;
-    }
-
-    /*
-     * Ordinary updates preserve their sparse rectangles.  This is important
-     * for cursor-sized/client-sized changes far away from each other.
-     */
-    for (uint32_t index = 0U;
-         index < g_compositor_snapshot.damage_count;
-         ++index) {
-
-        const window_damage_rect_t *rect =
-            &g_compositor_snapshot.damage_rects[index];
-
-        compositor_qemu_repair_add(
-            front,
-            rect);
-
-        compositor_qemu_repair_add(
-            back,
-            rect);
-    }
-}
-
-static void compositor_qemu_copy_repair_set(
-    volatile uint32_t *destination,
-    const uint32_t *source,
-    const compositor_qemu_repair_set_t *repair) {
-
-    if (destination == 0 ||
-        source == 0 ||
-        repair == 0) {
-        return;
-    }
-
-    for (uint32_t index = 0U;
-         index < repair->count;
-         ++index) {
-
-        const window_damage_rect_t *rect =
-            &repair->rects[index];
-
-        if (rect->left >= rect->right ||
-            rect->top >= rect->bottom) {
-            continue;
-        }
-
-        /*
-         * Large rectangles can still use the persistent helper CPUs.  Small
-         * repairs deliberately stay on one CPU; waking remote workers for a
-         * 64x64/24x24 rectangle costs more than the copy itself.
-         */
-        if (compositor_copy_rect_parallel_buffers(
-                destination,
-                source,
-                g_window_server.display_stride,
-                g_window_server.display_stride,
-                rect)) {
-            continue;
-        }
-
-        const uint32_t width =
-            rect->right - rect->left;
-
-        for (uint32_t row = rect->top;
-             row < rect->bottom;
-             ++row) {
-
-            compositor_copy_wc_scanline(
-                destination +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    rect->left,
-                source +
-                    (uint64_t)row *
-                        g_window_server.display_stride +
-                    rect->left,
-                width);
-        }
-    }
-}
-
 static bool compositor_commit_qemu_stdvga(void) {
     volatile uint32_t *back;
     volatile uint32_t *front;
     const uint32_t *scene;
-    compositor_qemu_repair_set_t *repair;
-    uint32_t repaired_slot;
+    window_damage_rect_t full;
 
     if (!qemu_stdvga_flip_available() ||
         g_window_server.composite_framebuffer == 0 ||
@@ -8297,79 +7844,56 @@ static bool compositor_commit_qemu_stdvga(void) {
         return false;
     }
 
-    compositor_qemu_repair_accumulate_scene();
-
-    repaired_slot =
-        g_compositor_qemu_repair.back_slot;
-
-    repair =
-        &g_compositor_qemu_repair.sets[
-            repaired_slot];
-
     back = qemu_stdvga_back_buffer();
-    if (back == 0)
-        return false;
+    if (back == 0) return false;
 
     scene =
         (const uint32_t *)(uintptr_t)
             g_window_server.composite_framebuffer;
 
-    /*
-     * This is the entire expensive part now.  Once both VRAM pages have
-     * received their initial full baseline, a drag copies only the accumulated
-     * move transaction for this physical page.
-     */
-    compositor_qemu_copy_repair_set(
-        back,
-        scene,
-        repair);
+    full.left = 0U;
+    full.top = 0U;
+    full.right = g_window_server.display_width;
+    full.bottom = g_window_server.display_height;
 
     /*
-     * Local serial stores need this fence.  Parallel helpers already fence
-     * their own WC stores before completion; the extra local fence is cheap
-     * and also orders any serial rectangles following them.
+     * Reuse the existing persistent scanline helpers when they are available.
+     * They already partition rows contiguously and publish through display
+     * core's MOVDIR64B/MOVNTI WC primitive.
      */
+    if (!compositor_copy_rect_parallel_buffers(
+            back,
+            scene,
+            g_window_server.display_stride,
+            g_window_server.display_stride,
+            &full)) {
+
+        for (uint32_t row = 0U;
+             row < g_window_server.display_height;
+             ++row) {
+
+            compositor_copy_wc_scanline(
+                back +
+                    (uint64_t)row *
+                    g_window_server.display_stride,
+                scene +
+                    (uint64_t)row *
+                    g_window_server.display_stride,
+                g_window_server.display_width);
+        }
+    }
+
     __asm__ volatile ("sfence" : : : "memory");
 
     if (!qemu_stdvga_flip()) {
-        /*
-         * Do not discard repair state on failure.  The backend currently
-         * disables itself after a verified flip failure, but retaining the
-         * state also makes this correct if that policy changes later.
-         */
         return false;
-    }
-
-    /*
-     * The old hidden page is now front and exactly matches the clean retained
-     * scene.  Its repair set becomes empty.  The old visible page becomes the
-     * new back page and keeps all damage accumulated while it was visible.
-     */
-    g_compositor_qemu_repair.sets[
-        repaired_slot].count = 0U;
-
-    {
-        uint32_t old_front =
-            g_compositor_qemu_repair.front_slot;
-
-        g_compositor_qemu_repair.front_slot =
-            g_compositor_qemu_repair.back_slot;
-
-        g_compositor_qemu_repair.back_slot =
-            old_front;
     }
 
     front = qemu_stdvga_front_buffer();
-    if (front == 0)
-        return false;
+    if (front == 0) return false;
 
-    /*
-     * Cursor-only HID updates write directly to this newly visible page.
-     * compositor_present_cursor_direct(true) immediately follows this commit
-     * and records that overlay into the new front page's repair set.
-     */
+    /* Cursor-only HID updates must follow the newly visible page. */
     g_window_server.framebuffer = front;
-
     return true;
 }
 
