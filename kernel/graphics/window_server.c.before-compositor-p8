@@ -3188,7 +3188,7 @@ static void focus_locked(window_server_window_t *window) {
  * scanline spans.  No kernel SIMD/FPU state is touched.
  */
 static inline void compositor_copy_wb_pixels(
-    uint32_t *destination,
+    volatile uint32_t *destination,
     const uint32_t *source,
     uint32_t pixels) {
 
@@ -3204,7 +3204,7 @@ static inline void compositor_copy_wb_pixels(
 
     if (qwords != 0U) {
         void *out =
-            (void *)destination;
+            (void *)(uintptr_t)destination;
 
         const void *in =
             (const void *)source;
@@ -3220,51 +3220,12 @@ static inline void compositor_copy_wb_pixels(
             : "memory");
     }
 
+    /*
+     * REP MOVSQ copied an even number of pixels.
+     */
     if ((pixels & 1U) != 0U) {
         destination[pixels - 1U] =
             source[pixels - 1U];
-    }
-}
-
-
-/*
- * Private retained-scene fill.  The global composite pointer remains volatile
- * for the GOP alias fallback; callers enter this helper only after proving the
- * target is ordinary cacheable WB RAM.
- */
-static inline void compositor_fill_wb_pixels(
-    uint32_t *destination,
-    uint32_t pixels,
-    uint32_t color) {
-
-    uint64_t pair;
-    uint64_t qwords;
-    void *out;
-
-    if (destination == 0 || pixels == 0U) {
-        return;
-    }
-
-    if ((((uintptr_t)destination) & 7U) != 0U) {
-        *destination++ = color;
-        --pixels;
-    }
-
-    pair = (uint64_t)color | ((uint64_t)color << 32U);
-    qwords = pixels >> 1U;
-    out = (void *)destination;
-
-    if (qwords != 0U) {
-        uint64_t count = qwords;
-        __asm__ volatile (
-            "rep stosq"
-            : "+D"(out), "+c"(count)
-            : "a"(pair)
-            : "memory");
-    }
-
-    if ((pixels & 1U) != 0U) {
-        *(uint32_t *)out = color;
     }
 }
 
@@ -3500,238 +3461,313 @@ static inline void compositor_prefetch_surface_page(
 }
 
 
-typedef struct compositor_surface_source_context {
-    vm_object_t *object;
+static inline kstatus_t compositor_surface_page_direct(
+    const compositor_window_view_t *view,
+    vm_object_t *object,
+    uint64_t offset,
+    bool create,
+    uint8_t **out) {
+
+    window_server_window_t *reference;
     compositor_surface_page_cache_t *cache;
-    uint64_t row_bytes;
-    bool readable;
-} compositor_surface_source_context_t;
+    uint64_t page_index;
+    uint8_t *base;
+    kstatus_t status;
 
-
-/*
- * Resolve row-invariant surface state once per window/damage pass.
- * This matters most for narrow retained-drag strips: successive rows can touch
- * different 4K pages even though only one or a few pixels are copied.
- */
-static void compositor_surface_source_prepare(
-    const compositor_window_view_t *window,
-    compositor_surface_source_context_t *context) {
-
-    vm_object_t *object;
-
-    if (context == 0) return;
-    *context = (compositor_surface_source_context_t){0};
-    if (window == 0) return;
-
-    context->row_bytes =
-        (uint64_t)window->width * sizeof(uint32_t);
-
-    if (window->resize_pending ||
-        window->section == 0 ||
-        window->section->vm_object == 0 ||
-        window->owner_address == 0U) {
-        return;
+    if (view == 0 ||
+        object == 0 ||
+        out == 0) {
+        return K_EINVAL;
     }
 
-    object = window->section->vm_object;
-    if (object->type != VM_OBJECT_SHARED) return;
+    page_index =
+        offset >> PAGE_SHIFT;
 
-    context->object = object;
-    context->cache = compositor_surface_cache_get(window);
-    context->readable = true;
-}
+    reference =
+        view->reference;
 
+    /*
+     * Ultra-hot path.
+     *
+     * Once the per-window cache exists, do NOT call
+     * compositor_surface_cache_get() on every surface page.
+     *
+     * Normal repaint path becomes:
+     *
+     *     window
+     *       -> cache
+     *       -> pages[index]
+     *       -> direct address
+     */
+    cache =
+        reference != 0 ?
+        (compositor_surface_page_cache_t *)
+            reference->compositor_cache :
+        0;
 
-/*
- * Positive cache hit:
- *     cache->pages[page_index]
- * No per-page reference->compositor_cache reload or section comparison.
- */
-static inline uint8_t *compositor_surface_page_resolve(
-    const compositor_surface_source_context_t *context,
-    uint64_t page_index) {
+    if (cache != 0 &&
+        cache->section == view->section &&
+        page_index < cache->page_count) {
 
-    compositor_surface_page_cache_t *cache;
-    uint8_t *base = 0;
+        base =
+            cache->pages[page_index];
 
-    if (context == 0 || !context->readable || context->object == 0) {
-        return 0;
-    }
-
-    cache = context->cache;
-
-    if (cache != 0 && page_index < cache->page_count) {
-        base = cache->pages[page_index];
         if (base != 0) {
-            compositor_prefetch_surface_page(cache, page_index);
-            return base;
+            compositor_prefetch_surface_page(
+                cache,
+                page_index);
+
+            *out = base;
+            return K_OK;
+        }
+    } else {
+        /*
+         * Slow initialization/stale-cache path.
+         *
+         * This normally runs only before the first positive page mapping for
+         * the window, or if a future implementation replaces its section.
+         */
+        cache =
+            compositor_surface_cache_get(view);
+
+        if (cache != 0 &&
+            page_index < cache->page_count) {
+
+            base =
+                cache->pages[page_index];
+
+            if (base != 0) {
+                *out = base;
+                return K_OK;
+            }
         }
     }
 
-    if (page_index > (UINT64_MAX >> PAGE_SHIFT)) return 0;
+    /*
+     * Cache miss.
+     *
+     * With create=false this is a pure lookup: the compositor still never
+     * allocates an untouched shared-surface page merely because it reads it.
+     */
+    status =
+        vm_object_shared_page_direct(
+            object,
+            offset,
+            create,
+            out);
 
-    if (vm_object_shared_page_direct(
-            context->object,
-            page_index << PAGE_SHIFT,
-            true,
-            &base) != K_OK ||
-        base == 0) {
-        return 0;
+    if (status != K_OK) {
+        return status;
     }
 
-    if (cache != 0 && page_index < cache->page_count) {
-        cache->pages[page_index] = base;
-        compositor_prefetch_surface_page(cache, page_index);
+    /*
+     * Positive mappings are stable for the lifetime of the shared section.
+     * Cache only successful mappings. A missing page remains NULL so Ring3
+     * can fault it in later and a subsequent compositor pass can discover it.
+     */
+    if (cache == 0) {
+        cache =
+            compositor_surface_cache_get(view);
     }
 
-    return base;
+    if (cache != 0 &&
+        page_index < cache->page_count &&
+        *out != 0) {
+
+        cache->pages[page_index] =
+            *out;
+
+        compositor_prefetch_surface_page(
+            cache,
+            page_index);
+    }
+
+    return K_OK;
 }
 
 
-static inline void compositor_surface_fill_destination(
-    uint32_t *wb_destination,
-    volatile uint32_t *device_destination,
-    uint32_t pixels,
-    uint32_t color) {
-
-    if (wb_destination != 0) {
-        compositor_fill_wb_pixels(wb_destination, pixels, color);
-    } else {
-        compositor_fill_surface_pixels(device_destination, pixels, color);
-    }
-}
-
-
-static inline void compositor_surface_copy_destination(
-    uint32_t *wb_destination,
-    volatile uint32_t *device_destination,
-    const uint32_t *source,
-    uint32_t pixels) {
-
-    if (wb_destination != 0) {
-        compositor_copy_wb_pixels(wb_destination, source, pixels);
-    } else {
-        display_core_publish_xrgb8888_span(
-            device_destination, source, pixels);
-    }
-}
-
-
-/*
- * source_row_offset is maintained incrementally by the caller.  The normal
- * hot path now does only page-index arithmetic + direct page-array lookup.
- */
 static void compositor_copy_surface_span(
     const compositor_window_view_t *window,
-    const compositor_surface_source_context_t *surface,
-    uint64_t source_row_offset,
+    uint32_t row,
     uint32_t first_column,
     uint32_t last_column,
-    uint32_t *wb_destination,
-    volatile uint32_t *device_destination,
-    uint64_t *cached_page_index,
+    volatile uint32_t *destination,
+    uint64_t *cached_page,
     uint8_t **cached_base) {
 
+    vm_object_t *object;
+    uint64_t pixel_index;
     uint64_t source_offset;
-    uint64_t column_offset;
     uint32_t remaining;
 
-    if (window == 0 || surface == 0 ||
-        (wb_destination == 0 && device_destination == 0) ||
-        cached_page_index == 0 || cached_base == 0 ||
+    if (window == 0 ||
+        destination == 0 ||
+        cached_page == 0 ||
+        cached_base == 0 ||
         first_column >= last_column) {
         return;
     }
 
-    remaining = last_column - first_column;
+    remaining =
+        last_column - first_column;
 
-    if (!surface->readable) {
-        compositor_surface_fill_destination(
-            wb_destination, device_destination,
-            remaining, window->background);
+    /*
+     * During live resize the client has not acknowledged the new stride yet.
+     * Never interpret the old surface with the new dimensions.
+     */
+    if (window->resize_pending ||
+        window->section == 0 ||
+        window->section->vm_object == 0 ||
+        window->owner_address == 0U) {
+
+        compositor_fill_surface_pixels(
+            destination,
+            remaining,
+            window->background);
+
         return;
     }
 
-    column_offset =
-        (uint64_t)first_column * sizeof(uint32_t);
+    object =
+        window->section->vm_object;
 
-    if (source_row_offset > UINT64_MAX - column_offset) {
-        compositor_surface_fill_destination(
-            wb_destination, device_destination,
-            remaining, window->background);
+    if (object->type != VM_OBJECT_SHARED) {
+        compositor_fill_surface_pixels(
+            destination,
+            remaining,
+            window->background);
+
         return;
     }
 
-    source_offset = source_row_offset + column_offset;
+    pixel_index =
+        (uint64_t)row *
+            window->width +
+        first_column;
 
+    if (pixel_index >
+        UINT64_MAX / sizeof(uint32_t)) {
+
+        compositor_fill_surface_pixels(
+            destination,
+            remaining,
+            window->background);
+
+        return;
+    }
+
+    source_offset =
+        pixel_index *
+        sizeof(uint32_t);
+
+    /*
+     * Snapshot dimensions should always fit the reserved surface capacity.
+     * Keep the bounds check here because compositor code must never read past
+     * the shared object if a malformed window state slips through.
+     */
     if (source_offset >= window->buffer_size) {
-        compositor_surface_fill_destination(
-            wb_destination, device_destination,
-            remaining, window->background);
+        compositor_fill_surface_pixels(
+            destination,
+            remaining,
+            window->background);
+
         return;
     }
 
     {
         uint64_t available_bytes =
-            window->buffer_size - source_offset;
-        uint64_t requested_bytes =
-            (uint64_t)remaining * sizeof(uint32_t);
+            window->buffer_size -
+            source_offset;
 
-        if (requested_bytes > available_bytes) {
+        uint64_t requested_bytes =
+            (uint64_t)remaining *
+            sizeof(uint32_t);
+
+        if (requested_bytes >
+            available_bytes) {
+
             uint32_t available_pixels =
-                (uint32_t)(available_bytes / sizeof(uint32_t));
+                (uint32_t)(
+                    available_bytes /
+                    sizeof(uint32_t));
 
             if (available_pixels < remaining) {
-                if (wb_destination != 0) {
-                    compositor_fill_wb_pixels(
-                        wb_destination + available_pixels,
-                        remaining - available_pixels,
-                        window->background);
-                } else {
-                    compositor_fill_surface_pixels(
-                        device_destination + available_pixels,
-                        remaining - available_pixels,
-                        window->background);
-                }
-                remaining = available_pixels;
+                compositor_fill_surface_pixels(
+                    destination +
+                        available_pixels,
+                    remaining -
+                        available_pixels,
+                    window->background);
+
+                remaining =
+                    available_pixels;
             }
         }
     }
 
     while (remaining != 0U) {
-        uint64_t page_index = source_offset >> PAGE_SHIFT;
-        uint32_t in_page =
-            (uint32_t)(source_offset & (PAGE_SIZE - 1U));
-        uint32_t page_pixels =
-            (PAGE_SIZE - in_page) / sizeof(uint32_t);
-        uint32_t chunk =
-            remaining < page_pixels ? remaining : page_pixels;
+        uint64_t page =
+            source_offset &
+            ~(uint64_t)(PAGE_SIZE - 1U);
 
-        if (*cached_page_index != page_index) {
-            *cached_base =
-                compositor_surface_page_resolve(surface, page_index);
-            *cached_page_index = page_index;
+        uint32_t in_page =
+            (uint32_t)(
+                source_offset &
+                (PAGE_SIZE - 1U));
+
+        uint32_t page_pixels =
+            (PAGE_SIZE - in_page) /
+            sizeof(uint32_t);
+
+        uint32_t chunk =
+            remaining < page_pixels ?
+            remaining :
+            page_pixels;
+
+        /*
+         * Keep a one-page hot cache across the entire window.  Linear XRGB
+         * surfaces normally touch physical backing pages sequentially.
+         */
+        if (*cached_page != page) {
+            uint8_t *base = 0;
+
+            if (compositor_surface_page_direct(window,
+                    object,
+                    page,
+                    true,
+                    &base) == K_OK) {
+
+                *cached_base = base;
+            } else {
+                *cached_base = 0;
+            }
+
+            *cached_page = page;
         }
 
         if (*cached_base != 0) {
             const uint32_t *source =
-                (const uint32_t *)(const void *)(*cached_base + in_page);
-            compositor_surface_copy_destination(
-                wb_destination, device_destination,
-                source, chunk);
+                (const uint32_t *)(const void *)(
+                    *cached_base +
+                    in_page);
+
+            compositor_copy_wb_pixels(
+                destination,
+                source,
+                chunk);
         } else {
-            compositor_surface_fill_destination(
-                wb_destination, device_destination,
-                chunk, window->background);
+            compositor_fill_surface_pixels(
+                destination,
+                chunk,
+                window->background);
         }
 
-        if (wb_destination != 0) {
-            wb_destination += chunk;
-        } else {
-            device_destination += chunk;
-        }
+        destination += chunk;
 
-        source_offset += (uint64_t)chunk * sizeof(uint32_t);
+        source_offset +=
+            (uint64_t)chunk *
+            sizeof(uint32_t);
+
         remaining -= chunk;
     }
 }
@@ -3741,12 +3777,8 @@ static void compositor_copy_surface_span(
 static void compositor_surface_locked(
     const compositor_window_view_t *window) {
 
-    compositor_surface_source_context_t source_context;
-    uint64_t cached_page_index = UINT64_MAX;
+    uint64_t cached_page = UINT64_MAX;
     uint8_t *cached_base = 0;
-    uint64_t source_row_offset;
-    bool private_wb;
-    uint32_t *private_scene;
 
     int64_t frame_width;
     int64_t frame_height;
@@ -3865,32 +3897,9 @@ static void compositor_surface_locked(
         return;
     }
 
-    compositor_surface_source_prepare(window, &source_context);
-
-    source_row_offset =
-        (uint64_t)(uint32_t)first_row *
-        source_context.row_bytes;
-
-    private_wb =
-        g_window_server.composite_framebuffer != 0 &&
-        g_window_server.composite_framebuffer !=
-            g_window_server.framebuffer;
-
-    private_scene =
-        private_wb ?
-            (uint32_t *)(uintptr_t)
-                g_window_server.composite_framebuffer :
-            0;
-
     for (uint32_t row = (uint32_t)first_row;
          row < (uint32_t)last_row;
          ++row) {
-
-        uint64_t row_source_offset =
-            source_row_offset;
-
-        source_row_offset +=
-            source_context.row_bytes;
 
         int64_t destination_y =
             surface_y + row;
@@ -3906,9 +3915,8 @@ static void compositor_surface_locked(
             base_last_column;
 
         uint32_t inset;
-        uint64_t destination_index;
-        uint32_t *wb_destination;
-        volatile uint32_t *device_destination;
+
+        volatile uint32_t *destination;
 
         inset = (frame_row >= 0 && frame_row < frame_height ?
                  compositor_corner_inset(
@@ -3938,7 +3946,9 @@ static void compositor_surface_locked(
             continue;
         }
 
-        destination_index =
+        destination =
+            g_window_server.composite_framebuffer +
+
             (uint64_t)
                 (uint32_t)destination_y *
                 g_window_server.display_stride +
@@ -3947,26 +3957,13 @@ static void compositor_surface_locked(
                 surface_x +
                 first_column);
 
-        if (private_wb) {
-            wb_destination =
-                private_scene + destination_index;
-            device_destination = 0;
-        } else {
-            wb_destination = 0;
-            device_destination =
-                g_window_server.composite_framebuffer +
-                destination_index;
-        }
-
         compositor_copy_surface_span(
             window,
-            &source_context,
-            row_source_offset,
+            row,
             (uint32_t)first_column,
             (uint32_t)last_column,
-            wb_destination,
-            device_destination,
-            &cached_page_index,
+            destination,
+            &cached_page,
             &cached_base);
     }
 }
@@ -6205,7 +6202,7 @@ static inline void compositor_move_wb_pixels(
         destination_address >= source_address + bytes) {
 
         compositor_copy_wb_pixels(
-            destination,
+            (volatile uint32_t *)destination,
             source,
             pixels);
 
