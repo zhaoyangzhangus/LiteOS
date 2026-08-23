@@ -78,18 +78,6 @@
 #define WINDOW_COMPOSITOR_COPY_STACK_SIZE (32U * 1024U)
 #define WINDOW_DESKTOP_ASSET_WORKER_STACK_SIZE (32U * 1024U)
 
-/*
- * One input pump consumes at most WINDOW_EVENT_CAPACITY reports. During a
- * drag, consume a few already-queued batches before committing a GOP frame so
- * the expensive visible copy targets the newest available pointer position
- * instead of replaying stale positions one frame at a time.
- *
- * This is bounded: continuously arriving input can never starve composition.
- */
-#ifndef WINDOW_COMPOSITOR_DRAG_INPUT_DRAIN_PASSES
-#define WINDOW_COMPOSITOR_DRAG_INPUT_DRAIN_PASSES 4U
-#endif
-
 /* WB desktop-cache -> WB retained-scene copies must stay cached. */
 #ifndef WINDOW_COMPOSITOR_PARALLEL_WB_COPY
 #define WINDOW_COMPOSITOR_PARALLEL_WB_COPY 0U
@@ -646,52 +634,20 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
                           window_server_worker_ready, 0,
                           UINT64_MAX) != K_OK) continue;
 
-        /*
-         * Normal pointer-only motion keeps the direct cursor HID-rate path.
-         *
-         * Active window drag is different: drawing the cursor immediately on
-         * scanout while the window is still at its previous committed position
-         * makes the cursor visibly run ahead of the window. It also means the
-         * following multi-megabyte GOP transaction can overwrite that cursor.
-         *
-         * During drag, drain a bounded number of queued input batches first,
-         * defer cursor publication, then commit scene + cursor together.
-         */
+        /* Update input and publish dirty scene regions immediately.  There
+         * is deliberately no fixed refresh-period sleep here: the display
+         * backend has no vblank/page-flip primitive, so an artificial 60Hz
+         * deadline only adds visible drag and repaint latency. */
         for (;;) {
-            bool defer_cursor_for_drag = false;
-
             if (input_core_pending() != 0U) {
                 window_server_pump_input_mode(false);
 
-                for (uint32_t pass = 1U;
-                     pass < WINDOW_COMPOSITOR_DRAG_INPUT_DRAIN_PASSES;
-                     ++pass) {
-
-                    bool drag_dirty;
-
-                    window_lock();
-                    drag_dirty =
-                        g_window_server.dragging_identifier != 0U &&
-                        g_window_server.dirty;
-                    window_unlock();
-
-                    if (!drag_dirty ||
-                        input_core_pending() == 0U) {
-                        break;
-                    }
-
-                    window_server_pump_input_mode(false);
-                }
-
-                window_lock();
-                defer_cursor_for_drag =
-                    g_window_server.dragging_identifier != 0U &&
-                    g_window_server.dirty;
-                window_unlock();
-
-                if (!defer_cursor_for_drag) {
-                    compositor_present_cursor_direct(false);
-                }
+                /*
+                 * The retained WB scene is cursor-free, so restoring the
+                 * previous 24x24 cursor and overlaying the new one is cheap
+                 * and safe at HID rate.
+                 */
+                compositor_present_cursor_direct(false);
             }
 
             {
@@ -702,13 +658,8 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
                 if (!dirty) break;
             }
 
-            /*
-             * window_server_pump_input_mode(true) performs one final bounded
-             * input drain before taking the immutable scene snapshot. Any
-             * reports arriving during rendering remain queued for the next
-             * frame; they can no longer move the cursor ahead of this drag
-             * transaction because the direct cursor was deferred above.
-             */
+            /* Drain the current damage immediately.  New damage generated
+             * while rendering is observed by the next loop iteration. */
             window_server_pump_input_mode(true);
         }
     }
@@ -6199,171 +6150,6 @@ static void compositor_publish_rect(const window_damage_rect_t *rect,
 }
 
 
-/*
- * Clip and publish one rectangle from the completed retained WB scene.
- *
- * This helper is used only by the GOP drag ghost-suppression prepass below.
- * The normal transaction still executes afterward and remains the authority
- * for the final visible frame.
- */
-static void compositor_publish_drag_exposure_rect(
-    int64_t left,
-    int64_t top,
-    int64_t right,
-    int64_t bottom) {
-
-    window_damage_rect_t rect;
-
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
-
-    if (right >
-        (int64_t)g_window_server.display_width) {
-        right = g_window_server.display_width;
-    }
-
-    if (bottom >
-        (int64_t)g_window_server.display_height) {
-        bottom = g_window_server.display_height;
-    }
-
-    if (left >= right ||
-        top >= bottom) {
-        return;
-    }
-
-    rect.left = (uint32_t)left;
-    rect.top = (uint32_t)top;
-    rect.right = (uint32_t)right;
-    rect.bottom = (uint32_t)bottom;
-
-    compositor_publish_rect(
-        &rect,
-        false);
-}
-
-
-/*
- * GOP has no page flip: the display engine can scan the visible framebuffer
- * while the CPU is copying a large moved-window transaction into it.
- *
- * The visually worst artifact is the trailing OLD\NEW edge remaining visible
- * while the multi-megabyte transaction is still progressing. The retained WB
- * scene already contains the final background/lower-window pixels there.
- *
- * Publish only those old-position exposure strips first. A one-pixel move of
- * an 800px-high window adds only ~3.2 KiB of WC traffic but removes the old
- * silhouette edge before the full transaction starts.
- *
- * This does not make GOP atomic; native scanout/page flip remains the complete
- * solution. It is a low-cost correctness-oriented mitigation for GOP.
- */
-static void compositor_publish_drag_old_exposure(void) {
-    const compositor_snapshot_t *snapshot =
-        &g_compositor_snapshot;
-
-    int64_t old_left;
-    int64_t old_top;
-    int64_t old_right;
-    int64_t old_bottom;
-
-    int64_t new_left;
-    int64_t new_top;
-    int64_t new_right;
-    int64_t new_bottom;
-
-    int64_t overlap_left;
-    int64_t overlap_top;
-    int64_t overlap_right;
-    int64_t overlap_bottom;
-
-    if (!snapshot->drag_blit_valid ||
-        snapshot->drag_width == 0U ||
-        snapshot->drag_height == 0U) {
-        return;
-    }
-
-    old_left = snapshot->drag_old_x;
-    old_top = snapshot->drag_old_y;
-    old_right =
-        old_left + (int64_t)snapshot->drag_width;
-    old_bottom =
-        old_top + (int64_t)snapshot->drag_height;
-
-    new_left = snapshot->drag_new_x;
-    new_top = snapshot->drag_new_y;
-    new_right =
-        new_left + (int64_t)snapshot->drag_width;
-    new_bottom =
-        new_top + (int64_t)snapshot->drag_height;
-
-    overlap_left =
-        old_left > new_left ?
-            old_left :
-            new_left;
-
-    overlap_top =
-        old_top > new_top ?
-            old_top :
-            new_top;
-
-    overlap_right =
-        old_right < new_right ?
-            old_right :
-            new_right;
-
-    overlap_bottom =
-        old_bottom < new_bottom ?
-            old_bottom :
-            new_bottom;
-
-    if (overlap_left >= overlap_right ||
-        overlap_top >= overlap_bottom) {
-
-        compositor_publish_drag_exposure_rect(
-            old_left,
-            old_top,
-            old_right,
-            old_bottom);
-
-        return;
-    }
-
-    /* OLD \ NEW horizontal strip, full old height. */
-    if (new_left > old_left) {
-        compositor_publish_drag_exposure_rect(
-            old_left,
-            old_top,
-            overlap_left,
-            old_bottom);
-    } else if (new_left < old_left) {
-        compositor_publish_drag_exposure_rect(
-            overlap_right,
-            old_top,
-            old_right,
-            old_bottom);
-    }
-
-    /*
-     * OLD \ NEW vertical strip over only the horizontal overlap, so it never
-     * double-publishes the horizontal strip above.
-     */
-    if (new_top > old_top) {
-        compositor_publish_drag_exposure_rect(
-            overlap_left,
-            old_top,
-            overlap_right,
-            overlap_top);
-    } else if (new_top < old_top) {
-        compositor_publish_drag_exposure_rect(
-            overlap_left,
-            overlap_bottom,
-            overlap_right,
-            old_bottom);
-    }
-}
-
-
 static void compositor_commit_snapshot(void) {
     bool commit_as_move_transaction;
     bool allow_yield;
@@ -6464,13 +6250,6 @@ static void compositor_commit_snapshot(void) {
     sched_preempt_disable();
 
     if (commit_as_move_transaction) {
-        /*
-         * Erase the retained drag's old-only trailing edge before starting the
-         * large visible bounding transaction. The extra traffic is normally
-         * only delta_x*height + delta_y*overlap_width pixels.
-         */
-        compositor_publish_drag_old_exposure();
-
         uint32_t left =
             g_window_server.display_width;
 
@@ -6905,32 +6684,6 @@ static bool compositor_snapshot_overwrites_presented_cursor(void) {
 
     cursor_bottom =
         cursor_top + WINDOW_CURSOR_HEIGHT;
-
-    /*
-     * Drag publication does NOT publish the sparse retained-damage strips.
-     * compositor_commit_snapshot() publishes their bounding transaction.
-     *
-     * P11 tested only the sparse rectangles here. A cursor inside the moved
-     * window is usually inside the bounding transaction but outside OLD\NEW
-     * and NEW\OLD, so the GOP copy overwrote it and force=false could then
-     * return early because presented_pointer_* already matched the live
-     * pointer.
-     */
-    if (g_compositor_snapshot.dragging_identifier != 0U) {
-        window_damage_rect_t transaction;
-
-        if (!compositor_snapshot_damage_bounds(
-                &g_compositor_snapshot,
-                &transaction)) {
-            return false;
-        }
-
-        return
-            cursor_right > (int64_t)transaction.left &&
-            cursor_bottom > (int64_t)transaction.top &&
-            cursor_left < (int64_t)transaction.right &&
-            cursor_top < (int64_t)transaction.bottom;
-    }
 
     for (uint32_t index = 0U;
          index < g_compositor_snapshot.damage_count;
