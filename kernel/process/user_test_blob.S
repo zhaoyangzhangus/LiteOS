@@ -371,6 +371,9 @@ liteos_user_runtime_blob_start:
 
     /* 主线程与 VM worker 并发操作同一地址空间的另一段固定映射。 */
     movb $0xA2, STAGE_MARK_ADDRESS
+    /* A2 progress: CHILD_MARK high bytes; low byte remains the 0xA5 ABI marker. */
+    movb $0, CHILD_MARK_ADDRESS+1
+    movb $0, CHILD_MARK_ADDRESS+2
     movq THREAD_ARGS_ADDRESS+8, %rax
     movq %rax, VM_WORKER_ENTRY_ADDRESS+8
     movq VM_WORKER_ENTRY_ADDRESS, %rax
@@ -421,6 +424,7 @@ liteos_user_runtime_blob_start:
     syscall
     testq %rax, %rax
     js .Lruntime_failure
+    incb CHILD_MARK_ADDRESS+1
     decl %r15d
     jnz .Lmain_vm_loop
     movl $SYS_WAIT_ONE, %eax
@@ -1415,6 +1419,7 @@ liteos_user_runtime_vm_worker:
     syscall
     testq %rax, %rax
     js .Lvm_worker_failure
+    incb CHILD_MARK_ADDRESS+2
     decl %r15d
     jnz .Lvm_worker_loop
     movb $0xD2, VM_CONCURRENT_PASS_ADDRESS

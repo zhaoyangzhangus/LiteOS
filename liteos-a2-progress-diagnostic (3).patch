@@ -1,0 +1,22 @@
+--- a/kernel/process/user_test_blob.S
++++ b/kernel/process/user_test_blob.S
+@@ -371,2 +371,5 @@
+     /* 主线程与 VM worker 并发操作同一地址空间的另一段固定映射。 */
+     movb $0xA2, STAGE_MARK_ADDRESS
++    /* A2 progress: CHILD_MARK high bytes; low byte remains the 0xA5 ABI marker. */
++    movb $0, CHILD_MARK_ADDRESS+1
++    movb $0, CHILD_MARK_ADDRESS+2
+@@ -416,5 +419,6 @@
+     syscall
+     testq %rax, %rax
+     js .Lruntime_failure
++    incb CHILD_MARK_ADDRESS+1
+     decl %r15d
+     jnz .Lmain_vm_loop
+@@ -1401,5 +1405,6 @@
+     syscall
+     testq %rax, %rax
+     js .Lvm_worker_failure
++    incb CHILD_MARK_ADDRESS+2
+     decl %r15d
+     jnz .Lvm_worker_loop
