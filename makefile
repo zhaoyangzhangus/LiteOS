@@ -22,7 +22,7 @@ else
 DEBUG_CFLAGS = -O2
 endif
 
-COMMON_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -Werror -ffreestanding -fno-builtin \
+COMMON_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -Werror -Wno-error=unused-function -ffreestanding -fno-builtin \
                 -fno-stack-protector -fno-stack-check -fno-pic -mno-red-zone \
                 -mno-sse -mno-mmx -mno-stack-arg-probe -fshort-wchar -Iinclude -MMD -MP
 KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DLITEOS_KERNEL_BUILD \

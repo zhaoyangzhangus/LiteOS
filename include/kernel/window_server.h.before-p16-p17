@@ -78,10 +78,6 @@ typedef struct window_server_window {
     uint32_t event_read;
     uint32_t event_write;
     uint32_t event_count;
-
-    /* Protected by the window-server lock. */
-    bool event_wake_pending;
-
     wait_queue_t event_waitq;
 } window_server_window_t;
 
