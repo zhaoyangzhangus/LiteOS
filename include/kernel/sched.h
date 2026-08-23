@@ -13,6 +13,7 @@ bool sched_validate_current_cpu(void);
 bool sched_accounting_self_test(void);
 bool sched_debug_cpu(uint32_t cpu_id, uint32_t *current_state,
                      uint64_t *current_tid, uint32_t *runnable_count);
+bool sched_cpu_uses_root(uint32_t cpu_id, paddr_t root);
 /* 引导栈切换到高地址别名后，同步空闲线程所使用的 Ring0 栈顶。 */
 bool sched_set_boot_kernel_stack(vaddr_t stack_top);
 

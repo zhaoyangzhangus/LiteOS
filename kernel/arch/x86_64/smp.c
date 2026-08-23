@@ -450,13 +450,36 @@ bool x86_smp_release_aps(void) {
 void x86_smp_ipi_interrupt(void) {
     uint32_t cpu_index = x86_current_cpu_index();
     bool reschedule = false;
+    bool idle_current = false;
+
     if (cpu_index < g_discovered_count && cpu_index < MAX_CPUS) {
         atomic_fetch_add_explicit(&g_ipi_acknowledgements[cpu_index], 1U,
                                   memory_order_release);
-        reschedule = atomic_exchange_explicit(&g_reschedule_pending[cpu_index], false,
-                                              memory_order_acq_rel);
+
+        /*
+         * idle CPU 的 reschedule IPI 只负责唤醒 HLT，不在中断栈上直接完成
+         * 首次 idle -> thread context switch。
+         *
+         * AP 启动 idle 循环和 scheduler_idle_main() 都会在 HLT 返回后通过
+         * x86_smp_take_reschedule_request() + sched_try_run_ready() 消费请求。
+         * BSP 若正在 runtime self-test 驱动循环，也会持续调用 schedule()。
+         *
+         * 保留 pending 很重要：若这里先 exchange(false)，HLT 返回后的 idle
+         * 路径会看不到请求，从而把首次运行完全依赖于中断内 schedule() 的时序。
+         */
+        thread_t *current = sched_current_thread();
+        idle_current = current != 0 && current->sched_class == SCHED_CLASS_IDLE;
+
+        if (!idle_current) {
+            reschedule = atomic_exchange_explicit(&g_reschedule_pending[cpu_index], false,
+                                                  memory_order_acq_rel);
+        }
     }
+
     liteos_lapic_end_of_interrupt();
+
+    if (idle_current) return;
+
     if (reschedule) {
         /* TLB shootdown 期间不能重入调度；保留请求，由下一次时钟继续处理。 */
         if (x86_tlb_shootdown_active() || sched_preempt_disabled()) {

@@ -7,6 +7,7 @@ cd "$script_dir"
 
 make_cmd="${MAKE:-make}"
 qemu_path="${QEMU_PATH:-$(command -v qemu-system-x86_64 || true)}"
+qemu_img_path="${QEMU_IMG:-$(command -v qemu-img || true)}"
 firmware="${OVMF_CODE:-}"
 build_dir="${BUILD:-build}"
 debug=0
@@ -118,6 +119,10 @@ fi
     echo "找不到 Linux QEMU，请安装 qemu-system-x86 或使用 --qemu PATH" >&2
     exit 1
 }
+[[ -n "$qemu_img_path" && -x "$qemu_img_path" ]] || {
+    echo "找不到 qemu-img，请安装 qemu-utils 或设置 QEMU_IMG" >&2
+    exit 1
+}
 
 if [[ -z "$firmware" ]]; then
     for candidate in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/ovmf/OVMF_CODE.fd /usr/share/qemu/edk2-x86_64-code.fd; do
@@ -160,6 +165,20 @@ for stale_entry in \
 done
 
 mkdir -p "$build_dir"
+
+# Do not boot directly from QEMU's `fat:rw:<directory>` backend.  Its vvfat
+# implementation can abort the whole emulator when a guest truncates or
+# fsyncs a file (for example Ctrl+S in notepad).  Materialize a normal FAT
+# disk image from a read-only directory view, then let the guest write that
+# raw image.  The generated image is disposable and never mutates build/esp.
+qemu_fat_image="$build_dir/qemu-fat.img"
+rm -f -- "$qemu_fat_image"
+if ! "$qemu_img_path" convert -O raw "fat:ro:$build_dir/esp" \
+        "$qemu_fat_image" >/dev/null 2>"$build_dir/qemu-img.stderr"; then
+    echo "无法生成 QEMU FAT 磁盘镜像，请查看 $build_dir/qemu-img.stderr" >&2
+    exit 1
+fi
+
 qemu_args=(
     -machine q35
     # P14: deterministic QEMU Standard VGA with enough BAR0 VRAM for two
@@ -179,17 +198,16 @@ qemu_args=(
 )
 
 if ((usb_storage)); then
-    # QEMU's FAT directory backend exposes build/esp as a removable FAT
-    # volume.  This is deliberately the only boot disk in USB mode, so both
-    # OVMF and LiteOS exercise the same U盘 filesystem and write path.
+    # The generated image is deliberately the only boot disk in USB mode, so
+    # both OVMF and LiteOS exercise the same U盘 filesystem and write path.
     qemu_args+=(
-        -drive "if=none,id=liteos-usb-stick,format=raw,file=fat:rw:$build_dir/esp"
+        -drive "if=none,id=liteos-usb-stick,format=raw,file=$qemu_fat_image"
         -device "qemu-xhci,id=liteos-xhci,msix=on"
         -device "usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
     )
 else
     qemu_args+=(
-        -drive "if=none,id=liteos-nvme0,format=raw,file=fat:rw:$build_dir/esp"
+        -drive "if=none,id=liteos-nvme0,format=raw,file=$qemu_fat_image"
         -device "nvme,drive=liteos-nvme0,serial=liteos-system,bootindex=1"
     )
 fi
@@ -221,6 +239,10 @@ fi
 if ((headless)); then
     qemu_args+=( -display none )
 else
+    # Capture keyboard input while the pointer is over the QEMU window.  GTK
+    # does not provide the macOS-only `full-grab` option; `grab-on-hover` is
+    # the supported Linux mechanism and avoids sending guest keys to the
+    # launcher terminal when the VM window is active.
     qemu_args+=( -display gtk,zoom-to-fit=off,grab-on-hover=on )
 
     if ((usb_nested)); then
@@ -279,6 +301,28 @@ fi
 
 stdout_log="$build_dir/qemu-stdout.log"
 stderr_log="$build_dir/qemu-stderr.log"
+
+# Ctrl+S is VSTOP (XOFF) in a host terminal.  If the QEMU GTK window has not
+# taken focus yet, the terminal consumes that byte instead of the emulated
+# USB keyboard.  Disable software flow control for this launcher and restore
+# the exact terminal mode on every exit path.  This only applies to an
+# interactive graphical launch; headless/debug invocations have no terminal
+# keyboard to capture.
+tty_state=""
+restore_tty() {
+    if [[ -n "$tty_state" ]]; then
+        stty "$tty_state" 2>/dev/null || true
+        tty_state=""
+    fi
+}
+if ((headless == 0)) && [[ -t 0 ]]; then
+    tty_state="$(stty -g 2>/dev/null || true)"
+    if [[ -n "$tty_state" ]]; then
+        stty -ixon -ixoff 2>/dev/null || true
+        trap restore_tty EXIT INT TERM
+    fi
+fi
+
 if ((debug)); then
     pid_file="$build_dir/qemu-debug.pid"
     if [[ -f "$pid_file" ]]; then
@@ -309,6 +353,7 @@ if ((debug)); then
     cleanup_debug() {
         if kill -0 "$qemu_pid" 2>/dev/null; then kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true; fi
         rm -f "$pid_file"
+        restore_tty
     }
     trap cleanup_debug EXIT INT TERM
     ready=0

@@ -169,6 +169,7 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
 
     uint32_t current_cpu = x86_current_cpu_index();
     uint64_t interrupt_flags = tlb_enable_ipi_delivery(current_cpu);
+    bool targets[MAX_CPUS] = {false};
 
     uint64_t generation = atomic_load_explicit(&g_tlb_generation,
                                                memory_order_relaxed) + 1U;
@@ -181,8 +182,21 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
 
     const x86_acpi_platform_t *platform = x86_acpi_platform();
     if (platform != 0) {
+        bool user_address = (uint64_t)virtual_address <= X86_64_USER_TOP;
+
+        /*
+         * 用户地址只需要失效此刻正在执行同一 root 的 CPU。
+         * 已切出的 CPU 下次 MOV CR3 进入该 PCID 时会自行刷新；内核地址仍
+         * 广播全部 online CPU，因为内核半区共享且可能使用 GLOBAL PTE。
+         *
+         * 发送和等待共用同一个 targets 快照，避免两个循环之间发生调度后
+         * 等待一个从未发送本 generation 的 CPU。
+         */
         for (uint32_t cpu_index = 0; cpu_index < platform->cpu_count; ++cpu_index) {
-            if (cpu_index == current_cpu || !x86_smp_cpu_online(cpu_index)) continue;
+            if (cpu_index == current_cpu || cpu_index >= MAX_CPUS ||
+                !x86_smp_cpu_online(cpu_index)) continue;
+            if (user_address && !sched_cpu_uses_root(cpu_index, root)) continue;
+            targets[cpu_index] = true;
             if (!send_tlb_ipi_with_retry(platform->cpus[cpu_index].apic_id)) {
                 tlb_finish_shootdown(current_cpu, interrupt_flags);
                 return false;
@@ -193,7 +207,7 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
         uint64_t ticks = x86_timeout_ns_to_tsc(1000000000ULL);
         uint64_t deadline = ticks > UINT64_MAX - start ? UINT64_MAX : start + ticks;
         for (uint32_t cpu_index = 0; cpu_index < platform->cpu_count; ++cpu_index) {
-            if (cpu_index == current_cpu || !x86_smp_cpu_online(cpu_index)) continue;
+            if (cpu_index >= MAX_CPUS || !targets[cpu_index]) continue;
             while (atomic_load_explicit(&g_tlb_acknowledgement[cpu_index],
                                         memory_order_acquire) != generation) {
                 if ((int64_t)(x86_read_tsc() - deadline) >= 0) {

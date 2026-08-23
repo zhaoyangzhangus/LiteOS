@@ -902,3 +902,27 @@ bool sched_debug_cpu(uint32_t cpu_id, uint32_t *current_state,
     scheduler_unlock(&cpu->queue.lock, queue_flags);
     return true;
 }
+
+/*
+ * 用户地址 TLB shootdown 的目标筛选。
+ *
+ * queue.current 在 schedule() 中先于 CR3 切换发布。切入目标地址空间时最多
+ * 多发一次 IPI；切出时 CPU 已只执行内核切换代码，不再访问旧用户映射。
+ * x86_switch_context_root() 的 MOV CR3 当前没有设置 PCID no-flush(bit 63)，
+ * 因此已经切出的 CPU 下次重新进入该 PCID 时会刷新旧 translation。
+ */
+bool sched_cpu_uses_root(uint32_t cpu_id, paddr_t root) {
+    if (root.value == 0 || cpu_id >= g_cpu_count ||
+        g_cpus[cpu_id].queue.idle == 0) return false;
+
+    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
+    thread_t *current = cpu->queue.current;
+    paddr_t current_root = g_kernel_root;
+    if (current != 0 && current->process != 0 && current->process->vm != 0) {
+        current_root = current->process->vm->root_table;
+    }
+    bool uses_root = current_root.value == root.value;
+    scheduler_unlock(&cpu->queue.lock, queue_flags);
+    return uses_root;
+}
