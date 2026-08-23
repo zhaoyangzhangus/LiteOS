@@ -6,7 +6,6 @@
 #include <kernel/elf_loader.h>
 #include <kernel/vfs.h>
 #include <kernel/display.h>
-#include <kernel/qemu_stdvga.h>
 #include <kernel/input.h>
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
@@ -327,9 +326,6 @@ typedef struct compositor_snapshot {
 } compositor_snapshot_t;
 
 static compositor_snapshot_t g_compositor_snapshot;
-
-/* True only for the scene frame switched through hidden StdVGA VRAM. */
-static bool g_compositor_scanout_flipped;
 
 /*
  * The scene is still composed by one owner, but the expensive final copy from
@@ -832,20 +828,6 @@ bool window_server_kernel_ready(void) {
     g_window_server.display_format = format;
     g_window_server.framebuffer =
         (volatile uint32_t *)(uintptr_t)display_core_framebuffer_virtual();
-
-    /*
-     * P14 can expose QEMU StdVGA BAR0 as two complete WC scanout pages.
-     * Point cursor-only updates at the page that is actually being scanned.
-     */
-    if (qemu_stdvga_flip_available()) {
-        volatile uint32_t *front =
-            qemu_stdvga_front_buffer();
-
-        if (front != 0) {
-            g_window_server.framebuffer = front;
-        }
-    }
-
     if (g_window_server.framebuffer == 0 || width == 0U || height == 0U ||
         stride < width) return false;
     /* 先在内核后备帧缓冲中完成整帧合成，再一次性提交到 GOP framebuffer。
@@ -6371,86 +6353,6 @@ static void compositor_publish_drag_old_exposure(void) {
 }
 
 
-/*
- * P14 QEMU StdVGA hidden-frame publication.
- *
- * The destination is not currently scanned out, so a complete retained scene
- * can be copied there without exposing intermediate rows. The first P14
- * version intentionally refreshes the full hidden frame: a page that was
- * previously visible can contain a software-cursor overlay, and full refresh
- * gives a simple correctness baseline before later incremental page tracking.
- */
-static bool compositor_commit_qemu_stdvga(void) {
-    volatile uint32_t *back;
-    volatile uint32_t *front;
-    const uint32_t *scene;
-    window_damage_rect_t full;
-
-    if (!qemu_stdvga_flip_available() ||
-        g_window_server.composite_framebuffer == 0 ||
-        g_window_server.composite_framebuffer ==
-            g_window_server.framebuffer ||
-        g_window_server.display_width == 0U ||
-        g_window_server.display_height == 0U ||
-        g_window_server.display_stride <
-            g_window_server.display_width) {
-        return false;
-    }
-
-    back = qemu_stdvga_back_buffer();
-    if (back == 0) return false;
-
-    scene =
-        (const uint32_t *)(uintptr_t)
-            g_window_server.composite_framebuffer;
-
-    full.left = 0U;
-    full.top = 0U;
-    full.right = g_window_server.display_width;
-    full.bottom = g_window_server.display_height;
-
-    /*
-     * Reuse the existing persistent scanline helpers when they are available.
-     * They already partition rows contiguously and publish through display
-     * core's MOVDIR64B/MOVNTI WC primitive.
-     */
-    if (!compositor_copy_rect_parallel_buffers(
-            back,
-            scene,
-            g_window_server.display_stride,
-            g_window_server.display_stride,
-            &full)) {
-
-        for (uint32_t row = 0U;
-             row < g_window_server.display_height;
-             ++row) {
-
-            compositor_copy_wc_scanline(
-                back +
-                    (uint64_t)row *
-                    g_window_server.display_stride,
-                scene +
-                    (uint64_t)row *
-                    g_window_server.display_stride,
-                g_window_server.display_width);
-        }
-    }
-
-    __asm__ volatile ("sfence" : : : "memory");
-
-    if (!qemu_stdvga_flip()) {
-        return false;
-    }
-
-    front = qemu_stdvga_front_buffer();
-    if (front == 0) return false;
-
-    /* Cursor-only HID updates must follow the newly visible page. */
-    g_window_server.framebuffer = front;
-    return true;
-}
-
-
 static void compositor_commit_snapshot(void) {
     bool commit_as_move_transaction;
     bool allow_yield;
@@ -6460,16 +6362,6 @@ static void compositor_commit_snapshot(void) {
         g_window_server.composite_framebuffer ==
             g_window_server.framebuffer ||
         g_compositor_snapshot.damage_count == 0U) {
-        return;
-    }
-
-    /*
-     * Native hidden-VRAM publication replaces the GOP visible copy entirely.
-     * The final Y_OFFSET write is the only operation that exposes this frame.
-     */
-    if (qemu_stdvga_flip_available() &&
-        compositor_commit_qemu_stdvga()) {
-        g_compositor_scanout_flipped = true;
         return;
     }
 
@@ -7107,7 +6999,6 @@ static void compositor_render_snapshot(void) {
 
         sched_preempt_enable();
     } else {
-        g_compositor_scanout_flipped = false;
         compositor_commit_snapshot();
 
         /*
@@ -7117,7 +7008,6 @@ static void compositor_render_snapshot(void) {
          * currently visible cursor rectangle.
          */
         compositor_present_cursor_direct(
-            g_compositor_scanout_flipped ||
             compositor_snapshot_overwrites_presented_cursor());
     }
 }

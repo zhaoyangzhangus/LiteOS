@@ -162,10 +162,6 @@ done
 mkdir -p "$build_dir"
 qemu_args=(
     -machine q35
-    # P14: deterministic QEMU Standard VGA with enough BAR0 VRAM for two
-    # 2560x1440x32bpp scanout pages.
-    -vga none
-    -device "VGA,vgamem_mb=64"
     -m 4096M
     -cpu qemu64
     -smp "$cpu_count"

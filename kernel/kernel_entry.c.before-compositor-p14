@@ -34,7 +34,6 @@
 #include <kernel/dma.h>
 #include <kernel/gpu.h>
 #include <kernel/display.h>
-#include <kernel/qemu_stdvga.h>
 #include <kernel/iommu.h>
 #include <kernel/device.h>
 #include <kernel/io.h>
@@ -2658,24 +2657,6 @@ static void __attribute__((noreturn)) kernel_main(void *context) {
         halt_forever();
     }
     serial_write("LITEOS_DISPLAY_CORE_OK\r\n");
-
-    /*
-     * Optional QEMU Standard VGA page-flip backend. Physical machines simply
-     * miss PCI 1234:1111 and keep the existing GOP path.
-     */
-    if (qemu_stdvga_flip_init(
-            info->FrameBufferBase,
-            framebuffer_virtual,
-            info->FrameBufferSize)) {
-
-        serial_write("LITEOS_QEMU_STDVGA_FLIP_OK\r\n");
-
-    } else if (qemu_stdvga_hardware_present()) {
-        serial_write("LITEOS_QEMU_STDVGA_FLIP_DISABLED ERR=");
-        serial_write_u32(qemu_stdvga_last_error());
-        serial_write("\r\n");
-    }
-
     if (!liteos_drop_identity_mapping()) {
         serial_write("LITEOS_IDENTITY_REMOVE_FAIL\r\n");
         halt_forever();
