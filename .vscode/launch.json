@@ -18,7 +18,7 @@
             "program": "${workspaceFolder}/build/esp/EFI/LITEOS/kernel.elf",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
-            "miDebuggerPath": "/usr/bin/gdb",
+            "miDebuggerPath": "gdb",
             "miDebuggerServerAddress": "127.0.0.1:1234",
             "preLaunchTask": "LiteOS: start WSL QEMU debug",
             "postDebugTask": "LiteOS: stop WSL QEMU debug",

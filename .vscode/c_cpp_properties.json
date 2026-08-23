@@ -2,7 +2,7 @@
     "configurations": [
         {
             "name": "LiteOS (WSL)",
-            "compilerPath": "/usr/bin/gcc",
+            "compilerPath": "gcc",
             "intelliSenseMode": "linux-gcc-x64",
             "cStandard": "c11",
             "cppStandard": "c++11",
