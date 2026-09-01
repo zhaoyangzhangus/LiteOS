@@ -1,14 +1,15 @@
 {
     "configurations": [
         {
-            "name": "LiteOS (WSL)",
+            "name": "LiteOS (Windows native)",
             "compilerPath": "gcc",
             "intelliSenseMode": "linux-gcc-x64",
             "cStandard": "c11",
             "cppStandard": "c++11",
             "includePath": [
                 "${workspaceFolder}/include",
-                "${workspaceFolder}/kernel",
+                "${workspaceFolder}/user/services/audiod",
+                "${workspaceFolder}/user/libc/include",
                 "${workspaceFolder}/build/generated"
             ],
             "defines": [

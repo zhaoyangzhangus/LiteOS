@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import os
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-BUILD = ROOT / "build"
+ROOT = Path(__file__).resolve().parents[2]
+BUILD = Path(os.environ.get("BUILD", str(ROOT / "build")))
+if not BUILD.is_absolute():
+    BUILD = ROOT / BUILD
+MOUSE_EVENT_DELAY = float(os.environ.get("XHCI_TEST_MOUSE_DELAY", "0.006"))
+MOUSE_READY_TIMEOUT = float(
+    os.environ.get("XHCI_TEST_MOUSE_READY_TIMEOUT", "5.0")
+)
+BOOT_READY_TIMEOUT = float(
+    os.environ.get("XHCI_TEST_BOOT_READY_TIMEOUT", "60.0")
+)
+QEMU_SECONDS = os.environ.get("XHCI_TEST_QEMU_SECONDS", "90")
+POLL_INTERVAL = float(os.environ.get("XHCI_TEST_POLL_INTERVAL", "0.25"))
 
 
 def serial_text(path):
     try:
         return path.read_text(errors="replace")
-    except FileNotFoundError:
+    except OSError:
         return ""
 
 
 def wait_until(predicate, timeout, label):
+    if POLL_INTERVAL <= 0.0:
+        raise RuntimeError("XHCI_TEST_POLL_INTERVAL must be positive")
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         if predicate():
             print("PASS:", label)
             return True
-        time.sleep(0.05)
+        time.sleep(POLL_INTERVAL)
     print("TIMEOUT:", label)
     return False
 
@@ -87,17 +102,26 @@ def choose_usb_mouse(hmp):
 
 def send_mouse_events(hmp, count=8):
     direction = 1
+    if MOUSE_EVENT_DELAY < 0.0:
+        raise RuntimeError("XHCI_TEST_MOUSE_DELAY must not be negative")
+
     for i in range(count):
         dx = 3 * direction
         dy = 1 if (i & 1) else -1
         hmp.cmd(f"mouse_move {dx} {dy}", 1.0)
         direction = -direction
-        time.sleep(0.006)
+        time.sleep(MOUSE_EVENT_DELAY)
 
 
 def run_case(name, settle_seconds):
     serial = BUILD / f"qemu-serial-{name}.log"
-    monitor = BUILD / f"qemu-monitor-{name}.sock"
+    monitor = Path(
+        os.environ.get(
+            "QEMU_MONITOR_SOCKET",
+            str(Path(tempfile.gettempdir()) /
+                f"liteos-xhci-hub-race-{name}.sock"),
+        )
+    )
     out_path = BUILD / f"hub-race-{name}.stdout"
     err_path = BUILD / f"hub-race-{name}.stderr"
 
@@ -124,9 +148,10 @@ def run_case(name, settle_seconds):
         runner = subprocess.Popen(
             [
                 str(ROOT / "run-qemu.sh"),
+                "--headless",
                 "--usb-nested",
                 "--monitor-socket", str(monitor),
-                "--seconds", "45",
+                "--seconds", QEMU_SECONDS,
                 "--no-build",
             ],
             cwd=ROOT,
@@ -137,6 +162,37 @@ def run_case(name, settle_seconds):
         if not wait_until(lambda: monitor.exists(), 12.0, "HMP online"):
             return False
 
+        if not wait_until(
+            lambda: "LITEOS_XHCI_HUB_RUNTIME_OK" in serial_text(canonical_serial),
+            BOOT_READY_TIMEOUT,
+            "Hub runtime ready",
+        ):
+            return False
+
+        if not wait_until(
+            lambda: "LITEOS_USB_DEVICE_COUNT=3" in serial_text(canonical_serial),
+            BOOT_READY_TIMEOUT,
+            "nested topology ready",
+        ):
+            return False
+
+        # The Hub becomes runtime-ready before the post-display user-runtime
+        # self-test finishes.  Keep this topology race focused on xHCI
+        # removal, instead of letting HID traffic perturb the unrelated
+        # process/VM teardown deadline.
+        if not wait_until(
+            lambda: "LITEOS_USER_RUNTIME_SUBTESTS_OK" in
+                    serial_text(canonical_serial),
+            BOOT_READY_TIMEOUT,
+            "boot runtime self-tests ready",
+        ):
+            return False
+        if "LITEOS_STAGE_FAIL" in serial_text(canonical_serial):
+            return False
+
+        # Delay the HMP client until the boot-critical runtime self-test is
+        # complete; an attached monitor adds enough TCG work to perturb its
+        # short scheduling window.
         end = time.monotonic() + 5.0
         while hmp is None:
             try:
@@ -146,20 +202,6 @@ def run_case(name, settle_seconds):
                     raise
                 time.sleep(0.05)
 
-        if not wait_until(
-            lambda: "LITEOS_XHCI_HUB_RUNTIME_OK" in serial_text(canonical_serial),
-            25.0,
-            "Hub runtime ready",
-        ):
-            return False
-
-        if not wait_until(
-            lambda: "LITEOS_USB_DEVICE_COUNT=3" in serial_text(canonical_serial),
-            20.0,
-            "nested topology ready",
-        ):
-            return False
-
         choose_usb_mouse(hmp)
         send_mouse_events(hmp, 8)
 
@@ -167,7 +209,7 @@ def run_case(name, settle_seconds):
         # the eight HMP commands themselves have completed before we continue.
         wait_until(
             lambda: "LITEOS_USB_MOUSE_EVENT_OK" in serial_text(canonical_serial),
-            5.0,
+            MOUSE_READY_TIMEOUT,
             "mouse path alive",
         )
 
@@ -198,6 +240,7 @@ def run_case(name, settle_seconds):
 
         after = serial_text(canonical_serial)
         got_transfer = after.count("LITEOS_DIAG_HUB_TRANSFER_EVENT") > base_transfer
+        stage_failed = "LITEOS_STAGE_FAIL" in after
 
         print()
         print("NEW DIAGNOSTICS:")
@@ -213,14 +256,15 @@ def run_case(name, settle_seconds):
         print("RESULT",
               name,
               "transfer=", "YES" if got_transfer else "NO",
-              "hub_change=", "YES" if removed else "NO")
+              "hub_change=", "YES" if removed else "NO",
+              "stage_fail=", "YES" if stage_failed else "NO")
 
         try:
             serial.write_text(after, encoding="utf-8")
         except Exception:
             pass
 
-        return removed
+        return removed and not stage_failed
 
     finally:
         if hmp is not None:

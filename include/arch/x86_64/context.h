@@ -29,13 +29,18 @@ typedef struct arch_thread_state {
     void *xsave_area;
     uint32_t xsave_size;
     uint32_t flags;
+    uint32_t syscall_active;
+    uint32_t syscall_reserved;
 } arch_thread_state_t;
 
-/* 旧版测试调度器的上下文接口，迁移完成后由 arch_switch_context 替代。 */
-typedef struct LITEOS_CPU_CONTEXT LITEOS_CPU_CONTEXT;
-VOID liteos_arch_context_switch(LITEOS_CPU_CONTEXT *from,
-                                const LITEOS_CPU_CONTEXT *to);
+bool x86_fp_state_create(arch_thread_state_t *state);
+void x86_fp_state_destroy(arch_thread_state_t *state);
+void x86_fp_state_reset_current(arch_thread_state_t *state);
+void x86_fp_state_clone_current(arch_thread_state_t *source,
+                                arch_thread_state_t *destination);
+void x86_fp_switch(arch_thread_state_t *from, arch_thread_state_t *to);
 
+/* 旧版测试调度器的上下文接口，迁移完成后由 arch_switch_context 替代。 */
 /* 规范线程只保存被调用者保持寄存器；返回地址位于保存的内核栈上。 */
 void x86_switch_context(arch_switch_context_t *from,
                         const arch_switch_context_t *to);

@@ -8,6 +8,7 @@
 #define NVME_ADMIN_QUEUE_DEPTH 64U
 #define NVME_IO_QUEUE_DEPTH    64U
 #define NVME_MAX_IO_QUEUES     8U
+#define NVME_MAX_CONTROLLERS   8U
 
 typedef struct __attribute__((packed)) nvme_command {
     uint32_t opcode_flags;
@@ -96,6 +97,7 @@ bool nvme_hardware_io_self_test(void);
 /* 验证无挂起 I/O 时的控制器复位、队列重建和复位后的读盘路径。 */
 bool nvme_hardware_reset_self_test(void);
 const nvme_controller_t *nvme_active_controller(void);
+nvme_controller_t *nvme_controller_at(uint32_t index);
 bool nvme_hardware_present(void);
 kstatus_t nvme_last_error(void);
 uint32_t nvme_last_stage(void);

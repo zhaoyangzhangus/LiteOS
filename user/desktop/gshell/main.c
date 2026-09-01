@@ -1,0 +1,1551 @@
+#include <stdint.h>
+#include <stdbool.h>
+
+#include <uapi/all.h>
+
+#include "../../runtime/liteos_text.h"
+#include "../../client_chrome.h"
+
+#define SHELL_LINE_CAPACITY 256U
+#define SHELL_OUTPUT_LINES 24U
+#define SHELL_MAP_BASE     0x06000000ULL
+#define SHELL_EVENT_WAIT OS_WAIT_INFINITE
+#define SHELL_CHILD_STACK_TOP 0x00007FFFFFEF0000ULL
+#define SHELL_LAUNCH_SLOTS 16U
+#define SHELL_HISTORY_LINES 16U
+#define SHELL_MAX_ARGUMENTS 8U
+#define SHELL_PATH_CAPACITY 256U
+#define SHELL_WINDOW_BACKGROUND 0x00F7F8FAU
+#define SHELL_INPUT_BACKGROUND  0x00E9EDF1U
+#define SHELL_INPUT_BORDER      0x00D2D8DFU
+#define SHELL_OUTPUT_TEXT       0x003A4752U
+#define SHELL_INPUT_TEXT        0x00506D9FU
+#define SHELL_CURSOR             0x005B86D6U
+
+typedef struct shell_window {
+    os_handle_t handle;
+    uint32_t identifier;
+    uint32_t width;
+    uint32_t height;
+    uint32_t *pixels;
+    const char *title;
+    uint32_t color;
+} shell_window_t;
+
+typedef struct shell_launch_context {
+    char path[SHELL_PATH_CAPACITY];
+    char argument_storage[SHELL_MAX_ARGUMENTS][SHELL_LINE_CAPACITY];
+    char *arguments[SHELL_MAX_ARGUMENTS + 1U];
+    os_handle_t output_read;
+    os_handle_t output_write;
+    bool redirect_output;
+} shell_launch_context_t;
+
+static shell_window_t g_shell = {
+    OS_INVALID_HANDLE, 0U, 0U, 0U, 0, "SHELL", SHELL_WINDOW_BACKGROUND,
+};
+static char g_command[SHELL_LINE_CAPACITY];
+static size_t g_command_length;
+static size_t g_command_cursor;
+static char g_output[SHELL_OUTPUT_LINES][SHELL_LINE_CAPACITY];
+static uint32_t g_output_count;
+static shell_launch_context_t g_launch_contexts[SHELL_LAUNCH_SLOTS];
+static uint32_t g_launch_slot_count;
+static char g_history[SHELL_HISTORY_LINES][SHELL_LINE_CAPACITY];
+static uint32_t g_history_count;
+static int32_t g_history_cursor = -1;
+static char g_cwd[SHELL_PATH_CAPACITY] = "/";
+static bool g_shift;
+static bool g_ctrl;
+static os_exec_fd_map_t g_exec_fd_map;
+static uint32_t g_display_width;
+static uint32_t g_display_height;
+static uint32_t *g_target;
+static uint32_t g_target_width;
+static uint32_t g_target_height;
+static bool g_damage_full;
+static uint32_t g_damage_x;
+static uint32_t g_damage_y;
+static uint32_t g_damage_width;
+static uint32_t g_damage_height;
+static uint8_t g_file_buffer[128];
+static char g_display_line[SHELL_LINE_CAPACITY];
+
+static void shell_damage_all(void) {
+    g_damage_full = true;
+    g_damage_x = 0U;
+    g_damage_y = 0U;
+    g_damage_width = g_shell.width;
+    g_damage_height = g_shell.height;
+}
+
+static void shell_damage_rect(uint32_t x, uint32_t y,
+                              uint32_t width, uint32_t height) {
+    uint32_t right;
+    uint32_t bottom;
+    if (g_damage_full || width == 0U || height == 0U) return;
+    if (x >= g_shell.width || y >= g_shell.height) return;
+    if (width > g_shell.width - x) width = g_shell.width - x;
+    if (height > g_shell.height - y) height = g_shell.height - y;
+    right = x + width;
+    bottom = y + height;
+    if (g_damage_width == 0U || g_damage_height == 0U) {
+        g_damage_x = x;
+        g_damage_y = y;
+        g_damage_width = width;
+        g_damage_height = height;
+        return;
+    }
+    if (x < g_damage_x) g_damage_x = x;
+    if (y < g_damage_y) g_damage_y = y;
+    if (right > g_damage_x + g_damage_width) {
+        g_damage_width = right - g_damage_x;
+    }
+    if (bottom > g_damage_y + g_damage_height) {
+        g_damage_height = bottom - g_damage_y;
+    }
+}
+
+static void shell_damage_reset(void) {
+    g_damage_full = false;
+    g_damage_x = 0U;
+    g_damage_y = 0U;
+    g_damage_width = 0U;
+    g_damage_height = 0U;
+}
+
+static void shell_damage_input_line(void) {
+    uint32_t y = g_shell.height > LITEOS_TEXT_HEIGHT + 4U ?
+        g_shell.height - LITEOS_TEXT_HEIGHT - 4U : 0U;
+    shell_damage_rect(0U, y, g_shell.width,
+                      g_shell.height - y);
+}
+
+static int64_t stat_path(const char *path, os_file_info_t *info);
+static bool file_exists(const char *path);
+
+static int64_t gshell_syscall_one(uint64_t number, uint64_t arg0) {
+    register uint64_t rax __asm__("rax") = number;
+    register uint64_t rdi __asm__("rdi") = arg0;
+    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi) :
+                      : "rcx", "r11", "memory");
+    return (int64_t)rax;
+}
+
+static int64_t gshell_syscall_two(uint64_t number, uint64_t arg0,
+                                  uint64_t arg1) {
+    register uint64_t rax __asm__("rax") = number;
+    register uint64_t rdi __asm__("rdi") = arg0;
+    register uint64_t rsi __asm__("rsi") = arg1;
+    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi) :
+                      : "rcx", "r11", "memory");
+    return (int64_t)rax;
+}
+
+static int64_t gshell_syscall_three(uint64_t number, uint64_t arg0,
+                                    uint64_t arg1, uint64_t arg2) {
+    register uint64_t rax __asm__("rax") = number;
+    register uint64_t rdi __asm__("rdi") = arg0;
+    register uint64_t rsi __asm__("rsi") = arg1;
+    register uint64_t rdx __asm__("rdx") = arg2;
+    register uint64_t r10 __asm__("r10") = 0U;
+    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
+                      "+d"(rdx), "+r"(r10) : : "rcx", "r11", "memory");
+    return (int64_t)rax;
+}
+
+static int64_t gshell_syscall_four(uint64_t number, uint64_t arg0,
+                                   uint64_t arg1, uint64_t arg2,
+                                   uint64_t arg3) {
+    register uint64_t rax __asm__("rax") = number;
+    register uint64_t rdi __asm__("rdi") = arg0;
+    register uint64_t rsi __asm__("rsi") = arg1;
+    register uint64_t rdx __asm__("rdx") = arg2;
+    register uint64_t r10 __asm__("r10") = arg3;
+    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
+                      "+d"(rdx), "+r"(r10) : : "rcx", "r11", "memory");
+    return (int64_t)rax;
+}
+
+static int64_t gshell_syscall_five(uint64_t number, uint64_t arg0,
+                                   uint64_t arg1, uint64_t arg2,
+                                   uint64_t arg3, uint64_t arg4) {
+    register uint64_t rax __asm__("rax") = number;
+    register uint64_t rdi __asm__("rdi") = arg0;
+    register uint64_t rsi __asm__("rsi") = arg1;
+    register uint64_t rdx __asm__("rdx") = arg2;
+    register uint64_t r10 __asm__("r10") = arg3;
+    register uint64_t r8 __asm__("r8") = arg4;
+    __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
+                      "+d"(rdx), "+r"(r10), "+r"(r8) :
+                      : "rcx", "r11", "memory");
+    return (int64_t)rax;
+}
+
+static void gshell_exit(uint64_t status) {
+    (void)gshell_syscall_one(OS_SYS_THREAD_EXIT, status);
+    for (;;) __asm__ volatile ("pause");
+}
+
+static void copy_text(char *destination, const char *source) {
+    uint32_t index = 0U;
+    while (index + 1U < SHELL_LINE_CAPACITY && source[index] != '\0') {
+        destination[index] = source[index];
+        ++index;
+    }
+    destination[index] = '\0';
+}
+
+static uint32_t text_length(const char *text) {
+    uint32_t length = 0U;
+    if (text == 0) return 0U;
+    while (text[length] != '\0' && length + 1U < SHELL_LINE_CAPACITY) ++length;
+    return length;
+}
+
+static void append_text(char *destination, uint32_t capacity, const char *source) {
+    uint32_t length = 0U;
+    uint32_t source_index = 0U;
+    if (destination == 0 || source == 0 || capacity == 0U) return;
+    while (length + 1U < capacity && destination[length] != '\0') ++length;
+    while (length + 1U < capacity && source[source_index] != '\0') {
+        destination[length++] = source[source_index++];
+    }
+    destination[length] = '\0';
+}
+
+static void append_character(char *destination, uint32_t capacity, char character) {
+    uint32_t length = 0U;
+    if (destination == 0 || capacity < 2U) return;
+    while (length + 1U < capacity && destination[length] != '\0') ++length;
+    if (length + 1U >= capacity) return;
+    destination[length++] = character;
+    destination[length] = '\0';
+}
+
+static void append_output(const char *text) {
+    if (g_output_count < SHELL_OUTPUT_LINES) {
+        copy_text(g_output[g_output_count++], text);
+        return;
+    }
+    for (uint32_t index = 1U; index < SHELL_OUTPUT_LINES; ++index) {
+        copy_text(g_output[index - 1U], g_output[index]);
+    }
+    copy_text(g_output[SHELL_OUTPUT_LINES - 1U], text);
+}
+
+static void clear_output(void) {
+    g_output_count = 0U;
+}
+
+static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                      uint32_t color) {
+    if (g_target == 0 || x >= g_target_width || y >= g_target_height) return;
+    if (width > g_target_width - x) width = g_target_width - x;
+    if (height > g_target_height - y) height = g_target_height - y;
+    for (uint32_t row = 0U; row < height; ++row) {
+        for (uint32_t column = 0U; column < width; ++column) {
+            g_target[(uint64_t)(y + row) * g_target_width + x + column] = color;
+        }
+    }
+}
+
+static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
+    liteos_text_draw(g_target, g_target_width, g_target_width, g_target_height,
+                     (int32_t)x, (int32_t)y, text, color);
+}
+
+static void build_prompt(char *buffer) {
+    if (buffer == 0) return;
+    buffer[0] = '\0';
+    append_text(buffer, SHELL_LINE_CAPACITY, "LITEOS:");
+    append_text(buffer, SHELL_LINE_CAPACITY, g_cwd);
+    append_text(buffer, SHELL_LINE_CAPACITY, "# ");
+}
+
+static uint32_t shell_text_width(const char *text, size_t length) {
+    uint32_t measured;
+    uint64_t fallback;
+
+    if (text == 0 || length == 0U) return 0U;
+    measured = liteos_text_measure_range(text, length);
+    if (measured != 0U) return measured;
+    fallback = (uint64_t)length * LITEOS_TEXT_WIDTH;
+    return fallback > UINT32_MAX ? UINT32_MAX : (uint32_t)fallback;
+}
+
+static void draw_input_line(void) {
+    const uint32_t input_x = 10U;
+    uint32_t input_right;
+    uint32_t available_width;
+    uint32_t prompt_length;
+    uint32_t line_length;
+    uint32_t view_start = 0U;
+    uint32_t cursor_position;
+    uint32_t cursor_prefix_width;
+    uint32_t prefix_width;
+    uint32_t cursor_width;
+    uint32_t input_y;
+    uint32_t input_height;
+    uint32_t low;
+    uint32_t high;
+    uint32_t middle;
+
+    build_prompt(g_display_line);
+    prompt_length = text_length(g_display_line);
+    append_text(g_display_line, SHELL_LINE_CAPACITY, g_command);
+    line_length = text_length(g_display_line);
+    cursor_position = prompt_length + (uint32_t)g_command_cursor;
+    if (cursor_position > line_length) cursor_position = line_length;
+    input_right = g_target_width > input_x ? g_target_width - input_x : 0U;
+    available_width = input_right > input_x ? input_right - input_x : 0U;
+    if (available_width <= 2U) return;
+    cursor_prefix_width = shell_text_width(g_display_line, cursor_position);
+    if (cursor_prefix_width > available_width - 2U) {
+        /* Prefix widths are monotonic for the left-to-right shell input.
+         * Binary search avoids measuring every character on each key event. */
+        low = 0U;
+        high = cursor_position;
+        while (low < high) {
+            middle = low + (high - low) / 2U;
+            prefix_width = shell_text_width(g_display_line, middle);
+            if (cursor_prefix_width > prefix_width &&
+                cursor_prefix_width - prefix_width > available_width - 2U) {
+                low = middle + 1U;
+            } else {
+                high = middle;
+            }
+        }
+        view_start = low;
+    }
+    cursor_width = shell_text_width(g_display_line + view_start,
+                                    cursor_position - view_start);
+    input_y = g_target_height > LITEOS_TEXT_HEIGHT + 4U ?
+        g_target_height - LITEOS_TEXT_HEIGHT - 4U : 0U;
+    input_height = LITEOS_TEXT_HEIGHT + 8U;
+    if (input_y >= 4U) {
+        fill_rect(6U, input_y - 4U,
+                  g_target_width > 12U ? g_target_width - 12U : g_target_width,
+                  input_height, SHELL_INPUT_BACKGROUND);
+        fill_rect(6U, input_y - 4U,
+                  g_target_width > 12U ? g_target_width - 12U : g_target_width,
+                  1U, SHELL_INPUT_BORDER);
+    }
+    liteos_text_draw_clipped(g_target, g_target_width, g_target_width,
+                             g_target_height, (int32_t)input_x,
+                             (int32_t)input_y, input_right,
+                             g_display_line + view_start, SHELL_INPUT_TEXT);
+    if (cursor_width < available_width) {
+        fill_rect(input_x + cursor_width, input_y, 2U, LITEOS_TEXT_HEIGHT,
+                  SHELL_CURSOR);
+    }
+}
+
+static void draw_terminal(void) {
+    uint32_t input_height = LITEOS_TEXT_HEIGHT + 8U;
+    uint32_t visible =
+        g_target_height > USER_CLIENT_CHROME_HEIGHT + input_height ?
+        (g_target_height - USER_CLIENT_CHROME_HEIGHT - input_height) /
+        LITEOS_TEXT_HEIGHT : 0U;
+    uint32_t first = g_output_count > visible ? g_output_count - visible : 0U;
+    uint32_t y = USER_CLIENT_CHROME_HEIGHT;
+
+    fill_rect(0U, 0U, g_target_width, g_target_height, g_shell.color);
+    fill_rect(0U, 0U, g_target_width, USER_CLIENT_CHROME_HEIGHT,
+              USER_CLIENT_CHROME_BACKGROUND);
+    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
+              USER_CLIENT_CHROME_SEPARATOR);
+    user_client_chrome_app_icon(g_target, g_target_width,
+                                g_target_width, g_target_height,
+                                16U, USER_CLIENT_CHROME_TITLE_Y,
+                                USER_CLIENT_CHROME_ICON_TERMINAL);
+    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "SHELL",
+              USER_CLIENT_CHROME_TEXT);
+    for (uint32_t index = first;
+         index < g_output_count &&
+         y + LITEOS_TEXT_HEIGHT + input_height <= g_target_height;
+         ++index, y += LITEOS_TEXT_HEIGHT) {
+        draw_text(10U, y, g_output[index], SHELL_OUTPUT_TEXT);
+    }
+    if (g_target_height >= LITEOS_TEXT_HEIGHT + 4U) draw_input_line();
+    user_client_chrome_close(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             USER_CLIENT_CHROME_HEIGHT,
+                             USER_CLIENT_CHROME_CLOSE_BG,
+                             USER_CLIENT_CHROME_CLOSE_FG);
+    user_client_chrome_frame(g_target, g_target_width,
+                             g_target_width, g_target_height,
+                             USER_CLIENT_CHROME_HEIGHT);
+}
+
+static void update_window(void) {
+    os_window_update_t request = {0};
+    if (g_shell.identifier == 0U) return;
+    if (!g_damage_full && (g_damage_width == 0U || g_damage_height == 0U)) {
+        return;
+    }
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.identifier = g_shell.identifier;
+    if (g_damage_full) {
+        request.width = g_shell.width;
+        request.height = g_shell.height;
+    } else {
+        request.x = (int32_t)g_damage_x;
+        request.y = (int32_t)g_damage_y;
+        request.width = g_damage_width;
+        request.height = g_damage_height;
+    }
+    (void)gshell_syscall_one(OS_SYS_WINDOW_UPDATE, (uint64_t)&request);
+    shell_damage_reset();
+}
+
+static void render_window(void) {
+    g_target = g_shell.pixels;
+    g_target_width = g_shell.width;
+    g_target_height = g_shell.height;
+    if (g_target == 0) return;
+    if (!g_damage_full && (g_damage_width == 0U || g_damage_height == 0U)) {
+        shell_damage_all();
+    }
+    draw_terminal();
+    update_window();
+}
+
+static bool create_window(int32_t x, int32_t y, uint32_t width,
+                          uint32_t height) {
+    os_window_create_t request = {0};
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.x = x;
+    request.y = y;
+    request.width = width;
+    request.height = height;
+    request.flags = OS_WINDOW_VISIBLE |
+                    OS_WINDOW_RESIZABLE |
+                    OS_WINDOW_CLIENT_DECORATIONS;
+    request.background = g_shell.color;
+    for (uint32_t i = 0U; i < 31U && g_shell.title[i] != '\0'; ++i) {
+        request.title[i] = g_shell.title[i];
+    }
+    request.address = SHELL_MAP_BASE;
+    if (gshell_syscall_one(OS_SYS_WINDOW_CREATE, (uint64_t)&request) != 0 ||
+        request.window == OS_INVALID_HANDLE || request.address == 0U) return false;
+    g_shell.handle = request.window;
+    g_shell.identifier = request.identifier;
+    g_shell.width = width;
+    g_shell.height = height;
+    g_shell.pixels = (uint32_t *)(uintptr_t)request.address;
+    return true;
+}
+
+static bool setup_windows(void) {
+    os_display_info_t info = {0};
+    uint32_t shell_width;
+    uint32_t shell_height;
+    info.hdr.size = sizeof(info);
+    info.hdr.version = OS_SYSCALL_ABI_VERSION;
+    if (gshell_syscall_one(OS_SYS_DISPLAY_GET_INFO, (uint64_t)&info) < 0 ||
+        info.width < 320U || info.height < 240U) return false;
+    g_display_width = info.width;
+    g_display_height = info.height;
+    /* Keep the shell as a normal centered app window.  The compositor does
+     * not add a titlebar; all visible chrome belongs to this surface. */
+    shell_width = info.width * 3U / 4U;
+    shell_height = info.height * 3U / 4U;
+    if (shell_width < 640U && info.width > 640U) shell_width = 640U;
+    if (shell_height < 420U && info.height > 420U) shell_height = 420U;
+    if (!create_window((int32_t)((info.width - shell_width) / 2U),
+                       (int32_t)((info.height - shell_height) / 2U),
+                       shell_width, shell_height)) return false;
+    return true;
+}
+
+static char key_to_ascii(uint32_t code, bool shift) {
+    static const char letters[] = "abcdefghijklmnopqrstuvwxyz";
+    static const char shifted_letters[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    if (code >= (uint32_t)'A' && code <= (uint32_t)'Z') {
+        return shift ? (char)code : (char)(code - (uint32_t)'A' + (uint32_t)'a');
+    }
+    if (code >= (uint32_t)'a' && code <= (uint32_t)'z') {
+        return shift ? (char)(code - (uint32_t)'a' + (uint32_t)'A') : (char)code;
+    }
+    if (code >= 0x04U && code <= 0x1DU) {
+        return shift ? shifted_letters[code - 0x04U] : letters[code - 0x04U];
+    }
+    if (code >= 0x1EU && code <= 0x26U) {
+        static const char numbers[] = "123456789";
+        static const char shifted[] = "!@#$%^&*(";
+        return shift ? shifted[code - 0x1EU] : numbers[code - 0x1EU];
+    }
+    if (code == 0x27U) return shift ? ')' : '0';
+    if (code == 0x2CU) return ' ';
+    if (code == 0x2DU) return shift ? '_' : '-';
+    if (code == 0x2EU) return shift ? '+' : '=';
+    if (code == 0x2FU) return shift ? '{' : '[';
+    if (code == 0x30U) return shift ? '}' : ']';
+    if (code == 0x31U) return shift ? '|' : '\\';
+    if (code == 0x33U) return shift ? ':' : ';';
+    if (code == 0x34U) return shift ? '"' : '\'';
+    if (code == 0x35U) return shift ? '~' : '`';
+    if (code == 0x36U) return shift ? '<' : ',';
+    if (code == 0x37U) return shift ? '>' : '.';
+    if (code == 0x38U) return shift ? '?' : '/';
+    return '\0';
+}
+
+static char lower_ascii(char character) {
+    return character >= 'A' && character <= 'Z' ?
+           (char)(character - 'A' + 'a') : character;
+}
+
+static bool text_equals_ignore_case(const char *left, const char *right) {
+    uint32_t index = 0U;
+    while (left[index] != '\0' || right[index] != '\0') {
+        if (lower_ascii(left[index]) != lower_ascii(right[index])) return false;
+        ++index;
+    }
+    return true;
+}
+
+static bool is_shell_space(char character) {
+    return character == ' ' || character == '\t';
+}
+
+/* Tokenize in place.  Quoting is useful for builtins now and keeps the
+ * command line compatible with a future argv-aware process_exec ABI. */
+static bool shell_tokenize(char *line, char **arguments, uint32_t *count,
+                           bool *background) {
+    uint32_t read_index = 0U;
+    uint32_t write_index = 0U;
+    uint32_t argument_start = 0U;
+    uint32_t argument_count = 0U;
+    bool in_single_quote = false;
+    bool in_double_quote = false;
+    bool escaped = false;
+    bool in_argument = false;
+
+    if (line == 0 || arguments == 0 || count == 0 || background == 0) return false;
+    *count = 0U;
+    *background = false;
+    while (line[read_index] != '\0') {
+        char character = line[read_index++];
+        if (escaped) {
+            line[write_index++] = character;
+            escaped = false;
+            in_argument = true;
+            continue;
+        }
+        if (character == '\\' && !in_single_quote) {
+            escaped = true;
+            in_argument = true;
+            continue;
+        }
+        if (character == '\'' && !in_double_quote) {
+            in_single_quote = !in_single_quote;
+            in_argument = true;
+            continue;
+        }
+        if (character == '"' && !in_single_quote) {
+            in_double_quote = !in_double_quote;
+            in_argument = true;
+            continue;
+        }
+        if (in_single_quote || in_double_quote) {
+            line[write_index++] = character;
+            continue;
+        }
+        if (character == '&') {
+            if (in_argument) {
+                if (argument_count >= SHELL_MAX_ARGUMENTS) return false;
+                line[write_index++] = '\0';
+                arguments[argument_count++] = line + argument_start;
+                in_argument = false;
+            }
+            *background = true;
+            while (is_shell_space(line[read_index])) ++read_index;
+            if (line[read_index] != '\0') return false;
+            continue;
+        }
+        if (is_shell_space(character)) {
+            if (in_argument) {
+                if (argument_count >= SHELL_MAX_ARGUMENTS) return false;
+                line[write_index++] = '\0';
+                arguments[argument_count++] = line + argument_start;
+                in_argument = false;
+            }
+            continue;
+        }
+        if (!in_argument) {
+            argument_start = write_index;
+            in_argument = true;
+        }
+        line[write_index++] = character;
+    }
+    if (escaped || in_single_quote || in_double_quote) return false;
+    if (in_argument) {
+        if (argument_count >= SHELL_MAX_ARGUMENTS) return false;
+        line[write_index++] = '\0';
+        arguments[argument_count++] = line + argument_start;
+    }
+    line[write_index] = '\0';
+    *count = argument_count;
+    return true;
+}
+
+static void remove_last_path_component(char *path) {
+    uint32_t length = 0U;
+    if (path == 0) return;
+    while (path[length] != '\0') ++length;
+    if (length <= 1U) {
+        path[0] = '/';
+        path[1] = '\0';
+        return;
+    }
+    while (length > 1U && path[length - 1U] != '/') --length;
+    path[length > 1U ? length - 1U : 1U] = '\0';
+}
+
+static bool resolve_path(const char *input, char *path) {
+    char combined[SHELL_PATH_CAPACITY];
+    uint32_t read_index = 0U;
+    uint32_t write_index = 0U;
+
+    if (input == 0 || input[0] == '\0' || path == 0) return false;
+    combined[0] = '\0';
+    if (input[0] == '/') {
+        append_text(combined, SHELL_PATH_CAPACITY, input);
+    } else {
+        append_text(combined, SHELL_PATH_CAPACITY, g_cwd);
+        if (combined[text_length(combined) - 1U] != '/') {
+            append_character(combined, SHELL_PATH_CAPACITY, '/');
+        }
+        append_text(combined, SHELL_PATH_CAPACITY, input);
+    }
+    path[0] = '/';
+    path[1] = '\0';
+    write_index = 1U;
+    while (combined[read_index] != '\0') {
+        uint32_t segment_start;
+        uint32_t segment_length;
+        while (combined[read_index] == '/') ++read_index;
+        if (combined[read_index] == '\0') break;
+        segment_start = read_index;
+        while (combined[read_index] != '\0' && combined[read_index] != '/') ++read_index;
+        segment_length = read_index - segment_start;
+        if (segment_length == 1U && combined[segment_start] == '.') continue;
+        if (segment_length == 2U && combined[segment_start] == '.' &&
+            combined[segment_start + 1U] == '.') {
+            remove_last_path_component(path);
+            write_index = text_length(path);
+            continue;
+        }
+        if (text_length(path) > 1U) {
+            append_character(path, SHELL_PATH_CAPACITY, '/');
+            write_index = text_length(path);
+        }
+        if (text_length(path) + segment_length >= SHELL_PATH_CAPACITY) return false;
+        for (uint32_t index = 0U; index < segment_length; ++index) {
+            path[write_index] = combined[segment_start + index];
+            ++write_index;
+        }
+        path[write_index] = '\0';
+        write_index = text_length(path);
+    }
+    return path[0] != '\0';
+}
+
+static bool make_program_path(const char *argument, char *path) {
+    static const char *const prefixes[] = { "/sbin/", "/bin/", "/native/", "/" };
+    char candidate[SHELL_LINE_CAPACITY];
+    bool has_slash = false;
+    if (argument == 0 || argument[0] == '\0' || path == 0) return false;
+    for (uint32_t index = 0U; argument[index] != '\0'; ++index) {
+        if (argument[index] == '/') {
+            has_slash = true;
+            break;
+        }
+    }
+    if (has_slash || argument[0] == '.') return resolve_path(argument, path);
+    if (resolve_path(argument, candidate) && file_exists(candidate)) {
+        copy_text(path, candidate);
+        return true;
+    }
+    for (uint32_t prefix_index = 0U;
+         prefix_index < sizeof(prefixes) / sizeof(prefixes[0]); ++prefix_index) {
+        candidate[0] = '\0';
+        append_text(candidate, SHELL_LINE_CAPACITY, prefixes[prefix_index]);
+        for (uint32_t index = 0U; argument[index] != '\0'; ++index) {
+            append_character(candidate, SHELL_LINE_CAPACITY,
+                             lower_ascii(argument[index]));
+        }
+        if (file_exists(candidate)) {
+            copy_text(path, candidate);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void append_text_chunk(const uint8_t *buffer, uint64_t count,
+                              char *line, uint32_t *line_length) {
+    if (buffer == 0 || line == 0 || line_length == 0) return;
+    for (uint64_t index = 0U; index < count; ++index) {
+        uint8_t value = buffer[index];
+        if (value == '\r') continue;
+        if (value == '\n' || *line_length + 1U >= SHELL_LINE_CAPACITY) {
+            line[*line_length] = '\0';
+            append_output(line);
+            *line_length = 0U;
+            if (value == '\n') continue;
+        }
+        if (value < 0x20U || value > 0x7EU) value = '.';
+        line[(*line_length)++] = (char)value;
+    }
+}
+
+static void finish_text_line(char *line, uint32_t *line_length) {
+    if (line == 0 || line_length == 0 || *line_length == 0U) return;
+    line[*line_length] = '\0';
+    append_output(line);
+    *line_length = 0U;
+}
+
+static void command_cat(const char *argument) {
+    char path[SHELL_LINE_CAPACITY];
+    char line[SHELL_LINE_CAPACITY] = {0};
+    os_handle_t handle = OS_INVALID_HANDLE;
+    uint32_t line_length = 0U;
+    uint64_t total = 0U;
+    if (!resolve_path(argument, path)) {
+        append_output("USAGE: CAT FILE");
+        return;
+    }
+    if (gshell_syscall_four(OS_SYS_FILE_OPEN, (uint64_t)path,
+                            OS_FILE_OPEN_READ, 0U,
+                            (uint64_t)&handle) < 0 ||
+        handle == OS_INVALID_HANDLE) {
+        append_output("CAT: FILE NOT FOUND");
+        return;
+    }
+    while (total < 2048U) {
+        uint64_t bytes = 0U;
+        uint64_t capacity = sizeof(g_file_buffer);
+        int64_t status = gshell_syscall_four(OS_SYS_FILE_READ, handle,
+                                             (uint64_t)g_file_buffer, capacity,
+                                             (uint64_t)&bytes);
+        if (status < 0) {
+            append_output("CAT: READ FAILED");
+            break;
+        }
+        if (bytes == 0U) break;
+        if (bytes > capacity) bytes = capacity;
+        append_text_chunk(g_file_buffer, bytes, line, &line_length);
+        total += bytes;
+    }
+    finish_text_line(line, &line_length);
+    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
+    if (total == 0U) append_output("CAT: EMPTY FILE");
+}
+
+static int64_t enumerate_directory(const char *path, uint32_t index,
+                                   os_file_info_t *info) {
+    os_file_enumerate_t request = {0};
+    if (path == 0 || info == 0) return -22;
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.path = (uint64_t)(uintptr_t)path;
+    request.index = index;
+    int64_t status = gshell_syscall_one(OS_SYS_FILE_ENUMERATE,
+                                        (uint64_t)&request);
+    if (status == 0) *info = request.info;
+    return status;
+}
+
+static int64_t stat_path(const char *path, os_file_info_t *info) {
+    os_file_stat_t request = {0};
+    if (path == 0 || info == 0) return -22;
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.path = (uint64_t)(uintptr_t)path;
+    int64_t status = gshell_syscall_one(OS_SYS_FILE_STAT,
+                                        (uint64_t)(uintptr_t)&request);
+    if (status == 0) *info = request.info;
+    return status;
+}
+
+static bool directory_exists(const char *path) {
+    os_file_info_t info = {0};
+    return stat_path(path, &info) == 0 && info.type == OS_FILE_TYPE_DIRECTORY;
+}
+
+static bool file_exists(const char *path) {
+    os_file_info_t info = {0};
+    return stat_path(path, &info) == 0 && info.type == OS_FILE_TYPE_REGULAR;
+}
+
+static void command_ls(const char *argument) {
+    char directory[SHELL_LINE_CAPACITY];
+    const char *requested = argument != 0 && argument[0] != '\0' ? argument : g_cwd;
+    if (!resolve_path(requested, directory)) {
+        append_output("LS: INVALID PATH");
+        return;
+    }
+    if (!directory_exists(directory)) {
+        if (file_exists(directory)) {
+            append_output(directory);
+        } else {
+            append_output("LS: DIRECTORY NOT FOUND");
+        }
+        return;
+    }
+    append_output(directory);
+    for (uint32_t index = 0U; index < 64U; ++index) {
+        os_file_info_t info = {0};
+        int64_t status = enumerate_directory(directory, index, &info);
+        if (status == -2) break;
+        if (status < 0) {
+            append_output("LS: ENUMERATION FAILED");
+            return;
+        }
+        g_display_line[0] = '\0';
+        append_text(g_display_line, SHELL_LINE_CAPACITY, info.name);
+        if (info.type == OS_FILE_TYPE_DIRECTORY) {
+            append_character(g_display_line, SHELL_LINE_CAPACITY, '/');
+        }
+        append_output(g_display_line);
+    }
+}
+
+static void set_exec_output_entry(os_exec_fd_entry_t *entry,
+                                  uint32_t descriptor, os_handle_t handle) {
+    if (entry == 0) return;
+    *entry = (os_exec_fd_entry_t){0};
+    entry->descriptor = descriptor;
+    entry->handle = handle;
+    entry->open_flags = OS_FILE_OPEN_WRITE;
+    entry->resource_flags = OS_EXEC_FD_PIPE;
+}
+
+static void build_exec_output_map(os_handle_t output_handle,
+                                  os_handle_t error_handle) {
+    g_exec_fd_map = (os_exec_fd_map_t){0};
+    g_exec_fd_map.hdr.size = sizeof(g_exec_fd_map);
+    g_exec_fd_map.hdr.version = OS_SYSCALL_ABI_VERSION;
+    g_exec_fd_map.count = 2U;
+    set_exec_output_entry(&g_exec_fd_map.entries[0], 1U, output_handle);
+    set_exec_output_entry(&g_exec_fd_map.entries[1], 2U, error_handle);
+}
+
+static __attribute__((noreturn)) void launch_program_entry(
+    uint64_t context_address) {
+    shell_launch_context_t *context =
+        (shell_launch_context_t *)(uintptr_t)context_address;
+    os_handle_t error_handle = OS_INVALID_HANDLE;
+    const os_exec_fd_map_t *descriptor_map = 0;
+    bool exec_ready = context != 0;
+    int64_t status = -22;
+    if (context != 0) {
+        if (context->redirect_output) {
+            (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE,
+                                     context->output_read);
+            if (gshell_syscall_three(OS_SYS_HANDLE_DUP,
+                                     context->output_write, 0U,
+                                     (uint64_t)(uintptr_t)&error_handle) < 0) {
+                exec_ready = false;
+            } else {
+                build_exec_output_map(context->output_write, error_handle);
+                descriptor_map = &g_exec_fd_map;
+            }
+        }
+        if (exec_ready) {
+            status = descriptor_map != 0 ?
+                gshell_syscall_four(OS_SYS_PROCESS_EXEC,
+                                    (uint64_t)(uintptr_t)context->path,
+                                    (uint64_t)(uintptr_t)context->arguments, 0U,
+                                    (uint64_t)(uintptr_t)descriptor_map) :
+                gshell_syscall_three(OS_SYS_PROCESS_EXEC,
+                                     (uint64_t)(uintptr_t)context->path,
+                                     (uint64_t)(uintptr_t)context->arguments, 0U);
+        }
+    }
+    (void)gshell_syscall_one(OS_SYS_THREAD_EXIT, status < 0 ? 1U : 0U);
+    for (;;) __asm__ volatile ("pause");
+}
+
+static void append_decimal(char *destination, uint32_t capacity, int64_t value) {
+    char digits[24];
+    uint64_t magnitude;
+    uint32_t digit_count = 0U;
+    if (destination == 0 || capacity == 0U) return;
+    destination[0] = '\0';
+    if (value < 0) {
+        append_character(destination, capacity, '-');
+        magnitude = (uint64_t)(-(value + 1)) + 1U;
+    } else {
+        magnitude = (uint64_t)value;
+    }
+    do {
+        digits[digit_count++] = (char)('0' + magnitude % 10U);
+        magnitude /= 10U;
+    } while (magnitude != 0U && digit_count < sizeof(digits));
+    while (digit_count != 0U) append_character(destination, capacity, digits[--digit_count]);
+}
+
+static void append_status_line(const char *prefix, int64_t value) {
+    char number[32];
+    g_display_line[0] = '\0';
+    append_text(g_display_line, SHELL_LINE_CAPACITY, prefix);
+    append_decimal(number, sizeof(number), value);
+    append_text(g_display_line, SHELL_LINE_CAPACITY, number);
+    append_output(g_display_line);
+}
+
+static bool read_program_output(os_handle_t handle) {
+    char line[SHELL_LINE_CAPACITY] = {0};
+    uint32_t line_length = 0U;
+    bool success = true;
+    for (;;) {
+        uint64_t bytes = 0U;
+        int64_t status = gshell_syscall_five(
+            OS_SYS_PIPE_READ, handle, (uint64_t)(uintptr_t)g_file_buffer,
+            sizeof(g_file_buffer), OS_WAIT_INFINITE,
+            (uint64_t)(uintptr_t)&bytes);
+        if (status < 0) {
+            append_output("PROGRAM OUTPUT READ FAILED");
+            success = false;
+            break;
+        }
+        if (bytes == 0U) break;
+        if (bytes > sizeof(g_file_buffer)) bytes = sizeof(g_file_buffer);
+        append_text_chunk(g_file_buffer, bytes, line, &line_length);
+    }
+    finish_text_line(line, &line_length);
+    return success;
+}
+
+static int64_t process_wait_status(int32_t status) {
+    uint32_t value = (uint32_t)status;
+    if ((value & 0x7FU) != 0U) return 128 + (int64_t)(value & 0x7FU);
+    return (int64_t)((value >> 8U) & 0xFFU);
+}
+
+static bool launch_program_foreground(shell_launch_context_t *context) {
+    os_pipe_create_t pipe = {0};
+    int64_t child_pid;
+    int32_t wait_status = 0;
+    bool output_success;
+    pipe.hdr.size = sizeof(pipe);
+    pipe.hdr.version = OS_SYSCALL_ABI_VERSION;
+    if (gshell_syscall_one(OS_SYS_PIPE_CREATE, (uint64_t)(uintptr_t)&pipe) < 0 ||
+        pipe.read_handle == OS_INVALID_HANDLE ||
+        pipe.write_handle == OS_INVALID_HANDLE) return false;
+    context->output_read = pipe.read_handle;
+    context->output_write = pipe.write_handle;
+    context->redirect_output = true;
+    child_pid = gshell_syscall_one(OS_SYS_PROCESS_FORK, 0U);
+    if (child_pid < 0) {
+        (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, pipe.read_handle);
+        (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, pipe.write_handle);
+        context->redirect_output = false;
+        return false;
+    }
+    if (child_pid == 0) launch_program_entry((uint64_t)(uintptr_t)context);
+    ++g_launch_slot_count;
+    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, pipe.write_handle);
+    context->output_read = OS_INVALID_HANDLE;
+    context->output_write = OS_INVALID_HANDLE;
+    context->redirect_output = false;
+    output_success = read_program_output(pipe.read_handle);
+    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, pipe.read_handle);
+    if (gshell_syscall_three(OS_SYS_PROCESS_WAIT, (uint64_t)child_pid, 0U,
+                             (uint64_t)(uintptr_t)&wait_status) < 0) {
+        append_output("PROGRAM WAIT FAILED");
+        return false;
+    }
+    append_status_line("PROGRAM EXIT STATUS ", process_wait_status(wait_status));
+    return output_success;
+}
+
+static bool launch_program_background(shell_launch_context_t *context) {
+    os_handle_t process_handle = OS_INVALID_HANDLE;
+    os_handle_t thread_handle = OS_INVALID_HANDLE;
+    os_thread_create_t arguments = {0};
+    int64_t status;
+    arguments.hdr.size = sizeof(arguments);
+    arguments.hdr.version = OS_SYSCALL_ABI_VERSION;
+    arguments.entry = (uint64_t)(uintptr_t)launch_program_entry;
+    arguments.stack_top = SHELL_CHILD_STACK_TOP;
+    arguments.argument = (uint64_t)(uintptr_t)context;
+    status = gshell_syscall_two(OS_SYS_PROCESS_CREATE, 0U,
+                                (uint64_t)&process_handle);
+    if (status < 0 || process_handle == OS_INVALID_HANDLE) return false;
+    status = gshell_syscall_three(OS_SYS_THREAD_CREATE, process_handle,
+                                  (uint64_t)&arguments,
+                                  (uint64_t)&thread_handle);
+    if (status < 0 || thread_handle == OS_INVALID_HANDLE) {
+        (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, process_handle);
+        return false;
+    }
+    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, thread_handle);
+    ++g_launch_slot_count;
+    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, process_handle);
+    return true;
+}
+
+static bool launch_program(const char *path, char **program_arguments,
+                           uint32_t argument_count, bool background) {
+    shell_launch_context_t *context;
+    uint32_t slot;
+    if (path == 0 || path[0] == '\0' || program_arguments == 0 ||
+        argument_count == 0U || argument_count > SHELL_MAX_ARGUMENTS ||
+        g_launch_slot_count >= SHELL_LAUNCH_SLOTS) {
+        return false;
+    }
+    slot = g_launch_slot_count;
+    context = &g_launch_contexts[slot];
+    copy_text(context->path, path);
+    for (uint32_t index = 0U; index < argument_count; ++index) {
+        copy_text(context->argument_storage[index], program_arguments[index]);
+        context->arguments[index] = context->argument_storage[index];
+    }
+    context->arguments[argument_count] = 0;
+    context->output_read = OS_INVALID_HANDLE;
+    context->output_write = OS_INVALID_HANDLE;
+    context->redirect_output = false;
+    return background ? launch_program_background(context) :
+                        launch_program_foreground(context);
+}
+
+static void remember_history(void) {
+    if (g_command_length == 0U) return;
+    if (g_history_count != 0U &&
+        text_equals_ignore_case(g_history[g_history_count - 1U], g_command)) return;
+    if (g_history_count < SHELL_HISTORY_LINES) {
+        copy_text(g_history[g_history_count++], g_command);
+    } else {
+        for (uint32_t index = 1U; index < SHELL_HISTORY_LINES; ++index) {
+            copy_text(g_history[index - 1U], g_history[index]);
+        }
+        copy_text(g_history[SHELL_HISTORY_LINES - 1U], g_command);
+    }
+}
+
+static void append_command_echo(void) {
+    build_prompt(g_display_line);
+    append_text(g_display_line, SHELL_LINE_CAPACITY, g_command);
+    append_output(g_display_line);
+}
+
+static void append_history_line(uint32_t index) {
+    char number[32];
+    append_decimal(number, sizeof(number), (int64_t)(index + 1U));
+    g_display_line[0] = '\0';
+    append_text(g_display_line, SHELL_LINE_CAPACITY, number);
+    append_text(g_display_line, SHELL_LINE_CAPACITY, "  ");
+    append_text(g_display_line, SHELL_LINE_CAPACITY, g_history[index]);
+    append_output(g_display_line);
+}
+
+static void command_echo(char **arguments, uint32_t count) {
+    g_display_line[0] = '\0';
+    for (uint32_t index = 1U; index < count; ++index) {
+        if (index != 1U) append_character(g_display_line, SHELL_LINE_CAPACITY, ' ');
+        append_text(g_display_line, SHELL_LINE_CAPACITY, arguments[index]);
+    }
+    append_output(g_display_line);
+}
+
+static void command_cd(char **arguments, uint32_t count) {
+    char path[SHELL_LINE_CAPACITY];
+    const char *target = count == 1U ? "/" : arguments[1];
+    if (count > 2U) {
+        append_output("USAGE: CD [DIRECTORY]");
+        return;
+    }
+    if (!resolve_path(target, path) || !directory_exists(path)) {
+        append_output("CD: DIRECTORY NOT FOUND");
+        return;
+    }
+    copy_text(g_cwd, path);
+}
+
+static int64_t file_path_operation(uint64_t syscall_number, const char *path,
+                                   uint32_t mode) {
+    os_file_path_op_t request = {0};
+    if (path == 0) return -22;
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.path = (uint64_t)(uintptr_t)path;
+    request.mode = mode;
+    return gshell_syscall_one(syscall_number, (uint64_t)(uintptr_t)&request);
+}
+
+static void command_stat(char **arguments, uint32_t count) {
+    char path[SHELL_LINE_CAPACITY];
+    os_file_info_t info = {0};
+    if (count != 2U) {
+        append_output("USAGE: STAT FILE");
+        return;
+    }
+    if (!resolve_path(arguments[1], path) || stat_path(path, &info) < 0) {
+        append_output("STAT: PATH NOT FOUND");
+        return;
+    }
+    g_display_line[0] = '\0';
+    append_text(g_display_line, SHELL_LINE_CAPACITY,
+                info.type == OS_FILE_TYPE_DIRECTORY ? "TYPE DIRECTORY" : "TYPE FILE");
+    append_output(g_display_line);
+    g_display_line[0] = '\0';
+    append_text(g_display_line, SHELL_LINE_CAPACITY, "SIZE ");
+    append_decimal(g_display_line + 5U, SHELL_LINE_CAPACITY - 5U,
+                   (int64_t)info.size);
+    append_output(g_display_line);
+}
+
+static void command_mkdir(char **arguments, uint32_t count) {
+    char path[SHELL_LINE_CAPACITY];
+    if (count != 2U) {
+        append_output("USAGE: MKDIR DIRECTORY");
+        return;
+    }
+    if (!resolve_path(arguments[1], path) ||
+        file_path_operation(OS_SYS_FILE_MKDIR, path, 0755U) < 0) {
+        append_output("MKDIR: FAILED");
+        return;
+    }
+    append_output("DIRECTORY CREATED");
+}
+
+static void command_touch(char **arguments, uint32_t count) {
+    char path[SHELL_LINE_CAPACITY];
+    os_handle_t handle = OS_INVALID_HANDLE;
+    if (count != 2U) {
+        append_output("USAGE: TOUCH FILE");
+        return;
+    }
+    if (!resolve_path(arguments[1], path) ||
+        gshell_syscall_four(OS_SYS_FILE_OPEN, (uint64_t)path,
+                            OS_FILE_OPEN_READ | OS_FILE_OPEN_WRITE |
+                            OS_FILE_OPEN_CREATE, 0666U, (uint64_t)&handle) < 0 ||
+        handle == OS_INVALID_HANDLE) {
+        append_output("TOUCH: FAILED");
+        return;
+    }
+    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
+    append_output("FILE READY");
+}
+
+static void command_remove(char **arguments, uint32_t count) {
+    char path[SHELL_LINE_CAPACITY];
+    if (count != 2U) {
+        append_output("USAGE: RM PATH");
+        return;
+    }
+    if (!resolve_path(arguments[1], path) ||
+        file_path_operation(OS_SYS_FILE_REMOVE, path, 0U) < 0) {
+        append_output("RM: FAILED");
+        return;
+    }
+    append_output("REMOVED");
+}
+
+static bool is_builtin_command(const char *name) {
+    static const char *const names[] = {
+        "help", "about", "status", "version", "clear", "echo", "pwd",
+        "cd", "ls", "dir", "cat", "stat", "mkdir", "touch", "rm",
+        "history", "which", "type", "open", "run", "fileman", "fm",
+        "notepad", "exit", "true", "false",
+    };
+    for (uint32_t index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
+        if (text_equals_ignore_case(name, names[index])) return true;
+    }
+    return false;
+}
+
+static void command_program(char **arguments, uint32_t count, bool background) {
+    char path[SHELL_LINE_CAPACITY];
+    if (count < 2U) {
+        append_output("USAGE: OPEN PROGRAM [&]");
+        return;
+    }
+    if (!make_program_path(arguments[1], path)) {
+        append_output("PROGRAM NOT FOUND");
+        return;
+    }
+    if (!launch_program(path, arguments + 1U, count - 1U, background)) {
+        append_output("PROGRAM LAUNCH FAILED");
+        return;
+    }
+    if (background) append_output("PROGRAM STARTED IN BACKGROUND");
+}
+
+static void command_external(char **arguments, uint32_t count, bool background) {
+    char path[SHELL_LINE_CAPACITY];
+    if (count == 0U) return;
+    if (!make_program_path(arguments[0], path)) {
+        append_output("COMMAND NOT FOUND");
+        return;
+    }
+    if (!launch_program(path, arguments, count, background)) {
+        append_output("PROGRAM LAUNCH FAILED");
+        return;
+    }
+    if (background) append_output("PROGRAM STARTED IN BACKGROUND");
+}
+
+static void execute_command(void) {
+    char *arguments[SHELL_MAX_ARGUMENTS];
+    uint32_t count = 0U;
+    bool background = false;
+    bool parsed;
+
+    if (g_command_length == 0U) {
+        append_output("TYPE HELP FOR COMMANDS");
+        goto reset_command;
+    }
+    remember_history();
+    append_command_echo();
+    parsed = shell_tokenize(g_command, arguments, &count, &background);
+    if (!parsed) {
+        append_output("SYNTAX ERROR: QUOTE OR ESCAPE NOT CLOSED");
+        goto reset_command;
+    }
+    if (count == 0U) {
+        append_output("TYPE HELP FOR COMMANDS");
+    } else if (text_equals_ignore_case(arguments[0], "help")) {
+        append_output("HELP ABOUT STATUS VERSION");
+        append_output("CLEAR ECHO PWD CD LS CAT STAT MKDIR TOUCH RM");
+        append_output("WHICH TYPE OPEN RUN NOTEPAD FILEMAN FM [ARGS]");
+        append_output("QUOTES AND BACKSLASH ESCAPES ARE SUPPORTED");
+    } else if (text_equals_ignore_case(arguments[0], "about")) {
+        append_output("LITEOS GRAPHICAL SHELL");
+        append_output("ONE WINDOW CLIENT COMPOSED BY KERNEL");
+    } else if (text_equals_ignore_case(arguments[0], "status")) {
+        append_output("WINDOW SERVER: KERNEL");
+        append_output("WINDOW COUNT: ONE SHELL");
+        append_output(g_cwd);
+    } else if (text_equals_ignore_case(arguments[0], "version")) {
+        append_output("LITEOS VERSION 1 ABI 1");
+    } else if (text_equals_ignore_case(arguments[0], "clear")) {
+        clear_output();
+    } else if (text_equals_ignore_case(arguments[0], "echo")) {
+        command_echo(arguments, count);
+    } else if (text_equals_ignore_case(arguments[0], "pwd")) {
+        append_output(g_cwd);
+    } else if (text_equals_ignore_case(arguments[0], "cd")) {
+        command_cd(arguments, count);
+    } else if (text_equals_ignore_case(arguments[0], "ls") ||
+               text_equals_ignore_case(arguments[0], "dir")) {
+        if (count > 2U) append_output("USAGE: LS [DIRECTORY]");
+        else command_ls(count == 2U ? arguments[1] : 0);
+    } else if (text_equals_ignore_case(arguments[0], "cat")) {
+        if (count != 2U) append_output("USAGE: CAT FILE");
+        else command_cat(arguments[1]);
+    } else if (text_equals_ignore_case(arguments[0], "stat")) {
+        command_stat(arguments, count);
+    } else if (text_equals_ignore_case(arguments[0], "mkdir")) {
+        command_mkdir(arguments, count);
+    } else if (text_equals_ignore_case(arguments[0], "touch")) {
+        command_touch(arguments, count);
+    } else if (text_equals_ignore_case(arguments[0], "rm")) {
+        command_remove(arguments, count);
+    } else if (text_equals_ignore_case(arguments[0], "history")) {
+        for (uint32_t index = 0U; index < g_history_count; ++index) {
+            append_history_line(index);
+        }
+    } else if (text_equals_ignore_case(arguments[0], "which") ||
+               text_equals_ignore_case(arguments[0], "type")) {
+        char path[SHELL_LINE_CAPACITY];
+        if (count != 2U) {
+            append_output("USAGE: WHICH COMMAND");
+        } else if (is_builtin_command(arguments[1])) {
+            g_display_line[0] = '\0';
+            append_text(g_display_line, SHELL_LINE_CAPACITY, "BUILTIN ");
+            append_text(g_display_line, SHELL_LINE_CAPACITY, arguments[1]);
+            append_output(g_display_line);
+        } else if (make_program_path(arguments[1], path)) {
+            append_output(path);
+        } else {
+            append_output("COMMAND NOT FOUND");
+        }
+    } else if (text_equals_ignore_case(arguments[0], "open") ||
+               text_equals_ignore_case(arguments[0], "run")) {
+        bool open_command = text_equals_ignore_case(arguments[0], "open");
+        command_program(arguments, count, open_command || background);
+    } else if (text_equals_ignore_case(arguments[0], "true")) {
+        /* A successful no-op is useful in scripts once command sequencing is added. */
+    } else if (text_equals_ignore_case(arguments[0], "false")) {
+        append_output("FALSE");
+    } else if (text_equals_ignore_case(arguments[0], "exit")) {
+        gshell_exit(0U);
+    } else {
+        command_external(arguments, count, background);
+    }
+
+reset_command:
+    g_command_length = 0U;
+    g_command_cursor = 0U;
+    g_history_cursor = -1;
+    g_command[0] = '\0';
+}
+
+static void clear_command_line(void) {
+    g_command_length = 0U;
+    g_command_cursor = 0U;
+    g_command[0] = '\0';
+}
+
+static void load_history_entry(int32_t index) {
+    if (index < 0 || (uint32_t)index >= g_history_count) return;
+    copy_text(g_command, g_history[(uint32_t)index]);
+    g_command_length = text_length(g_command);
+    g_command_cursor = g_command_length;
+}
+
+static void history_previous(void) {
+    if (g_history_count == 0U) return;
+    if (g_history_cursor < 0) g_history_cursor = (int32_t)g_history_count - 1;
+    else if (g_history_cursor > 0) --g_history_cursor;
+    load_history_entry(g_history_cursor);
+}
+
+static void history_next(void) {
+    if (g_history_cursor < 0) return;
+    if ((uint32_t)(g_history_cursor + 1) >= g_history_count) {
+        g_history_cursor = -1;
+        clear_command_line();
+        return;
+    }
+    ++g_history_cursor;
+    load_history_entry(g_history_cursor);
+}
+
+static bool text_has_prefix_ignore_case(const char *text, const char *prefix) {
+    uint32_t index = 0U;
+    while (prefix[index] != '\0') {
+        if (text[index] == '\0' || lower_ascii(text[index]) != lower_ascii(prefix[index])) {
+            return false;
+        }
+        ++index;
+    }
+    return true;
+}
+
+static void insert_command_text(const char *text) {
+    uint32_t length = text_length(text);
+    if (text == 0 || length == 0U || g_command_length + length >= SHELL_LINE_CAPACITY) return;
+    for (uint32_t index = (uint32_t)g_command_length + length;
+         index >= g_command_cursor + length; --index) {
+        g_command[index] = g_command[index - length];
+    }
+    for (uint32_t index = 0U; index < length; ++index) {
+        g_command[g_command_cursor + index] = text[index];
+    }
+    g_command_length += length;
+    g_command_cursor += length;
+    g_command[g_command_length] = '\0';
+}
+
+static void insert_command_character(char character) {
+    char text[2] = {character, '\0'};
+    insert_command_text(text);
+}
+
+static void backspace_command_character(void) {
+    if (g_command_cursor == 0U) return;
+    for (uint32_t index = (uint32_t)g_command_cursor; index <= g_command_length; ++index) {
+        g_command[index - 1U] = g_command[index];
+    }
+    --g_command_cursor;
+    --g_command_length;
+}
+
+static void delete_command_character(void) {
+    if (g_command_cursor >= g_command_length) return;
+    for (uint32_t index = (uint32_t)g_command_cursor; index < g_command_length; ++index) {
+        g_command[index] = g_command[index + 1U];
+    }
+    --g_command_length;
+}
+
+static void complete_command(void) {
+    static const char *const candidates[] = {
+        "help", "about", "status", "version", "clear", "echo", "pwd", "cd",
+        "ls", "dir", "cat", "history", "which", "type", "open", "run", "exit",
+        "true", "false", "deviced", "logd", "crashd", "audiod", "gshell",
+        "notepad", "fileman", "fm", "taskmgr", "netmgr", "imageview", "dyn-gfx",
+        "libc-test",
+    };
+    uint32_t start = (uint32_t)g_command_cursor;
+    uint32_t matches = 0U;
+    const char *match = 0;
+    if (g_command_cursor != g_command_length) return;
+    while (start != 0U && !is_shell_space(g_command[start - 1U])) --start;
+    if (start != 0U) return;
+    g_command[g_command_cursor] = '\0';
+    for (uint32_t index = 0U; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
+        if (text_has_prefix_ignore_case(candidates[index], g_command + start)) {
+            ++matches;
+            match = candidates[index];
+        }
+    }
+    if (matches == 1U && match != 0) {
+        insert_command_text(match + g_command_cursor - start);
+    } else if (matches > 1U) {
+        append_output("MATCHES:");
+        for (uint32_t index = 0U; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
+            if (text_has_prefix_ignore_case(candidates[index], g_command + start)) {
+                append_output(candidates[index]);
+            }
+        }
+    }
+}
+
+static bool handle_key(const os_window_event_t *event) {
+    const os_input_event_t *input = event != 0 ? &event->input : 0;
+    char character;
+    bool full_damage = false;
+    /* EVENT_READ 已按 g_shell.identifier 过滤；不要因某个输入后端未回填
+     * event.identifier 而丢弃本来属于 shell 的按键。 */
+    if (event == 0 || event->type != OS_WINDOW_EVENT_INPUT ||
+        input == 0 || input->type != OS_INPUT_EVENT_KEY) return false;
+    if (input->code == 0xE1U || input->code == 0xE5U) {
+        g_shift = input->value != OS_INPUT_VALUE_RELEASE;
+        return false;
+    }
+    if (input->code == 0xE0U || input->code == 0xE4U) {
+        g_ctrl = input->value != OS_INPUT_VALUE_RELEASE;
+        return false;
+    }
+    if (input->value == OS_INPUT_VALUE_RELEASE) return false;
+    if (g_ctrl && input->code == 0x2EU) {
+        (void)liteos_text_adjust(1);
+        full_damage = true;
+    } else if (g_ctrl && input->code == 0x2DU) {
+        (void)liteos_text_adjust(-1);
+        full_damage = true;
+    } else if (g_ctrl && (input->code == 0x14U || input->code == (uint32_t)'Q')) {
+        gshell_exit(0U);
+    } else if (g_ctrl &&
+               (input->code == 0x04U || input->code == (uint32_t)'A')) {
+        g_command_cursor = 0U;
+    } else if (g_ctrl && (input->code == 0x08U || input->code == (uint32_t)'E')) {
+        g_command_cursor = g_command_length;
+    } else if (g_ctrl && (input->code == 0x06U || input->code == (uint32_t)'C')) {
+        if (g_command_length != 0U) append_output("^C");
+        clear_command_line();
+        full_damage = true;
+    } else if (g_ctrl && (input->code == 0x0FU || input->code == (uint32_t)'L')) {
+        clear_output();
+        full_damage = true;
+    } else if (g_ctrl && (input->code == 0x18U || input->code == (uint32_t)'U')) {
+        clear_command_line();
+    } else if (g_ctrl && (input->code == 0x07U || input->code == (uint32_t)'G')) {
+        delete_command_character();
+    } else if (input->code == 0x28U || input->code == 0x58U) {
+        execute_command();
+        full_damage = true;
+    } else if (input->code == 0x2AU) {
+        backspace_command_character();
+    } else if (input->code == 0x4FU) {
+        if (g_command_cursor < g_command_length) ++g_command_cursor;
+    } else if (input->code == 0x50U) {
+        if (g_command_cursor != 0U) --g_command_cursor;
+    } else if (input->code == 0x4AU) {
+        g_command_cursor = 0U;
+    } else if (input->code == 0x4DU) {
+        g_command_cursor = g_command_length;
+    } else if (input->code == 0x4CU) {
+        delete_command_character();
+    } else if (input->code == 0x52U) {
+        history_previous();
+    } else if (input->code == 0x51U) {
+        history_next();
+    } else if (input->code == 0x2BU) {
+        complete_command();
+        /* Multiple matches append output rows; a unique completion only
+         * changes the input line, but the conservative full path keeps both
+         * cases correct without a command-result return value. */
+        full_damage = true;
+    } else if (!g_ctrl) {
+        character = key_to_ascii(input->code, g_shift);
+        if (character != '\0') insert_command_character(character);
+    }
+    if (full_damage) shell_damage_all();
+    else shell_damage_input_line();
+    render_window();
+    return true;
+}
+
+static bool handle_event(const os_window_event_t *event) {
+    uint64_t pixels;
+
+    if (event == 0) return false;
+
+    /* V2.3 cooperative close */
+    if (event->type ==
+        OS_WINDOW_EVENT_CLOSE_REQUEST) {
+
+        gshell_exit(0U);
+    }
+
+    if (event->type == OS_WINDOW_EVENT_RESIZE) {
+        if (event->resize.width == 0U || event->resize.height == 0U) return false;
+        pixels = (uint64_t)event->resize.width * event->resize.height;
+        if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return false;
+        g_shell.width = event->resize.width;
+        g_shell.height = event->resize.height;
+        shell_damage_all();
+        render_window();
+        return true;
+    }
+    if (event->type == OS_WINDOW_EVENT_INPUT &&
+        event->input.type == OS_INPUT_EVENT_RELATIVE &&
+        event->input.code == OS_INPUT_REL_WHEEL &&
+        event->input.value != 0 && g_ctrl) {
+        (void)liteos_text_adjust(event->input.value > 0 ? 1 : -1);
+        shell_damage_all();
+        render_window();
+        return true;
+    }
+    if (event->type == OS_WINDOW_EVENT_INPUT &&
+        event->input.type == OS_INPUT_EVENT_BUTTON &&
+        event->input.code == OS_INPUT_BUTTON_LEFT &&
+        event->input.value == OS_INPUT_VALUE_PRESS &&
+        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
+                                     g_shell.width,
+                                     USER_CLIENT_CHROME_HEIGHT)) {
+        gshell_exit(0U);
+    }
+    return handle_key(event);
+}
+
+__attribute__((noreturn)) void gshell_entry(void) {
+    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE) ||
+        !setup_windows()) gshell_exit(1U);
+    append_output("LITEOS GRAPHICAL SHELL READY");
+    append_output("WINDOW CONTENT IS COMPOSITED BY KERNEL");
+    append_output("TYPE HELP FOR COMMANDS");
+    append_output("CTRL +/- FONT  CTRL+WHEEL FONT");
+    shell_damage_all();
+    render_window();
+    for (;;) {
+        os_window_event_read_t request = {0};
+        int64_t status;
+        request.hdr.size = sizeof(request);
+        request.hdr.version = OS_SYSCALL_ABI_VERSION;
+        request.identifier = g_shell.identifier;
+        request.timeout_ns = SHELL_EVENT_WAIT;
+        status = gshell_syscall_one(OS_SYS_WINDOW_EVENT_READ, (uint64_t)&request);
+        if (status == 0) {
+            (void)handle_event(&request.event);
+        } else if (status != -11 && status != -110) {
+            __asm__ volatile ("pause");
+        }
+    }
+}
+
+int main(void) {
+    gshell_entry();
+}

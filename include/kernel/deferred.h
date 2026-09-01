@@ -29,3 +29,11 @@ bool deferred_try_schedule(deferred_work_fn_t function, void *argument);
 bool deferred_schedule_critical(deferred_work_fn_t function, void *argument);
 uint32_t deferred_run(uint32_t budget);
 bool deferred_self_test(void);
+
+/* Failure-only diagnostics for a producer that remains in deferred_schedule. */
+uint32_t deferred_debug_progress(uint32_t cpu_index);
+uint32_t deferred_debug_waiting(uint32_t cpu_index);
+uint32_t deferred_debug_lock_owner(void);
+uint32_t deferred_debug_lock_state(void);
+uint32_t deferred_debug_worker_state(void);
+uint32_t deferred_debug_queue_count(void);

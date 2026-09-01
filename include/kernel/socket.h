@@ -16,7 +16,7 @@ struct completion_port;
 #define SOCKET_PROTOCOL_UDP 17U
 #define SOCKET_PROTOCOL_TCP 6U
 #define SOCKET_RX_QUEUE_DEPTH 16U
-#define SOCKET_MAX_PAYLOAD 2048U
+#define SOCKET_MAX_PAYLOAD 4096U
 #define SOCKET_LISTEN_BACKLOG 8U
 #define SOCKET_STREAM_BUFFER_SIZE 8192U
 #define SOCKET_TCP_RETRANSMIT_TIMEOUT_NS 200000000ULL
@@ -92,6 +92,10 @@ kstatus_t socket_send_ipv6(socket_t *socket, const void *buffer, size_t length,
 kstatus_t socket_recv_ipv6(socket_t *socket, void *buffer, size_t length,
                            socket_ipv6_endpoint_t *source, uint64_t timeout_ns,
                            uint64_t *bytes);
+kstatus_t socket_shutdown(socket_t *socket, uint32_t how);
+kstatus_t socket_get_info(socket_t *socket, os_socket_info_t *info);
+kstatus_t socket_get_option(socket_t *socket, uint32_t option, int32_t *value);
+kstatus_t socket_set_option(socket_t *socket, uint32_t option, int32_t value);
 kstatus_t socket_send_async_ipv6(socket_t *socket, const void *buffer, size_t length,
                                  const uint8_t address[16], uint16_t port,
                                  struct completion_port *completion_port,

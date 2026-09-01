@@ -2,6 +2,7 @@
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
+#include <kernel/bitmap.h>
 #include <arch/x86_64/paging.h>
 
 #define VMALLOC_MANAGED_SIZE  (1ULL << 30)
@@ -78,23 +79,11 @@ static void vmalloc_initialize(void) {
     }
 }
 
-static bool bitmap_test(uint32_t bit) {
-    return (g_vmalloc_bitmap[bit >> 6] & (1ULL << (bit & 63U))) != 0;
-}
-
-static void bitmap_set_range(uint32_t start, uint32_t count, bool used) {
-    for (uint32_t i = 0; i < count; ++i) {
-        uint64_t mask = 1ULL << ((start + i) & 63U);
-        if (used) g_vmalloc_bitmap[(start + i) >> 6] |= mask;
-        else g_vmalloc_bitmap[(start + i) >> 6] &= ~mask;
-    }
-}
-
 static bool find_virtual_run(uint32_t count, uint32_t *start_out) {
     uint32_t run_start = 0;
     uint32_t run_length = 0;
     for (uint32_t page = 0; page < VMALLOC_PAGE_COUNT; ++page) {
-        if (!bitmap_test(page)) {
+        if (!bitmap_test_bit(g_vmalloc_bitmap, page)) {
             if (run_length == 0) run_start = page;
             if (++run_length == count) {
                 *start_out = run_start;
@@ -128,7 +117,7 @@ void *vmalloc(size_t size) {
         vmalloc_unlock_irqrestore(irq_flags);
         return 0;
     }
-    bitmap_set_range(bitmap_start, total_pages, true);
+    bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, true);
     area->used = true;
     area->bitmap_start = bitmap_start;
     area->total_pages = total_pages;
@@ -167,7 +156,7 @@ void *vmalloc(size_t size) {
                 if (page != 0) page_free(page);
             }
         }
-        bitmap_set_range(bitmap_start, total_pages, false);
+        bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, false);
         area->used = false;
         area->root_table = paddr_make(0);
         vmalloc_unlock_irqrestore(irq_flags);
@@ -219,7 +208,8 @@ void vfree(void *pointer) {
         vmalloc_unlock_irqrestore(irq_flags);
         return;
     }
-    bitmap_set_range(area->bitmap_start, area->total_pages, false);
+    bitmap_set_range(g_vmalloc_bitmap, area->bitmap_start, area->total_pages,
+                     false);
     area->used = false;
     area->root_table = paddr_make(0);
     vmalloc_unlock_irqrestore(irq_flags);

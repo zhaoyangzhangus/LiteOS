@@ -1,709 +1,750 @@
-#include "window.h"
-#include <kernel/input.h>
+#include <arch/x86_64/paging.h>
+#include <kernel/console.h>
+#include <kernel/kmem.h>
+#include <kernel/perf.h>
+#include <kernel/telemetry.h>
+#include <kernel/vm.h>
+#include "internal.h"
 
-static BOOLEAN window_belongs(const LITEOS_WINDOW_MANAGER *manager,
-                              const LITEOS_WINDOW *window) {
-    if (manager == 0 || window == 0) return 0;
-    for (UINT32 i = 0; i < LITEOS_WINDOW_COUNT; ++i) {
-        if (&manager->Windows[i] == window) return manager->Windows[i].Used;
+/* REFACTOR_P7A_WINDOW_OWNER: registry lifetime, removal, and public window API. */
+
+void window_object_destroy(void *raw_object) {
+    window_server_window_t *window = (window_server_window_t *)raw_object;
+    if (window == 0) return;
+
+    if (window->compositor_cache != 0) {
+        kfree(window->compositor_cache);
+        window->compositor_cache = 0;
     }
-    return 0;
+
+    if (window->section != 0) {
+        object_put(window->section);
+        window->section = 0;
+    }
+    if (window->owner != 0) {
+        object_put(window->owner);
+        window->owner = 0;
+    }
+    kfree(window);
 }
 
-static UINT32 min_u32(UINT32 left, UINT32 right) {
-    return left < right ? left : right;
+static void window_handle_close(void *object) {
+    window_server_handle_closed((window_server_window_t *)object);
 }
 
-static BOOLEAN display_valid(const LITEOS_DISPLAY *display) {
-    return display != 0 && display->Base != 0U && display->Width != 0U &&
-           display->Height != 0U && display->PixelsPerScanLine >= display->Width;
-}
+const object_ops_t g_window_object_ops = {
+    .destroy = window_object_destroy,
+    .handle_close = window_handle_close,
+    .type_name = "Window",
+    .is_signaled = 0,
+    .wait_value = 0,
+};
 
-static BOOLEAN display_same(const LITEOS_DISPLAY *left,
-                            const LITEOS_DISPLAY *right) {
-    if (left == 0 || right == 0) return 0;
-    return left->Base == right->Base && left->Width == right->Width &&
-           left->Height == right->Height &&
-           left->PixelsPerScanLine == right->PixelsPerScanLine &&
-           left->Format == right->Format;
-}
+void window_registry_reset_locked(void) {
+    g_window_server.count = 0U;
+    g_window_server.next_identifier = 1U;
 
-static VOID mark_full_damage(LITEOS_WINDOW_MANAGER *manager) {
-    if (manager == 0) return;
-    manager->Dirty = 1;
-    manager->DirtyX = 0U;
-    manager->DirtyY = 0U;
-    manager->DirtyWidth = manager->Display.Width;
-    manager->DirtyHeight = manager->Display.Height;
-    for (UINT32 i = 0U; i < LITEOS_WINDOW_OUTPUT_COUNT; ++i) {
-        if (manager->Outputs[i].Active) manager->Outputs[i].FullDamage = 1;
+    for (uint32_t index = 0U;
+         index < WINDOW_SERVER_MAX_WINDOWS;
+         ++index) {
+        g_window_server.windows[index] = 0;
     }
 }
 
-static VOID mark_dirty(LITEOS_WINDOW_MANAGER *manager,
-                       INT64 x, INT64 y, UINT32 width, UINT32 height) {
-    INT64 right;
-    INT64 bottom;
-    UINT32 clipped_x;
-    UINT32 clipped_y;
-    UINT32 clipped_right;
-    UINT32 clipped_bottom;
-    if (manager == 0 || width == 0U || height == 0U) return;
-    right = x + (INT64)width;
-    bottom = y + (INT64)height;
-    if (right <= 0 || bottom <= 0 || x >= (INT64)manager->Display.Width ||
-        y >= (INT64)manager->Display.Height) return;
-    clipped_x = x <= 0 ? 0U : (UINT32)x;
-    clipped_y = y <= 0 ? 0U : (UINT32)y;
-    clipped_right = right >= (INT64)manager->Display.Width ? manager->Display.Width :
-                    (UINT32)right;
-    clipped_bottom = bottom >= (INT64)manager->Display.Height ? manager->Display.Height :
-                     (UINT32)bottom;
-    if (clipped_x >= clipped_right || clipped_y >= clipped_bottom) return;
-    if (!manager->Dirty) {
-        manager->Dirty = 1;
-        manager->DirtyX = clipped_x;
-        manager->DirtyY = clipped_y;
-        manager->DirtyWidth = clipped_right - clipped_x;
-        manager->DirtyHeight = clipped_bottom - clipped_y;
+bool window_registry_append_locked(window_server_window_t *window) {
+    uint32_t identifier;
+
+    if (window == 0 ||
+        g_window_server.count >= WINDOW_SERVER_MAX_WINDOWS) {
+        return false;
+    }
+
+    identifier = g_window_server.next_identifier++;
+    if (identifier == 0U) {
+        identifier = g_window_server.next_identifier++;
+    }
+
+    window->identifier = identifier;
+    g_window_server.windows[g_window_server.count++] = window;
+    return true;
+}
+
+bool window_registry_remove_locked(window_server_window_t *window) {
+    if (window == 0) {
+        return false;
+    }
+
+    for (uint32_t index = 0U;
+         index < g_window_server.count;
+         ++index) {
+        if (g_window_server.windows[index] != window) {
+            continue;
+        }
+
+        for (uint32_t move = index + 1U;
+             move < g_window_server.count;
+             ++move) {
+            g_window_server.windows[move - 1U] =
+                g_window_server.windows[move];
+        }
+
+        --g_window_server.count;
+        g_window_server.windows[g_window_server.count] = 0;
+        return true;
+    }
+
+    return false;
+}
+
+void window_registry_move_to_front_locked(window_server_window_t *window) {
+    uint32_t position;
+
+    if (window == 0) {
         return;
     }
-    UINT64 old_right = (UINT64)manager->DirtyX + manager->DirtyWidth;
-    UINT64 old_bottom = (UINT64)manager->DirtyY + manager->DirtyHeight;
-    if (clipped_x < manager->DirtyX) manager->DirtyX = clipped_x;
-    if (clipped_y < manager->DirtyY) manager->DirtyY = clipped_y;
-    if (clipped_right > old_right) old_right = clipped_right;
-    if (clipped_bottom > old_bottom) old_bottom = clipped_bottom;
-    manager->DirtyWidth = (UINT32)(old_right - manager->DirtyX);
-    manager->DirtyHeight = (UINT32)(old_bottom - manager->DirtyY);
-}
 
-static UINT32 color_from_background(UINT32 color) {
-    return color;
-}
-
-static LITEOS_WINDOW *window_by_identifier(LITEOS_WINDOW_MANAGER *manager,
-                                           UINT32 identifier) {
-    if (manager == 0 || identifier == 0U) return 0;
-    for (UINT32 i = 0U; i < LITEOS_WINDOW_COUNT; ++i) {
-        if (manager->Windows[i].Used &&
-            manager->Windows[i].Identifier == identifier) {
-            return &manager->Windows[i];
-        }
-    }
-    return 0;
-}
-
-static BOOLEAN window_contains_point(const LITEOS_WINDOW *window,
-                                     INT64 x, INT64 y,
-                                     UINT32 *local_x, UINT32 *local_y) {
-    INT64 offset_x;
-    INT64 offset_y;
-    if (window == 0 || !window->Used || !window->Visible) return 0;
-    offset_x = x - (INT64)window->X;
-    offset_y = y - (INT64)window->Y;
-    if (offset_x < 0 || offset_y < 0 || (UINT64)offset_x >= window->Width ||
-        (UINT64)offset_y >= window->Height) return 0;
-    if (local_x != 0) *local_x = (UINT32)offset_x;
-    if (local_y != 0) *local_y = (UINT32)offset_y;
-    return 1;
-}
-
-static BOOLEAN window_titlebar_contains_point(const LITEOS_WINDOW *window,
-                                              INT64 x, INT64 y,
-                                              UINT32 *local_x, UINT32 *local_y) {
-    UINT32 titlebar_height;
-    UINT32 hit_x;
-    UINT32 hit_y;
-    if (!window_contains_point(window, x, y, &hit_x, &hit_y)) return 0;
-    titlebar_height = min_u32(window->Height, LITEOS_WINDOW_TITLEBAR_HEIGHT);
-    if (hit_y >= titlebar_height) return 0;
-    if (local_x != 0) *local_x = hit_x;
-    if (local_y != 0) *local_y = hit_y;
-    return 1;
-}
-
-static INT32 clamp_to_i32(INT64 value) {
-    if (value > 2147483647LL) return 2147483647;
-    if (value < -2147483647LL - 1LL) return (-2147483647 - 1);
-    return (INT32)value;
-}
-
-static INT32 pointer_event_coordinate(UINT32 coordinate) {
-    return coordinate > 2147483647U ? 2147483647 : (INT32)coordinate;
-}
-
-static BOOLEAN raise_window(LITEOS_WINDOW_MANAGER *manager,
-                            LITEOS_WINDOW *window) {
-    UINT8 index;
-    if (manager == 0 || !window_belongs(manager, window)) return 0;
-    index = (UINT8)(window - manager->Windows);
-    for (UINT32 position = 0U; position < manager->ZOrderCount; ++position) {
-        if (manager->ZOrder[position] != index) continue;
-        if (position + 1U == manager->ZOrderCount) return 1;
-        for (UINT32 next = position + 1U; next < manager->ZOrderCount; ++next) {
-            manager->ZOrder[next - 1U] = manager->ZOrder[next];
-        }
-        manager->ZOrder[manager->ZOrderCount - 1U] = index;
-        mark_dirty(manager, window->X, window->Y, window->Width, window->Height);
-        return 1;
-    }
-    return 0;
-}
-
-/* 重启合成器后优先恢复当前焦点；原窗口缓冲区仍归窗口对象持有。 */
-static void restore_focus(LITEOS_WINDOW_MANAGER *manager) {
-    LITEOS_WINDOW *focused;
-    if (manager == 0) return;
-    focused = window_by_identifier(manager, manager->FocusedIdentifier);
-    if (focused != 0 && focused->Visible) return;
-    manager->FocusedIdentifier = 0U;
-    for (UINT32 i = manager->ZOrderCount; i != 0U; --i) {
-        LITEOS_WINDOW *window = &manager->Windows[manager->ZOrder[i - 1U]];
-        if (window->Used && window->Visible) {
-            manager->FocusedIdentifier = window->Identifier;
-            return;
-        }
-    }
-}
-
-static void reset_focus_cycle(LITEOS_WINDOW_MANAGER *manager) {
-    UINT32 count = 0U;
-    if (manager == 0) return;
-    for (UINT32 order = manager->ZOrderCount; order != 0U; --order) {
-        LITEOS_WINDOW *window = &manager->Windows[manager->ZOrder[order - 1U]];
-        if (!window->Used || !window->Visible) continue;
-        manager->FocusCycleIdentifiers[count++] = window->Identifier;
-    }
-    manager->FocusCycleCount = count;
-    manager->FocusCycleIndex = 0U;
-    for (UINT32 index = 0U; index < count; ++index) {
-        if (manager->FocusCycleIdentifiers[index] == manager->FocusedIdentifier) {
-            manager->FocusCycleIndex = index;
+    for (position = 0U;
+         position < g_window_server.count;
+         ++position) {
+        if (g_window_server.windows[position] == window) {
             break;
         }
     }
-    for (UINT32 index = count; index < LITEOS_WINDOW_COUNT; ++index) {
-        manager->FocusCycleIdentifiers[index] = 0U;
+
+    if (position >= g_window_server.count ||
+        position + 1U >= g_window_server.count) {
+        return;
     }
+
+    for (uint32_t index = position + 1U;
+         index < g_window_server.count;
+         ++index) {
+        g_window_server.windows[index - 1U] =
+            g_window_server.windows[index];
+    }
+
+    g_window_server.windows[g_window_server.count - 1U] = window;
 }
 
-static BOOLEAN focus_window(LITEOS_WINDOW_MANAGER *manager,
-                            LITEOS_WINDOW *window, BOOLEAN reset_cycle) {
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning ||
-        !window_belongs(manager, window) || !window->Visible ||
-        !raise_window(manager, window)) return 0;
-    manager->FocusedIdentifier = window->Identifier;
-    if (reset_cycle) reset_focus_cycle(manager);
-    return 1;
+static bool window_lifecycle_test_fail(uint32_t step, kstatus_t status) {
+    uint32_t code = status < 0 ? (uint32_t)(-status) : (uint32_t)status;
+    liteos_serial_write("LITEOS_WINDOW_TEST_FAIL STEP=");
+    liteos_serial_write_u32(step);
+    liteos_serial_write(" STATUS=");
+    liteos_serial_write_u32(code);
+    liteos_serial_write("\r\n");
+    return false;
 }
 
-BOOLEAN liteos_window_manager_init(LITEOS_WINDOW_MANAGER *manager,
-                                   const LITEOS_BOOT_INFO *boot_info) {
-    UINT64 required_framebuffer_size;
-    if (manager == 0 || boot_info == 0 || manager->Initialized ||
-        boot_info->FrameBufferBase == 0 || boot_info->FrameBufferWidth == 0 ||
-        boot_info->FrameBufferHeight == 0 || boot_info->FrameBufferPixelsPerScanLine == 0 ||
-        boot_info->FrameBufferFormat > LITEOS_PIXEL_BITMASK ||
-        boot_info->FrameBufferPixelsPerScanLine > (UINT32)-1 / boot_info->FrameBufferHeight) {
-        return 0;
+/* REFACTOR_P7A_WINDOW_TEST_OWNER: canonical lifecycle and registry coverage. */
+bool window_lifecycle_self_test(void) {
+    process_t *owner = 0;
+    window_server_window_t *first = 0;
+    window_server_window_t *second = 0;
+    window_server_snapshot_t snapshot = {0};
+    uint32_t initial_count = 0U;
+    uint32_t dirty_rects;
+    uint64_t benchmark_start;
+    input_event_t pointer_event = {0};
+    kstatus_t status;
+    bool success = false;
+    bool count_restored = false;
+
+    if (process_create(0, &owner) != K_OK) {
+        success = window_lifecycle_test_fail(1U, K_EIO);
+        goto cleanup;
     }
-    required_framebuffer_size = (UINT64)boot_info->FrameBufferPixelsPerScanLine *
-                                boot_info->FrameBufferHeight * sizeof(UINT32);
-    if (boot_info->FrameBufferSize < required_framebuffer_size) return 0;
-    manager->Display.Base = boot_info->FrameBufferBase;
-    manager->Display.Width = boot_info->FrameBufferWidth;
-    manager->Display.Height = boot_info->FrameBufferHeight;
-    manager->Display.PixelsPerScanLine = boot_info->FrameBufferPixelsPerScanLine;
-    manager->Display.Format = boot_info->FrameBufferFormat;
-    for (UINT32 i = 0; i < 4U; ++i) manager->Display.Mask[i] = boot_info->FrameBufferMask[i];
-    for (UINT32 i = 0U; i < LITEOS_WINDOW_OUTPUT_COUNT; ++i) {
-        manager->Outputs[i].Active = 0;
-        manager->Outputs[i].FullDamage = 0;
-        manager->Outputs[i].VBlankSequence = 0U;
-        manager->Outputs[i].PresentedVBlank = 0U;
-        manager->Outputs[i].MissedVBlankCount = 0U;
-        manager->Outputs[i].HotplugGeneration = 0U;
+    if (!window_server_kernel_ready()) {
+        success = window_lifecycle_test_fail(2U, K_EIO);
+        goto cleanup;
     }
-    manager->Outputs[0].Active = 1;
-    manager->Outputs[0].FullDamage = 1;
-    manager->Outputs[0].Display = manager->Display;
-    manager->Outputs[0].HotplugGeneration = 1U;
-    manager->OutputCount = 1U;
-    for (UINT32 i = 0; i < LITEOS_WINDOW_COUNT; ++i) {
-        manager->Windows[i].Used = 0;
-        manager->ZOrder[i] = 0;
+
+    window_lock();
+    initial_count = g_window_server.count;
+    window_unlock();
+
+    if (!compositor_copy_self_test()) {
+        success = window_lifecycle_test_fail(3U, K_EIO);
+        goto cleanup;
     }
-    manager->WindowCount = 0;
-    manager->ZOrderCount = 0;
-    manager->NextIdentifier = 1U;
-    manager->Dirty = 0;
-    manager->DirtyX = 0;
-    manager->DirtyY = 0;
-    manager->DirtyWidth = 0U;
-    manager->DirtyHeight = 0U;
-    manager->InputRead = 0;
-    manager->InputWrite = 0;
-    manager->InputCount = 0;
-    manager->FocusedIdentifier = 0U;
-    manager->FocusCycleCount = 0U;
-    manager->FocusCycleIndex = 0U;
-    for (UINT32 i = 0U; i < LITEOS_WINDOW_COUNT; ++i) {
-        manager->FocusCycleIdentifiers[i] = 0U;
+
+    compositor_snapshot_test_clear_damage_tiles();
+    if (!compositor_snapshot_test_set_damage_tile(0U)) {
+        success = window_lifecycle_test_fail(4U, K_EIO);
+        goto cleanup;
     }
-    manager->PointerX = manager->Display.Width / 2U;
-    manager->PointerY = manager->Display.Height / 2U;
-    manager->PointerButtons = 0U;
-    manager->KeyboardModifiers = 0U;
-    manager->DraggedIdentifier = 0U;
-    manager->DragOffsetX = 0U;
-    manager->DragOffsetY = 0U;
-    manager->CompositorGeneration = 1U;
-    manager->FrameSequence = 0U;
-    manager->CompositorRunning = 1;
-    manager->Initialized = 1;
-    mark_full_damage(manager);
-    return 1;
+    benchmark_start = telemetry_timestamp();
+    dirty_rects = compositor_snapshot_tiles_to_rects(
+        &g_compositor_snapshot,
+        WINDOW_DAMAGE_MAX_SNAPSHOT_RECTS);
+    kernel_perf_emit_scope("graphics.single_dirty_tile", benchmark_start);
+    kernel_perf_emit_value("graphics.dirty_tiles_frame", dirty_rects);
+    compositor_snapshot_test_clear_damage_tiles();
+    if (dirty_rects != 1U) {
+        success = window_lifecycle_test_fail(4U, K_EIO);
+        goto cleanup;
+    }
+
+    if (window_server_create(owner, 8, 8, 96U, 56U,
+                             OS_WINDOW_VISIBLE, 0x00102030U,
+                             "back", &first) != K_OK) {
+        success = window_lifecycle_test_fail(3U, K_EIO);
+        goto cleanup;
+    }
+
+    benchmark_start = telemetry_timestamp();
+    compositor_frame_run();
+    kernel_perf_emit_scope("graphics.single_window_compose", benchmark_start);
+
+    if (window_server_create(owner, 48, 24, 96U, 56U,
+                             OS_WINDOW_VISIBLE, 0x00203040U,
+                             "front", &second) != K_OK) {
+        success = window_lifecycle_test_fail(4U, K_EIO);
+        goto cleanup;
+    }
+
+    benchmark_start = telemetry_timestamp();
+    compositor_frame_run();
+    kernel_perf_emit_scope("graphics.overlap_2", benchmark_start);
+
+    if (window_server_snapshot(initial_count, &snapshot) != K_OK ||
+        snapshot.identifier != first->identifier ||
+        snapshot.owner_pid != (uint32_t)owner->pid ||
+        snapshot.x != 8 || snapshot.y != 8 ||
+        snapshot.width != 96U || snapshot.height != 56U ||
+        snapshot.visible == 0U || snapshot.title[0] != 'b') {
+        success = window_lifecycle_test_fail(5U, K_EIO);
+        goto cleanup;
+    }
+    if (window_server_snapshot(initial_count + 1U, &snapshot) != K_OK ||
+        snapshot.identifier != second->identifier ||
+        snapshot.focused == 0U || snapshot.title[0] != 'f') {
+        success = window_lifecycle_test_fail(6U, K_EIO);
+        goto cleanup;
+    }
+    if (window_server_focus(first->identifier) != K_OK) {
+        success = window_lifecycle_test_fail(7U, K_EIO);
+        goto cleanup;
+    }
+    benchmark_start = telemetry_timestamp();
+    status = window_server_set(first, 21, 17, 1U);
+    kernel_perf_emit_scope("graphics.window_move_latency", benchmark_start);
+    if (status != K_OK) {
+        success = window_lifecycle_test_fail(8U, K_EIO);
+        goto cleanup;
+    }
+    if (window_server_update(owner, first->identifier, 21, 17,
+                             96U, 56U, 0U) != K_OK) {
+        success = window_lifecycle_test_fail(9U, K_EIO);
+        goto cleanup;
+    }
+    if (window_server_snapshot(initial_count + 1U, &snapshot) != K_OK ||
+        snapshot.identifier != first->identifier ||
+        snapshot.x != 21 || snapshot.y != 17 ||
+        snapshot.focused == 0U) {
+        success = window_lifecycle_test_fail(10U, K_EIO);
+        goto cleanup;
+    }
+
+    pointer_event.device_id = 0xC0DEU;
+    pointer_event.type = INPUT_EVENT_POINTER;
+    pointer_event.code = 0U;
+    pointer_event.value2 = 1;
+    pointer_event.value3 = 0;
+    pointer_event.value4 = 0;
+    benchmark_start = telemetry_timestamp();
+    status = input_core_push(&pointer_event);
+    if (status != K_OK) {
+        success = window_lifecycle_test_fail(13U, status);
+        goto cleanup;
+    }
+    window_server_pump_input_mode(true);
+    kernel_perf_emit_scope("graphics.input_present", benchmark_start);
+
+    if (window_server_set(second, 48, 24, 0U) != K_OK) {
+        success = window_lifecycle_test_fail(11U, K_EIO);
+        goto cleanup;
+    }
+    if (window_server_snapshot(initial_count, &snapshot) != K_OK ||
+        snapshot.identifier != second->identifier ||
+        snapshot.visible != 0U) {
+        success = window_lifecycle_test_fail(12U, K_EIO);
+        goto cleanup;
+    }
+
+    success = true;
+
+cleanup:
+    if (second != 0) {
+        window_server_handle_closed(second);
+        window_server_put(second);
+    }
+    if (first != 0) {
+        window_server_handle_closed(first);
+        window_server_put(first);
+    }
+    if (owner != 0) {
+        window_lock();
+        count_restored = g_window_server.count == initial_count;
+        window_unlock();
+        (void)process_abort(owner);
+        object_put(owner);
+    }
+    if (!count_restored) {
+        (void)window_lifecycle_test_fail(13U, K_EIO);
+        return false;
+    }
+    return success;
 }
 
-BOOLEAN liteos_window_manager_destroy(LITEOS_WINDOW_MANAGER *manager) {
-    if (manager == 0 || !manager->Initialized) return 0;
-    for (UINT32 i = 0; i < LITEOS_WINDOW_COUNT; ++i) {
-        if (manager->Windows[i].Used && !liteos_window_destroy(manager, &manager->Windows[i])) return 0;
-    }
-    manager->CompositorRunning = 0;
-    manager->Initialized = 0;
-    return 1;
-}
+void remove_window_locked(window_server_window_t *window) {
+    window_server_window_t *new_focused = 0;
 
-LITEOS_WINDOW *liteos_window_create(LITEOS_WINDOW_MANAGER *manager,
-                                    INT32 x, INT32 y, UINT32 width, UINT32 height,
-                                    UINT32 background, BOOLEAN visible) {
-    if (manager == 0 || !manager->Initialized || width == 0U || height == 0U ||
-        width > (UINT32)-1 / height || manager->WindowCount >= LITEOS_WINDOW_COUNT) return 0;
-    UINT64 bytes = (UINT64)width * height * sizeof(UINT32);
-    for (UINT32 i = 0; i < LITEOS_WINDOW_COUNT; ++i) {
-        LITEOS_WINDOW *window = &manager->Windows[i];
-        if (window->Used) continue;
-        if (!liteos_buddy_alloc_bytes(bytes, &window->BufferBlock)) return 0;
-        window->Pixels = (UINT32 *)(uintptr_t)window->BufferBlock.PhysicalAddress;
-        for (UINT64 pixel = 0; pixel < (UINT64)width * height; ++pixel) {
-            window->Pixels[pixel] = color_from_background(background);
-        }
-        window->Used = 1;
-        window->Visible = visible ? 1 : 0;
-        window->Identifier = manager->NextIdentifier++;
-        if (window->Identifier == 0U) window->Identifier = manager->NextIdentifier++;
-        window->X = x;
-        window->Y = y;
-        window->Width = width;
-        window->Height = height;
-        window->Background = background;
-        manager->ZOrder[manager->ZOrderCount++] = (UINT8)i;
-        ++manager->WindowCount;
-        if (window->Visible) {
-            manager->FocusedIdentifier = window->Identifier;
-        }
-        reset_focus_cycle(manager);
-        mark_dirty(manager, x, y, width, height);
-        return window;
+    if (window == 0 ||
+        !window_registry_remove_locked(window)) {
+        return;
     }
-    return 0;
-}
 
-BOOLEAN liteos_window_destroy(LITEOS_WINDOW_MANAGER *manager,
-                              LITEOS_WINDOW *window) {
-    if (manager == 0 || !manager->Initialized || !window_belongs(manager, window)) return 0;
-    mark_dirty(manager, window->X, window->Y, window->Width, window->Height);
-    for (UINT32 i = 0; i < manager->ZOrderCount; ++i) {
-        if (manager->ZOrder[i] != (UINT8)(window - manager->Windows)) continue;
-        for (UINT32 j = i + 1U; j < manager->ZOrderCount; ++j) {
-            manager->ZOrder[j - 1U] = manager->ZOrder[j];
-        }
-        --manager->ZOrderCount;
-        break;
-    }
-    if (!liteos_buddy_free(&window->BufferBlock)) return 0;
-    if (manager->FocusedIdentifier == window->Identifier) {
-        manager->FocusedIdentifier = 0U;
-    }
-    if (manager->DraggedIdentifier == window->Identifier) {
-        manager->DraggedIdentifier = 0U;
-        manager->DragOffsetX = 0U;
-        manager->DragOffsetY = 0U;
-    }
-    window->Used = 0;
-    window->Visible = 0;
-    window->Identifier = 0;
-    window->Pixels = 0;
-    if (manager->WindowCount != 0U) --manager->WindowCount;
-    restore_focus(manager);
-    reset_focus_cycle(manager);
-    return 1;
-}
+    window_mark_window_locked(window);
 
-BOOLEAN liteos_window_move(LITEOS_WINDOW_MANAGER *manager,
-                           LITEOS_WINDOW *window, INT32 x, INT32 y) {
-    if (manager == 0 || !manager->Initialized || !window_belongs(manager, window)) return 0;
-    mark_dirty(manager, window->X, window->Y, window->Width, window->Height);
-    window->X = x;
-    window->Y = y;
-    mark_dirty(manager, window->X, window->Y, window->Width, window->Height);
-    return 1;
-}
-
-BOOLEAN liteos_window_show(LITEOS_WINDOW_MANAGER *manager,
-                           LITEOS_WINDOW *window, BOOLEAN visible) {
-    if (manager == 0 || !manager->Initialized || !window_belongs(manager, window)) return 0;
-    if (window->Visible == (visible ? 1 : 0)) return 1;
-    mark_dirty(manager, window->X, window->Y, window->Width, window->Height);
-    window->Visible = visible ? 1 : 0;
-    if (!window->Visible && manager->FocusedIdentifier == window->Identifier) {
-        manager->FocusedIdentifier = 0U;
-        restore_focus(manager);
-    }
-    if (!window->Visible && manager->DraggedIdentifier == window->Identifier) {
-        manager->DraggedIdentifier = 0U;
-        manager->DragOffsetX = 0U;
-        manager->DragOffsetY = 0U;
-    } else if (window->Visible && manager->FocusedIdentifier == 0U) {
-        manager->FocusedIdentifier = window->Identifier;
-    }
-    reset_focus_cycle(manager);
-    return 1;
-}
-
-BOOLEAN liteos_window_focus(LITEOS_WINDOW_MANAGER *manager,
-                            LITEOS_WINDOW *window) {
-    return focus_window(manager, window, 1);
-}
-
-BOOLEAN liteos_window_focus_next(LITEOS_WINDOW_MANAGER *manager) {
-    LITEOS_WINDOW *window;
-    UINT32 next;
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning) return 0;
-    if (manager->FocusCycleCount == 0U || manager->FocusCycleIndex >= manager->FocusCycleCount ||
-        manager->FocusCycleIdentifiers[manager->FocusCycleIndex] != manager->FocusedIdentifier) {
-        reset_focus_cycle(manager);
-    }
-    if (manager->FocusCycleCount == 0U) return 0;
-    for (UINT32 attempt = 1U; attempt <= manager->FocusCycleCount; ++attempt) {
-        next = (manager->FocusCycleIndex + attempt) % manager->FocusCycleCount;
-        window = window_by_identifier(manager, manager->FocusCycleIdentifiers[next]);
-        if (window == 0 || !window->Visible) continue;
-        if (!focus_window(manager, window, 0)) return 0;
-        manager->FocusCycleIndex = next;
-        return 1;
-    }
-    return 0;
-}
-
-UINT32 liteos_window_focused(const LITEOS_WINDOW_MANAGER *manager) {
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning) {
-        return 0U;
-    }
-    return manager->FocusedIdentifier;
-}
-
-LITEOS_WINDOW *liteos_window_hit_test(LITEOS_WINDOW_MANAGER *manager,
-                                      INT32 x, INT32 y) {
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning) return 0;
-    for (UINT32 order = manager->ZOrderCount; order != 0U; --order) {
-        LITEOS_WINDOW *window = &manager->Windows[manager->ZOrder[order - 1U]];
-        if (window_contains_point(window, x, y, 0, 0)) return window;
-    }
-    return 0;
-}
-
-BOOLEAN liteos_window_pointer_move_relative(LITEOS_WINDOW_MANAGER *manager,
-                                            INT32 delta_x, INT32 delta_y) {
-    LITEOS_WINDOW *dragged;
-    INT64 next_x;
-    INT64 next_y;
-    INT64 window_x;
-    INT64 window_y;
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning ||
-        manager->Display.Width == 0U || manager->Display.Height == 0U) return 0;
-    next_x = (INT64)manager->PointerX + delta_x;
-    next_y = (INT64)manager->PointerY + delta_y;
-    if (next_x < 0) next_x = 0;
-    if (next_y < 0) next_y = 0;
-    if (next_x >= manager->Display.Width) next_x = manager->Display.Width - 1U;
-    if (next_y >= manager->Display.Height) next_y = manager->Display.Height - 1U;
-    manager->PointerX = (UINT32)next_x;
-    manager->PointerY = (UINT32)next_y;
-    if ((manager->PointerButtons & LITEOS_WINDOW_POINTER_BUTTON_LEFT) == 0U ||
-        manager->DraggedIdentifier == 0U) return 1;
-    dragged = window_by_identifier(manager, manager->DraggedIdentifier);
-    if (dragged == 0 || !dragged->Visible) {
-        manager->DraggedIdentifier = 0U;
-        manager->DragOffsetX = 0U;
-        manager->DragOffsetY = 0U;
-        return 1;
-    }
-    window_x = (INT64)manager->PointerX - manager->DragOffsetX;
-    window_y = (INT64)manager->PointerY - manager->DragOffsetY;
-    if (dragged->X != clamp_to_i32(window_x) || dragged->Y != clamp_to_i32(window_y)) {
-        return liteos_window_move(manager, dragged, clamp_to_i32(window_x), clamp_to_i32(window_y));
-    }
-    return 1;
-}
-
-BOOLEAN liteos_window_pointer_button(LITEOS_WINDOW_MANAGER *manager,
-                                     UINT32 button, BOOLEAN pressed) {
-    LITEOS_WINDOW *window;
-    UINT32 local_x;
-    UINT32 local_y;
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning ||
-        button != LITEOS_WINDOW_POINTER_BUTTON_LEFT) return 0;
-    if (!pressed) {
-        manager->PointerButtons &= ~LITEOS_WINDOW_POINTER_BUTTON_LEFT;
-        manager->DraggedIdentifier = 0U;
-        manager->DragOffsetX = 0U;
-        manager->DragOffsetY = 0U;
-        return 1;
-    }
-    if ((manager->PointerButtons & LITEOS_WINDOW_POINTER_BUTTON_LEFT) != 0U) return 1;
-    manager->PointerButtons |= LITEOS_WINDOW_POINTER_BUTTON_LEFT;
-    window = liteos_window_hit_test(manager, pointer_event_coordinate(manager->PointerX),
-                                    pointer_event_coordinate(manager->PointerY));
-    if (window == 0 || !liteos_window_focus(manager, window)) return 1;
-    if (!window_titlebar_contains_point(window, manager->PointerX, manager->PointerY,
-                                        &local_x, &local_y)) return 1;
-    manager->DraggedIdentifier = window->Identifier;
-    manager->DragOffsetX = local_x;
-    manager->DragOffsetY = local_y;
-    return 1;
-}
-
-BOOLEAN liteos_window_fill(LITEOS_WINDOW_MANAGER *manager,
-                           LITEOS_WINDOW *window, UINT32 x, UINT32 y,
-                           UINT32 width, UINT32 height, UINT32 color) {
-    if (manager == 0 || !manager->Initialized || !window_belongs(manager, window) ||
-        x >= window->Width || y >= window->Height || width == 0U || height == 0U) return 0;
-    width = min_u32(width, window->Width - x);
-    height = min_u32(height, window->Height - y);
-    for (UINT32 row = 0; row < height; ++row) {
-        UINT32 *pixels = window->Pixels + (UINT64)(y + row) * window->Width + x;
-        for (UINT32 column = 0; column < width; ++column) pixels[column] = color;
-    }
-    mark_dirty(manager, (INT64)window->X + x, (INT64)window->Y + y, width, height);
-    return 1;
-}
-
-BOOLEAN liteos_window_output_attach(LITEOS_WINDOW_MANAGER *manager,
-                                    UINT32 output, const LITEOS_DISPLAY *display) {
-    LITEOS_WINDOW_OUTPUT *target;
-    if (manager == 0 || display == 0 || !manager->Initialized ||
-        !manager->CompositorRunning || output == 0U ||
-        output >= LITEOS_WINDOW_OUTPUT_COUNT || !display_valid(display)) return 0;
-    target = &manager->Outputs[output];
-    for (UINT32 i = 0U; i < LITEOS_WINDOW_OUTPUT_COUNT; ++i) {
-        if (i != output && manager->Outputs[i].Active &&
-            display_same(&manager->Outputs[i].Display, display)) return 0;
-    }
-    if (target->Active && display_same(&target->Display, display)) return 1;
-    if (!target->Active) ++manager->OutputCount;
-    target->Active = 1;
-    target->FullDamage = 1;
-    target->Display = *display;
-    target->VBlankSequence = 0U;
-    target->PresentedVBlank = 0U;
-    target->MissedVBlankCount = 0U;
-    ++target->HotplugGeneration;
-    if (target->HotplugGeneration == 0U) target->HotplugGeneration = 1U;
-    mark_full_damage(manager);
-    return 1;
-}
-
-BOOLEAN liteos_window_output_detach(LITEOS_WINDOW_MANAGER *manager,
-                                    UINT32 output) {
-    LITEOS_WINDOW_OUTPUT *target;
-    if (manager == 0 || !manager->Initialized || output == 0U ||
-        output >= LITEOS_WINDOW_OUTPUT_COUNT ||
-        !(target = &manager->Outputs[output])->Active) return 0;
-    target->Active = 0;
-    target->FullDamage = 0;
-    target->Display = (LITEOS_DISPLAY){0};
-    target->VBlankSequence = 0U;
-    target->PresentedVBlank = 0U;
-    target->MissedVBlankCount = 0U;
-    ++target->HotplugGeneration;
-    if (target->HotplugGeneration == 0U) target->HotplugGeneration = 1U;
-    if (manager->OutputCount != 0U) --manager->OutputCount;
-    return 1;
-}
-
-BOOLEAN liteos_window_vblank(LITEOS_WINDOW_MANAGER *manager, UINT32 output) {
-    LITEOS_WINDOW_OUTPUT *target;
-    if (manager == 0 || !manager->Initialized || output >= LITEOS_WINDOW_OUTPUT_COUNT ||
-        !(target = &manager->Outputs[output])->Active) return 0;
-    ++target->VBlankSequence;
-    if (manager->Dirty && target->VBlankSequence > target->PresentedVBlank + 1U) {
-        ++target->MissedVBlankCount;
-    }
-    return 1;
-}
-
-UINT32 liteos_window_output_count(const LITEOS_WINDOW_MANAGER *manager) {
-    return manager != 0 && manager->Initialized ? manager->OutputCount : 0U;
-}
-
-UINT64 liteos_window_missed_vblanks(const LITEOS_WINDOW_MANAGER *manager,
-                                    UINT32 output) {
-    if (manager == 0 || !manager->Initialized || output >= LITEOS_WINDOW_OUTPUT_COUNT ||
-        !manager->Outputs[output].Active) return 0U;
-    return manager->Outputs[output].MissedVBlankCount;
-}
-
-BOOLEAN liteos_window_present(LITEOS_WINDOW_MANAGER *manager) {
-    BOOLEAN rendered = 0;
-    if (manager == 0 || !manager->Initialized || !manager->CompositorRunning) return 0;
-    if (!manager->Dirty) {
-        for (UINT32 i = 0U; i < LITEOS_WINDOW_OUTPUT_COUNT; ++i) {
-            if (manager->Outputs[i].Active && manager->Outputs[i].FullDamage) {
-                rendered = 1;
+    if (g_window_server.focused_identifier == window->identifier) {
+        window_scene_set_focus_identifier_locked(0U);
+        for (uint32_t j = g_window_server.count; j != 0U; --j) {
+            window_server_window_t *candidate =
+                g_window_server.windows[j - 1U];
+            if (!candidate->minimized &&
+                (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+                window_scene_set_focus_identifier_locked(candidate->identifier);
+                new_focused = candidate;
                 break;
             }
         }
-        if (!rendered) return 1;
     }
-    for (UINT32 output_index = 0U; output_index < LITEOS_WINDOW_OUTPUT_COUNT;
-         ++output_index) {
-        LITEOS_WINDOW_OUTPUT *output = &manager->Outputs[output_index];
-        UINT32 left;
-        UINT32 top;
-        UINT32 right;
-        UINT32 bottom;
-        if (!output->Active) continue;
-        if (output->FullDamage) {
-            left = 0U;
-            top = 0U;
-            right = output->Display.Width;
-            bottom = output->Display.Height;
-        } else {
-            left = manager->DirtyX;
-            top = manager->DirtyY;
-            right = min_u32(output->Display.Width, manager->DirtyX + manager->DirtyWidth);
-            bottom = min_u32(output->Display.Height, manager->DirtyY + manager->DirtyHeight);
-        }
-        if (left >= right || top >= bottom) continue;
-        volatile UINT32 *display = (volatile UINT32 *)(uintptr_t)output->Display.Base;
-        for (UINT32 y = top; y < bottom; ++y) {
-            for (UINT32 x = left; x < right; ++x) {
-            UINT32 color = 0;
-            for (UINT32 order = 0; order < manager->ZOrderCount; ++order) {
-                LITEOS_WINDOW *window = &manager->Windows[manager->ZOrder[order]];
-                INT32 display_x = (INT32)x;
-                INT32 display_y = (INT32)y;
-                if (!window->Used || !window->Visible || display_x < window->X ||
-                    display_y < window->Y || (UINT32)(display_x - window->X) >= window->Width ||
-                    (UINT32)(display_y - window->Y) >= window->Height) continue;
-                color = window->Pixels[(UINT64)(display_y - window->Y) * window->Width +
-                                       (UINT32)(display_x - window->X)];
-            }
-            display[(UINTN)y * output->Display.PixelsPerScanLine + x] = color;
-            }
-        }
-        output->FullDamage = 0;
-        output->PresentedVBlank = output->VBlankSequence;
-        rendered = 1;
+
+    if (g_window_server.title_pressed_identifier ==
+        window->identifier) {
+        window_clear_title_capture_locked();
     }
-    manager->Dirty = 0;
-    if (rendered) ++manager->FrameSequence;
-    return 1;
+
+    if (g_window_server.dragging_identifier == window->identifier) {
+        window_input_clear_drag_locked();
+    }
+
+    window_mark_window_locked(new_focused);
+    object_put(window); /* registry reference */
 }
 
-BOOLEAN liteos_window_compositor_restart(LITEOS_WINDOW_MANAGER *manager) {
-    if (manager == 0 || !manager->Initialized) return 0;
-    /* 运行代次先失效，调用方不能在重启窗口中提交帧。 */
-    manager->CompositorRunning = 0;
-    ++manager->CompositorGeneration;
-    if (manager->CompositorGeneration == 0U) manager->CompositorGeneration = 1U;
-    mark_full_damage(manager);
-    restore_focus(manager);
-    manager->CompositorRunning = 1;
-    return 1;
+
+kstatus_t window_server_register_manager(process_t *process) {
+    (void)process;
+    /* 合成和输入路由已经属于 Ring0，用户进程不能接管窗口服务器。 */
+    return window_server_kernel_ready() ? K_EPERM : K_EIO;
 }
 
-BOOLEAN liteos_window_compositor_running(const LITEOS_WINDOW_MANAGER *manager) {
-    return manager != 0 && manager->Initialized && manager->CompositorRunning;
+bool window_server_is_manager(process_t *process) {
+    (void)process;
+    return false;
 }
 
-UINT32 liteos_window_compositor_generation(const LITEOS_WINDOW_MANAGER *manager) {
-    return manager != 0 && manager->Initialized ? manager->CompositorGeneration : 0U;
+kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
+                               uint32_t width, uint32_t height,
+                               uint32_t flags, uint32_t background,
+                               const char *title, window_server_window_t **out) {
+    uint64_t pixels;
+    uint64_t bytes;
+    shared_section_t *section = 0;
+    window_server_window_t *window;
+    window_server_window_t *old_focused;
+
+    if (out == 0 || owner == 0 || !window_server_init() || width == 0U ||
+        height == 0U || width > UINT32_MAX / height ||
+        (flags & ~(OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE |
+                   OS_WINDOW_CLIENT_DECORATIONS)) != 0U) {
+        return K_EINVAL;
+    }
+
+    /*
+     * Resizable windows get a stable virtual surface mapping large enough for
+     * any on-screen size.  VM_OBJECT_SHARED is demand-paged, so this reserves
+     * virtual capacity without eagerly allocating a full-screen physical
+     * buffer.
+     */
+    if ((flags & OS_WINDOW_RESIZABLE) != 0U) {
+        if (!window_server_kernel_ready()) return K_EIO;
+        if (width > g_window_server.display_width ||
+            height > g_window_server.display_height) {
+            return K_EINVAL;
+        }
+        pixels = (uint64_t)g_window_server.display_width *
+                 g_window_server.display_height;
+    } else {
+        pixels = (uint64_t)width * height;
+    }
+
+    if (pixels > UINT64_MAX / sizeof(uint32_t)) return K_EINVAL;
+    bytes = pixels * sizeof(uint32_t);
+    if (bytes > UINT64_MAX - (PAGE_SIZE - 1U)) return K_EINVAL;
+    bytes = (bytes + PAGE_SIZE - 1U) &
+            ~(uint64_t)(PAGE_SIZE - 1U);
+
+    if (shared_section_create(bytes, &section) != K_OK) return K_ENOMEM;
+    window = (window_server_window_t *)kzalloc(sizeof(*window), 0);
+    if (window == 0) {
+        object_put(section);
+        return K_ENOMEM;
+    }
+    refcount_init(&window->object.refs, 1U);
+    window->object.type = KOBJECT_TYPE_WINDOW;
+    window->object.flags = 0U;
+    window->object.ops = &g_window_object_ops;
+    window->owner = owner;
+    object_get(owner);
+    window->section = section;
+    window->x = x;
+    window->y = y;
+    window->width = width;
+    window->height = height;
+    window->flags = flags;
+    window->background = background;
+    window->buffer_size = bytes;
+    window->owner_address = 0U;
+    window->compositor_cache = 0;
+    window->compositor_presented_x = x;
+    window->compositor_presented_y = y;
+    window->compositor_presented_width = 0U;
+    window->compositor_presented_height = 0U;
+    window->compositor_presented_valid = false;
+    window->dirty = true;
+    window->resize_pending = false;
+    window->maximized = false;
+    window->minimized = false;
+    window->restore_x = x;
+    window->restore_y = y;
+    window->restore_width = width;
+    window->restore_height = height;
+    window->event_read = 0U;
+    window->event_write = 0U;
+    window->event_count = 0U;
+    window->event_wake_pending = false;
+    wait_queue_init(&window->event_waitq);
+    for (uint32_t i = 0U; i + 1U < sizeof(window->title); ++i) {
+        window->title[i] = title != 0 ? title[i] : '\0';
+        if (window->title[i] == '\0') break;
+    }
+    window->title[sizeof(window->title) - 1U] = '\0';
+    window_lock();
+    old_focused = window_scene_find_locked(g_window_server.focused_identifier);
+    if (!window_registry_append_locked(window)) {
+        window_unlock();
+        object_put(window);
+        return K_ENOMEM;
+    }
+    object_get(window); /* registry reference */
+    if ((window->flags & OS_WINDOW_VISIBLE) != 0U) {
+        window_scene_set_focus_identifier_locked(window->identifier);
+    }
+    window_mark_window_locked(old_focused);
+    window_mark_window_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    *out = window;
+    return K_OK;
 }
 
-UINT64 liteos_window_frame_sequence(const LITEOS_WINDOW_MANAGER *manager) {
-    return manager != 0 && manager->Initialized ? manager->FrameSequence : 0U;
+kstatus_t window_server_lookup(uint32_t identifier, window_server_window_t **out) {
+    window_server_window_t *window;
+    if (out == 0 || !window_server_init()) return K_EINVAL;
+    window_lock();
+    window = window_scene_find_locked(identifier);
+    if (window == 0 || !object_try_get(window)) {
+        window_unlock();
+        return K_ENOENT;
+    }
+    window_unlock();
+    *out = window;
+    return K_OK;
 }
 
-BOOLEAN liteos_input_push(LITEOS_WINDOW_MANAGER *manager,
-                          const LITEOS_INPUT_EVENT *event) {
-    if (manager == 0 || event == 0 || !manager->Initialized ||
-        manager->InputCount >= LITEOS_INPUT_EVENT_COUNT) return 0;
-    manager->InputEvents[manager->InputWrite] = *event;
-    manager->InputWrite = (manager->InputWrite + 1U) % LITEOS_INPUT_EVENT_COUNT;
-    ++manager->InputCount;
-    return 1;
+uint32_t window_server_window_identifier(
+    const window_server_window_t *window) {
+    return window != 0 ? window->identifier : 0U;
 }
 
-BOOLEAN liteos_input_pop(LITEOS_WINDOW_MANAGER *manager,
-                         LITEOS_INPUT_EVENT *event) {
-    if (manager == 0 || event == 0 || !manager->Initialized || manager->InputCount == 0U) return 0;
-    *event = manager->InputEvents[manager->InputRead];
-    manager->InputRead = (manager->InputRead + 1U) % LITEOS_INPUT_EVENT_COUNT;
-    --manager->InputCount;
-    return 1;
+uint64_t window_server_window_buffer_size(
+    const window_server_window_t *window) {
+    return window != 0 ? window->buffer_size : 0U;
 }
 
-BOOLEAN liteos_window_pump_input(LITEOS_WINDOW_MANAGER *manager) {
-    input_event_t event;
-    if (manager == 0 || !manager->Initialized) return 0;
-    while (input_core_pop(&event) == K_OK) {
-        LITEOS_INPUT_EVENT window_event = {0};
-        if (event.type == INPUT_EVENT_KEY) {
-            window_event.Type = LITEOS_INPUT_KEY;
-            if (event.code == LITEOS_WINDOW_KEY_LEFT_ALT ||
-                event.code == LITEOS_WINDOW_KEY_RIGHT_ALT) {
-                if (event.value == INPUT_VALUE_PRESS || event.value == INPUT_VALUE_REPEAT) {
-                    manager->KeyboardModifiers |= 1U;
-                } else if (event.value == INPUT_VALUE_RELEASE) {
-                    manager->KeyboardModifiers &= ~1U;
-                }
-            } else if (event.code == LITEOS_WINDOW_KEY_TAB &&
-                       (event.value == INPUT_VALUE_PRESS ||
-                        event.value == INPUT_VALUE_REPEAT) &&
-                       (manager->KeyboardModifiers & 1U) != 0U &&
-                       !liteos_window_focus_next(manager)) {
-                return 0;
-            }
-        } else if (event.type == INPUT_EVENT_BUTTON) {
-            window_event.Type = LITEOS_INPUT_POINTER_BUTTON;
-            if (event.code == INPUT_BUTTON_LEFT &&
-                !liteos_window_pointer_button(manager,
-                                               LITEOS_WINDOW_POINTER_BUTTON_LEFT,
-                                               event.value != INPUT_VALUE_RELEASE)) {
-                return 0;
-            }
-        } else if (event.type == INPUT_EVENT_RELATIVE) {
-            window_event.Type = LITEOS_INPUT_POINTER_MOVE;
-            if (event.code == INPUT_REL_X) {
-                if (!liteos_window_pointer_move_relative(manager, event.value, 0)) return 0;
-            } else if (event.code == INPUT_REL_Y) {
-                if (!liteos_window_pointer_move_relative(manager, 0, event.value)) return 0;
-            }
-        } else {
+void window_server_put(window_server_window_t *window) {
+    object_put(window);
+}
+
+void window_server_handle_closed(window_server_window_t *window) {
+    bool referenced = false;
+    if (window == 0 || !window_server_init()) return;
+    window_lock();
+    object_get(window);
+    referenced = true;
+    remove_window_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    (void)wake_all(&window->event_waitq);
+    if (referenced) object_put(window);
+}
+
+void window_server_close_process(process_t *owner) {
+    window_server_window_t *removed[WINDOW_SERVER_MAX_WINDOWS];
+    uint32_t removed_count = 0U;
+    if (owner == 0 || !window_server_init()) return;
+    window_lock();
+    for (uint32_t index = 0U; index < g_window_server.count;) {
+        window_server_window_t *window = g_window_server.windows[index];
+        if (window == 0 || window->owner != owner) {
+            ++index;
             continue;
         }
-        window_event.Code = event.code;
-        if (window_event.Type != LITEOS_INPUT_KEY) {
-            window_event.X = pointer_event_coordinate(manager->PointerX);
-            window_event.Y = pointer_event_coordinate(manager->PointerY);
+        /* remove_window_locked() compacts the array, so keep the index. */
+        object_get(window);
+        remove_window_locked(window);
+        if (removed_count < WINDOW_SERVER_MAX_WINDOWS) {
+            removed[removed_count++] = window;
+        } else {
+            object_put(window);
         }
-        window_event.Value = event.value;
-        window_event.Timestamp = event.timestamp;
-        if (!liteos_input_push(manager, &window_event)) return 0;
     }
-    return 1;
+    window_unlock();
+    for (uint32_t index = 0U; index < removed_count; ++index) {
+        (void)wake_all(&removed[index]->event_waitq);
+        object_put(removed[index]);
+    }
+    if (removed_count != 0U) window_server_notify_worker();
+}
+
+kstatus_t window_server_set_owner_address(window_server_window_t *window,
+                                          uint64_t address) {
+    if (window == 0 || address == 0U || (address & (PAGE_SIZE - 1U)) != 0U) {
+        return K_EINVAL;
+    }
+    window_lock();
+    window->owner_address = address;
+    window_mark_window_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_snapshot(uint32_t index, window_server_snapshot_t *out) {
+    window_server_window_t *window;
+    if (out == 0 || !window_server_init()) return K_EINVAL;
+    window_lock();
+    if (index >= g_window_server.count) {
+        window_unlock();
+        return K_ENOENT;
+    }
+    window = g_window_server.windows[index];
+    out->identifier = window->identifier;
+    out->owner_pid = window->owner != 0 ? (uint32_t)window->owner->pid : 0U;
+    out->x = window->x;
+    out->y = window->y;
+    out->width = window->width;
+    out->height = window->height;
+    out->visible = (window->flags & OS_WINDOW_VISIBLE) != 0U;
+    out->focused = window->identifier == g_window_server.focused_identifier;
+    out->z_order = index;
+    out->buffer_size = window->buffer_size;
+    for (uint32_t i = 0U; i < sizeof(out->title); ++i) out->title[i] = window->title[i];
+    window_unlock();
+    return K_OK;
+}
+
+kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y,
+                            uint32_t visible) {
+    window_server_window_t *old_focused;
+    int32_t old_x;
+    int32_t old_y;
+    if (window == 0 || (visible & ~1U) != 0U) return K_EINVAL;
+    window_lock();
+    old_x = window->x;
+    old_y = window->y;
+    old_focused = window_scene_find_locked(g_window_server.focused_identifier);
+    window_mark_moved_rect_locked(old_x, old_y, x, y,
+                                  window_outer_width(window->width, window->flags),
+                                  window_outer_height(window->height, window->flags),
+                                  true);
+    window->x = x;
+    window->y = y;
+    if (visible != 0U) window->flags |= OS_WINDOW_VISIBLE;
+    else window->flags &= ~OS_WINDOW_VISIBLE;
+    if (visible == 0U && g_window_server.focused_identifier == window->identifier) {
+        window_scene_set_focus_identifier_locked(0U);
+        for (uint32_t i = g_window_server.count; i != 0U; --i) {
+            window_server_window_t *candidate = g_window_server.windows[i - 1U];
+            if ((candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+                window_scene_set_focus_identifier_locked(candidate->identifier);
+                break;
+            }
+        }
+    }
+    window_mark_window_locked(old_focused);
+    window_mark_window_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_focus(uint32_t identifier) {
+    window_server_window_t *window;
+    if (!window_server_init()) return K_EINVAL;
+    window_lock();
+    window = window_scene_find_locked(identifier);
+    if (window == 0 || (window->flags & OS_WINDOW_VISIBLE) == 0U) {
+        window_unlock();
+        return K_ENOENT;
+    }
+    window_scene_focus_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_map(window_server_window_t *window, process_t *process,
+                            uint64_t requested_address, uint64_t *mapped_address) {
+    vm_object_t *object;
+    vaddr_t address;
+    kstatus_t status;
+    if (window == 0 || process == 0 || mapped_address == 0 ||
+        window->section == 0 || process->vm == 0) return K_EINVAL;
+    object = window->section->vm_object;
+    if (object == 0) return K_EIO;
+    vm_object_get(object);
+    address = (vaddr_t)requested_address;
+    status = vm_map_object(process->vm, object, &address, 0U,
+                           (size_t)window->buffer_size,
+                           VM_PROT_USER | VM_PROT_READ | VM_PROT_WRITE,
+                           VM_MAP_SHARED);
+    vm_object_put(object);
+    if (status != K_OK) return status;
+    *mapped_address = (uint64_t)address;
+    return K_OK;
+}
+
+kstatus_t window_server_dispatch(uint32_t identifier, const os_input_event_t *event) {
+    window_server_window_t *window;
+    if (event == 0 || !window_server_init()) return K_EINVAL;
+    window_lock();
+    window = window_scene_find_locked(identifier);
+    if (window == 0 || window->owner == 0) {
+        window_unlock();
+        return K_ENOENT;
+    }
+    if (window->event_count >= WINDOW_EVENT_CAPACITY) {
+        window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
+        --window->event_count;
+    }
+    window->events[window->event_write].identifier = identifier;
+    window->events[window->event_write].type = OS_WINDOW_EVENT_INPUT;
+    window->events[window->event_write].input = *event;
+    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
+    ++window->event_count;
+    window_event_schedule_wake_locked(window);
+    window_unlock();
+
+    if (window_flush_event_wakes()) {
+        (void)wake_all(
+            &g_window_server.event_waitq);
+    }
+
+    return K_OK;
+}
+
+typedef struct window_event_wait_context {
+    process_t *process;
+    uint32_t identifier;
+    os_window_event_t *event;
+} window_event_wait_context_t;
+
+static bool window_event_available(void *raw_context) {
+    window_event_wait_context_t *context =
+        (window_event_wait_context_t *)raw_context;
+    bool available = false;
+    window_lock();
+    for (uint32_t i = 0U; i < g_window_server.count; ++i) {
+        window_server_window_t *window = g_window_server.windows[i];
+        if (window->owner != context->process ||
+            (context->identifier != 0U && window->identifier != context->identifier) ||
+            window->event_count == 0U) continue;
+        *context->event = window->events[window->event_read];
+        window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
+        --window->event_count;
+        available = true;
+        break;
+    }
+    window_unlock();
+    return available;
+}
+
+kstatus_t window_server_event_read(process_t *process, uint32_t identifier,
+                                   os_window_event_t *event, uint64_t timeout_ns) {
+    window_event_wait_context_t context;
+    window_server_window_t *wait_window = 0;
+    wait_queue_t *wait_queue = &g_window_server.event_waitq;
+    kstatus_t status;
+    if (process == 0 || event == 0 || !window_server_init()) return K_EINVAL;
+    context.process = process;
+    context.identifier = identifier;
+    context.event = event;
+    if (window_event_available(&context)) return K_OK;
+    if (timeout_ns == 0U) return K_EAGAIN;
+    if (identifier != 0U) {
+        /* Keep the embedded queue alive across a blocked read.  Teardown
+         * wakes this queue before dropping the registry reference. */
+        if (window_server_lookup(identifier, &wait_window) != K_OK ||
+            wait_window->owner != process) {
+            if (wait_window != 0) window_server_put(wait_window);
+            return K_EPERM;
+        }
+        wait_queue = &wait_window->event_waitq;
+    }
+    status = wait_on_queue(wait_queue, window_event_available,
+                           &context, timeout_ns);
+    if (wait_window != 0) window_server_put(wait_window);
+    return status;
+}
+
+kstatus_t window_server_update(process_t *process, uint32_t identifier,
+                               int32_t x, int32_t y, uint32_t width,
+                               uint32_t height, uint32_t flags) {
+    window_server_window_t *window;
+    if (process == 0 || identifier == 0U || flags != 0U ||
+        (width == 0U) != (height == 0U)) return K_EINVAL;
+    if (!window_server_kernel_ready()) return K_EIO;
+    window_lock();
+    window = window_scene_find_locked(identifier);
+    if (window == 0 || window->owner != process) {
+        window_unlock();
+        return K_EPERM;
+    }
+
+    /*
+     * A resizable client acknowledges the current row stride by submitting a
+     * full-surface damage rectangle with exactly the current width/height.
+     * A stale redraw for an older resize cannot expose mis-strided pixels.
+     */
+    if (window->resize_pending && x == 0 && y == 0 &&
+        width == window->width && height == window->height) {
+        window->resize_pending = false;
+    }
+
+    window->dirty = true;
+    if (width == 0U) {
+        window_mark_window_locked(window);
+    } else {
+        window_mark_surface_locked(window, x, y, width, height);
+    }
+    window_unlock();
+    /* A client update is independent of input.  Wake the compositor even
+     * when the input queue is empty; otherwise the worker can sleep until the
+     * next mouse report and every redraw appears one event late. */
+    window_server_notify_worker();
+    return K_OK;
 }

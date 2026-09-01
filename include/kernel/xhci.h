@@ -8,9 +8,14 @@ struct device;
 /* xHCI 控制器后端：控制器没有出现时允许无 USB 的 QEMU/物理机继续启动。 */
 bool xhci_hardware_present(void);
 bool xhci_hardware_self_test(void);
+bool xhci_event_queue_self_test(void);
+bool xhci_transfer_encode_self_test(void);
+bool xhci_device_context_self_test(void);
+bool xhci_endpoint_context_self_test(void);
 bool xhci_usb_device_enumerated(void);
 uint32_t xhci_usb_device_count(void);
 bool xhci_usb_hid_configured(void);
+bool xhci_usb_keyboard_configured(void);
 bool xhci_usb_mouse_configured(void);
 bool xhci_usb_audio_configured(void);
 bool xhci_usb_hub_configured(void);
@@ -20,6 +25,13 @@ bool xhci_usb_bluetooth_configured(void);
 bool xhci_usb_mass_storage_configured(void);
 bool xhci_usb_msc_query(uint8_t slot, uint8_t *interface_number,
                         uint8_t *bulk_in, uint8_t *bulk_out);
+bool xhci_usb_msc_is_uas(uint8_t slot);
+bool xhci_usb_msc_recover_uas(uint8_t slot);
+bool xhci_usb_msc_fallback_to_bot(uint8_t slot);
+kstatus_t xhci_usb_msc_scsi_command(uint8_t slot, const uint8_t *command,
+                                    uint8_t command_length, void *buffer,
+                                    uint32_t length, bool direction_in,
+                                    uint32_t *actual);
 
 /* BOT keeps the Event Ring consumer across CBW/DATA/CSW. */
 kstatus_t xhci_usb_bulk_session_begin(uint8_t slot);

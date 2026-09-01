@@ -40,6 +40,9 @@ typedef struct x86_cpu_local {
     /* 本 CPU 独占；无需 locked atomic。Step5 allocator 也复用它固定 CPU。 */
     uint32_t PreemptDisable;
     uint32_t PreemptReserved;
+    /* 由 SYSCALL 入口维护；调度器切换时随线程上下文保存。 */
+    uint32_t SyscallActive;
+    uint32_t SyscallReserved;
 } x86_cpu_local_t;
 
 #define X86_CPU_LOCAL_ONLINE (1U << 0)
@@ -47,6 +50,7 @@ typedef struct x86_cpu_local {
 #define X86_CPU_LOCAL_SELF_OFFSET             40U
 #define X86_CPU_LOCAL_CPU_INDEX_OFFSET        48U
 #define X86_CPU_LOCAL_PREEMPT_DISABLE_OFFSET  72U
+#define X86_CPU_LOCAL_SYSCALL_ACTIVE_OFFSET   80U
 
 _Static_assert(__builtin_offsetof(x86_cpu_local_t, Self) == X86_CPU_LOCAL_SELF_OFFSET,
                "x86 CPU-local Self ABI changed");
@@ -55,6 +59,9 @@ _Static_assert(__builtin_offsetof(x86_cpu_local_t, CpuIndex) == X86_CPU_LOCAL_CP
 _Static_assert(__builtin_offsetof(x86_cpu_local_t, PreemptDisable) ==
                X86_CPU_LOCAL_PREEMPT_DISABLE_OFFSET,
                "x86 CPU-local preempt ABI changed");
+_Static_assert(__builtin_offsetof(x86_cpu_local_t, SyscallActive) ==
+               X86_CPU_LOCAL_SYSCALL_ACTIVE_OFFSET,
+               "x86 CPU-local syscall ABI changed");
 
 /*
  * Fast local helpers are valid after x86 CPU-local setup.  They deliberately
@@ -81,10 +88,17 @@ static inline bool x86_preempt_disabled_fast(void) {
     return value != 0U;
 }
 
+static inline bool x86_syscall_active_fast(void) {
+    uint32_t value;
+    __asm__ volatile ("movl %%gs:80, %0" : "=r"(value));
+    return value != 0U;
+}
+
 #define X86_PROTECTION_WRITE_PROTECT (1U << 0)
 #define X86_PROTECTION_NX            (1U << 1)
 #define X86_PROTECTION_SMEP          (1U << 2)
 #define X86_PROTECTION_SMAP          (1U << 3)
+#define X86_PROTECTION_FPU           (1U << 4)
 
 extern x86_cpu_features_t x86_boot_cpu_features;
 void x86_cpu_detect_features(void);

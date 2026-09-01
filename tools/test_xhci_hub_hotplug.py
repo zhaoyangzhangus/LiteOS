@@ -1,30 +1,59 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import os
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 
-ROOT = Path(__file__).resolve().parents[1]
-BUILD = ROOT / "build"
+ROOT = Path(__file__).resolve().parents[2]
+BUILD = Path(os.environ.get("BUILD", str(ROOT / "build")))
+if not BUILD.is_absolute():
+    BUILD = ROOT / BUILD
 
 SERIAL = BUILD / "qemu-serial.log"
-MONITOR = BUILD / "qemu-monitor.sock"
+MONITOR = Path(
+    os.environ.get(
+        "QEMU_MONITOR_SOCKET",
+        str(Path(tempfile.gettempdir()) / "liteos-xhci-hub-hotplug.sock"),
+    )
+)
 
 RUNNER_STDOUT = BUILD / "b10b3-runner.stdout"
 RUNNER_STDERR = BUILD / "b10b3-runner.stderr"
+# QEMU's HMP mouse_move path coalesces updates faster than the guest's USB
+# polling interval.  Keep the default deliberately above that coalescing
+# window so the stress phase measures HID re-arming rather than host-input
+# batching.  CI can still override it for a controller-specific probe.
+MOUSE_EVENT_DELAY = float(os.environ.get("XHCI_TEST_MOUSE_DELAY", "0.05"))
+MOUSE_READY_TIMEOUT = float(
+    os.environ.get("XHCI_TEST_MOUSE_READY_TIMEOUT", "5.0")
+)
+HUB_SETTLE_SECONDS = float(
+    os.environ.get("XHCI_TEST_HUB_SETTLE", "1.0")
+)
+BOOT_READY_TIMEOUT = float(
+    os.environ.get("XHCI_TEST_BOOT_READY_TIMEOUT", "60.0")
+)
+QEMU_SECONDS = os.environ.get("XHCI_TEST_QEMU_SECONDS", "120")
+POLL_INTERVAL = float(os.environ.get("XHCI_TEST_POLL_INTERVAL", "0.25"))
 
 
 def serial_text():
     if not SERIAL.exists():
         return ""
 
-    return SERIAL.read_text(
-        errors="replace"
-    )
+    try:
+        return SERIAL.read_text(errors="replace")
+    except OSError:
+        # QEMU writes this file directly in headless mode.  A Windows/WSL
+        # mounted-file read can briefly return EAGAIN/ENODATA while the file
+        # is being extended; the next polling iteration will retry.
+        return ""
 
 
 def fail(message):
@@ -32,6 +61,8 @@ def fail(message):
 
 
 def wait_until(predicate, label, timeout=15.0):
+    if POLL_INTERVAL <= 0.0:
+        fail("XHCI_TEST_POLL_INTERVAL must be positive")
     deadline = time.monotonic() + timeout
 
     while time.monotonic() < deadline:
@@ -39,7 +70,7 @@ def wait_until(predicate, label, timeout=15.0):
             print("PASS:", label)
             return
 
-        time.sleep(0.05)
+        time.sleep(POLL_INTERVAL)
 
     fail("timeout: " + label)
 
@@ -205,10 +236,14 @@ def choose_usb_mouse(hmp):
 def send_mouse_events(hmp, count):
     direction = 1
 
+    if MOUSE_EVENT_DELAY < 0.0:
+        fail("XHCI_TEST_MOUSE_DELAY must not be negative")
+    if HUB_SETTLE_SECONDS < 0.0:
+        fail("XHCI_TEST_HUB_SETTLE must not be negative")
+
     for i in range(count):
         dx = 3 * direction
         dy = 1 if (i & 1) else -1
-
         hmp.command(
             f"mouse_move {dx} {dy}",
             timeout=1.0
@@ -219,7 +254,14 @@ def send_mouse_events(hmp, count):
         #
         # Avoid collapsing every host movement into one guest report.
         #
-        time.sleep(0.006)
+        time.sleep(MOUSE_EVENT_DELAY)
+
+    # A button transition is a stronger end-to-end probe than movement alone:
+    # it must produce a boot-mouse interrupt report even when a headless QEMU
+    # frontend coalesces relative motion.
+    hmp.command("mouse_button 1", timeout=1.0)
+    time.sleep(MOUSE_EVENT_DELAY)
+    hmp.command("mouse_button 0", timeout=1.0)
 
 
 def print_serial_tail():
@@ -268,11 +310,12 @@ def main():
         runner = subprocess.Popen(
             [
                 str(ROOT / "run-qemu.sh"),
+                "--headless",
                 "--usb-nested",
                 "--monitor-socket",
                 str(MONITOR),
                 "--seconds",
-                "70",
+                QEMU_SECONDS,
                 "--no-build",
             ],
             cwd=ROOT,
@@ -291,20 +334,6 @@ def main():
             12.0
         )
 
-        deadline = time.monotonic() + 5.0
-
-        while True:
-            try:
-                hmp = HMP(
-                    MONITOR
-                )
-                break
-            except OSError:
-                if time.monotonic() >= deadline:
-                    raise
-
-                time.sleep(0.05)
-
         # ----------------------------------------------------
         # Initial nested topology
         # ----------------------------------------------------
@@ -314,14 +343,14 @@ def main():
                 "LITEOS_XHCI_MSIX_OK"
                 in serial_text(),
             "MSI-X runtime ready",
-            20.0
+            BOOT_READY_TIMEOUT
         )
 
         wait_until(
             lambda:
                 latest_device_count() >= 3,
             "Hub -> Hub -> Mouse published",
-            20.0
+            BOOT_READY_TIMEOUT
         )
 
         #
@@ -335,8 +364,50 @@ def main():
                 "LITEOS_DEFERRED_WORKER_OK"
                 in serial_text(),
             "persistent deferred worker ready",
-            20.0
+            BOOT_READY_TIMEOUT
         )
+
+        # The deferred worker is published before the graphics worker.  Wait
+        # for the complete post-boot scheduler boundary before injecting HID
+        # input, otherwise the first report can race window-worker startup.
+        wait_until(
+            lambda:
+                "LITEOS_WINDOW_WORKER_OK"
+                in serial_text(),
+            "window worker ready",
+            BOOT_READY_TIMEOUT
+        )
+
+        # The window worker starts before the post-display user-runtime
+        # self-test.  Do not inject HID traffic while that test is still
+        # exercising VM, scheduler, and process teardown; otherwise this
+        # hotplug test can manufacture an unrelated USER_RUNTIME timeout.
+        wait_until(
+            lambda:
+                "LITEOS_USER_RUNTIME_SUBTESTS_OK"
+                in serial_text(),
+            "boot runtime self-tests ready",
+            BOOT_READY_TIMEOUT
+        )
+
+        if "LITEOS_STAGE_FAIL" in serial_text():
+            fail(
+                "boot runtime self-test failed before hotplug"
+            )
+
+        # Keep the monitor server online during boot, but do not attach a
+        # client until the boot-critical runtime self-test has completed.  A
+        # live HMP connection changes QEMU's main-loop load enough to perturb
+        # that deliberately tight self-test window on TCG.
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                hmp = HMP(MONITOR)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
         #
         # Generate a few initial events, but deliberately stay well
@@ -354,13 +425,18 @@ def main():
                 "LITEOS_USB_MOUSE_EVENT_OK"
                 in serial_text(),
             "initial nested mouse works",
-            5.0
+            MOUSE_READY_TIMEOUT
         )
 
         if "LITEOS_XHCI_HID_EVENTS_256" in serial_text():
             fail(
                 "256 HID milestone occurred before hotplug test"
             )
+
+        # Let QEMU's Hub interrupt endpoint return to its normal NAK/retry
+        # state before changing a downstream port.  This avoids coupling the
+        # topology test to the last mouse report's completion timing.
+        time.sleep(HUB_SETTLE_SECONDS)
 
         baseline_changes = (
             hub_change_count()
@@ -431,6 +507,11 @@ def main():
             12.0
         )
 
+        # device_add is asynchronous in QEMU.  The Hub-change marker means
+        # the Slot is published, while the host input device may still be
+        # joining QEMU's active-mouse list.
+        time.sleep(HUB_SETTLE_SECONDS)
+
         if "LITEOS_XHCI_FAIL=" in serial_text():
             fail(
                 "xHCI failure during child re-enumeration"
@@ -453,7 +534,7 @@ def main():
         #
         send_mouse_events(
             hmp,
-            420
+            640
         )
 
         wait_until(
@@ -467,11 +548,11 @@ def main():
         if (
             "LITEOS_XHCI_FAIL="
             in serial_text() or
-            "LITEOS_XHCI_MSIX_FAIL"
-            in serial_text()
+            "LITEOS_XHCI_MSIX_FAIL" in serial_text() or
+            "LITEOS_STAGE_FAIL" in serial_text()
         ):
             fail(
-                "runtime xHCI failure after replug"
+                "runtime xHCI or boot-stage failure after replug"
             )
 
         final_changes = (

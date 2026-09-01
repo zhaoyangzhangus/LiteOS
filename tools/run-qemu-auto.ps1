@@ -1,14 +1,46 @@
 param(
-    [int]$Cpu = 4
+    [int]$Cpu = 4,
+    [switch]$Debug,
+    [switch]$NvmeRoot,
+    [switch]$AllDisks,
+    [int]$GdbPort = 1234,
+    [string]$Build = '',
+    [string]$ToolPrefix = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$projectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$buildName = if ($Build) { $Build } elseif ($env:LITEOS_BUILD) { $env:LITEOS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
+if ([IO.Path]::IsPathRooted($buildName) -or $buildName -match '(^|[\\/])\.\.(?:[\\/]|$)') {
+    throw "Build directory must be relative to the project: $buildName"
+}
+$buildDirectory = Join-Path $projectRoot $buildName
+$buildLog = Join-Path $buildDirectory 'qemu-build.log'
+$failurePattern = '(^|[^A-Z])(FAIL|FAILED|FAILURE|ERROR|FATAL|PANIC|ABORT|INVALID|CANNOT|UNDEFINED REFERENCE)([^A-Z]|$)'
+
+function Invoke-WslBuild([string]$distro, [string]$command) {
+    New-Item -ItemType Directory -Force -Path $buildDirectory | Out-Null
+    Set-Content -LiteralPath $buildLog -Value '' -NoNewline
+
+    & wsl.exe -d $distro -- bash -lc $command 2>&1 |
+        ForEach-Object {
+            $line = [string]$_
+            Add-Content -LiteralPath $buildLog -Value $line
+            if ($line -match $failurePattern) { Write-Host $line }
+        }
+    $status = $LASTEXITCODE
+    if ($status -ne 0) {
+        throw "LiteOS build failed in WSL ($status). See $buildLog."
+    }
+}
 
 function Get-WslDistro {
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) { return $null }
+
     $preferred = @($env:LITEOS_WSL_DISTRO, 'Debian', 'Ubuntu')
     $available = @(
-        (& wsl.exe -l -q 2>$null) |
+        (& $wsl.Source -l -q 2>$null) |
             ForEach-Object { ("$_" -replace "`0", '').Trim() } |
             Where-Object { $_ }
     )
@@ -46,6 +78,18 @@ function Get-WslProjectRoot([string]$distro) {
     return "/mnt/$drive$rest"
 }
 
+function Test-NativeToolchain([string]$prefix) {
+    $make = Find-OptionalPath @(
+        'C:\Program Files\w64devkit\bin\make.exe',
+        'C:\w64devkit\bin\make.exe'
+    ) 'make.exe'
+    $compiler = Find-OptionalPath @(
+        (Join-Path 'C:\Program Files\w64devkit\bin' ($prefix + 'gcc.exe')),
+        (Join-Path 'C:\w64devkit\bin' ($prefix + 'gcc.exe'))
+    ) ($prefix + 'gcc.exe')
+    return $make -and $compiler
+}
+
 $distro = Get-WslDistro
 $qemu = Find-OptionalPath @(
     'C:\Program Files\qemu\qemu-system-x86_64.exe',
@@ -67,29 +111,62 @@ if ($qemu) {
 }
 
 $useNativeQemu = $qemu -and $qemuImg -and $firmware
-$kernel = Join-Path $projectRoot 'build\esp\EFI\LITEOS\kernel.elf'
-$bootloader = Join-Path $projectRoot 'build\esp\EFI\BOOT\BOOTX64.EFI'
+$nativePrefix = if ($ToolPrefix) {
+    $ToolPrefix
+} elseif ($env:LITEOS_TOOLPREFIX) {
+    $env:LITEOS_TOOLPREFIX
+} elseif ($env:TOOLPREFIX) {
+    $env:TOOLPREFIX
+} else {
+    'x86_64-w64-mingw32-'
+}
+$useNativeToolchain = Test-NativeToolchain $nativePrefix
+$kernel = Join-Path $buildDirectory 'esp\EFI\LITEOS\kernel.elf'
+$bootloader = Join-Path $buildDirectory 'esp\EFI\BOOT\BOOTX64.EFI'
 
 if ($useNativeQemu) {
-    if (-not $distro) {
+    if ($useNativeToolchain) {
+        $buildScript = Join-Path $projectRoot 'tools\build-windows.ps1'
+        $buildArguments = @(
+            '-Build', $buildName,
+            '-Debug', '2',
+            '-Serial',
+            '-ToolPrefix', $nativePrefix
+        )
+        Write-Verbose 'Environment: Windows native QEMU + native w64devkit build'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Native Windows build failed ($LASTEXITCODE)."
+        }
+    }
+    elseif (-not $distro) {
         if (-not (Test-Path -LiteralPath $kernel) -or
             -not (Test-Path -LiteralPath $bootloader)) {
-            throw 'WSL is required to build LiteOS, but no WSL distribution was found.'
+            throw 'Native QEMU is available, but no native LiteOS toolchain or WSL distribution was found.'
         }
-        Write-Host 'Environment: Windows native QEMU (existing build)'
+        Write-Verbose 'Environment: Windows native QEMU (existing build)'
     } else {
         $wslRoot = Get-WslProjectRoot $distro
         $escapedRoot = $wslRoot.Replace("'", "'\''")
-        $buildCommand = "cd '$escapedRoot' && ./build-wsl.sh esp DEBUG=2 LITEOS_DEBUG_SERIAL=1"
-        Write-Host "Environment: Windows native QEMU + WSL build ($distro)"
-        & wsl.exe -d $distro -- bash -lc $buildCommand
-        if ($LASTEXITCODE -ne 0) {
-            throw "LiteOS build failed in WSL ($LASTEXITCODE)."
-        }
+        $escapedBuildName = $buildName.Replace("'", "'\''")
+        $buildCommand = "cd '$escapedRoot' && BUILD='$escapedBuildName' ./build-wsl.sh esp DEBUG=2 LITEOS_DEBUG_SERIAL=1"
+        Write-Verbose "Environment: Windows native QEMU + WSL fallback build ($distro)"
+        Invoke-WslBuild $distro $buildCommand
     }
 
+    $nativeArguments = @('-Cpu', $Cpu)
+    $nativeArguments += @('-Build', $buildName)
+    if ($NvmeRoot) {
+        $nativeArguments += '-NvmeRoot'
+    }
+    if ($AllDisks) {
+        $nativeArguments += '-AllDisks'
+    }
+    if ($Debug) {
+        $nativeArguments += @('-Debug', '-GdbPort', $GdbPort)
+    }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
-        (Join-Path $projectRoot 'run-qemu-windows.ps1') -Cpu $Cpu
+        (Join-Path $projectRoot 'run-qemu-windows.ps1') @nativeArguments
     exit $LASTEXITCODE
 }
 
@@ -99,7 +176,20 @@ if (-not $distro) {
 
 $wslRoot = Get-WslProjectRoot $distro
 $escapedRoot = $wslRoot.Replace("'", "'\''")
-$runCommand = "cd '$escapedRoot' && ./run-qemu.sh --keep-open --cpu $Cpu"
-Write-Host "Environment: WSL QEMU ($distro)"
+$escapedBuildName = $buildName.Replace("'", "'\''")
+$runArguments = if ($Debug) {
+    "./run-qemu.sh --debug --gdb-port $GdbPort --cpu $Cpu"
+} else {
+    "./run-qemu.sh --keep-open --cpu $Cpu"
+}
+if ($NvmeRoot) {
+    $runArguments += ' --nvme-root'
+}
+if ($AllDisks) {
+    $runArguments += ' --all-disks'
+}
+$protocolPrefix = if ($Debug) { 'LITEOS_DEBUG_PROTOCOL=1 ' } else { '' }
+$runCommand = "cd '$escapedRoot' && BUILD='$escapedBuildName' $protocolPrefix$runArguments"
+Write-Verbose "Environment: WSL QEMU ($distro)"
 & wsl.exe -d $distro -- bash -lc $runCommand
 exit $LASTEXITCODE

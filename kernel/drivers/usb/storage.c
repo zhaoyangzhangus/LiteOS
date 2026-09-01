@@ -1,7 +1,9 @@
 #include <usb/storage.h>
 
+#include <arch/x86_64/cpu.h>
 #include <kernel/console.h>
 #include <kernel/deferred.h>
+#include <kernel/realtest.h>
 #include <kernel/xhci.h>
 
 #include <stdatomic.h>
@@ -17,6 +19,7 @@
 #define SCSI_READ_10              0x28U
 #define SCSI_WRITE_10             0x2AU
 #define SCSI_SYNCHRONIZE_CACHE_10 0x35U
+#define USB_MSC_LOCK_TIMEOUT_NS   1000000000ULL
 
 typedef struct __attribute__((packed)) usb_msc_cbw {
     uint32_t signature;
@@ -41,6 +44,7 @@ _Static_assert(sizeof(usb_msc_csw_t) == 13U, "USB MSC CSW ABI");
 typedef struct usb_msc_device {
     atomic_bool busy;
     atomic_bool online;
+    atomic_uint busy_owner_cpu;
     uint8_t slot;
     uint8_t interface_number;
     uint8_t bulk_in;
@@ -55,6 +59,11 @@ typedef struct usb_msc_device {
 static usb_msc_device_t g_usb_msc[USB_MSC_MAX_SLOT];
 static LITEOS_BLOCK_MANAGER g_usb_msc_block_manager;
 static atomic_uint g_usb_msc_manager_state;
+
+static void usb_msc_record_status(const char *stage, kstatus_t status) {
+    uint32_t value = status < 0 ? (uint32_t)(-status) : (uint32_t)status;
+    liteos_realtest_mark_number(stage, value);
+}
 
 static uint32_t msc_be32(const uint8_t value[4]) {
     return ((uint32_t)value[0] << 24) |
@@ -107,7 +116,11 @@ static bool usb_msc_manager_init_once(void) {
  * here: the owner may be running on this CPU and must be allowed to complete.
  */
 static bool usb_msc_enter(usb_msc_device_t *device) {
+    uint64_t deadline;
+
     if (device == 0) return false;
+    deadline = x86_read_tsc() +
+               x86_timeout_ns_to_tsc(USB_MSC_LOCK_TIMEOUT_NS);
 
     for (;;) {
         if (!atomic_load_explicit(&device->online, memory_order_acquire)) {
@@ -118,13 +131,29 @@ static bool usb_msc_enter(usb_msc_device_t *device) {
         if (atomic_compare_exchange_weak_explicit(
                 &device->busy, &expected, true,
                 memory_order_acq_rel, memory_order_acquire)) {
+            atomic_store_explicit(&device->busy_owner_cpu,
+                                  x86_current_cpu_index(),
+                                  memory_order_release);
             break;
+        }
+        if ((int64_t)(x86_read_tsc() - deadline) >= 0) {
+            liteos_realtest_mark_number("USB_MSC_BUSY_TIMEOUT", device->slot);
+            liteos_realtest_mark_number(
+                "USB_MSC_BUSY_OWNER",
+                atomic_load_explicit(&device->busy_owner_cpu,
+                                     memory_order_acquire));
+            liteos_realtest_mark_number("USB_MSC_BUSY_ONLINE",
+                atomic_load_explicit(&device->online, memory_order_acquire) ?
+                1U : 0U);
+            return false;
         }
         __asm__ volatile ("pause");
     }
 
     /* Detach can race the acquisition.  Never start a new command offline. */
     if (!atomic_load_explicit(&device->online, memory_order_acquire)) {
+        atomic_store_explicit(&device->busy_owner_cpu, UINT32_MAX,
+                              memory_order_release);
         atomic_store_explicit(&device->busy, false, memory_order_release);
         return false;
     }
@@ -132,6 +161,8 @@ static bool usb_msc_enter(usb_msc_device_t *device) {
 }
 
 static void usb_msc_leave(usb_msc_device_t *device) {
+    atomic_store_explicit(&device->busy_owner_cpu, UINT32_MAX,
+                          memory_order_release);
     atomic_store_explicit(&device->busy, false, memory_order_release);
 }
 
@@ -154,6 +185,12 @@ static kstatus_t usb_msc_bot_locked(usb_msc_device_t *device,
         return K_EINVAL;
     }
 
+    if (xhci_usb_msc_is_uas(device->slot)) {
+        return xhci_usb_msc_scsi_command(
+            device->slot, command, command_length, data, data_length,
+            direction_in, actual_data);
+    }
+
     cbw.signature = USB_MSC_CBW_SIGNATURE;
     cbw.tag = ++device->next_tag;
     if (cbw.tag == 0U) cbw.tag = ++device->next_tag;
@@ -171,6 +208,9 @@ static kstatus_t usb_msc_bot_locked(usb_msc_device_t *device,
         device->slot, device->bulk_out, false,
         &cbw, sizeof(cbw), &actual);
     if (status != K_OK || actual != sizeof(cbw)) {
+        liteos_realtest_mark_number("USB_MSC_BOT_FAIL_STAGE", 1U);
+        usb_msc_record_status("USB_MSC_BOT_FAIL_STATUS", status);
+        usb_msc_record_status("USB_MSC_BOT_FAIL_ACTUAL", (kstatus_t)actual);
         if (status == K_OK) status = K_EIO;
         goto done;
     }
@@ -180,7 +220,11 @@ static kstatus_t usb_msc_bot_locked(usb_msc_device_t *device,
             device->slot,
             direction_in ? device->bulk_in : device->bulk_out,
             direction_in, data, data_length, &data_actual);
-        if (status != K_OK) goto done;
+        if (status != K_OK) {
+            liteos_realtest_mark_number("USB_MSC_BOT_FAIL_STAGE", 2U);
+            usb_msc_record_status("USB_MSC_BOT_FAIL_STATUS", status);
+            goto done;
+        }
     }
 
     actual = 0U;
@@ -188,6 +232,9 @@ static kstatus_t usb_msc_bot_locked(usb_msc_device_t *device,
         device->slot, device->bulk_in, true,
         &csw, sizeof(csw), &actual);
     if (status != K_OK || actual != sizeof(csw)) {
+        liteos_realtest_mark_number("USB_MSC_BOT_FAIL_STAGE", 3U);
+        usb_msc_record_status("USB_MSC_BOT_FAIL_STATUS", status);
+        usb_msc_record_status("USB_MSC_BOT_FAIL_ACTUAL", (kstatus_t)actual);
         if (status == K_OK) status = K_EIO;
         goto done;
     }
@@ -195,6 +242,7 @@ static kstatus_t usb_msc_bot_locked(usb_msc_device_t *device,
     if (csw.signature != USB_MSC_CSW_SIGNATURE ||
         csw.tag != cbw.tag || csw.status != 0U ||
         csw.residue > data_length) {
+        liteos_realtest_mark_number("USB_MSC_BOT_FAIL_STAGE", 4U);
         status = K_EIO;
         goto done;
     }
@@ -341,11 +389,15 @@ static void usb_msc_attach_work(void *argument) {
         !xhci_usb_msc_query(slot, &interface_number, &bulk_in, &bulk_out))
         return;
 
+    liteos_realtest_mark_number("USB_MSC_ATTACH_BEGIN", slot);
+
     usb_msc_device_t *device = &g_usb_msc[slot];
     if (atomic_exchange_explicit(&device->busy, true,
                                  memory_order_acq_rel)) return;
+    atomic_store_explicit(&device->busy_owner_cpu, x86_current_cpu_index(),
+                          memory_order_release);
     if (atomic_load_explicit(&device->online, memory_order_acquire)) {
-        atomic_store_explicit(&device->busy, false, memory_order_release);
+        usb_msc_leave(device);
         return;
     }
 
@@ -360,6 +412,27 @@ static void usb_msc_attach_work(void *argument) {
     device->block_device = 0;
 
     kstatus_t status = usb_msc_inquiry(device);
+    usb_msc_record_status("USB_MSC_INQUIRY_STATUS", status);
+    if (status != K_OK && xhci_usb_msc_is_uas(slot)) {
+        for (uint32_t retry = 0U; retry < 2U && status != K_OK; ++retry) {
+            if (!xhci_usb_msc_recover_uas(slot)) break;
+            liteos_realtest_mark_number("USB_MSC_UAS_RETRY", retry + 1U);
+            status = usb_msc_inquiry(device);
+            usb_msc_record_status("USB_MSC_UAS_RETRY_STATUS", status);
+        }
+    }
+    if (status != K_OK && xhci_usb_msc_is_uas(slot)) {
+        liteos_realtest_mark_number("USB_MSC_UAS_FALLBACK_STATUS",
+                                    (uint32_t)(-status));
+        if (xhci_usb_msc_fallback_to_bot(slot) &&
+            xhci_usb_msc_query(slot, &interface_number, &bulk_in, &bulk_out)) {
+            device->interface_number = interface_number;
+            device->bulk_in = bulk_in;
+            device->bulk_out = bulk_out;
+            status = usb_msc_inquiry(device);
+            usb_msc_record_status("USB_MSC_BOT_INQUIRY_STATUS", status);
+        }
+    }
     if (status == K_OK) {
         status = K_EIO;
         for (uint32_t retry = 0U; retry < 8U; ++retry) {
@@ -367,12 +440,23 @@ static void usb_msc_attach_work(void *argument) {
             if (status == K_OK) break;
             __asm__ volatile ("pause");
         }
+        usb_msc_record_status("USB_MSC_READY_STATUS", status);
     }
-    if (status == K_OK) status = usb_msc_read_capacity(device);
+    if (status == K_OK) {
+        status = usb_msc_read_capacity(device);
+        usb_msc_record_status("USB_MSC_CAPACITY_STATUS", status);
+    }
 
-    if (status != K_OK || !usb_msc_manager_init_once()) {
+    if (status != K_OK) {
+        liteos_realtest_mark_number("USB_MSC_SCSI_FAIL", (uint32_t)(-status));
         liteos_serial_write("LITEOS_USB_MSC_SCSI_FAIL\r\n");
-        atomic_store_explicit(&device->busy, false, memory_order_release);
+        usb_msc_leave(device);
+        return;
+    }
+    if (!usb_msc_manager_init_once()) {
+        liteos_realtest_mark("USB_MSC_MANAGER_FAIL");
+        liteos_serial_write("LITEOS_USB_MSC_SCSI_FAIL\r\n");
+        usb_msc_leave(device);
         return;
     }
 
@@ -382,12 +466,14 @@ static void usb_msc_attach_work(void *argument) {
             usb_msc_block_read, usb_msc_block_write, usb_msc_block_flush,
             device, &device->block_device)) {
         liteos_serial_write("LITEOS_USB_MSC_BLOCK_REGISTER_FAIL\r\n");
-        atomic_store_explicit(&device->busy, false, memory_order_release);
+        usb_msc_leave(device);
         return;
     }
 
+    liteos_realtest_mark("USB_MSC_BLOCK_REGISTER_OK");
+
     atomic_store_explicit(&device->online, true, memory_order_release);
-    atomic_store_explicit(&device->busy, false, memory_order_release);
+    usb_msc_leave(device);
 
     liteos_serial_write("LITEOS_USB_MSC_FOUND SLOT=");
     liteos_serial_write_u32(slot);

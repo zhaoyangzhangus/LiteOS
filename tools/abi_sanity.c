@@ -20,6 +20,38 @@ ABI_ASSERT(sizeof(os_timespec_t) == 16, "timespec size changed");
 ABI_ASSERT(offsetof(os_timespec_t, seconds) == 0, "timespec.seconds offset changed");
 ABI_ASSERT(offsetof(os_timespec_t, nanoseconds) == 8, "timespec.nanoseconds offset changed");
 ABI_ASSERT(offsetof(os_timespec_t, reserved) == 12, "timespec.reserved offset changed");
+ABI_ASSERT(sizeof(os_exec_fd_entry_t) == 288,
+           "exec fd entry ABI size changed");
+ABI_ASSERT(offsetof(os_exec_fd_entry_t, descriptor) == 0,
+           "exec fd entry.descriptor offset changed");
+ABI_ASSERT(offsetof(os_exec_fd_entry_t, handle) == 8,
+           "exec fd entry.handle offset changed");
+ABI_ASSERT(offsetof(os_exec_fd_entry_t, path) == 32,
+           "exec fd entry.path offset changed");
+ABI_ASSERT(sizeof(os_exec_fd_map_t) == 73744,
+           "exec fd map ABI size changed");
+ABI_ASSERT(offsetof(os_exec_fd_map_t, entries) == 16,
+           "exec fd map.entries offset changed");
+ABI_ASSERT(sizeof(os_clock_set_t) == 32, "clock set ABI size changed");
+ABI_ASSERT(offsetof(os_clock_set_t, hdr) == 0, "clock set.hdr offset changed");
+ABI_ASSERT(offsetof(os_clock_set_t, clock_id) == 8, "clock set.clock_id offset changed");
+ABI_ASSERT(offsetof(os_clock_set_t, value) == 16, "clock set.value offset changed");
+ABI_ASSERT(sizeof(os_pipe_create_t) == 32, "pipe create ABI size changed");
+ABI_ASSERT(offsetof(os_pipe_create_t, hdr) == 0, "pipe create.hdr offset changed");
+ABI_ASSERT(offsetof(os_pipe_create_t, flags) == 8, "pipe create.flags offset changed");
+ABI_ASSERT(offsetof(os_pipe_create_t, read_handle) == 16, "pipe create.read_handle offset changed");
+ABI_ASSERT(offsetof(os_pipe_create_t, write_handle) == 24, "pipe create.write_handle offset changed");
+ABI_ASSERT(sizeof(os_signal_action_t) == 32, "signal action ABI size changed");
+ABI_ASSERT(offsetof(os_signal_action_t, handler) == 0,
+           "signal action.handler offset changed");
+ABI_ASSERT(offsetof(os_signal_action_t, mask) == 8,
+           "signal action.mask offset changed");
+ABI_ASSERT(offsetof(os_signal_action_t, restorer) == 16,
+           "signal action.restorer offset changed");
+ABI_ASSERT(offsetof(os_signal_action_t, flags) == 24,
+           "signal action.flags offset changed");
+ABI_ASSERT(offsetof(os_signal_action_t, reserved) == 28,
+           "signal action.reserved offset changed");
 ABI_ASSERT(sizeof(os_io_vec_t) == 16, "io vector ABI size changed");
 ABI_ASSERT(offsetof(os_io_vec_t, address) == 0, "io vector.address offset changed");
 ABI_ASSERT(offsetof(os_io_vec_t, length) == 8, "io vector.length offset changed");
@@ -132,6 +164,16 @@ ABI_ASSERT(offsetof(os_socket_ipv6_async_send_t, port) == 64,
            "socket IPv6 async.port offset changed");
 ABI_ASSERT(offsetof(os_socket_ipv6_async_send_t, flags) == 66,
            "socket IPv6 async.flags offset changed");
+ABI_ASSERT(sizeof(os_socket_shutdown_t) == 24,
+           "socket shutdown ABI size changed");
+ABI_ASSERT(offsetof(os_socket_shutdown_t, hdr) == 0,
+           "socket shutdown.hdr offset changed");
+ABI_ASSERT(offsetof(os_socket_shutdown_t, socket) == 8,
+           "socket shutdown.socket offset changed");
+ABI_ASSERT(offsetof(os_socket_shutdown_t, how) == 16,
+           "socket shutdown.how offset changed");
+ABI_ASSERT(offsetof(os_socket_shutdown_t, reserved) == 20,
+           "socket shutdown.reserved offset changed");
 ABI_ASSERT(sizeof(os_gpu_create_context_t) == 24, "gpu context ABI size changed");
 ABI_ASSERT(offsetof(os_gpu_create_context_t, hdr) == 0, "gpu context.hdr offset changed");
 ABI_ASSERT(offsetof(os_gpu_create_context_t, device) == 8, "gpu context.device offset changed");
@@ -172,15 +214,6 @@ ABI_ASSERT(offsetof(os_display_commit_t, wait_fence) == 56, "display commit.wait
 ABI_ASSERT(offsetof(os_display_commit_t, wait_value) == 64, "display commit.wait_value offset changed");
 ABI_ASSERT(offsetof(os_display_commit_t, signal_fence) == 72, "display commit.signal_fence offset changed");
 ABI_ASSERT(offsetof(os_display_commit_t, signal_value) == 80, "display commit.signal_value offset changed");
-ABI_ASSERT(sizeof(os_token_info_t) == 48, "token ABI size changed");
-ABI_ASSERT(offsetof(os_token_info_t, hdr) == 0, "token.hdr offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, uid) == 8, "token.uid offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, gid) == 12, "token.gid offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, groups) == 16, "token.groups offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, privileges) == 24, "token.privileges offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, capabilities) == 32, "token.capabilities offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, flags) == 40, "token.flags offset changed");
-ABI_ASSERT(offsetof(os_token_info_t, reserved) == 44, "token.reserved offset changed");
 ABI_ASSERT(sizeof(os_device_open_t) == 32, "device open ABI size changed");
 ABI_ASSERT(offsetof(os_device_open_t, hdr) == 0, "device open.hdr offset changed");
 ABI_ASSERT(offsetof(os_device_open_t, device_id) == 8, "device open.device_id offset changed");
@@ -264,26 +297,44 @@ ABI_ASSERT(sizeof(os_window_event_read_t) == 64, "window event read ABI size cha
 ABI_ASSERT(sizeof(os_window_input_dispatch_t) == 40, "window dispatch ABI size changed");
 
 static int abi_runtime_checks(void) {
-    if (OS_SYSCALL_ABI_VERSION != 1U || OS_INVALID_HANDLE != 0) return 1;
-    if (OS_SYS_THREAD_EXIT != 0x0000 || OS_SYS_VM_MAP != 0x0100 ||
+    if (OS_SYSCALL_ABI_VERSION != 1U || OS_INVALID_HANDLE != 0 ||
+        OS_CLOCK_REALTIME != 0U || OS_CLOCK_MONOTONIC != 1U) return 1;
+    if (OS_SYS_THREAD_EXIT != 0x0000 || OS_SYS_PROCESS_FORK != 0x0006 ||
+        OS_SYS_PROCESS_WAIT != 0x0007 || OS_SYS_THREAD_CONTEXT != 0x0008 ||
+        OS_SYS_VM_MAP != 0x0100 ||
+        OS_SYS_VM_SYNC != 0x0104 || OS_SYS_VM_ADVISE != 0x0105 ||
         OS_SYS_HANDLE_CLOSE != 0x0200 || OS_SYS_FILE_OPEN != 0x0300 ||
         OS_SYS_FILE_ENUMERATE != 0x0304 ||
         OS_SYS_FILE_SEEK != 0x0305 || OS_SYS_FILE_STAT != 0x0306 ||
         OS_SYS_FILE_TRUNCATE != 0x0307 || OS_SYS_FILE_REMOVE != 0x0308 ||
         OS_SYS_FILE_MKDIR != 0x0309 ||
         OS_SYS_PORT_CREATE != 0x0400 || OS_SYS_SOCKET_CREATE != 0x0500 ||
+        OS_SYS_SOCKET_SHUTDOWN != 0x0510 ||
         OS_SYS_DEVICE_OPEN != 0x0600 || OS_SYS_DEVICE_ENUMERATE != 0x0602 ||
         OS_SYS_GPU_CREATE_CTX != 0x0700 ||
         OS_SYS_DISPLAY_COMMIT != 0x0710 ||
         OS_SYS_DISPLAY_GET_INFO != 0x0711 ||
         OS_SYS_AUDIO_OPEN != 0x0720 || OS_SYS_AUDIO_CONTROL != 0x0721 ||
-        OS_SYS_TOKEN_QUERY != 0x0800 || OS_SYS_CLOCK_GET != 0x0900 ||
+        OS_SYS_CLOCK_GET != 0x0900 || OS_SYS_CLOCK_SET != 0x0902 ||
+        OS_SYS_EXCEPTION_RETURN != 0x0910 ||
+        OS_SYS_SIGNAL_ACTION != 0x0911 || OS_SYS_SIGNAL_MASK != 0x0912 ||
+        OS_SYS_SIGNAL_SEND != 0x0913 ||
         OS_SYS_INPUT_READ != 0x0A00 ||
         OS_SYS_WINDOW_REGISTER_MANAGER != 0x0C00 ||
         OS_SYS_WINDOW_EVENT_READ != 0x0C08) return 1;
     if (OS_WAIT_MAX_HANDLES != 1024U || OS_WAIT_INDEX_ALL != UINT32_MAX ||
         OS_WAIT_INFINITE != UINT64_MAX) return 1;
+    if (OS_PIPE_BUF != 4096U || OS_PIPE_DEFAULT_SIZE != 65536U ||
+        (OS_PIPE_FLAG_CLOEXEC | OS_PIPE_FLAG_NONBLOCK) != OS_PIPE_FLAG_MASK) return 1;
     if ((OS_VM_READ | OS_VM_WRITE | OS_VM_EXEC) != 7U) return 1;
+    if ((OS_VM_SYNC_ASYNC | OS_VM_SYNC_INVALIDATE | OS_VM_SYNC_SYNC) != 7U ||
+        OS_VM_ADVICE_NORMAL != 0U || OS_VM_ADVICE_RANDOM != 1U ||
+        OS_VM_ADVICE_SEQUENTIAL != 2U || OS_VM_ADVICE_WILLNEED != 3U ||
+        OS_VM_ADVICE_DONTNEED != 4U) return 1;
+    if (OS_THREAD_CONTEXT_GET_FS != 0U ||
+        OS_THREAD_CONTEXT_SET_FS != 1U) return 1;
+    if (OS_SIGNAL_COUNT != 64U || OS_SIGKILL != 9U || OS_SIGSTOP != 19U ||
+        OS_SIGNAL_UNBLOCKABLE_MASK != ((1ULL << 8U) | (1ULL << 18U))) return 1;
     return 0;
 }
 

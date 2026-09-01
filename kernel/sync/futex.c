@@ -1,15 +1,20 @@
+#include <arch/x86_64/paging.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/futex.h>
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
 #include <kernel/wait.h>
+#include <kernel/vm.h>
 
 #define FUTEX_BUCKET_COUNT 256U
+#define FUTEX_USER_BASE 0x0000000000010000ULL
+#define FUTEX_USER_END  (X86_64_USER_TOP + 1ULL)
 
 typedef struct futex_entry {
     list_head_t node;
+    /* The physical word is the identity shared by process aliases. */
+    uint64_t key;
     process_t *process;
-    vaddr_t address;
     uint32_t refs;
     wait_queue_t waitq;
 } futex_entry_t;
@@ -30,27 +35,19 @@ typedef struct {
 static futex_bucket_t g_futex_buckets[FUTEX_BUCKET_COUNT];
 static atomic_uint g_futex_init_state;
 
-static void futex_lock(spinlock_t *lock) {
-    while (atomic_exchange_explicit(&lock->state, 1U, memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+/*
+ * Futex bucket ownership protects the entry list.  The lock is also taken
+ * from the wake path on a different CPU, so a holder must not be switched
+ * away while another CPU is spinning for it.
+ */
+static void futex_bucket_lock(spinlock_t *lock) {
+    sched_preempt_disable();
+    spinlock_lock(lock);
 }
 
-static void futex_unlock(spinlock_t *lock) {
-    atomic_store_explicit(&lock->state, 0U, memory_order_release);
-}
-
-static void list_insert_tail(list_head_t *head, list_head_t *node) {
-    node->next = head;
-    node->prev = head->prev;
-    head->prev->next = node;
-    head->prev = node;
-}
-
-static void list_remove_node(list_head_t *node) {
-    node->prev->next = node->next;
-    node->next->prev = node->prev;
-    list_init(node);
+static void futex_bucket_unlock(spinlock_t *lock) {
+    spinlock_unlock(lock);
+    sched_preempt_enable();
 }
 
 static futex_entry_t *entry_from_node(list_head_t *node) {
@@ -75,55 +72,85 @@ static void futex_init(void) {
     }
 }
 
-static uint32_t futex_hash(process_t *process, vaddr_t address) {
-    uint64_t value = ((uint64_t)(uintptr_t)process >> 4) ^
-                     ((uint64_t)address >> 2) ^ ((uint64_t)address >> 21);
+static uint32_t futex_hash(uint64_t key) {
+    uint64_t value = key >> 2;
+    value ^= key >> 21;
     value ^= value >> 32;
     return (uint32_t)value & (FUTEX_BUCKET_COUNT - 1U);
 }
 
-static futex_entry_t *find_locked(futex_bucket_t *bucket, process_t *process,
-                                  vaddr_t address) {
+static futex_entry_t *find_locked(futex_bucket_t *bucket, uint64_t key) {
     for (list_head_t *node = bucket->entries.next; node != &bucket->entries;
          node = node->next) {
         futex_entry_t *entry = entry_from_node(node);
-        if (entry->process == process && entry->address == address) return entry;
+        if (entry->key == key) return entry;
     }
     return 0;
 }
 
+static kstatus_t futex_resolve_key(process_t *process, vaddr_t address,
+                                   uint64_t *out_key) {
+    if (process == 0 || process->vm == 0 || out_key == 0 ||
+        address < FUTEX_USER_BASE || address >= FUTEX_USER_END) {
+        return K_EACCES;
+    }
+
+    paddr_t physical;
+    kstatus_t status = x86_translate_page(process->vm->root_table, address,
+                                           &physical, 0);
+    if (status != K_OK) {
+        status = vm_handle_fault(process->vm, &(vm_fault_info_t){
+            .address = address,
+            .access = VM_PROT_READ,
+            .cpu_error = 0,
+        });
+        if (status != K_OK) return status;
+        status = x86_translate_page(process->vm->root_table, address,
+                                    &physical, 0);
+        if (status != K_OK) return status;
+    }
+
+    /* Include the byte offset so different words in one shared page do not
+     * wake each other.  Callers already enforce 4-byte user alignment. */
+    *out_key = physical.value;
+    return K_OK;
+}
+
 static kstatus_t futex_get(process_t *process, vaddr_t address, bool create,
                            futex_entry_t **out) {
-    uint32_t index = futex_hash(process, address);
+    uint64_t key;
+    kstatus_t status = futex_resolve_key(process, address, &key);
+    if (status != K_OK) return status;
+    uint32_t index = futex_hash(key);
     futex_bucket_t *bucket = &g_futex_buckets[index];
     futex_entry_t *candidate = 0;
     for (;;) {
-        futex_lock(&bucket->lock);
-        futex_entry_t *entry = find_locked(bucket, process, address);
+        futex_bucket_lock(&bucket->lock);
+        futex_entry_t *entry = find_locked(bucket, key);
         if (entry != 0) {
             ++entry->refs;
-            futex_unlock(&bucket->lock);
+            futex_bucket_unlock(&bucket->lock);
             kfree(candidate);
             *out = entry;
             return K_OK;
         }
         if (!create) {
-            futex_unlock(&bucket->lock);
+            futex_bucket_unlock(&bucket->lock);
             kfree(candidate);
             return K_ENOENT;
         }
         if (candidate != 0) {
+            candidate->key = key;
             candidate->process = process;
-            candidate->address = address;
             candidate->refs = 1U;
             object_get(process);
             wait_queue_init(&candidate->waitq);
-            list_insert_tail(&bucket->entries, &candidate->node);
-            futex_unlock(&bucket->lock);
+            list_add_tail(&bucket->entries, &candidate->node);
+            futex_bucket_unlock(&bucket->lock);
             *out = candidate;
             return K_OK;
         }
-        futex_unlock(&bucket->lock);
+        futex_bucket_unlock(&bucket->lock);
         candidate = (futex_entry_t *)kzalloc(sizeof(*candidate), 0);
         if (candidate == 0) return K_ENOMEM;
         list_init(&candidate->node);
@@ -131,15 +158,15 @@ static kstatus_t futex_get(process_t *process, vaddr_t address, bool create,
 }
 
 static void futex_put(futex_entry_t *entry) {
-    uint32_t index = futex_hash(entry->process, entry->address);
+    uint32_t index = futex_hash(entry->key);
     futex_bucket_t *bucket = &g_futex_buckets[index];
     bool destroy = false;
-    futex_lock(&bucket->lock);
+    futex_bucket_lock(&bucket->lock);
     if (entry->refs != 0 && --entry->refs == 0) {
-        list_remove_node(&entry->node);
+        list_del(&entry->node);
         destroy = true;
     }
-    futex_unlock(&bucket->lock);
+    futex_bucket_unlock(&bucket->lock);
     if (destroy) {
         object_put(entry->process);
         kfree(entry);

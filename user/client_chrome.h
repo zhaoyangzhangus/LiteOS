@@ -4,8 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "font12x24.h"
-
 /* Shared Files-like client chrome metrics and palette.  Each application
  * still owns its content canvas, but its title strip and controls line up
  * with the same 56px light header. */
@@ -23,9 +21,24 @@
 #define USER_CLIENT_CHROME_CARD         0x00FFFFFFU
 #define USER_CLIENT_CHROME_CARD_BORDER  0x00E1E5E9U
 
+static inline uint32_t user_client_chrome_blend_xrgb8888(
+    uint32_t destination, uint32_t source, uint8_t alpha) {
+    uint32_t inverse = 255U - alpha;
+    uint32_t red = (((source >> 16U) & 0xFFU) * alpha +
+                    ((destination >> 16U) & 0xFFU) * inverse + 127U) / 255U;
+    uint32_t green = (((source >> 8U) & 0xFFU) * alpha +
+                      ((destination >> 8U) & 0xFFU) * inverse + 127U) / 255U;
+    uint32_t blue = ((source & 0xFFU) * alpha +
+                     (destination & 0xFFU) * inverse + 127U) / 255U;
+    return (destination & 0xFF000000U) | (red << 16U) |
+           (green << 8U) | blue;
+}
+
 #define USER_CLIENT_CHROME_ICON_TERMINAL 1U
 #define USER_CLIENT_CHROME_ICON_NOTE     2U
 #define USER_CLIENT_CHROME_ICON_NETWORK  3U
+#define USER_CLIENT_CHROME_ICON_IMAGE    4U
+#define USER_CLIENT_CHROME_ICON_TASKS    5U
 
 /* The same 16x16 alpha raster used by Fileman for the client close action. */
 static const char user_client_close_alpha[16][17] = {
@@ -51,7 +64,8 @@ static inline void user_client_chrome_pixel(uint32_t *pixels,
     if (alpha == 255U) {
         *destination = color;
     } else {
-        *destination = font12x24_blend_xrgb8888(*destination, color, alpha);
+        *destination = user_client_chrome_blend_xrgb8888(*destination,
+                                                         color, alpha);
     }
 }
 
@@ -182,6 +196,35 @@ static inline void user_client_chrome_app_icon(uint32_t *pixels,
         user_client_chrome_pixel(pixels, stride, width, height,
                                  x + 17U, y + 16U,
                                  USER_CLIENT_CHROME_ICON_ACCENT, 255U);
+    } else if (kind == USER_CLIENT_CHROME_ICON_IMAGE) {
+        user_client_chrome_round_rect(pixels, stride, width, height,
+                                      x + 5U, y + 5U, 14U, 14U,
+                                      0x00FFFFFFU);
+        user_client_chrome_pixel(pixels, stride, width, height,
+                                 x + 16U, y + 8U,
+                                 USER_CLIENT_CHROME_ICON_ACCENT, 255U);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 7U, y + 15U, 4U, 2U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 10U, y + 12U, 5U, 5U,
+                                     USER_CLIENT_CHROME_ICON_FG);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 14U, y + 14U, 4U, 3U,
+                                     USER_CLIENT_CHROME_ICON_FG);
+    } else if (kind == USER_CLIENT_CHROME_ICON_TASKS) {
+        user_client_chrome_round_rect(pixels, stride, width, height,
+                                      x + 5U, y + 5U, 14U, 14U,
+                                      USER_CLIENT_CHROME_ICON_FG);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 8U, y + 14U, 2U, 3U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 11U, y + 11U, 2U, 6U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
+        user_client_chrome_fill_rect(pixels, stride, width, height,
+                                     x + 14U, y + 8U, 2U, 9U,
+                                     USER_CLIENT_CHROME_ICON_ACCENT);
     }
 }
 

@@ -75,7 +75,10 @@ static int read_blob(const char *path, uint8_t **out, size_t *size) {
         return 0;
     }
     length = ftell(file);
-    if (length <= 0 || (unsigned long)length > SIZE_MAX) {
+    /* ftell() returns long.  Every supported host here has a size_t wide
+     * enough to represent a positive long; comparing through unsigned long
+     * is rejected by MinGW when long is 32-bit and size_t is 64-bit. */
+    if (length <= 0) {
         fclose(file);
         return 0;
     }
@@ -204,6 +207,9 @@ int main(int argc, char **argv) {
     put_header(image, DATA_OFFSET + 0x400U, 48U);
     put_path(image, DATA_OFFSET + 0x480U, "/sbin/gshell");
     put_path(image, DATA_OFFSET + 0x4C0U, "/sbin/netd");
+    put_path(image, DATA_OFFSET + 0x500U, "/sbin/deviced");
+    put_path(image, DATA_OFFSET + 0x520U, "/sbin/logd");
+    put_path(image, DATA_OFFSET + 0x540U, "/sbin/crashd");
 
     if (!write_image(argv[2], image)) {
         fprintf(stderr, "cannot write %s\n", argv[2]);

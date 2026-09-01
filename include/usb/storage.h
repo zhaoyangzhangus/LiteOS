@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#include "block.h"
+#include <kernel/block_device.h>
 
 /* USB Mass Storage: Bulk-Only Transport + SCSI transparent subclass. */
 /* LITEOS_USB_ROOT_PATCH_V1: boot-stage synchronous MSC attach. */

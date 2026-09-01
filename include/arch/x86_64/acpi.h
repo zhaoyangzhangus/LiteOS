@@ -1,6 +1,6 @@
 #pragma once
 
-#include "bootinfo.h"
+#include <kernel/bootinfo.h>
 #include <kernel/base.h>
 
 #define X86_MAX_IOAPICS       16U
@@ -54,9 +54,16 @@ typedef struct {
     uint8_t sleep_type_s4;
     bool sleep_supported;
     uint16_t pm1b_control_block;
+    uint64_t reset_address;
+    uint8_t reset_space_id;
+    uint8_t reset_bit_width;
+    uint8_t reset_access_size;
+    uint8_t reset_value;
+    bool reset_supported;
 } x86_acpi_platform_t;
 
 bool x86_acpi_discover(const LITEOS_BOOT_INFO *boot_info);
 const x86_acpi_platform_t *x86_acpi_platform(void);
 bool x86_acpi_sleep_supported(void);
 kstatus_t x86_acpi_enter_sleep(uint8_t sleep_state);
+bool x86_acpi_reset(void);

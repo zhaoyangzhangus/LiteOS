@@ -1,5 +1,27 @@
 #pragma once
-#include "../../../OS_Implementation_Specification_COMPLETE/include/arch/x86_64/paging.h"
+#pragma once
+#include <kernel/base.h>
+
+#define X86_64_VA_BITS 48u
+#define X86_64_USER_TOP 0x00007fffffffffffULL
+
+#define X86_64_DIRECT_MAP_BASE 0xffff800000000000ULL
+#define X86_64_DIRECT_MAP_END  0xffffbfffffffffffULL
+#define X86_64_VMALLOC_BASE    0xffffc00000000000ULL
+#define X86_64_VMALLOC_END     0xffffdfffffffffffULL
+#define X86_64_MMIO_BASE       0xffffe00000000000ULL
+#define X86_64_MMIO_END        0xffffefffffffffffULL
+#define X86_64_KERNEL_AUX_BASE 0xfffff00000000000ULL
+#define X86_64_KERNEL_IMAGE_BASE 0xffffffff80000000ULL
+
+enum x86_cache_mode {
+    X86_CACHE_WB = 0,
+    X86_CACHE_WC,
+    X86_CACHE_UC,
+};
+
+uint64_t x86_pte_cache_bits(enum x86_cache_mode mode, bool large_page);
+bool x86_is_canonical(uint64_t va);
 
 enum x86_page_map_flags {
     X86_PAGE_WRITE  = 1u << 0,
@@ -32,3 +54,8 @@ bool x86_tlb_shootdown_active(void);
 bool x86_tlb_cpu_waiting(uint32_t cpu_index);
 void x86_tlb_wait_begin(void);
 void x86_tlb_wait_end(void);
+void x86_page_table_debug_state(uint32_t *lock_state, uint32_t *owner_cpu,
+                                uint32_t *waiter_cpu, uint64_t *wait_count);
+void x86_tlb_debug_state(uint32_t *lock_state, uint32_t *owner_cpu,
+                         uint32_t *waiting_mask, uint32_t *ack_mask,
+                         uint64_t *generation);

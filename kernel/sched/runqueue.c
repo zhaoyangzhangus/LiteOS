@@ -1,0 +1,166 @@
+#include "internal.h"
+
+static thread_t *rt_thread_from_node(list_head_t *node) {
+    return (thread_t *)((uint8_t *)node -
+                        __builtin_offsetof(thread_t, sched.rt_node));
+}
+
+static thread_t *fair_thread_from_node(rb_node_t *node) {
+    return (thread_t *)((uint8_t *)node -
+                        __builtin_offsetof(thread_t, sched.fair_node));
+}
+
+static bool fair_before(const thread_t *left, const thread_t *right) {
+    if (left->sched.vruntime != right->sched.vruntime) {
+        return left->sched.vruntime < right->sched.vruntime;
+    }
+    if (left->tid != right->tid) return left->tid < right->tid;
+    return (uintptr_t)left < (uintptr_t)right;
+}
+
+static void fair_insert(run_queue_t *queue, thread_t *thread) {
+    rb_node_t *parent = 0;
+    rb_node_t **link = &queue->fair_root.root;
+    while (*link != 0) {
+        parent = *link;
+        thread_t *candidate = fair_thread_from_node(parent);
+        link = fair_before(thread, candidate) ? &parent->left : &parent->right;
+    }
+    rb_node_t *node = &thread->sched.fair_node;
+    node->left = 0;
+    node->right = 0;
+    node->parent_color = (uintptr_t)parent | RB_TREE_RED;
+    *link = node;
+    rb_tree_insert_rebalance(&queue->fair_root, node);
+    ++queue->fair_count;
+    rb_node_t *first = rb_tree_first(&queue->fair_root);
+    queue->min_vruntime = fair_thread_from_node(first)->sched.vruntime;
+}
+
+static void fair_remove(run_queue_t *queue, thread_t *thread) {
+    rb_tree_erase(&queue->fair_root, &thread->sched.fair_node);
+    if (queue->fair_count != 0) --queue->fair_count;
+    rb_node_t *first = rb_tree_first(&queue->fair_root);
+    if (first != 0) queue->min_vruntime = fair_thread_from_node(first)->sched.vruntime;
+}
+
+bool validate_fair_node(rb_node_t *node, rb_node_t *parent,
+                        thread_t **previous, uint32_t black_depth,
+                        uint32_t *expected_black_depth, uint32_t *count) {
+    if (node == 0) {
+        if (*expected_black_depth == UINT32_MAX) *expected_black_depth = black_depth;
+        return black_depth == *expected_black_depth;
+    }
+    if (rb_tree_parent(node) != parent) return false;
+    if (rb_tree_color(node) == RB_TREE_BLACK) {
+        ++black_depth;
+    } else if (rb_tree_color(node->left) == RB_TREE_RED ||
+               rb_tree_color(node->right) == RB_TREE_RED) {
+        return false;
+    }
+    if (!validate_fair_node(node->left, node, previous, black_depth,
+                            expected_black_depth, count)) return false;
+    thread_t *thread = fair_thread_from_node(node);
+    if (*previous != 0 && !fair_before(*previous, thread)) return false;
+    *previous = thread;
+    ++*count;
+    return validate_fair_node(node->right, node, previous, black_depth,
+                              expected_black_depth, count);
+}
+
+void initialize_thread(thread_t *thread, uint64_t tid, uint8_t class_id,
+                       uint8_t priority) {
+    uint8_t *bytes = (uint8_t *)thread;
+    for (size_t index = 0; index < sizeof(*thread); ++index) bytes[index] = 0;
+    refcount_init(&thread->object.refs, 1U);
+    atomic_init(&thread->state, THREAD_READY);
+    atomic_init(&thread->blocked_waiter, 0);
+    thread->tid = tid;
+    thread->sched_class = class_id;
+    thread->rt_priority = priority;
+    thread->base_sched_class = class_id;
+    thread->base_rt_priority = priority;
+    thread->sched.weight = 1024U;
+    thread->sched.vruntime = 0;
+    list_init(&thread->sched.rt_node);
+    list_init(&thread->process_node);
+    list_init(&thread->owned_mutexes);
+    for (uint32_t word = 0; word < MAX_CPUS / 64U; ++word) {
+        thread->affinity.bits[word] = UINT64_MAX;
+    }
+}
+
+void sched_initialize_new_thread(thread_t *thread, uint32_t cpu_id,
+                                 bool pin_to_cpu) {
+    if (thread == 0) return;
+
+    atomic_init(&thread->state, THREAD_NEW);
+    atomic_init(&thread->blocked_waiter, 0);
+    thread->sched_class = SCHED_CLASS_FAIR;
+    thread->rt_priority = 0U;
+    thread->base_sched_class = SCHED_CLASS_FAIR;
+    thread->base_rt_priority = 0U;
+    thread->sched.runtime_ns = 0U;
+    thread->sched.vruntime = 0U;
+    thread->sched.exec_start_ns = 0U;
+    thread->sched.weight = 1024U;
+    thread->sched.nice = 0;
+    thread->sched.latency_hint = 0;
+    thread->sched.flags = 0U;
+    list_init(&thread->sched.rt_node);
+
+    thread->current_cpu = (uint16_t)(cpu_id < MAX_CPUS ? cpu_id : 0U);
+    for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
+        thread->affinity.bits[word] = UINT64_MAX;
+    }
+    if (pin_to_cpu && cpu_id < MAX_CPUS) {
+        for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
+            thread->affinity.bits[word] = 0U;
+        }
+        thread->affinity.bits[cpu_id >> 6] = 1ULL << (cpu_id & 63U);
+    }
+    sched_mark_initial_placement(thread);
+}
+
+void sched_initialize_test_thread(thread_t *thread, uint64_t tid,
+                                  uint8_t class_id, uint8_t priority) {
+    initialize_thread(thread, tid, class_id, priority);
+}
+
+void enqueue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+    if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) != 0 ||
+        atomic_load_explicit(&thread->state, memory_order_relaxed) != THREAD_READY) return;
+    if (thread->sched_class == SCHED_CLASS_RT) {
+        list_add(&cpu->queue.rt_queues[thread->rt_priority], &thread->sched.rt_node);
+        cpu->queue.rt_bitmap |= 1U << thread->rt_priority;
+    } else if (thread->sched_class == SCHED_CLASS_FAIR) {
+        fair_insert(&cpu->queue, thread);
+    } else {
+        return;
+    }
+    thread->sched.flags |= SCHED_ENTITY_ENQUEUED;
+    ++cpu->queue.nr_running;
+}
+
+void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+    if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) == 0) return;
+    if (thread->sched_class == SCHED_CLASS_RT) {
+        list_del(&thread->sched.rt_node);
+        if (list_empty(&cpu->queue.rt_queues[thread->rt_priority])) {
+            cpu->queue.rt_bitmap &= ~(1U << thread->rt_priority);
+        }
+    } else if (thread->sched_class == SCHED_CLASS_FAIR) {
+        fair_remove(&cpu->queue, thread);
+    }
+    thread->sched.flags &= (uint16_t)~SCHED_ENTITY_ENQUEUED;
+    if (cpu->queue.nr_running != 0) --cpu->queue.nr_running;
+}
+
+thread_t *pick_locked(scheduler_cpu_t *cpu) {
+    if (cpu->queue.rt_bitmap != 0) {
+        uint32_t priority = (uint32_t)__builtin_ctz(cpu->queue.rt_bitmap);
+        return rt_thread_from_node(cpu->queue.rt_queues[priority].next);
+    }
+    rb_node_t *first = rb_tree_first(&cpu->queue.fair_root);
+    return first != 0 ? fair_thread_from_node(first) : cpu->queue.idle;
+}

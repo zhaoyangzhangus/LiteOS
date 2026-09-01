@@ -3,39 +3,27 @@
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/smp.h>
 #include <kernel/process.h>
+#include <kernel/perf.h>
+#include <kernel/telemetry.h>
 #include <kernel/wait.h>
 #include <kernel/deferred.h>
-#include "syscall.h"
+#include "internal.h"
+#include <arch/x86_64/syscall_internal.h>
 
-#define SCHED_ENTITY_ENQUEUED (1U << 0)
-#define RB_RED   0U
-#define RB_BLACK 1U
-
-typedef struct {
-    run_queue_t queue;
-
-    /*
-     * 已经离开其执行栈、等待 sched_finish_switch() 回收的 DEAD 线程。
-     *
-     * 不能只保存一个指针：同一 CPU 上连续线程退出时，前一个 reaper
-     * 尚未完成就可能再次发生 context switch。
-     */
-    thread_t *reap_head;
-    thread_t *reap_tail;
-
-    /*
-     * IF=0 的 post-switch 不能直接做 VM/TLB teardown。
-     * 此位保证每 CPU 最多只有一个 deferred drain 请求。
-     */
-    atomic_bool reap_deferred_queued;
-
-    vaddr_t idle_stack_top;
-} scheduler_cpu_t;
-
-static scheduler_cpu_t g_cpus[MAX_CPUS];
+/* Definition shared with clock.c through the private scheduler header. */
+scheduler_cpu_t g_cpus[MAX_CPUS];
 static thread_t g_idle_threads[MAX_CPUS];
-static uint32_t g_cpu_count;
+uint32_t g_cpu_count;
 static paddr_t g_kernel_root;
+static arch_switch_context_t *g_context_test_from;
+static arch_switch_context_t *g_context_test_to;
+static volatile uint32_t g_context_test_ran;
+
+void sched_mark_initial_placement(thread_t *thread) {
+    if (thread != 0) {
+        thread->sched.flags |= SCHED_ENTITY_INITIAL_PLACEMENT;
+    }
+}
 
 /*
  * Idle is a real scheduler target, but it is not created through the normal
@@ -47,9 +35,19 @@ static paddr_t g_kernel_root;
 static __attribute__((noreturn)) void scheduler_idle_main(void *argument) {
     (void)argument;
     for (;;) {
+        /*
+         * A request can be published in the short CLI window between two
+         * HLT cycles. Poll before sleeping so a lost IPI cannot strand a
+         * READY thread on this idle CPU.
+         */
+        if (x86_smp_take_reschedule_request() ||
+            sched_runnable_count() != 0U) {
+            (void)sched_try_run_ready();
+        }
         __asm__ volatile ("sti; hlt" : : : "memory");
         sched_finish_switch();
-        if (x86_smp_take_reschedule_request()) {
+        if (x86_smp_take_reschedule_request() ||
+            sched_runnable_count() != 0U) {
             (void)sched_try_run_ready();
         }
         __asm__ volatile ("cli" : : : "memory");
@@ -96,7 +94,7 @@ static void scheduler_zero(void *memory, size_t size) {
     while (size-- != 0) *bytes++ = 0;
 }
 
-static bool scheduler_current_cpu(uint32_t *cpu_id) {
+bool scheduler_current_cpu(uint32_t *cpu_id) {
     uint32_t current = x86_current_cpu_index();
     if (cpu_id == 0 || current >= g_cpu_count || !x86_smp_cpu_online(current)) {
         return false;
@@ -105,19 +103,7 @@ static bool scheduler_current_cpu(uint32_t *cpu_id) {
     return true;
 }
 
-static bool scheduler_cpu_available(uint32_t cpu_id) {
-    return cpu_id < g_cpu_count && x86_smp_cpu_online(cpu_id) &&
-           g_cpus[cpu_id].queue.idle != 0;
-}
-
-/*
- * Run queues are touched both by normal kernel paths (wake/enqueue) and by
- * the LAPIC tick.  A normal path must not be interrupted locally after it
- * owns a queue lock: the tick can enter schedule() and otherwise spin on the
- * same lock forever.  Keep IRQ masking scoped to each individual queue-lock
- * critical section so cross-CPU wakeup/IPI delivery remains outside it.
- */
-static uint64_t scheduler_lock(spinlock_t *lock) {
+uint64_t scheduler_lock(spinlock_t *lock) {
     uint64_t flags = scheduler_irq_save();
     while (atomic_exchange_explicit(&lock->state, 1U, memory_order_acquire) != 0U) {
         __asm__ volatile ("pause");
@@ -125,383 +111,9 @@ static uint64_t scheduler_lock(spinlock_t *lock) {
     return flags;
 }
 
-static void scheduler_unlock(spinlock_t *lock, uint64_t flags) {
+void scheduler_unlock(spinlock_t *lock, uint64_t flags) {
     atomic_store_explicit(&lock->state, 0U, memory_order_release);
     scheduler_irq_restore(flags);
-}
-
-static bool scheduler_affinity_allows(const thread_t *thread, uint32_t cpu_id) {
-    return thread != 0 && cpu_id < MAX_CPUS &&
-           (thread->affinity.bits[cpu_id >> 6] & (1ULL << (cpu_id & 63U))) != 0;
-}
-
-static uint32_t scheduler_choose_cpu(thread_t *thread, uint32_t current_cpu) {
-    uint32_t best_cpu = current_cpu;
-    uint32_t best_load = UINT32_MAX;
-    for (uint32_t cpu_id = 0; cpu_id < g_cpu_count; ++cpu_id) {
-        if (!scheduler_cpu_available(cpu_id) ||
-            !scheduler_affinity_allows(thread, cpu_id)) continue;
-        scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-        uint64_t flags = scheduler_lock(&cpu->queue.lock);
-        uint32_t load = cpu->queue.nr_running +
-                        (cpu->queue.current != cpu->queue.idle ? 1U : 0U);
-        scheduler_unlock(&cpu->queue.lock, flags);
-        if (load < best_load || (load == best_load && cpu_id == current_cpu)) {
-            best_cpu = cpu_id;
-            best_load = load;
-        }
-    }
-    return best_cpu;
-}
-
-static rb_node_t *rb_parent(const rb_node_t *node) {
-    return node != 0 ? (rb_node_t *)(node->parent_color & ~(uintptr_t)3U) : 0;
-}
-
-static unsigned rb_color(const rb_node_t *node) {
-    return node != 0 ? (unsigned)(node->parent_color & 1U) : RB_BLACK;
-}
-
-static void rb_set_parent(rb_node_t *node, rb_node_t *parent) {
-    if (node != 0) node->parent_color = (node->parent_color & 1U) | (uintptr_t)parent;
-}
-
-static void rb_set_color(rb_node_t *node, unsigned color) {
-    if (node != 0) node->parent_color = (node->parent_color & ~(uintptr_t)1U) | color;
-}
-
-static void rb_rotate_left(rb_root_t *root, rb_node_t *node) {
-    rb_node_t *right = node->right;
-    rb_node_t *parent = rb_parent(node);
-    node->right = right->left;
-    if (right->left != 0) rb_set_parent(right->left, node);
-    right->left = node;
-    rb_set_parent(node, right);
-    rb_set_parent(right, parent);
-    if (parent == 0) root->root = right;
-    else if (parent->left == node) parent->left = right;
-    else parent->right = right;
-}
-
-static void rb_rotate_right(rb_root_t *root, rb_node_t *node) {
-    rb_node_t *left = node->left;
-    rb_node_t *parent = rb_parent(node);
-    node->left = left->right;
-    if (left->right != 0) rb_set_parent(left->right, node);
-    left->right = node;
-    rb_set_parent(node, left);
-    rb_set_parent(left, parent);
-    if (parent == 0) root->root = left;
-    else if (parent->left == node) parent->left = left;
-    else parent->right = left;
-}
-
-static void rb_insert_fixup(rb_root_t *root, rb_node_t *node) {
-    rb_node_t *parent;
-    while ((parent = rb_parent(node)) != 0 && rb_color(parent) == RB_RED) {
-        rb_node_t *grand = rb_parent(parent);
-        if (parent == grand->left) {
-            rb_node_t *uncle = grand->right;
-            if (rb_color(uncle) == RB_RED) {
-                rb_set_color(parent, RB_BLACK);
-                rb_set_color(uncle, RB_BLACK);
-                rb_set_color(grand, RB_RED);
-                node = grand;
-            } else {
-                if (node == parent->right) {
-                    node = parent;
-                    rb_rotate_left(root, node);
-                    parent = rb_parent(node);
-                    grand = rb_parent(parent);
-                }
-                rb_set_color(parent, RB_BLACK);
-                rb_set_color(grand, RB_RED);
-                rb_rotate_right(root, grand);
-            }
-        } else {
-            rb_node_t *uncle = grand->left;
-            if (rb_color(uncle) == RB_RED) {
-                rb_set_color(parent, RB_BLACK);
-                rb_set_color(uncle, RB_BLACK);
-                rb_set_color(grand, RB_RED);
-                node = grand;
-            } else {
-                if (node == parent->left) {
-                    node = parent;
-                    rb_rotate_right(root, node);
-                    parent = rb_parent(node);
-                    grand = rb_parent(parent);
-                }
-                rb_set_color(parent, RB_BLACK);
-                rb_set_color(grand, RB_RED);
-                rb_rotate_left(root, grand);
-            }
-        }
-    }
-    rb_set_color(root->root, RB_BLACK);
-}
-
-static rb_node_t *rb_first(const rb_root_t *root) {
-    rb_node_t *node = root->root;
-    if (node == 0) return 0;
-    while (node->left != 0) node = node->left;
-    return node;
-}
-
-static void rb_transplant(rb_root_t *root, rb_node_t *old_node, rb_node_t *new_node) {
-    rb_node_t *parent = rb_parent(old_node);
-    if (parent == 0) root->root = new_node;
-    else if (old_node == parent->left) parent->left = new_node;
-    else parent->right = new_node;
-    rb_set_parent(new_node, parent);
-}
-
-static void rb_erase_fixup(rb_root_t *root, rb_node_t *node, rb_node_t *parent) {
-    while (node != root->root && rb_color(node) == RB_BLACK) {
-        if (parent == 0) break;
-        if (node == parent->left) {
-            rb_node_t *sibling = parent->right;
-            if (rb_color(sibling) == RB_RED) {
-                rb_set_color(sibling, RB_BLACK);
-                rb_set_color(parent, RB_RED);
-                rb_rotate_left(root, parent);
-                sibling = parent->right;
-            }
-            if (sibling == 0) {
-                node = parent;
-                parent = rb_parent(parent);
-                continue;
-            }
-            if (rb_color(sibling->left) == RB_BLACK &&
-                rb_color(sibling->right) == RB_BLACK) {
-                rb_set_color(sibling, RB_RED);
-                node = parent;
-                parent = rb_parent(parent);
-            } else {
-                if (rb_color(sibling->right) == RB_BLACK) {
-                    rb_set_color(sibling->left, RB_BLACK);
-                    rb_set_color(sibling, RB_RED);
-                    rb_rotate_right(root, sibling);
-                    sibling = parent->right;
-                }
-                rb_set_color(sibling, rb_color(parent));
-                rb_set_color(parent, RB_BLACK);
-                rb_set_color(sibling->right, RB_BLACK);
-                rb_rotate_left(root, parent);
-                node = root->root;
-                parent = 0;
-            }
-        } else {
-            rb_node_t *sibling = parent->left;
-            if (rb_color(sibling) == RB_RED) {
-                rb_set_color(sibling, RB_BLACK);
-                rb_set_color(parent, RB_RED);
-                rb_rotate_right(root, parent);
-                sibling = parent->left;
-            }
-            if (sibling == 0) {
-                node = parent;
-                parent = rb_parent(parent);
-                continue;
-            }
-            if (rb_color(sibling->left) == RB_BLACK &&
-                rb_color(sibling->right) == RB_BLACK) {
-                rb_set_color(sibling, RB_RED);
-                node = parent;
-                parent = rb_parent(parent);
-            } else {
-                if (rb_color(sibling->left) == RB_BLACK) {
-                    rb_set_color(sibling->right, RB_BLACK);
-                    rb_set_color(sibling, RB_RED);
-                    rb_rotate_left(root, sibling);
-                    sibling = parent->left;
-                }
-                rb_set_color(sibling, rb_color(parent));
-                rb_set_color(parent, RB_BLACK);
-                rb_set_color(sibling->left, RB_BLACK);
-                rb_rotate_right(root, parent);
-                node = root->root;
-                parent = 0;
-            }
-        }
-    }
-    rb_set_color(node, RB_BLACK);
-}
-
-static void rb_erase(rb_root_t *root, rb_node_t *node) {
-    rb_node_t *moved = node;
-    unsigned moved_color = rb_color(moved);
-    rb_node_t *child;
-    rb_node_t *child_parent;
-    if (node->left == 0) {
-        child = node->right;
-        child_parent = rb_parent(node);
-        rb_transplant(root, node, node->right);
-    } else if (node->right == 0) {
-        child = node->left;
-        child_parent = rb_parent(node);
-        rb_transplant(root, node, node->left);
-    } else {
-        moved = node->right;
-        while (moved->left != 0) moved = moved->left;
-        moved_color = rb_color(moved);
-        child = moved->right;
-        if (rb_parent(moved) == node) {
-            child_parent = moved;
-            rb_set_parent(child, moved);
-        } else {
-            child_parent = rb_parent(moved);
-            rb_transplant(root, moved, moved->right);
-            moved->right = node->right;
-            rb_set_parent(moved->right, moved);
-        }
-        rb_transplant(root, node, moved);
-        moved->left = node->left;
-        rb_set_parent(moved->left, moved);
-        rb_set_color(moved, rb_color(node));
-    }
-    if (moved_color == RB_BLACK) rb_erase_fixup(root, child, child_parent);
-    node->left = 0;
-    node->right = 0;
-    node->parent_color = 0;
-}
-
-static thread_t *rt_thread_from_node(list_head_t *node) {
-    return (thread_t *)((uint8_t *)node - __builtin_offsetof(thread_t, sched.rt_node));
-}
-
-static thread_t *fair_thread_from_node(rb_node_t *node) {
-    return (thread_t *)((uint8_t *)node -
-                        __builtin_offsetof(thread_t, sched.fair_node));
-}
-
-static bool fair_before(const thread_t *left, const thread_t *right) {
-    if (left->sched.vruntime != right->sched.vruntime) {
-        return left->sched.vruntime < right->sched.vruntime;
-    }
-    if (left->tid != right->tid) return left->tid < right->tid;
-    return (uintptr_t)left < (uintptr_t)right;
-}
-
-static void fair_insert(run_queue_t *queue, thread_t *thread) {
-    rb_node_t *parent = 0;
-    rb_node_t **link = &queue->fair_root.root;
-    while (*link != 0) {
-        parent = *link;
-        thread_t *candidate = fair_thread_from_node(parent);
-        link = fair_before(thread, candidate) ? &parent->left : &parent->right;
-    }
-    rb_node_t *node = &thread->sched.fair_node;
-    node->left = 0;
-    node->right = 0;
-    node->parent_color = (uintptr_t)parent | RB_RED;
-    *link = node;
-    rb_insert_fixup(&queue->fair_root, node);
-    ++queue->fair_count;
-    rb_node_t *first = rb_first(&queue->fair_root);
-    queue->min_vruntime = fair_thread_from_node(first)->sched.vruntime;
-}
-
-static void fair_remove(run_queue_t *queue, thread_t *thread) {
-    rb_erase(&queue->fair_root, &thread->sched.fair_node);
-    if (queue->fair_count != 0) --queue->fair_count;
-    rb_node_t *first = rb_first(&queue->fair_root);
-    if (first != 0) queue->min_vruntime = fair_thread_from_node(first)->sched.vruntime;
-}
-
-static bool validate_fair_node(rb_node_t *node, rb_node_t *parent,
-                               thread_t **previous, uint32_t black_depth,
-                               uint32_t *expected_black_depth, uint32_t *count) {
-    if (node == 0) {
-        if (*expected_black_depth == UINT32_MAX) *expected_black_depth = black_depth;
-        return black_depth == *expected_black_depth;
-    }
-    if (rb_parent(node) != parent) return false;
-    if (rb_color(node) == RB_BLACK) {
-        ++black_depth;
-    } else if (rb_color(node->left) == RB_RED || rb_color(node->right) == RB_RED) {
-        return false;
-    }
-    if (!validate_fair_node(node->left, node, previous, black_depth,
-                            expected_black_depth, count)) return false;
-    thread_t *thread = fair_thread_from_node(node);
-    if (*previous != 0 && !fair_before(*previous, thread)) return false;
-    *previous = thread;
-    ++*count;
-    return validate_fair_node(node->right, node, previous, black_depth,
-                              expected_black_depth, count);
-}
-
-static void scheduler_list_insert(list_head_t *head, list_head_t *node) {
-    node->next = head->next;
-    node->prev = head;
-    head->next->prev = node;
-    head->next = node;
-}
-
-static void scheduler_list_remove(list_head_t *node) {
-    node->prev->next = node->next;
-    node->next->prev = node->prev;
-    node->next = node->prev = node;
-}
-
-static void initialize_thread(thread_t *thread, uint64_t tid, uint8_t class_id,
-                               uint8_t priority) {
-    scheduler_zero(thread, sizeof(*thread));
-    refcount_init(&thread->object.refs, 1U);
-    atomic_init(&thread->state, THREAD_READY);
-    thread->tid = tid;
-    thread->sched_class = class_id;
-    thread->rt_priority = priority;
-    thread->base_sched_class = class_id;
-    thread->base_rt_priority = priority;
-    thread->sched.weight = 1024U;
-    thread->sched.vruntime = 0;
-    list_init(&thread->sched.rt_node);
-    list_init(&thread->process_node);
-    list_init(&thread->global_node);
-    list_init(&thread->owned_mutexes);
-    for (uint32_t word = 0; word < MAX_CPUS / 64U; ++word) {
-        thread->affinity.bits[word] = UINT64_MAX;
-    }
-}
-
-static void enqueue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
-    if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) != 0 ||
-        atomic_load_explicit(&thread->state, memory_order_relaxed) != THREAD_READY) return;
-    if (thread->sched_class == SCHED_CLASS_RT) {
-        scheduler_list_insert(&cpu->queue.rt_queues[thread->rt_priority], &thread->sched.rt_node);
-        cpu->queue.rt_bitmap |= 1U << thread->rt_priority;
-    } else if (thread->sched_class == SCHED_CLASS_FAIR) {
-        fair_insert(&cpu->queue, thread);
-    } else {
-        return;
-    }
-    thread->sched.flags |= SCHED_ENTITY_ENQUEUED;
-    ++cpu->queue.nr_running;
-}
-
-static void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
-    if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) == 0) return;
-    if (thread->sched_class == SCHED_CLASS_RT) {
-        scheduler_list_remove(&thread->sched.rt_node);
-        if (list_empty(&cpu->queue.rt_queues[thread->rt_priority])) {
-            cpu->queue.rt_bitmap &= ~(1U << thread->rt_priority);
-        }
-    } else if (thread->sched_class == SCHED_CLASS_FAIR) {
-        fair_remove(&cpu->queue, thread);
-    }
-    thread->sched.flags &= (uint16_t)~SCHED_ENTITY_ENQUEUED;
-    if (cpu->queue.nr_running != 0) --cpu->queue.nr_running;
-}
-
-static thread_t *pick_locked(scheduler_cpu_t *cpu) {
-    if (cpu->queue.rt_bitmap != 0) {
-        uint32_t priority = (uint32_t)__builtin_ctz(cpu->queue.rt_bitmap);
-        return rt_thread_from_node(cpu->queue.rt_queues[priority].next);
-    }
-    rb_node_t *first = rb_first(&cpu->queue.fair_root);
-    return first != 0 ? fair_thread_from_node(first) : cpu->queue.idle;
 }
 
 /*
@@ -590,10 +202,12 @@ bool sched_set_boot_kernel_stack(vaddr_t stack_top) {
     return true;
 }
 
-void sched_enqueue(thread_t *thread) {
-    if (thread == 0 || thread->sched_class == SCHED_CLASS_IDLE || g_cpu_count == 0) return;
+static bool sched_enqueue_internal(thread_t *thread, bool notify_local) {
+    if (thread == 0 || thread->sched_class == SCHED_CLASS_IDLE || g_cpu_count == 0) {
+        return false;
+    }
     uint32_t current_cpu;
-    if (!scheduler_current_cpu(&current_cpu)) return;
+    if (!scheduler_current_cpu(&current_cpu)) return false;
     uint32_t cpu_id = scheduler_cpu_available(thread->current_cpu) ?
                       thread->current_cpu : current_cpu;
     /* 只有具备真实内核保存栈的线程才参与跨 CPU 分配；纯结构自检固定在指定队列。 */
@@ -602,9 +216,9 @@ void sched_enqueue(thread_t *thread) {
      * 远端 idle CPU 的首次运行由 reschedule IPI 唤醒，并在 idle loop
      * 中消费 pending request，因此不再需要强制 creator-local。
      */
-    if ((thread->flags & THREAD_FLAG_INITIAL_PLACEMENT) != 0) {
+    if ((thread->sched.flags & SCHED_ENTITY_INITIAL_PLACEMENT) != 0) {
         cpu_id = scheduler_choose_cpu(thread, current_cpu);
-        thread->flags &= ~THREAD_FLAG_INITIAL_PLACEMENT;
+        thread->sched.flags &= (uint16_t)~SCHED_ENTITY_INITIAL_PLACEMENT;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
     uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
@@ -612,9 +226,72 @@ void sched_enqueue(thread_t *thread) {
     thread->current_cpu = (uint16_t)cpu_id;
     enqueue_locked(cpu, thread);
     bool enqueued = cpu->queue.nr_running != before;
+    bool notify = enqueued &&
+                  (cpu_id != current_cpu ||
+                   (notify_local && cpu->queue.current != cpu->queue.idle));
     scheduler_unlock(&cpu->queue.lock, queue_flags);
-    if (enqueued && cpu_id != current_cpu) {
+    if (notify) {
+        /*
+         * Remote CPUs always need an IPI.  Normal local enqueue also uses a
+         * self-IPI so a real current thread observes prompt preemption.  The
+         * boot-only caller disables that local notification explicitly while
+         * the BSP is still executing on its unsaved bootstrap continuation.
+         */
         (void)x86_smp_request_reschedule(cpu_id);
+    }
+    return enqueued;
+}
+
+bool sched_enqueue(thread_t *thread) {
+    return sched_enqueue_internal(thread, true);
+}
+
+bool sched_enqueue_bootstrap(thread_t *thread) {
+    return sched_enqueue_internal(thread, false);
+}
+
+kstatus_t sched_start_thread(thread_t *thread) {
+    if (thread == 0) return K_EINVAL;
+
+    unsigned expected = THREAD_NEW;
+    if (!atomic_compare_exchange_strong_explicit(
+            &thread->state, &expected, THREAD_READY,
+            memory_order_acq_rel, memory_order_acquire)) {
+        return expected == THREAD_READY || expected == THREAD_RUNNING ?
+               K_EBUSY : K_EINVAL;
+    }
+
+    /* The scheduler publishes READY and owns the corresponding queue insert. */
+    (void)sched_enqueue(thread);
+    return K_OK;
+}
+
+bool sched_publish_blocked(thread_t *thread) {
+    if (thread == 0) return false;
+
+    unsigned expected = THREAD_RUNNING;
+    return atomic_compare_exchange_strong_explicit(
+        &thread->state, &expected, THREAD_BLOCKED,
+        memory_order_acq_rel, memory_order_acquire);
+}
+
+bool sched_publish_dead(thread_t *thread) {
+    if (thread == 0) return false;
+
+    uint32_t cpu_id;
+    bool current = scheduler_current_cpu(&cpu_id) &&
+                   cpu_id < MAX_CPUS && g_cpus[cpu_id].queue.current == thread;
+    unsigned state = atomic_load_explicit(&thread->state, memory_order_acquire);
+    for (;;) {
+        if (state == THREAD_DEAD) return false;
+        if (state == THREAD_BLOCKED ||
+            (state == THREAD_RUNNING && !current)) return false;
+
+        if (atomic_compare_exchange_weak_explicit(
+                &thread->state, &state, THREAD_DEAD,
+                memory_order_release, memory_order_acquire)) {
+            return true;
+        }
     }
 }
 
@@ -622,17 +299,12 @@ void sched_wake(thread_t *thread) {
     if (thread == 0 || g_cpu_count == 0) return;
 
     /*
-     * wait_on_queue() owns the wake protocol while blocked_waiter is set.
-     * A legal queue wake/timeout/cancel first transitions waiter.state away
-     * from WAITER_WAITING and only then calls sched_wake().
+     * The wait queue owns the waiter state transition, while this function
+     * owns the thread state transition.  They are deliberately independent:
+     * a waiter may already have left its queue when the scheduler observes the
+     * blocked thread.  Do not gate this wake on the stack-local waiter; doing
+     * so can lose a child/fence wake during the hand-off between two CPUs.
      */
-    waiter_t *blocked_waiter = thread->blocked_waiter;
-    if (blocked_waiter != 0 &&
-        atomic_load_explicit(&blocked_waiter->state,
-                             memory_order_acquire) == WAITER_WAITING) {
-        return;
-    }
-
     uint32_t caller_cpu = x86_current_cpu_index();
     uint32_t cpu_id = scheduler_cpu_available(thread->current_cpu) ?
                       thread->current_cpu : caller_cpu;
@@ -640,9 +312,13 @@ void sched_wake(thread_t *thread) {
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
     uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
     unsigned expected = THREAD_BLOCKED;
-    if (!atomic_compare_exchange_strong_explicit(&thread->state, &expected, THREAD_READY,
-                                                  memory_order_acq_rel,
-                                                  memory_order_relaxed)) {
+    bool woke = atomic_compare_exchange_strong_explicit(
+        &thread->state,
+        &expected,
+        THREAD_READY,
+        memory_order_acq_rel,
+        memory_order_relaxed);
+    if (!woke) {
         scheduler_unlock(&cpu->queue.lock, queue_flags);
         return;
     }
@@ -651,15 +327,19 @@ void sched_wake(thread_t *thread) {
      * 若线程仍是该 CPU 的 current，它还没有保存完内核上下文。这里只改变状态，
      * 随后的 schedule() 会在同一把锁下重新入队；否则可直接发布到原 CPU。
      * 阻塞唤醒暂不迁移，避免同一内核栈在两个 CPU 上同时执行。
-     */
-    bool enqueued = false;
+    */
     if (cpu->queue.current != thread) {
-        uint32_t before = cpu->queue.nr_running;
         enqueue_locked(cpu, thread);
-        enqueued = cpu->queue.nr_running != before;
     }
     scheduler_unlock(&cpu->queue.lock, queue_flags);
-    if (enqueued && cpu_id != caller_cpu) {
+    /*
+     * A blocked current thread is briefly still published as queue.current
+     * until the blocking path switches away.  In that window it is not
+     * re-enqueued, but the successful BLOCKED -> READY transition still
+     * needs to interrupt the target CPU so the pending switch cannot be
+     * stranded behind an unrelated timer tick.
+     */
+    if (woke) {
         (void)x86_smp_request_reschedule(cpu_id);
     }
 }
@@ -670,19 +350,18 @@ static void scheduler_reap_enqueue_locked(scheduler_cpu_t *cpu,
 
     uint32_t flags =
         __atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE);
+    uint16_t sched_flags = thread->sched.flags;
 
     /*
      * 没有 execution ref 的线程不需要 deferred reap。
      * QUEUED 防止异常的重复 schedule 把同一线程加入两次。
      */
     if ((flags & THREAD_FLAG_EXECUTION_REF) == 0U ||
-        (flags & THREAD_FLAG_EXECUTION_REAP_QUEUED) != 0U) {
+        (sched_flags & SCHED_ENTITY_REAP_QUEUED) != 0U) {
         return;
     }
 
-    __atomic_fetch_or(&thread->flags,
-                      THREAD_FLAG_EXECUTION_REAP_QUEUED,
-                      __ATOMIC_RELEASE);
+    thread->sched.flags |= SCHED_ENTITY_REAP_QUEUED;
 
     thread->reap_next = 0;
 
@@ -753,6 +432,17 @@ void schedule(void) {
     if (next != 0 && next != current && current != 0 &&
         current->arch.switch_ctx.rsp != 0 &&
         next->arch.switch_ctx.rsp != 0) {
+        x86_cpu_local_t *local = x86_cpu_local_current();
+        if (local != 0) {
+            /*
+             * A syscall may explicitly block and call schedule().  Keep
+             * that fact with the thread so the next thread on this CPU does
+             * not inherit the caller's syscall-only interrupt policy.
+             */
+            current->arch.syscall_active = local->SyscallActive;
+            local->SyscallActive = next == cpu->queue.idle ? 0U :
+                                   next->arch.syscall_active;
+        }
         paddr_t root = g_kernel_root;
         vaddr_t kernel_stack = cpu->idle_stack_top;
         if (next->process != 0 && next->process->vm != 0) {
@@ -764,6 +454,7 @@ void schedule(void) {
         x86_tss_set_rsp0(kernel_stack);
         x86_syscall_set_kernel_stack(kernel_stack);
         x86_set_user_fs_base(next->arch.fs_base);
+        x86_fp_switch(&current->arch, &next->arch);
         paddr_t cr3 = paddr_make(x86_cr3_value(
             root, next->process != 0 && next->process->vm != 0 ?
                 next->process->vm->pcid : 0U));
@@ -804,7 +495,8 @@ void sched_preempt_disable(void) {
 }
 
 void sched_preempt_enable(void) {
-    if (x86_preempt_disabled_fast()) x86_preempt_enable_fast();
+    if (!x86_preempt_disabled_fast()) return;
+    x86_preempt_enable_fast();
 }
 
 bool sched_preempt_disabled(void) {
@@ -842,10 +534,7 @@ static thread_t *scheduler_reap_pop_cpu(uint32_t cpu_id) {
          * EXECUTION_REF itself continues to protect thread lifetime until
          * thread_release_execution_ref() finishes.
          */
-        __atomic_fetch_and(
-            &thread->flags,
-            ~THREAD_FLAG_EXECUTION_REAP_QUEUED,
-            __ATOMIC_RELEASE);
+        thread->sched.flags &= (uint16_t)~SCHED_ENTITY_REAP_QUEUED;
     }
 
     scheduler_unlock(&cpu->queue.lock,
@@ -1013,26 +702,54 @@ void sched_block_current(void) {
     if (!scheduler_current_cpu(&cpu_id)) return;
     thread_t *current = g_cpus[cpu_id].queue.current;
     if (current == 0 || current == g_cpus[cpu_id].queue.idle) return;
-    atomic_store_explicit(&current->state, THREAD_BLOCKED, memory_order_release);
-    schedule();
+    if (sched_publish_blocked(current)) schedule();
 }
 
-void sched_tick(uint64_t now_ns) {
-    uint32_t cpu_id;
-    if (!scheduler_current_cpu(&cpu_id)) return;
-    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    cpu->queue.clock_ns = now_ns;
-    thread_t *current = cpu->queue.current;
-    if (current == 0) return;
-    if (current == cpu->queue.idle) {
-        if (sched_runnable_count() != 0) schedule();
-        return;
+bool sched_state_transition_self_test(void) {
+    thread_t thread = {0};
+    atomic_init(&thread.state, THREAD_RUNNING);
+    atomic_init(&thread.blocked_waiter, 0);
+
+    if (!sched_publish_blocked(&thread) ||
+        atomic_load_explicit(&thread.state, memory_order_acquire) !=
+            THREAD_BLOCKED ||
+        sched_publish_dead(&thread)) {
+        return false;
     }
-    uint64_t delta = current->sched.exec_start_ns == 0 ? 0 : now_ns - current->sched.exec_start_ns;
-    current->sched.runtime_ns += delta;
-    current->sched.exec_start_ns = now_ns;
-    if (current->sched_class == SCHED_CLASS_FAIR) current->sched.vruntime += delta;
-    if (current->sched_class == SCHED_CLASS_RT || delta != 0) schedule();
+
+    atomic_store_explicit(&thread.state, THREAD_READY, memory_order_release);
+    if (!sched_publish_dead(&thread) ||
+        atomic_load_explicit(&thread.state, memory_order_acquire) != THREAD_DEAD ||
+        sched_publish_dead(&thread)) {
+        return false;
+    }
+    return true;
+}
+
+static void sched_context_test_entry(void) {
+    g_context_test_ran = 1U;
+    x86_switch_context(g_context_test_to, g_context_test_from);
+    for (;;) __asm__ volatile ("cli; hlt" : : : "memory");
+}
+
+bool sched_context_switch_self_test(void) {
+    static uint8_t stack[4096] __attribute__((aligned(16)));
+    arch_switch_context_t from = {0};
+    arch_switch_context_t to = {0};
+    uintptr_t stack_top = ((uintptr_t)stack + sizeof(stack)) & ~(uintptr_t)15U;
+
+    stack_top -= sizeof(uint64_t);
+    *(uint64_t *)stack_top = (uint64_t)(uintptr_t)&sched_context_test_entry;
+    to.rsp = stack_top;
+    g_context_test_from = &from;
+    g_context_test_to = &to;
+    g_context_test_ran = 0U;
+    uint64_t benchmark_start = telemetry_timestamp();
+    x86_switch_context(&from, &to);
+    kernel_perf_emit_scope("scheduler.context_switch", benchmark_start);
+    g_context_test_from = 0;
+    g_context_test_to = 0;
+    return g_context_test_ran == 1U;
 }
 
 kstatus_t sched_set_affinity(thread_t *thread, const cpumask_t *mask) {
@@ -1098,7 +815,7 @@ bool sched_validate_current_cpu(void) {
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
     uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
     bool valid = cpu->queue.fair_root.root == 0 ||
-                 rb_color(cpu->queue.fair_root.root) == RB_BLACK;
+                 rb_tree_color(cpu->queue.fair_root.root) == RB_TREE_BLACK;
     thread_t *previous = 0;
     uint32_t black_depth = UINT32_MAX;
     uint32_t fair_count = 0;

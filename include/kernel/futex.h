@@ -2,7 +2,8 @@
 
 #include <kernel/process.h>
 
-/* Futex 键由进程地址空间和用户虚拟地址共同组成，不跨进程错误唤醒。 */
+/* Futex key uses the physical user word, so aliases of a shared page wake
+ * across processes while private COW pages remain independent. */
 kstatus_t futex_wait(process_t *process, uint32_t __user *address,
                      uint32_t expected, uint64_t timeout_ns);
 kstatus_t futex_wake(process_t *process, uint32_t __user *address,

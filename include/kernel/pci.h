@@ -69,6 +69,7 @@ kstatus_t pci_msix_mask(pci_device_t *device, uint16_t entry, bool masked);
 kstatus_t pci_enable_memory_busmaster(pci_device_t *device);
 kstatus_t pci_msi_configure(pci_device_t *device, uint32_t apic_id,
                             uint8_t vector);
+kstatus_t pci_msi_disable(pci_device_t *device);
 const pci_host_t *pci_current_host(void);
 bool pci_ecam_self_test(void);
 uint32_t pci_ecam_last_error(void);

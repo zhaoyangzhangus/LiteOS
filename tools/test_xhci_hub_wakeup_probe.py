@@ -1,16 +1,31 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+import os
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-BUILD = ROOT / "build"
+ROOT = Path(__file__).resolve().parents[2]
+BUILD = Path(os.environ.get("BUILD", str(ROOT / "build")))
+if not BUILD.is_absolute():
+    BUILD = ROOT / BUILD
 SERIAL = BUILD / "qemu-serial.log"
-MONITOR = BUILD / "qemu-monitor-wakeup-probe.sock"
+MONITOR = Path(
+    os.environ.get(
+        "QEMU_MONITOR_SOCKET",
+        str(Path(tempfile.gettempdir()) / "liteos-xhci-hub-wakeup-probe.sock"),
+    )
+)
+MOUSE_EVENT_DELAY = float(os.environ.get("XHCI_TEST_MOUSE_DELAY", "0.006"))
+BOOT_READY_TIMEOUT = float(
+    os.environ.get("XHCI_TEST_BOOT_READY_TIMEOUT", "60.0")
+)
+QEMU_SECONDS = os.environ.get("XHCI_TEST_QEMU_SECONDS", "90")
+POLL_INTERVAL = float(os.environ.get("XHCI_TEST_POLL_INTERVAL", "0.25"))
 OUT = BUILD / "xhci-hub-wakeup-probe.stdout"
 ERR = BUILD / "xhci-hub-wakeup-probe.stderr"
 
@@ -18,17 +33,19 @@ ERR = BUILD / "xhci-hub-wakeup-probe.stderr"
 def serial_text():
     try:
         return SERIAL.read_text(errors="replace")
-    except FileNotFoundError:
+    except OSError:
         return ""
 
 
 def wait_for(predicate, timeout, label):
+    if POLL_INTERVAL <= 0.0:
+        raise RuntimeError("XHCI_TEST_POLL_INTERVAL must be positive")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
             print("PASS:", label)
             return True
-        time.sleep(0.05)
+        time.sleep(POLL_INTERVAL)
     print("TIMEOUT:", label)
     return False
 
@@ -109,9 +126,10 @@ def main():
         runner = subprocess.Popen(
             [
                 str(ROOT / "run-qemu.sh"),
+                "--headless",
                 "--usb-nested",
                 "--monitor-socket", str(MONITOR),
-                "--seconds", "90",
+                "--seconds", QEMU_SECONDS,
                 "--no-build",
             ],
             cwd=ROOT,
@@ -122,6 +140,29 @@ def main():
         if not wait_for(lambda: MONITOR.exists(), 12.0, "HMP socket online"):
             return 2
 
+        if not wait_for(
+            lambda: "LITEOS_XHCI_HUB_RUNTIME_OK" in serial_text(),
+            BOOT_READY_TIMEOUT,
+            "Hub runtime ready",
+        ):
+            return 3
+
+        # Hub runtime readiness precedes the post-display user-runtime
+        # self-test.  Wait for that independent boot gate before removing a
+        # device, so a recovery probe cannot turn a slow self-test into a
+        # misleading stage failure.
+        if not wait_for(
+            lambda: "LITEOS_USER_RUNTIME_SUBTESTS_OK" in serial_text(),
+            BOOT_READY_TIMEOUT,
+            "boot runtime self-tests ready",
+        ):
+            return 4
+        if "LITEOS_STAGE_FAIL" in serial_text():
+            return 5
+
+        # Attach HMP only after the boot-critical user-runtime self-test.  A
+        # connected monitor increases TCG main-loop load and can otherwise
+        # perturb that self-test's scheduling window.
         end = time.monotonic() + 5.0
         while hmp is None:
             try:
@@ -130,13 +171,6 @@ def main():
                 if time.monotonic() >= end:
                     raise
                 time.sleep(0.05)
-
-        if not wait_for(
-            lambda: "LITEOS_XHCI_HUB_RUNTIME_OK" in serial_text(),
-            25.0,
-            "Hub runtime ready",
-        ):
-            return 3
 
         # Give the freshly armed interrupt endpoints enough time to reach
         # QEMU's normal NAK/retry state even for the slowest legal interval
@@ -175,6 +209,7 @@ def main():
         )
 
         got_change = serial_text().count("LITEOS_USB_RUNTIME_HUB_CHANGE") > baseline_change
+        stage_failed = "LITEOS_STAGE_FAIL" in serial_text()
 
         print_new_diag(baseline_len)
 
@@ -182,6 +217,7 @@ def main():
         print("=== RESULT ===")
         print("hub_transfer_event:", "YES" if got_transfer else "NO")
         print("runtime_hub_change:", "YES" if got_change else "NO")
+        print("stage_failure:", "YES" if stage_failed else "NO")
 
         if ERR.exists():
             qemu_err = ERR.read_text(errors="replace").strip()
@@ -190,7 +226,7 @@ def main():
                 print("=== QEMU STDERR TAIL ===")
                 print(qemu_err[-6000:])
 
-        return 0 if got_transfer else 1
+        return 0 if got_transfer and not stage_failed else 1
 
     finally:
         if hmp is not None:

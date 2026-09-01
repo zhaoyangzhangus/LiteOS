@@ -1,6 +1,0 @@
-compiler: /usr/bin/cc
-ok: True
-stdout:
-
-stderr:
-

@@ -2,27 +2,20 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "LiteOS: QEMU (F5 auto detect)",
-            "type": "node-terminal",
-            "request": "launch",
-            "command": "bash -lc './run-qemu.sh --keep-open --cpu 4'",
-            "cwd": "${workspaceFolder}",
-            "windows": {
-                "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\run-qemu-auto.ps1\""
-            }
-        },
-        {
-            "name": "LiteOS: Kernel debug (WSL QEMU)",
+            "name": "LiteOS: Kernel debug (F5 auto detect)",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/esp/EFI/LITEOS/kernel.elf",
+            "program": "${workspaceFolder}/build-refactor/esp/EFI/LITEOS/kernel.elf",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerPath": "gdb",
             "miDebuggerServerAddress": "127.0.0.1:1234",
-            "preLaunchTask": "LiteOS: start WSL QEMU debug",
-            "postDebugTask": "LiteOS: stop WSL QEMU debug",
+            "preLaunchTask": "LiteOS: start QEMU debug (auto)",
+            "postDebugTask": "LiteOS: stop QEMU debug (auto)",
             "stopAtEntry": false,
+            "windows": {
+                "miDebuggerPath": "C:\\Program Files\\w64devkit\\bin\\gdb.exe"
+            },
             "logging": {
                 "engineLogging": true,
                 "trace": true,
@@ -30,27 +23,13 @@
             },
             "setupCommands": [
                 {
-                    "description": "Make GDB resolve paths from the workspace",
-                    "text": "cd ${workspaceFolder}"
-                },
-                {
                     "description": "Disable GDB pagination",
                     "text": "set pagination off",
                     "ignoreFailures": true
                 },
                 {
-                    "description": "Do not stop on KVM HLT exits reported as SIGQUIT",
-                    "text": "handle SIGQUIT nostop noprint pass",
-                    "ignoreFailures": true
-                },
-                {
                     "description": "Show the next instruction",
                     "text": "set disassemble-next-line on",
-                    "ignoreFailures": true
-                },
-                {
-                    "description": "Step over code without debug line information",
-                    "text": "set step-mode off",
                     "ignoreFailures": true
                 }
             ],

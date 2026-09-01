@@ -5,6 +5,7 @@
 /* 可选 Intel e1000 后端：QEMU 未提供网卡时不影响无网卡启动。 */
 bool e1000_hardware_present(void);
 bool e1000_self_test(void);
+bool e1000_packet_queue_self_test(void);
 bool e1000_rss_self_test(void);
 uint32_t e1000_hardware_queue_count(void);
 uint32_t e1000_software_queue_count(void);

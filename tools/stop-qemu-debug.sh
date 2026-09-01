@@ -2,7 +2,8 @@
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-pid_file="$script_dir/build/qemu-debug.pid"
+build_dir="${BUILD:-build}"
+pid_file="$script_dir/$build_dir/qemu-debug.pid"
 
 if [[ ! -f "$pid_file" ]]; then
     exit 0

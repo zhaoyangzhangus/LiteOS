@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "sha256.h"
+#include <boot/sha256.h>
 
 static int write_hex(FILE *output, const UINT8 digest[32]) {
     static const CHAR8 digits[] = "0123456789abcdef";

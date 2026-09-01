@@ -14,6 +14,7 @@ debug=0
 no_build=0
 headless=0
 usb_nested=0
+all_disks=0
 # Boot from the removable FAT volume by default.  The USB-root kernel path
 # already validates /init and /init-runtime before selecting it as /.  Keep an
 # explicit NVMe switch for diagnostics and for comparing the old path.
@@ -26,6 +27,7 @@ seconds=10
 cpu_count=4
 gdb_port=1234
 debug_level=2
+qemu_trace="${QEMU_TRACE:-}"
 
 usage() {
     cat <<'EOF'
@@ -37,6 +39,7 @@ usage() {
   --headless          不显示图形窗口
   --usb-nested        测试 xHCI -> Hub -> Hub -> Mouse
   --usb-storage       使用 xHCI USB Mass Storage U盘启动（默认）
+  --all-disks         在 USB 根盘之外附加一个 NVMe 数据盘
   --nvme-root         使用原来的 NVMe 根盘启动（诊断/回退）
   --monitor-socket P  在 Unix socket P 开启 HMP monitor
   --keep-open         普通运行模式下持续运行，Ctrl-C 退出
@@ -64,6 +67,7 @@ while (($# > 0)); do
         # semantics even though normal boots default to USB.
         --usb-nested) usb_nested=1; usb_storage=0; shift ;;
         --usb-storage) usb_storage=1; shift ;;
+        --all-disks) all_disks=1; shift ;;
         --nvme-root) usb_storage=0; shift ;;
         --monitor-socket)
             (($# >= 2)) || {
@@ -106,12 +110,12 @@ if [[ -n "$monitor_socket" &&
     monitor_socket="$script_dir/$monitor_socket"
 fi
 
-if ((usb_nested && headless)); then
-    echo "--usb-nested 需要图形窗口以产生鼠标输入" >&2
-    exit 2
-fi
 if ((usb_nested && usb_storage)); then
     echo "--usb-nested 与 --usb-storage 请分开测试" >&2
+    exit 2
+fi
+if ((all_disks && usb_storage == 0)); then
+    echo "--all-disks 当前要求 USB 作为 UEFI 根盘" >&2
     exit 2
 fi
 
@@ -134,11 +138,35 @@ fi
     exit 1
 }
 
+mkdir -p "$build_dir"
+
+mirror_build_stdout() {
+    tee "$build_dir/qemu-build.log" |
+    awk 'tolower($0) ~ /(^|[^a-z])(fail|failed|failure|error|fatal|panic|abort|invalid|cannot|could not|undefined reference|make(\[[0-9]+\])?: \*\*\*)([^a-z]|$)/ {
+            print
+            fflush()
+        }'
+}
+
+mirror_build_stderr() {
+    tee "$build_dir/qemu-build-stderr.log" |
+        awk 'tolower($0) ~ /(^|[^a-z])(fail|failed|failure|error|fatal|panic|abort|invalid|cannot|could not|undefined reference|make(\[[0-9]+\])?: \*\*\*)([^a-z]|$)/ {
+            print
+            fflush()
+        }' >&2
+}
+
 if ((no_build == 0)); then
     # QEMU keeps the COM1 mirror enabled so this script can expose boot
     # markers in qemu-serial.log.  A normal hardware build uses the makefile
     # default LITEOS_DEBUG_SERIAL=0 and is GOP-only.
-    "$make_cmd" -f GNUmakefile esp DEBUG="$debug_level" LITEOS_DEBUG_SERIAL=1
+    build_status=0
+    "$make_cmd" -f GNUmakefile esp DEBUG="$debug_level" LITEOS_DEBUG_SERIAL=1 \
+        > >(mirror_build_stdout) 2> >(mirror_build_stderr) || build_status=$?
+    if ((build_status != 0)); then
+        echo "LiteOS 构建失败（退出码：$build_status），请查看 $build_dir/qemu-build.log" >&2
+        exit "$build_status"
+    fi
 fi
 [[ -f "$build_dir/esp/EFI/LITEOS/kernel.elf" ]] || {
     echo "找不到 $build_dir/esp/EFI/LITEOS/kernel.elf，请先构建镜像" >&2
@@ -161,10 +189,7 @@ for stale_entry in \
     stale_name="$(basename -- "$stale_entry")"
     stale_target="$stale_dir/"$stale_name".$$"
     mv -- "$stale_entry" "$stale_target"
-    echo "Quarantined stale VFS artifact: $stale_target"
 done
-
-mkdir -p "$build_dir"
 
 # Do not boot directly from QEMU's `fat:rw:<directory>` backend.  Its vvfat
 # implementation can abort the whole emulator when a guest truncates or
@@ -172,11 +197,32 @@ mkdir -p "$build_dir"
 # disk image from a read-only directory view, then let the guest write that
 # raw image.  The generated image is disposable and never mutates build/esp.
 qemu_fat_image="$build_dir/qemu-fat.img"
+qemu_secondary_image="$build_dir/qemu-nvme-data.img"
 rm -f -- "$qemu_fat_image"
 if ! "$qemu_img_path" convert -O raw "fat:ro:$build_dir/esp" \
         "$qemu_fat_image" >/dev/null 2>"$build_dir/qemu-img.stderr"; then
     echo "无法生成 QEMU FAT 磁盘镜像，请查看 $build_dir/qemu-img.stderr" >&2
     exit 1
+fi
+if ((all_disks)); then
+    rm -f -- "$qemu_secondary_image"
+    if ! "$qemu_img_path" convert -O raw "fat:ro:$build_dir/esp" \
+            "$qemu_secondary_image" >/dev/null 2>"$build_dir/qemu-img-secondary.stderr"; then
+        echo "无法生成 QEMU 第二个 FAT 磁盘镜像，请查看 $build_dir/qemu-img-secondary.stderr" >&2
+        exit 1
+    fi
+fi
+
+# A non-interactive headless launch must not make QEMU's serial backend depend
+# on the stdout process-substitution pipe.  That pipe changes TCG timing under
+# Popen/VS Code task runners and can hide a guest wakeup race.  Keep the live
+# terminal path unchanged, while giving headless automation a direct serial
+# file that is still mirrored to qemu-serial.log below.
+serial_device="file:/dev/stdout"
+serial_to_file=0
+if ((headless)) && [[ ! -t 1 ]]; then
+    serial_device="file:$build_dir/qemu-serial.log"
+    serial_to_file=1
 fi
 
 qemu_args=(
@@ -186,11 +232,17 @@ qemu_args=(
     -vga none
     -device "VGA,vgamem_mb=64"
     -m 4096M
-    -cpu qemu64
+    # The freestanding crypto tests require a strong seed.  QEMU's qemu64
+    # model hides RDRAND by default, so expose the virtual instruction without
+    # changing the rest of the compatibility-oriented CPU model.
+    -cpu qemu64,rdrand=on
     -smp "$cpu_count"
     -drive "if=pflash,format=raw,readonly=on,file=$firmware"
     -boot order=c
-    -serial "file:$build_dir/qemu-serial.log"
+    # Interactive launches use QEMU stdout as the live COM1 stream; headless
+    # non-PTY launches use the direct serial file selected above so polling
+    # tools do not depend on a process-substitution pipe.
+    -serial "$serial_device"
     -no-reboot
     -no-shutdown
     -d guest_errors
@@ -203,8 +255,16 @@ if ((usb_storage)); then
     qemu_args+=(
         -drive "if=none,id=liteos-usb-stick,format=raw,file=$qemu_fat_image"
         -device "qemu-xhci,id=liteos-xhci,msix=on"
-        -device "usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
     )
+    usb_storage_device="usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
+    if ((all_disks)); then usb_storage_device+=",bootindex=1"; fi
+    qemu_args+=( -device "$usb_storage_device" )
+    if ((all_disks)); then
+        qemu_args+=(
+            -drive "if=none,id=liteos-nvme-data,format=raw,file=$qemu_secondary_image"
+            -device "nvme,drive=liteos-nvme-data,serial=liteos-data,bootindex=2"
+        )
+    fi
 else
     qemu_args+=(
         -drive "if=none,id=liteos-nvme0,format=raw,file=$qemu_fat_image"
@@ -230,10 +290,8 @@ fi
 
 if ((no_kvm == 0)) && [[ -r /dev/kvm && -w /dev/kvm ]]; then
     qemu_args+=( -accel kvm )
-    echo 'QEMU accelerator: KVM'
 else
     qemu_args+=( -accel tcg,thread=multi )
-    echo 'QEMU accelerator: TCG (no usable /dev/kvm)'
 fi
 
 if ((headless)); then
@@ -244,50 +302,60 @@ else
     # the supported Linux mechanism and avoids sending guest keys to the
     # launcher terminal when the VM window is active.
     qemu_args+=( -display gtk,zoom-to-fit=off,grab-on-hover=on )
-
-    if ((usb_nested)); then
-        #
-        # B10B-2 NESTED USB HUB TOPOLOGY
-        #
-        # Physical topology:
-        #
-        #   xHCI root port 1
-        #        |
-        #        +-- Hub #1
-        #              |
-        #              +-- port 1: Hub #2
-        #                          |
-        #                          +-- port 1: Mouse
-        #
-        # xHCI route strings expected by LiteOS:
-        #
-        #   Hub #1 : 0x00000
-        #   Hub #2 : 0x00001
-        #   Mouse  : 0x00011
-        #
-        qemu_args+=(
-            -device "qemu-xhci,id=liteos-xhci,msix=on"
-            -device "usb-hub,id=liteos-hub1,bus=liteos-xhci.0,port=1"
-            -device "usb-hub,id=liteos-hub2,bus=liteos-xhci.0,port=1.1"
-            -device "usb-mouse,id=liteos-nested-mouse,bus=liteos-xhci.0,port=1.1.1"
-        )
-    elif ((usb_storage == 0)); then
-        qemu_args+=(
-            -device "qemu-xhci,id=liteos-xhci,msix=on"
-            -device "usb-kbd,bus=liteos-xhci.0"
-            -device "usb-mouse,bus=liteos-xhci.0"
-        )
-    else
-        # USB boot already created the xHCI controller for the storage device;
-        # add the input devices to that same controller in GUI mode.
-        qemu_args+=(
-            -device "usb-kbd,bus=liteos-xhci.0"
-            -device "usb-mouse,bus=liteos-xhci.0"
-        )
-    fi
 fi
 
-if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" ); fi
+if ((usb_nested)); then
+    #
+    # B10B-2 NESTED USB HUB TOPOLOGY
+    #
+    # Physical topology:
+    #
+    #   xHCI root port 1
+    #        |
+    #        +-- Hub #1
+    #              |
+    #              +-- port 1: Hub #2
+    #                          |
+    #                          +-- port 1: Mouse
+    #
+    # xHCI route strings expected by LiteOS:
+    #
+    #   Hub #1 : 0x00000
+    #   Hub #2 : 0x00001
+    #   Mouse  : 0x00011
+    #
+    # Keep the topology independent of the display backend so automated HMP
+    # tests can inject input in headless QEMU as well as in the GTK window.
+    qemu_args+=(
+        -device "qemu-xhci,id=liteos-xhci,msix=on"
+        -device "usb-hub,id=liteos-hub1,bus=liteos-xhci.0,port=1"
+        -device "usb-hub,id=liteos-hub2,bus=liteos-xhci.0,port=1.1"
+        -device "usb-mouse,id=liteos-nested-mouse,bus=liteos-xhci.0,port=1.1.1"
+    )
+elif ((usb_storage == 0)); then
+    qemu_args+=(
+        -device "qemu-xhci,id=liteos-xhci,msix=on"
+        -device "usb-kbd,bus=liteos-xhci.0"
+        -device "usb-mouse,bus=liteos-xhci.0"
+    )
+else
+    # USB boot already created the xHCI controller for the storage device;
+    # add the input devices to that same controller in every display mode.
+    qemu_args+=(
+        -device "usb-kbd,bus=liteos-xhci.0"
+        -device "usb-mouse,bus=liteos-xhci.0"
+    )
+fi
+
+if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" -S ); fi
+if [[ -n "$qemu_trace" ]]; then
+    IFS=',' read -r -a trace_events <<< "$qemu_trace"
+    for trace_event in "${trace_events[@]}"; do
+        [[ -n "$trace_event" ]] || continue
+        qemu_args+=( -trace "enable=$trace_event" )
+    done
+    qemu_args+=( -trace "file=$build_dir/qemu-trace.log" )
+fi
 if [[ -n "$net_dump" ]]; then
     # Give the diagnostic filter a named user-net backend.  `-net dump` was
     # removed from newer QEMU builds and cannot attach to the implicit NIC.
@@ -301,6 +369,34 @@ fi
 
 stdout_log="$build_dir/qemu-stdout.log"
 stderr_log="$build_dir/qemu-stderr.log"
+serial_log="$build_dir/qemu-serial.log"
+
+# Keep the complete stream in the two log files, but keep the interactive
+# terminal quiet unless a line describes a failure or an abnormal stop.
+mirror_qemu_stdout() {
+    if ((serial_to_file)); then
+        tee "$stdout_log"
+    else
+        tee "$stdout_log" "$serial_log"
+    fi |
+    awk '/(^|[^A-Z])(FAIL|ERROR|FATAL|PANIC|FAULT|TIMEOUT|ASSERT)([^A-Z]|$)/ {
+            sub(/\r$/, "", $0)
+            print
+            fflush()
+        }'
+}
+
+mirror_qemu_stderr() {
+    # QEMU normally reports the deliberate timeout termination on stderr.  It
+    # remains in qemu-stderr.log, but only diagnostic-looking lines reach the
+    # interactive terminal.
+    tee "$stderr_log" |
+        awk '!/terminating on signal 15 from pid/ &&
+             tolower($0) ~ /error|fail|fatal|panic|abort|invalid|cannot|could not|unsupported|assert|segmentation|fault/ {
+            print
+            fflush()
+        }' >&2
+}
 
 # Ctrl+S is VSTOP (XOFF) in a host terminal.  If the QEMU GTK window has not
 # taken focus yet, the terminal consumes that byte instead of the emulated
@@ -324,6 +420,11 @@ if ((headless == 0)) && [[ -t 0 ]]; then
 fi
 
 if ((debug)); then
+    emit_debug_marker() {
+        [[ "${LITEOS_DEBUG_PROTOCOL:-0}" == "1" ]] || return 0
+        printf '%s\n' "$1"
+    }
+
     pid_file="$build_dir/qemu-debug.pid"
     if [[ -f "$pid_file" ]]; then
         old_pid="$(cat "$pid_file" 2>/dev/null || true)"
@@ -346,8 +447,10 @@ if ((debug)); then
         fi
         rm -f "$pid_file"
     fi
-    echo 'QEMU_DEBUG_START'
-    "$qemu_path" "${qemu_args[@]}" >"$stdout_log" 2>"$stderr_log" &
+    emit_debug_marker 'QEMU_DEBUG_START'
+    "$qemu_path" "${qemu_args[@]}" \
+        > >(mirror_qemu_stdout) \
+        2> >(mirror_qemu_stderr) &
     qemu_pid=$!
     echo "$qemu_pid" >"$pid_file"
     cleanup_debug() {
@@ -370,19 +473,23 @@ if ((debug)); then
         sleep 0.1
     done
     ((ready)) || { echo "QEMU GDB 端口 ${gdb_port} 未就绪" >&2; exit 1; }
-    echo 'QEMU_DEBUG_READY'
+    emit_debug_marker 'QEMU_DEBUG_READY'
     wait "$qemu_pid"
 else
     run_status=0
     if ((keep_open)); then
-        "$qemu_path" "${qemu_args[@]}" >"$stdout_log" 2>"$stderr_log" || run_status=$?
+        "$qemu_path" "${qemu_args[@]}" \
+            > >(mirror_qemu_stdout) \
+            2> >(mirror_qemu_stderr) || run_status=$?
     else
-        timeout --foreground --signal=TERM "${seconds}s" "$qemu_path" "${qemu_args[@]}" >"$stdout_log" 2>"$stderr_log" || run_status=$?
+        timeout --foreground --signal=TERM "${seconds}s" \
+            "$qemu_path" "${qemu_args[@]}" \
+            > >(mirror_qemu_stdout) \
+            2> >(mirror_qemu_stderr) || run_status=$?
         if ((run_status == 124)); then run_status=0; fi
     fi
     if ((run_status != 0)); then
         echo "QEMU 退出码：$run_status，请查看 $stderr_log" >&2
         exit "$run_status"
     fi
-    [[ -f "$build_dir/qemu-serial.log" ]] && cat "$build_dir/qemu-serial.log"
 fi

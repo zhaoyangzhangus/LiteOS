@@ -65,6 +65,9 @@ typedef struct input_pointer_motion {
 #define INPUT_CORE_CAPACITY 256U
 
 bool input_core_init(void);
+/* Bind a generic consumer wait queue; the input Owner never names a client
+ * subsystem such as Graphics. */
+void input_core_bind_wakeup(wait_queue_t *wait_queue);
 kstatus_t input_core_push(const input_event_t *event);
 kstatus_t input_core_push_pointer(const input_pointer_motion_t *motion);
 kstatus_t input_core_pop(input_event_t *event);

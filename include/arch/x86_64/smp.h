@@ -1,6 +1,6 @@
 #pragma once
 
-#include "bootinfo.h"
+#include <kernel/bootinfo.h>
 #include <kernel/base.h>
 
 #define X86_AP_BOOT_STACK_SIZE (64U * 1024U)
@@ -18,6 +18,7 @@ typedef struct {
 
 bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info);
 bool x86_smp_release_aps(void);
+bool x86_smp_enable_ap_timers(void);
 bool x86_smp_ipi_self_test(void);
 bool x86_smp_request_reschedule(uint32_t cpu_index);
 bool x86_smp_take_reschedule_request(void);

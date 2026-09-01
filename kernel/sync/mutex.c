@@ -45,19 +45,6 @@ static void pi_unlock(void) {
     atomic_store_explicit(&g_pi_lock.state, 0U, memory_order_release);
 }
 
-static void list_insert_tail_local(list_head_t *head, list_head_t *node) {
-    node->next = head;
-    node->prev = head->prev;
-    head->prev->next = node;
-    head->prev = node;
-}
-
-static void list_remove_local(list_head_t *node) {
-    node->prev->next = node->next;
-    node->next->prev = node->prev;
-    list_init(node);
-}
-
 static kmutex_t *mutex_from_owner_node(list_head_t *node) {
     return (kmutex_t *)((uint8_t *)node - __builtin_offsetof(kmutex_t, owner_node));
 }
@@ -120,7 +107,7 @@ static bool would_deadlock(thread_t *thread, kmutex_t *mutex) {
 static void assign_owner(kmutex_t *mutex, thread_t *thread) {
     mutex->owner = thread;
     if (mutex->pi_enabled) {
-        list_insert_tail_local(&thread->owned_mutexes, &mutex->owner_node);
+        list_add_tail(&thread->owned_mutexes, &mutex->owner_node);
     }
 }
 
@@ -157,7 +144,7 @@ static bool kmutex_try_acquire_predicate(void *opaque) {
     pi_lock();
     if (context->mutex->owner == 0) {
         if (context->waiter->linked) {
-            list_remove_local(&context->waiter->node);
+            list_del(&context->waiter->node);
             context->waiter->linked = false;
         }
         context->thread->pi_blocked_on = 0;
@@ -191,7 +178,7 @@ kstatus_t kmutex_lock(kmutex_t *mutex, uint64_t timeout_ns) {
         pi_unlock();
         return K_EBUSY;
     }
-    list_insert_tail_local(&mutex->pi_waiters, &waiter.node);
+    list_add_tail(&mutex->pi_waiters, &waiter.node);
     waiter.linked = true;
     current->pi_blocked_on = mutex;
     if (mutex->pi_enabled) recompute_thread_priority(mutex->owner, 0);
@@ -202,7 +189,7 @@ kstatus_t kmutex_lock(kmutex_t *mutex, uint64_t timeout_ns) {
                                      &context, timeout_ns);
     pi_lock();
     if (waiter.linked) {
-        list_remove_local(&waiter.node);
+        list_del(&waiter.node);
         waiter.linked = false;
     }
     if (current->pi_blocked_on == mutex) current->pi_blocked_on = 0;
@@ -223,7 +210,7 @@ kstatus_t kmutex_unlock(kmutex_t *mutex) {
         return K_EPERM;
     }
     if (mutex->pi_enabled && mutex->owner_node.next != &mutex->owner_node) {
-        list_remove_local(&mutex->owner_node);
+        list_del(&mutex->owner_node);
     }
     mutex->owner = 0;
     if (mutex->pi_enabled) recompute_thread_priority(current, 0);
@@ -231,19 +218,6 @@ kstatus_t kmutex_unlock(kmutex_t *mutex) {
     /* 唤醒全部竞争者，让仍在等待的线程重新向新所有者传播优先级。 */
     (void)wake_all(&mutex->waitq);
     return K_OK;
-}
-
-static void initialize_test_thread(thread_t *thread, uint8_t class_id, uint8_t priority) {
-    uint8_t *bytes = (uint8_t *)thread;
-    for (size_t i = 0; i < sizeof(*thread); ++i) bytes[i] = 0;
-    atomic_init(&thread->state, THREAD_READY);
-    thread->sched_class = class_id;
-    thread->rt_priority = priority;
-    thread->base_sched_class = class_id;
-    thread->base_rt_priority = priority;
-    thread->current_cpu = 0;
-    list_init(&thread->sched.rt_node);
-    list_init(&thread->owned_mutexes);
 }
 
 bool kmutex_pi_self_test(void) {
@@ -254,9 +228,9 @@ bool kmutex_pi_self_test(void) {
     thread_t high;
     kmutex_waiter_t high_waiter;
     kmutex_waiter_t low_waiter;
-    initialize_test_thread(&low, SCHED_CLASS_FAIR, 0);
-    initialize_test_thread(&middle, SCHED_CLASS_FAIR, 0);
-    initialize_test_thread(&high, SCHED_CLASS_RT, 2U);
+    sched_initialize_test_thread(&low, 1U, SCHED_CLASS_FAIR, 0U);
+    sched_initialize_test_thread(&middle, 2U, SCHED_CLASS_FAIR, 0U);
+    sched_initialize_test_thread(&high, 3U, SCHED_CLASS_RT, 2U);
     kmutex_init(&first, true);
     kmutex_init(&second, true);
     list_init(&high_waiter.node);
@@ -272,16 +246,16 @@ bool kmutex_pi_self_test(void) {
     assign_owner(&first, &low);
     assign_owner(&second, &middle);
     low.pi_blocked_on = &second;
-    list_insert_tail_local(&first.pi_waiters, &high_waiter.node);
-    list_insert_tail_local(&second.pi_waiters, &low_waiter.node);
+    list_add_tail(&first.pi_waiters, &high_waiter.node);
+    list_add_tail(&second.pi_waiters, &low_waiter.node);
     recompute_thread_priority(&low, 0);
     bool donated = low.sched_class == SCHED_CLASS_RT && low.rt_priority == 2U &&
                    middle.sched_class == SCHED_CLASS_RT && middle.rt_priority == 2U;
-    list_remove_local(&high_waiter.node);
-    list_remove_local(&low_waiter.node);
+    list_del(&high_waiter.node);
+    list_del(&low_waiter.node);
     low.pi_blocked_on = 0;
-    if (first.owner_node.next != &first.owner_node) list_remove_local(&first.owner_node);
-    if (second.owner_node.next != &second.owner_node) list_remove_local(&second.owner_node);
+    if (first.owner_node.next != &first.owner_node) list_del(&first.owner_node);
+    if (second.owner_node.next != &second.owner_node) list_del(&second.owner_node);
     first.owner = 0;
     second.owner = 0;
     recompute_thread_priority(&low, 0);
