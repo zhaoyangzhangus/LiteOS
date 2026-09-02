@@ -10,6 +10,13 @@
 typedef struct scheduler_cpu {
     run_queue_t queue;
 
+    /*
+     * Read-mostly scheduler load snapshot.
+     * low 32 bits: queued runnable threads.
+     * high 32 bits: queued + current non-idle runnable thread.
+     */
+    atomic_uint_fast64_t queue_snapshot;
+
     /* Threads that left their execution stack and await final reclamation. */
     thread_t *reap_head;
     thread_t *reap_tail;
@@ -22,6 +29,43 @@ typedef struct scheduler_cpu {
 
 extern scheduler_cpu_t g_cpus[MAX_CPUS];
 extern uint32_t g_cpu_count;
+
+static inline uint64_t scheduler_make_queue_snapshot(
+    const scheduler_cpu_t *cpu) {
+    uint32_t runnable = cpu->queue.nr_running;
+    uint32_t load = runnable;
+    thread_t *current = cpu->queue.current;
+
+    if (current != 0 &&
+        current != cpu->queue.idle &&
+        (current->sched.flags & SCHED_ENTITY_ENQUEUED) == 0U) {
+        unsigned state =
+            atomic_load_explicit(&current->state, memory_order_relaxed);
+        if (state == THREAD_RUNNING || state == THREAD_READY) {
+            ++load;
+        }
+    }
+
+    return ((uint64_t)load << 32) | (uint64_t)runnable;
+}
+
+static inline void scheduler_publish_queue_snapshot(scheduler_cpu_t *cpu) {
+    atomic_store_explicit(&cpu->queue_snapshot,
+                          scheduler_make_queue_snapshot(cpu),
+                          memory_order_release);
+}
+
+static inline uint32_t scheduler_snapshot_runnable(
+    const scheduler_cpu_t *cpu) {
+    return (uint32_t)atomic_load_explicit(&cpu->queue_snapshot,
+                                          memory_order_acquire);
+}
+
+static inline uint32_t scheduler_snapshot_load(
+    const scheduler_cpu_t *cpu) {
+    return (uint32_t)(atomic_load_explicit(&cpu->queue_snapshot,
+                                           memory_order_acquire) >> 32);
+}
 
 bool scheduler_current_cpu(uint32_t *cpu_id);
 uint64_t scheduler_lock(spinlock_t *lock);

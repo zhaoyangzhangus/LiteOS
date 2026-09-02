@@ -23,5 +23,8 @@ void sched_tick(uint64_t now_ns) {
     if (current->sched_class == SCHED_CLASS_FAIR) {
         current->sched.vruntime += delta;
     }
-    if (current->sched_class == SCHED_CLASS_RT || delta != 0) schedule();
+    if ((current->sched_class == SCHED_CLASS_RT || delta != 0) &&
+        sched_runnable_count() != 0U) {
+        schedule();
+    }
 }

@@ -37,10 +37,7 @@ uint32_t scheduler_choose_cpu(thread_t *thread, uint32_t current_cpu) {
         if (!scheduler_cpu_available(cpu_id) ||
             !scheduler_affinity_allows(thread, cpu_id)) continue;
         scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-        uint64_t flags = scheduler_lock(&cpu->queue.lock);
-        uint32_t load = cpu->queue.nr_running +
-                        (cpu->queue.current != cpu->queue.idle ? 1U : 0U);
-        scheduler_unlock(&cpu->queue.lock, flags);
+        uint32_t load = scheduler_snapshot_load(cpu);
         if (load < best_load || (load == best_load && cpu_id == current_cpu)) {
             best_cpu = cpu_id;
             best_load = load;

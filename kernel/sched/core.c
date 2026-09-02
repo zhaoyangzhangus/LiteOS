@@ -111,6 +111,21 @@ uint64_t scheduler_lock(spinlock_t *lock) {
     return flags;
 }
 
+/*
+ * Local scheduler entry points already disabled interrupts before taking
+ * the local runqueue lock. Avoid a second IRQ-save/restore pair there.
+ */
+static void scheduler_lock_irq_disabled(spinlock_t *lock) {
+    while (atomic_exchange_explicit(&lock->state, 1U,
+                                    memory_order_acquire) != 0U) {
+        __asm__ volatile ("pause");
+    }
+}
+
+static void scheduler_unlock_irq_disabled(spinlock_t *lock) {
+    atomic_store_explicit(&lock->state, 0U, memory_order_release);
+}
+
 void scheduler_unlock(spinlock_t *lock, uint64_t flags) {
     atomic_store_explicit(&lock->state, 0U, memory_order_release);
     scheduler_irq_restore(flags);
@@ -167,6 +182,7 @@ void sched_cpu_init(uint32_t cpu_id) {
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
     scheduler_zero(cpu, sizeof(*cpu));
     atomic_init(&cpu->queue.lock.state, 0U);
+    atomic_init(&cpu->queue_snapshot, 0U);
     atomic_init(&cpu->reap_deferred_queued, false);
     cpu->queue.fair_root.root = 0;
     for (uint32_t priority = 0; priority < RT_PRIORITY_LEVELS; ++priority) {
@@ -177,6 +193,7 @@ void sched_cpu_init(uint32_t cpu_id) {
     g_idle_threads[cpu_id].current_cpu = (uint16_t)cpu_id;
     cpu->queue.idle = &g_idle_threads[cpu_id];
     cpu->queue.current = cpu->queue.idle;
+    scheduler_publish_queue_snapshot(cpu);
     cpu->idle_stack_top = x86_cpu_kernel_stack(cpu_id);
     scheduler_init_idle_context(&g_idle_threads[cpu_id], cpu->idle_stack_top);
     if (cpu_id + 1U > g_cpu_count) g_cpu_count = cpu_id + 1U;
@@ -331,7 +348,7 @@ void sched_wake(thread_t *thread) {
     if (cpu->queue.current != thread) {
         enqueue_locked(cpu, thread);
     }
-    scheduler_unlock(&cpu->queue.lock, queue_flags);
+    scheduler_unlock_irq_disabled(&cpu->queue.lock);
     /*
      * A blocked current thread is briefly still published as queue.current
      * until the blocking path switches away.  In that window it is not
@@ -386,7 +403,7 @@ void schedule(void) {
         return;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
+    scheduler_lock_irq_disabled(&cpu->queue.lock);
     thread_t *current = cpu->queue.current;
     if (current != 0 && current != cpu->queue.idle) {
         unsigned current_state = atomic_load_explicit(&current->state,
@@ -406,6 +423,7 @@ void schedule(void) {
         next->current_cpu = (uint16_t)cpu_id;
         cpu->queue.current = next;
     }
+    scheduler_publish_queue_snapshot(cpu);
     scheduler_accounting_transition(&cpu->queue, current, next);
     /*
      * DEAD current 的 execution ref 只能在真正离开它的栈/CR3 后释放。
@@ -473,7 +491,7 @@ bool sched_try_run_ready(void) {
         return false;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
+    scheduler_lock_irq_disabled(&cpu->queue.lock);
     thread_t *next = pick_locked(cpu);
     /* 丢弃没有真实上下文的早期自检线程，避免空闲 CPU 被假线程锁死。 */
     while (next != 0 && next != cpu->queue.idle &&
@@ -483,7 +501,7 @@ bool sched_try_run_ready(void) {
         next = pick_locked(cpu);
     }
     bool runnable = next != 0 && next != cpu->queue.idle;
-    scheduler_unlock(&cpu->queue.lock, queue_flags);
+    scheduler_unlock_irq_disabled(&cpu->queue.lock);
     scheduler_irq_restore(irq_flags);
     if (runnable) schedule();
     return runnable;
@@ -803,10 +821,7 @@ uint32_t sched_runnable_count(void) {
     uint32_t cpu_id;
     if (!scheduler_current_cpu(&cpu_id)) return 0;
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
-    uint32_t count = cpu->queue.nr_running;
-    scheduler_unlock(&cpu->queue.lock, queue_flags);
-    return count;
+    return scheduler_snapshot_runnable(cpu);
 }
 
 bool sched_validate_current_cpu(void) {

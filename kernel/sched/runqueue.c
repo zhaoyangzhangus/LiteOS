@@ -140,6 +140,7 @@ void enqueue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
     }
     thread->sched.flags |= SCHED_ENTITY_ENQUEUED;
     ++cpu->queue.nr_running;
+    scheduler_publish_queue_snapshot(cpu);
 }
 
 void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
@@ -154,6 +155,7 @@ void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
     }
     thread->sched.flags &= (uint16_t)~SCHED_ENTITY_ENQUEUED;
     if (cpu->queue.nr_running != 0) --cpu->queue.nr_running;
+    scheduler_publish_queue_snapshot(cpu);
 }
 
 thread_t *pick_locked(scheduler_cpu_t *cpu) {
