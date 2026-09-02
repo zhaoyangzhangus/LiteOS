@@ -167,7 +167,7 @@ static void deferred_wake_worker(void) {
     if (atomic_load_explicit(&g_deferred.worker.state,
                              memory_order_acquire) != THREAD_RUNNING) {
         deferred_debug_set(9U);
-        (void)x86_smp_request_reschedule(g_deferred.worker.current_cpu);
+        (void)x86_smp_request_reschedule(g_deferred.worker.owner_cpu);
     }
     deferred_debug_set(10U);
 }
@@ -307,6 +307,8 @@ bool deferred_start_worker(void) {
     worker->tid = 0U;
     worker->process = 0;
     atomic_init(&worker->state, THREAD_READY);
+    atomic_init(&worker->block_epoch, 0U);
+    atomic_init(&worker->command_ack, 0U);
 
     worker->kernel_stack_base = g_deferred_worker_stack;
     worker->kernel_stack_size = sizeof(g_deferred_worker_stack);
@@ -332,6 +334,7 @@ bool deferred_start_worker(void) {
     }
     worker->affinity.bits[cpu_id >> 6] =
         1ULL << (cpu_id & 63U);
+    worker->owner_cpu = (uint16_t)cpu_id;
     worker->current_cpu = (uint16_t)cpu_id;
 
     /*

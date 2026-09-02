@@ -162,6 +162,8 @@ bool desktop_shell_start_asset_worker(uint32_t compositor_cpu) {
     worker->tid = UINT64_MAX - 4ULL;
     worker->process = 0;
     atomic_init(&worker->state, THREAD_READY);
+    atomic_init(&worker->block_epoch, 0U);
+        atomic_init(&worker->command_ack, 0U);
     worker->kernel_stack_base = g_desktop_asset_worker_stack;
     worker->kernel_stack_size = sizeof(g_desktop_asset_worker_stack);
     worker->kernel_stack_top =
@@ -181,6 +183,7 @@ bool desktop_shell_start_asset_worker(uint32_t compositor_cpu) {
         worker->affinity.bits[word] = 0U;
     }
     worker->affinity.bits[asset_cpu >> 6] = 1ULL << (asset_cpu & 63U);
+    worker->owner_cpu = (uint16_t)asset_cpu;
     worker->current_cpu = (uint16_t)asset_cpu;
 
     uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;

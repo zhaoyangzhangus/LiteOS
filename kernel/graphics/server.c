@@ -289,6 +289,8 @@ bool window_server_start_worker(void) {
     worker->tid = UINT64_MAX - 1ULL;
     worker->process = 0;
     atomic_init(&worker->state, THREAD_READY);
+    atomic_init(&worker->block_epoch, 0U);
+        atomic_init(&worker->command_ack, 0U);
     worker->kernel_stack_base = g_window_server_worker_stack;
     worker->kernel_stack_size = sizeof(g_window_server_worker_stack);
     worker->kernel_stack_top =
@@ -312,6 +314,7 @@ bool window_server_start_worker(void) {
         worker->affinity.bits[word] = 0U;
     }
     worker->affinity.bits[worker_cpu >> 6] = 1ULL << (worker_cpu & 63U);
+    worker->owner_cpu = (uint16_t)worker_cpu;
     worker->current_cpu = (uint16_t)worker_cpu;
 
     uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
@@ -366,7 +369,7 @@ bool window_server_start_asset_worker(void) {
      * they can no longer delay the boot-critical runtime hand-off.
      */
     return desktop_shell_start_asset_worker(
-        g_window_server.worker.current_cpu);
+        g_window_server.worker.owner_cpu);
 }
 
 bool window_server_kernel_ready(void) {

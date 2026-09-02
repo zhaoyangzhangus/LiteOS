@@ -33,8 +33,11 @@ static BOOLEAN canonical_scheduler_self_test(void) {
     uint64_t benchmark_start;
     for (UINTN i = 0; i < sizeof(thread); ++i) ((UINT8 *)&thread)[i] = 0;
     atomic_init(&thread.state, THREAD_READY);
+    atomic_init(&thread.block_epoch, 0U);
     atomic_init(&thread.blocked_waiter, 0);
+    atomic_init(&thread.command_ack, 0U);
     thread.sched_class = SCHED_CLASS_FAIR;
+    thread.owner_cpu = 0;
     thread.current_cpu = 0;
     list_init(&thread.sched.rt_node);
     benchmark_start = telemetry_timestamp();
@@ -71,9 +74,12 @@ static BOOLEAN canonical_scheduler_self_test(void) {
             ((UINT8 *)&fair_threads[i])[byte] = 0;
         }
         atomic_init(&fair_threads[i].state, THREAD_READY);
+        atomic_init(&fair_threads[i].block_epoch, 0U);
         atomic_init(&fair_threads[i].blocked_waiter, 0);
+        atomic_init(&fair_threads[i].command_ack, 0U);
         fair_threads[i].tid = i + 1U;
         fair_threads[i].sched_class = SCHED_CLASS_FAIR;
+        fair_threads[i].owner_cpu = 0;
         fair_threads[i].current_cpu = 0;
         fair_threads[i].sched.vruntime = (uint64_t)((i * 197U) % 307U);
         list_init(&fair_threads[i].sched.rt_node);
@@ -323,6 +329,14 @@ BOOLEAN liteos_init_scheduler(const LITEOS_BOOT_INFO *boot_info,
     }
     kernel_perf_emit_scope("scheduler.accounting", benchmark_start);
     hooks->write("LITEOS_SCHED_ACCOUNTING_OK\r\n");
+    if (!sched_fair_policy_self_test()) {
+        return scheduler_fail(hooks, "LITEOS_SCHED_FAIR_FAIL\r\n");
+    }
+    hooks->write("LITEOS_SCHED_FAIR_OK\r\n");
+    if (!sched_rt_policy_self_test()) {
+        return scheduler_fail(hooks, "LITEOS_SCHED_RT_FAIL\r\n");
+    }
+    hooks->write("LITEOS_SCHED_RT_OK\r\n");
     benchmark_start = telemetry_timestamp();
     if (!sched_balance_self_test()) {
         return scheduler_fail(hooks, "LITEOS_SCHED_BALANCE_FAIL\r\n");
@@ -335,6 +349,10 @@ BOOLEAN liteos_init_scheduler(const LITEOS_BOOT_INFO *boot_info,
         return scheduler_fail(hooks, "LITEOS_SCHED_STATE_TRANSITION_FAIL\r\n");
     }
     hooks->write("LITEOS_SCHED_STATE_TRANSITION_OK\r\n");
+    if (!sched_remote_wake_self_test()) {
+        return scheduler_fail(hooks, "LITEOS_SCHED_REMOTE_WAKE_FAIL\r\n");
+    }
+    hooks->write("LITEOS_SCHED_REMOTE_WAKE_OK\r\n");
     liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
                        LITEOS_DEBUG_STEP_PROGRESS, 4U);
     if (!sched_context_switch_self_test()) {

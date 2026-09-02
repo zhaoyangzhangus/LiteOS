@@ -74,7 +74,10 @@ void initialize_thread(thread_t *thread, uint64_t tid, uint8_t class_id,
     for (size_t index = 0; index < sizeof(*thread); ++index) bytes[index] = 0;
     refcount_init(&thread->object.refs, 1U);
     atomic_init(&thread->state, THREAD_READY);
+    atomic_init(&thread->block_epoch, 0U);
+    atomic_init(&thread->start_pending, false);
     atomic_init(&thread->blocked_waiter, 0);
+    atomic_init(&thread->command_ack, 0U);
     thread->tid = tid;
     thread->sched_class = class_id;
     thread->rt_priority = priority;
@@ -95,7 +98,10 @@ void sched_initialize_new_thread(thread_t *thread, uint32_t cpu_id,
     if (thread == 0) return;
 
     atomic_init(&thread->state, THREAD_NEW);
+    atomic_init(&thread->block_epoch, 0U);
+    atomic_init(&thread->start_pending, false);
     atomic_init(&thread->blocked_waiter, 0);
+    atomic_init(&thread->command_ack, 0U);
     thread->sched_class = SCHED_CLASS_FAIR;
     thread->rt_priority = 0U;
     thread->base_sched_class = SCHED_CLASS_FAIR;
@@ -103,6 +109,7 @@ void sched_initialize_new_thread(thread_t *thread, uint32_t cpu_id,
     thread->sched.runtime_ns = 0U;
     thread->sched.vruntime = 0U;
     thread->sched.exec_start_ns = 0U;
+    thread->sched.slice_runtime_ns = 0U;
     thread->sched.weight = 1024U;
     thread->sched.nice = 0;
     thread->sched.latency_hint = 0;
@@ -110,6 +117,11 @@ void sched_initialize_new_thread(thread_t *thread, uint32_t cpu_id,
     list_init(&thread->sched.rt_node);
 
     thread->current_cpu = (uint16_t)(cpu_id < MAX_CPUS ? cpu_id : 0U);
+    thread->owner_cpu = thread->current_cpu;
+    thread->migration_target_cpu = UINT16_MAX;
+    thread->migration_pending = false;
+    thread->command_release_next = 0;
+    thread->command_release_count = 0U;
     for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
         thread->affinity.bits[word] = UINT64_MAX;
     }
@@ -127,11 +139,12 @@ void sched_initialize_test_thread(thread_t *thread, uint64_t tid,
     initialize_thread(thread, tid, class_id, priority);
 }
 
-void enqueue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+void enqueue_local(scheduler_cpu_t *cpu, thread_t *thread) {
     if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) != 0 ||
         atomic_load_explicit(&thread->state, memory_order_relaxed) != THREAD_READY) return;
     if (thread->sched_class == SCHED_CLASS_RT) {
-        list_add(&cpu->queue.rt_queues[thread->rt_priority], &thread->sched.rt_node);
+        list_add_tail(&cpu->queue.rt_queues[thread->rt_priority],
+                      &thread->sched.rt_node);
         cpu->queue.rt_bitmap |= 1U << thread->rt_priority;
     } else if (thread->sched_class == SCHED_CLASS_FAIR) {
         fair_insert(&cpu->queue, thread);
@@ -143,7 +156,7 @@ void enqueue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
     scheduler_publish_queue_snapshot(cpu);
 }
 
-void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+void dequeue_local(scheduler_cpu_t *cpu, thread_t *thread) {
     if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) == 0) return;
     if (thread->sched_class == SCHED_CLASS_RT) {
         list_del(&thread->sched.rt_node);
@@ -158,11 +171,36 @@ void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
     scheduler_publish_queue_snapshot(cpu);
 }
 
-thread_t *pick_locked(scheduler_cpu_t *cpu) {
+thread_t *pick_next_local(scheduler_cpu_t *cpu) {
     if (cpu->queue.rt_bitmap != 0) {
         uint32_t priority = (uint32_t)__builtin_ctz(cpu->queue.rt_bitmap);
         return rt_thread_from_node(cpu->queue.rt_queues[priority].next);
     }
     rb_node_t *first = rb_tree_first(&cpu->queue.fair_root);
     return first != 0 ? fair_thread_from_node(first) : cpu->queue.idle;
+}
+
+bool sched_rt_policy_self_test(void) {
+    scheduler_cpu_t cpu = {0};
+    thread_t first = {0};
+    thread_t second = {0};
+    thread_t higher = {0};
+    for (uint32_t priority = 0U; priority < RT_PRIORITY_LEVELS; ++priority) {
+        list_init(&cpu.queue.rt_queues[priority]);
+    }
+    atomic_init(&cpu.queue_snapshot, 0U);
+    initialize_thread(&first, 1U, SCHED_CLASS_RT, 7U);
+    initialize_thread(&second, 2U, SCHED_CLASS_RT, 7U);
+    initialize_thread(&higher, 3U, SCHED_CLASS_RT, 3U);
+
+    enqueue_local(&cpu, &first);
+    enqueue_local(&cpu, &second);
+    if (pick_next_local(&cpu) != &first) return false;
+    dequeue_local(&cpu, &first);
+    if (pick_next_local(&cpu) != &second) return false;
+    enqueue_local(&cpu, &higher);
+    if (pick_next_local(&cpu) != &higher) return false;
+    dequeue_local(&cpu, &second);
+    dequeue_local(&cpu, &higher);
+    return cpu.queue.nr_running == 0U && cpu.queue.rt_bitmap == 0U;
 }

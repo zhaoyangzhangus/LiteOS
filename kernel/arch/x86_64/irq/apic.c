@@ -235,5 +235,6 @@ UINT64 liteos_lapic_timer_interrupt(LITEOS_INTERRUPT_CONTEXT *context) {
     if (x86_syscall_active_fast()) return 0;
     uint64_t now_tsc = x86_read_tsc();
     sched_tick(x86_tsc_to_ns(now_tsc));
+    if (sched_tick_should_preempt()) schedule();
     return 0;
 }

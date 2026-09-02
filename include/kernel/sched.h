@@ -30,6 +30,7 @@ typedef struct sched_entity {
     uint64_t runtime_ns;
     uint64_t vruntime;
     uint64_t exec_start_ns;
+    uint64_t slice_runtime_ns;
     uint32_t weight;
     int8_t nice;
     int8_t latency_hint;
@@ -45,6 +46,14 @@ typedef struct thread {
     struct process *process;
     /* Scheduler-owned runnable-state publication; Process only observes it. */
     atomic_uint state;
+    /*
+     * Scheduler-owned blocking generation.
+     * The owner CPU increments it before publishing THREAD_BLOCKED.
+     * Remote SPSC wake commands carry this value to reject stale wakes.
+     */
+     atomic_uint block_epoch;
+    /* Non-owner start requests are serialized independently of state. */
+    atomic_bool start_pending;
     /* Process-owned execution-reference and reaping lifetime flags. */
     uint32_t flags;
 
@@ -60,10 +69,16 @@ typedef struct thread {
     size_t user_stack_size;
     bool user_stack_owned;
 
-    /* Scheduler-owned accounting, queue membership, and CPU placement. */
+    /* Scheduler-owned accounting and queue membership. */
     sched_entity_t sched;
     cpumask_t affinity;
+    /* Runqueue owner; only the owner may mutate queue linkage. */
+    uint16_t owner_cpu;
+    /* Current/last execution placement, kept separate from owner_cpu. */
     uint16_t current_cpu;
+    /* Owner-local migration hand-off for a currently running thread. */
+    uint16_t migration_target_cpu;
+    bool migration_pending;
     uint8_t sched_class;
     uint8_t rt_priority;
     uint8_t base_sched_class;
@@ -78,6 +93,11 @@ typedef struct thread {
 
     /* Scheduler-owned post-context-switch reaper FIFO link. */
     struct thread *reap_next;
+    /* Scheduler-owned coalesced command-reference release link. */
+    struct thread *command_release_next;
+    uint32_t command_release_count;
+    /* Remote state/remove commands may wait for owner-side consumption. */
+    atomic_uint command_ack;
 
     /* Wait-owned blocking association. */
     struct waiter * _Atomic blocked_waiter;
@@ -97,7 +117,6 @@ typedef struct thread {
 #define RT_PRIORITY_LEVELS 32u
 
 typedef struct run_queue {
-    spinlock_t lock;
     thread_t *current;
     thread_t *idle;
 
@@ -132,12 +151,16 @@ bool sched_enqueue(thread_t *thread);
 bool sched_enqueue_bootstrap(thread_t *thread);
 kstatus_t sched_start_thread(thread_t *thread);
 bool sched_publish_blocked(thread_t *thread);
+bool sched_publish_running(thread_t *thread);
 /* Scheduler only publishes the terminal runnable-state transition. */
 bool sched_publish_dead(thread_t *thread);
 void sched_wake(thread_t *thread);
 void sched_block_current(void);
 void schedule(void);
+/* Consume an IPI doorbell and schedule only when the local policy requires it. */
+void sched_handle_reschedule_request(void);
 void sched_tick(uint64_t now_ns);
+bool sched_tick_should_preempt(void);
 kstatus_t sched_set_affinity(thread_t *thread, const cpumask_t *mask);
 void sched_set_effective_priority(thread_t *thread, uint8_t class_id,
                                   uint8_t rt_priority);
@@ -152,8 +175,11 @@ void sched_preempt_enable(void);
 bool sched_preempt_disabled(void);
 bool sched_validate_current_cpu(void);
 bool sched_accounting_self_test(void);
+bool sched_fair_policy_self_test(void);
+bool sched_rt_policy_self_test(void);
 bool sched_balance_self_test(void);
 bool sched_state_transition_self_test(void);
+bool sched_remote_wake_self_test(void);
 bool sched_context_switch_self_test(void);
 bool sched_debug_cpu(uint32_t cpu_id, uint32_t *current_state,
                      uint64_t *current_tid, uint32_t *runnable_count);

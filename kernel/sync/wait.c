@@ -178,8 +178,7 @@ kstatus_t wait_on_queue(wait_queue_t *queue, bool (*predicate)(void *), void *co
             waiter_unlink_locked(&waiter);
             atomic_store_explicit(&thread->blocked_waiter, 0,
                                   memory_order_release);
-            atomic_store_explicit(&thread->state, THREAD_RUNNING,
-                                  memory_order_release);
+            (void)sched_publish_running(thread);
             wait_unlock(&queue->lock, queue_lock_flags);
             wait_unlock(&g_timeout_lock, timeout_lock_flags);
             continue;
@@ -188,8 +187,7 @@ kstatus_t wait_on_queue(wait_queue_t *queue, bool (*predicate)(void *), void *co
             waiter_unlink_locked(&waiter);
             atomic_store_explicit(&thread->blocked_waiter, 0,
                                   memory_order_release);
-            atomic_store_explicit(&thread->state, THREAD_RUNNING,
-                                  memory_order_release);
+            (void)sched_publish_running(thread);
             wait_unlock(&queue->lock, queue_lock_flags);
             wait_unlock(&g_timeout_lock, timeout_lock_flags);
             return K_ETIMEDOUT;

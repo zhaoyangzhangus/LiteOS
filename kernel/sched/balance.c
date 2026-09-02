@@ -8,6 +8,7 @@ bool sched_balance_self_test(void) {
 
     initialize_thread(&thread, UINT64_C(0x42414c414e4345),
                       SCHED_CLASS_FAIR, 0U);
+    thread.owner_cpu = (uint16_t)current_cpu;
     thread.current_cpu = (uint16_t)current_cpu;
     uint32_t selected = scheduler_choose_cpu(&thread, current_cpu);
     if (!scheduler_cpu_available(selected)) return false;

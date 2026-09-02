@@ -604,7 +604,7 @@ void x86_smp_ipi_interrupt(void) {
                                       memory_order_release);
             }
         } else {
-            schedule();
+            sched_handle_reschedule_request();
         }
     }
 }

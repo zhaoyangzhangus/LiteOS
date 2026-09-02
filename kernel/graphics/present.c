@@ -228,6 +228,8 @@ bool compositor_present_start_copy_workers(uint32_t compositor_cpu) {
         worker->tid = UINT64_MAX - 2ULL - index;
         worker->process = 0;
         atomic_init(&worker->state, THREAD_READY);
+        atomic_init(&worker->block_epoch, 0U);
+        atomic_init(&worker->command_ack, 0U);
         worker->kernel_stack_base = g_compositor_copy_worker_stacks[index];
         worker->kernel_stack_size = WINDOW_COMPOSITOR_COPY_STACK_SIZE;
         worker->kernel_stack_top =
@@ -248,6 +250,7 @@ bool compositor_present_start_copy_workers(uint32_t compositor_cpu) {
         }
         worker->affinity.bits[cpu_ids[index] >> 6] =
             1ULL << (cpu_ids[index] & 63U);
+        worker->owner_cpu = (uint16_t)cpu_ids[index];
         worker->current_cpu = (uint16_t)cpu_ids[index];
 
         uintptr_t stack_top = (uintptr_t)worker->kernel_stack_top;
