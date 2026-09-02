@@ -86,10 +86,7 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
          */
         if(!xhci_drain_startup_events(
                xhci_controller_state(),
-               &g_xhci_event_dispatch_ops) ||
-           !xhci_hub_runtime_start(
-               xhci_controller_state(),
-               &g_xhci_hub_runtime_ops))
+               &g_xhci_event_dispatch_ops))
         {
             if(xhci_last_error() == 0U)
             {
@@ -97,13 +94,39 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
             }
 
             liteos_serial_write(
-                "LITEOS_XHCI_HUB_RUNTIME_FAIL\r\n");
+                "LITEOS_XHCI_EVENT_DRAIN_FAIL\r\n");
 
-            success =
-                false;
+            success = false;
+            keep_controller = false;
+        }
+        else if(!xhci_hub_runtime_start(
+                    xhci_controller_state(),
+                    &g_xhci_hub_runtime_ops))
+        {
+            /* A broken optional Hub must not discard a directly attached
+             * root MSC device.  Keep storage and HID runtime available; the
+             * Hub hotplug path remains disabled for this controller. */
+            if(xhci_usb_mass_storage_configured())
+            {
+                liteos_realtest_mark(
+                    "XHCI_HUB_RUNTIME_OPTIONAL_FAIL_WITH_MSC");
+                liteos_serial_write(
+                    "LITEOS_XHCI_HUB_RUNTIME_OPTIONAL_FAIL\r\n");
+                xhci_clear_error();
+            }
+            else
+            {
+                if(xhci_last_error() == 0U)
+                {
+                    xhci_set_error(76U);
+                }
 
-            keep_controller =
-                false;
+                liteos_serial_write(
+                    "LITEOS_XHCI_HUB_RUNTIME_FAIL\r\n");
+
+                success = false;
+                keep_controller = false;
+            }
         }
 
     /* Runtime xHCI I/O is interrupt-driven.  A controller without an MSI or

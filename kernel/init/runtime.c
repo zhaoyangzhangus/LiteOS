@@ -58,6 +58,7 @@
 #include <kernel/console.h>
 #include <kernel/irq.h>
 #include <kernel/nvme_core.h>
+#include <kernel/rtl8126.h>
 #include <ascii_font.h>
 #include <arch/x86_64/syscall_internal.h>
 #include <usb/storage.h>
@@ -73,6 +74,7 @@
 static UINT64 g_framebuffer_virtual_base;
 
 #define halt_forever() liteos_kernel_halt_forever_at(__FILE__, __LINE__)
+#define LITEOS_REALTEST_NETWORK_TIMEOUT_NS 15000000000ULL
 
 static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
     LITEOS_BOOT_INFO *info = (LITEOS_BOOT_INFO *)context;
@@ -213,7 +215,20 @@ static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
      * desktop-running result first and start artwork loading afterwards.
      */
     liteos_console_disable();
-    if (liteos_realtest_enabled()) liteos_realtest_finish_success();
+    bool realtest_network_required =
+        liteos_realtest_enabled() && rtl8126_hardware_present();
+    bool realtest_success_reported = false;
+    uint64_t realtest_network_deadline = 0U;
+    if (realtest_network_required) {
+        uint64_t timeout = x86_timeout_ns_to_tsc(
+            LITEOS_REALTEST_NETWORK_TIMEOUT_NS);
+        realtest_network_deadline = timeout == UINT64_MAX ? UINT64_MAX :
+                                    x86_read_tsc() + timeout;
+        liteos_realtest_checkpoint("LITEOS_REALTEST_WAIT_DHCP");
+    } else if (liteos_realtest_enabled()) {
+        liteos_realtest_finish_success();
+        realtest_success_reported = true;
+    }
     (void)window_server_start_asset_worker();
     /*
      * 启动自测完成后，BSP 仍需保留一个真正的 Ring0 普通上下文。
@@ -264,9 +279,21 @@ static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
                 liteos_serial_write_u32(net_status.ipv4_prefix_length);
                 liteos_serial_write("\r\n");
                 reported_ipv4 = net_status.ipv4_address;
+                if (realtest_network_required && !realtest_success_reported) {
+                    liteos_realtest_checkpoint("LITEOS_REALTEST_NETWORK_OK");
+                    liteos_realtest_finish_success();
+                    realtest_success_reported = true;
+                }
             } else if (net_status.ipv4_address == 0U) {
                 reported_ipv4 = 0U;
             }
+        }
+        if (realtest_network_required && !realtest_success_reported &&
+            realtest_network_deadline != 0U &&
+            realtest_network_deadline != UINT64_MAX &&
+            (int64_t)(x86_read_tsc() - realtest_network_deadline) >= 0) {
+            liteos_realtest_checkpoint("LITEOS_REALTEST_DHCP_TIMEOUT");
+            liteos_realtest_finish_failure();
         }
         user_init_poll();
     }

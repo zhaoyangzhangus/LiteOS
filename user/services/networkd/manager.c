@@ -37,6 +37,8 @@ static netmgr_window_t g_window = {
 static os_net_status_t g_status;
 static bool g_status_valid;
 static bool g_ctrl;
+static bool g_refresh_key_down;
+static bool g_refresh_requested;
 static uint32_t g_refresh_tick;
 
 #define NETMGR_DAMAGE_CAPACITY 4U
@@ -529,6 +531,10 @@ static bool refresh_status(void) {
     return true;
 }
 
+static bool is_refresh_key(uint32_t code) {
+    return code == 0x15U || code == (uint32_t)'R';
+}
+
 static bool create_window(void) {
     os_display_info_t display = {0};
     os_window_create_t request = {0};
@@ -602,6 +608,16 @@ static void handle_key(const os_window_event_t *event) {
         g_ctrl = input->value != OS_INPUT_VALUE_RELEASE;
         return;
     }
+    if (is_refresh_key(input->code)) {
+        if (input->value == OS_INPUT_VALUE_RELEASE) {
+            g_refresh_key_down = false;
+        } else if (!g_refresh_key_down) {
+            g_refresh_key_down = true;
+            g_refresh_requested = true;
+            g_refresh_tick = 0U;
+        }
+        return;
+    }
     if (input->value == OS_INPUT_VALUE_RELEASE) return;
 
     if (g_ctrl &&
@@ -619,10 +635,6 @@ static void handle_key(const os_window_event_t *event) {
         netmgr_damage_all();
         render();
         return;
-    }
-    if (input->code == 0x15U || input->code == (uint32_t)'R') {
-        g_refresh_tick = 0U;
-        (void)refresh_status();
     }
 }
 
@@ -698,9 +710,20 @@ static int netmgr_main(void) {
             __asm__ volatile ("pause");
         }
 
-        if (++g_refresh_tick >= NETMGR_REFRESH_TICKS) {
-            g_refresh_tick = 0U;
-            (void)refresh_status();
+        /* Only refresh while the event wait is idle.  Counting input events
+         * made a rapid key stream invoke synchronous window updates and could
+         * starve the compositor/input path. */
+        if (status != 0) {
+            if (g_refresh_requested) {
+                g_refresh_requested = false;
+                g_refresh_key_down = false;
+                g_refresh_tick = 0U;
+                (void)refresh_status();
+            } else if (status == -110 &&
+                       ++g_refresh_tick >= NETMGR_REFRESH_TICKS) {
+                g_refresh_tick = 0U;
+                (void)refresh_status();
+            }
         }
     }
 }

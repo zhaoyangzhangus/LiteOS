@@ -186,15 +186,15 @@ try {
     $log = Get-Content -LiteralPath $outputLog -Raw
     Append-FirmwareStateIfNeeded $outputLog $log $firmwareState
     $log = Get-Content -LiteralPath $outputLog -Raw
-    if ($log -match 'LITEOS_REALTEST_PASS') {
-        Write-Result 'pass' "Copied $sourceLog from volume $($volume.UniqueId)."
-        $collectionComplete = $true
-        exit 0
-    }
     if ($log -match 'LITEOS_REALTEST_FAIL') {
         Write-Result 'guest-failure' "Copied failure log from $sourceLog."
         $collectionComplete = $true
         exit 1
+    }
+    if ($log -match 'LITEOS_REALTEST_PASS') {
+        Write-Result 'pass' "Copied $sourceLog from volume $($volume.UniqueId)."
+        $collectionComplete = $true
+        exit 0
     }
     if (Test-TerminalFirmwareFailure $firmwareState) {
         Write-Result 'firmware-failure' "Firmware state: $firmwareState"

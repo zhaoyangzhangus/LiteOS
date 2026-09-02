@@ -2,6 +2,7 @@
 #include <kernel/e1000.h>
 #include <kernel/message_port.h>
 #include <kernel/net_manager.h>
+#include <kernel/rtl8126.h>
 #include <kernel/spinlock.h>
 #include <kernel/socket.h>
 #include <uapi/network.h>
@@ -95,7 +96,7 @@ void net_manager_poll(void) {
      * queued behind an ARP request; an IRQ for the ARP reply alone is not a
      * timer.  The deferred-poll gate coalesces this with an IRQ-triggered
      * poll, so keeping the kick here is bounded and does not duplicate work. */
-    (void)e1000_schedule_deferred_poll();
+    if (!e1000_interrupt_ready()) (void)e1000_schedule_deferred_poll();
     /* Keep the retransmission clock independent from RX/deferred-worker
      * progress.  An ARP reply may be the last packet received before a
      * pending SYN needs to be emitted. */
@@ -110,6 +111,7 @@ void net_manager_poll(void) {
         ipv4_gateway = e1000_ipv4_gateway();
         ipv6_configured = e1000_ipv6_address(ipv6_address);
         (void)e1000_get_mac_address(mac);
+        rtl8126_emit_diagnostic();
     }
     net_manager_lock();
     link_changed =

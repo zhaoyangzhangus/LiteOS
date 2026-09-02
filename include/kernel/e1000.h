@@ -3,7 +3,9 @@
 #include <kernel/base.h>
 
 /* 可选 Intel e1000 后端：QEMU 未提供网卡时不影响无网卡启动。 */
+/* Network facade for the QEMU e1000 and native Realtek RTL8126 backends. */
 bool e1000_hardware_present(void);
+bool e1000_intel_hardware_present(void);
 bool e1000_self_test(void);
 bool e1000_packet_queue_self_test(void);
 bool e1000_rss_self_test(void);

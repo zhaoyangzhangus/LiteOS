@@ -63,8 +63,15 @@ const pci_device_t *pci_find_class(const pci_host_t *host, uint8_t class_code,
                                    uint8_t subclass, uint8_t prog_if);
 kstatus_t pci_msix_table(const pci_device_t *device, paddr_t *physical,
                          uint16_t *entry_count);
+kstatus_t pci_msix_read_entry(const pci_device_t *device, uint16_t entry,
+                              uint64_t *message_address,
+                              uint32_t *message_data,
+                              uint32_t *vector_control);
+kstatus_t pci_read_config32(const pci_device_t *device, uint16_t offset,
+                             uint32_t *value);
 kstatus_t pci_msix_configure(pci_device_t *device, uint16_t entry,
                              uint32_t apic_id, uint8_t vector);
+kstatus_t pci_msix_disable(pci_device_t *device);
 kstatus_t pci_msix_mask(pci_device_t *device, uint16_t entry, bool masked);
 kstatus_t pci_enable_memory_busmaster(pci_device_t *device);
 kstatus_t pci_msi_configure(pci_device_t *device, uint32_t apic_id,

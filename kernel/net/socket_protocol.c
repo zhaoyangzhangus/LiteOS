@@ -55,6 +55,7 @@ kstatus_t socket_inject_udp(uint32_t source_address, uint16_t source_port,
     atomic_store_explicit(&private->datagram_count, count + 1U, memory_order_release);
     socket_unlock(&target->lock);
     (void)wake_all(&target->waitq);
+    object_notify_signaled(target);
     object_put(target);
     return K_OK;
 }
@@ -108,6 +109,7 @@ kstatus_t socket_inject_udp_ipv6(const uint8_t source_address[16], uint16_t sour
     atomic_store_explicit(&private->datagram_count, count + 1U, memory_order_release);
     socket_unlock(&target->lock);
     (void)wake_all(&target->waitq);
+    object_notify_signaled(target);
     object_put(target);
     return K_OK;
 }

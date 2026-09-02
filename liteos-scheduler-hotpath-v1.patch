@@ -1,0 +1,231 @@
+diff --git a/kernel/sched/internal.h b/kernel/sched/internal.h
+--- a/kernel/sched/internal.h
++++ b/kernel/sched/internal.h
+@@ -7,6 +7,13 @@
+ /* Private scheduler state shared only by the scheduler implementation files. */
+ typedef struct scheduler_cpu {
+     run_queue_t queue;
++
++    /*
++     * Lockless read-mostly snapshot:
++     *   low  32 bits: queued runnable threads (queue.nr_running)
++     *   high 32 bits: total schedulable load (queued + current when runnable)
++     *
++     * Writers already serialize through queue.lock.  Publishing this snapshot
++     * is only a release store (a normal MOV on x86-64), while load balancing,
++     * tick and idle polling no longer need to acquire a remote runqueue lock.
++     */
++    atomic_uint_fast64_t queue_snapshot;
+
+     /* Threads that left their execution stack and await final reclamation. */
+     thread_t *reap_head;
+@@ -20,6 +27,52 @@ typedef struct scheduler_cpu {
+ extern scheduler_cpu_t g_cpus[MAX_CPUS];
+ extern uint32_t g_cpu_count;
+
++static inline uint64_t scheduler_make_queue_snapshot(
++    const scheduler_cpu_t *cpu) {
++    uint32_t runnable = cpu->queue.nr_running;
++    uint32_t load = runnable;
++    thread_t *current = cpu->queue.current;
++
++    /*
++     * During schedule() the old current can temporarily be re-enqueued before
++     * queue.current is switched.  Do not count it twice in that window.
++     *
++     * BLOCKED/DEAD current is also not runnable even though queue.current still
++     * points at it until the context-switch decision is committed.
++     */
++    if (current != 0 &&
++        current != cpu->queue.idle &&
++        (current->sched.flags & SCHED_ENTITY_ENQUEUED) == 0U) {
++        unsigned state =
++            atomic_load_explicit(&current->state, memory_order_relaxed);
++        if (state == THREAD_RUNNING || state == THREAD_READY) {
++            ++load;
++        }
++    }
++
++    return ((uint64_t)load << 32) | (uint64_t)runnable;
++}
++
++static inline void scheduler_publish_queue_snapshot(scheduler_cpu_t *cpu) {
++    atomic_store_explicit(&cpu->queue_snapshot,
++                          scheduler_make_queue_snapshot(cpu),
++                          memory_order_release);
++}
++
++static inline uint32_t scheduler_snapshot_runnable(
++    const scheduler_cpu_t *cpu) {
++    return (uint32_t)atomic_load_explicit(&cpu->queue_snapshot,
++                                          memory_order_acquire);
++}
++
++static inline uint32_t scheduler_snapshot_load(
++    const scheduler_cpu_t *cpu) {
++    return (uint32_t)(atomic_load_explicit(&cpu->queue_snapshot,
++                                           memory_order_acquire) >> 32);
++}
++
+ bool scheduler_current_cpu(uint32_t *cpu_id);
+ uint64_t scheduler_lock(spinlock_t *lock);
+ void scheduler_unlock(spinlock_t *lock, uint64_t flags);
+diff --git a/kernel/sched/runqueue.c b/kernel/sched/runqueue.c
+--- a/kernel/sched/runqueue.c
++++ b/kernel/sched/runqueue.c
+@@ -128,6 +128,7 @@ void enqueue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+     }
+     thread->sched.flags |= SCHED_ENTITY_ENQUEUED;
+     ++cpu->queue.nr_running;
++    scheduler_publish_queue_snapshot(cpu);
+ }
+ void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+     if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) == 0) return;
+@@ -142,6 +143,7 @@ void dequeue_locked(scheduler_cpu_t *cpu, thread_t *thread) {
+     }
+     thread->sched.flags &= (uint16_t)~SCHED_ENTITY_ENQUEUED;
+     if (cpu->queue.nr_running != 0) --cpu->queue.nr_running;
++    scheduler_publish_queue_snapshot(cpu);
+ }
+ thread_t *pick_locked(scheduler_cpu_t *cpu) {
+     if (cpu->queue.rt_bitmap != 0) {
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -103,11 +103,33 @@ uint64_t scheduler_lock(spinlock_t *lock) {
+     }
+     return flags;
+ }
+
++/*
++ * schedule() and sched_try_run_ready() already disabled local interrupts
++ * before acquiring the runqueue lock.  Calling scheduler_lock() there used to
++ * execute another PUSHFQ/CLI pair and scheduler_unlock() restored IF=0 again.
++ * Keep only the inter-CPU serialization in those paths.
++ */
++static void scheduler_lock_irq_disabled(spinlock_t *lock) {
++    while (atomic_exchange_explicit(&lock->state, 1U,
++                                    memory_order_acquire) != 0U) {
++        __asm__ volatile ("pause");
++    }
++}
++
++static void scheduler_unlock_irq_disabled(spinlock_t *lock) {
++    atomic_store_explicit(&lock->state, 0U, memory_order_release);
++}
++
+ void scheduler_unlock(spinlock_t *lock, uint64_t flags) {
+     atomic_store_explicit(&lock->state, 0U, memory_order_release);
+     scheduler_irq_restore(flags);
+ }
+@@ -155,6 +177,7 @@ void sched_cpu_init(uint32_t cpu_id) {
+     if (cpu_id >= MAX_CPUS) return;
+     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+     scheduler_zero(cpu, sizeof(*cpu));
+     atomic_init(&cpu->queue.lock.state, 0U);
++    atomic_init(&cpu->queue_snapshot, UINT64_C(0));
+     atomic_init(&cpu->reap_deferred_queued, false);
+     cpu->queue.fair_root.root = 0;
+     for (uint32_t priority = 0; priority < RT_PRIORITY_LEVELS; ++priority) {
+@@ -166,6 +189,7 @@ void sched_cpu_init(uint32_t cpu_id) {
+     g_idle_threads[cpu_id].current_cpu = (uint16_t)cpu_id;
+     cpu->queue.idle = &g_idle_threads[cpu_id];
+     cpu->queue.current = cpu->queue.idle;
++    scheduler_publish_queue_snapshot(cpu);
+     cpu->idle_stack_top = x86_cpu_kernel_stack(cpu_id);
+     scheduler_init_idle_context(&g_idle_threads[cpu_id], cpu->idle_stack_top);
+     if (cpu_id + 1U > g_cpu_count) g_cpu_count = cpu_id + 1U;
+@@ -362,7 +386,7 @@ void schedule(void) {
+         return;
+     }
+     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+-    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
++    scheduler_lock_irq_disabled(&cpu->queue.lock);
+     thread_t *current = cpu->queue.current;
+     if (current != 0 && current != cpu->queue.idle) {
+         unsigned current_state = atomic_load_explicit(&current->state,
+@@ -382,6 +406,7 @@ void schedule(void) {
+         next->current_cpu = (uint16_t)cpu_id;
+         cpu->queue.current = next;
+     }
++    scheduler_publish_queue_snapshot(cpu);
+     scheduler_accounting_transition(&cpu->queue, current, next);
+     /*
+      * DEAD current 的 execution ref 只能在真正离开它的栈/CR3 后释放。
+@@ -398,7 +423,7 @@ void schedule(void) {
+         next->arch.switch_ctx.rsp != 0) {
+         scheduler_reap_enqueue_locked(cpu, current);
+     }
+-    scheduler_unlock(&cpu->queue.lock, queue_flags);
++    scheduler_unlock_irq_disabled(&cpu->queue.lock);
+     /*
+      * 只有具备真实保存栈的线程才触发架构切换。这样早期纯数据结构自检仍可使用
+      * 临时 thread_t，而正式线程会同步 CR3、TSS.RSP0、FS.base 和系统调用栈。
+@@ -446,7 +471,7 @@ bool sched_try_run_ready(void) {
+         return false;
+     }
+     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+-    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
++    scheduler_lock_irq_disabled(&cpu->queue.lock);
+     thread_t *next = pick_locked(cpu);
+     /* 丢弃没有真实上下文的早期自检线程，避免空闲 CPU 被假线程锁死。 */
+     while (next != 0 && next != cpu->queue.idle &&
+@@ -456,7 +481,7 @@ bool sched_try_run_ready(void) {
+         next = pick_locked(cpu);
+     }
+     bool runnable = next != 0 && next != cpu->queue.idle;
+-    scheduler_unlock(&cpu->queue.lock, queue_flags);
++    scheduler_unlock_irq_disabled(&cpu->queue.lock);
+     scheduler_irq_restore(irq_flags);
+     if (runnable) schedule();
+     return runnable;
+@@ -752,11 +777,8 @@ uint32_t sched_runnable_count(void) {
+     uint32_t cpu_id;
+     if (!scheduler_current_cpu(&cpu_id)) return 0;
+     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+-    uint64_t queue_flags = scheduler_lock(&cpu->queue.lock);
+-    uint32_t count = cpu->queue.nr_running;
+-    scheduler_unlock(&cpu->queue.lock, queue_flags);
+-    return count;
++    return scheduler_snapshot_runnable(cpu);
+ }
+ bool sched_validate_current_cpu(void) {
+     uint32_t cpu_id;
+diff --git a/kernel/sched/balance.c b/kernel/sched/balance.c
+--- a/kernel/sched/balance.c
++++ b/kernel/sched/balance.c
+@@ -32,11 +32,7 @@ uint32_t scheduler_choose_cpu(thread_t *thread, uint32_t current_cpu) {
+     for (uint32_t cpu_id = 0; cpu_id < g_cpu_count; ++cpu_id) {
+         if (!scheduler_cpu_available(cpu_id) ||
+             !scheduler_affinity_allows(thread, cpu_id)) continue;
+         scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+-        uint64_t flags = scheduler_lock(&cpu->queue.lock);
+-        uint32_t load = cpu->queue.nr_running +
+-                        (cpu->queue.current != cpu->queue.idle ? 1U : 0U);
+-        scheduler_unlock(&cpu->queue.lock, flags);
++        uint32_t load = scheduler_snapshot_load(cpu);
+         if (load < best_load || (load == best_load && cpu_id == current_cpu)) {
+             best_cpu = cpu_id;
+             best_load = load;
+diff --git a/kernel/sched/clock.c b/kernel/sched/clock.c
+--- a/kernel/sched/clock.c
++++ b/kernel/sched/clock.c
+@@ -21,6 +21,15 @@ void sched_tick(uint64_t now_ns) {
+     if (current->sched_class == SCHED_CLASS_FAIR) {
+         current->sched.vruntime += delta;
+     }
+-    if (current->sched_class == SCHED_CLASS_RT || delta != 0) schedule();
++
++    /*
++     * Do not put the only runnable thread through:
++     *   RUNNING -> READY -> tree/list insert -> pick -> erase -> RUNNING
++     * on every LAPIC tick.  Cross-CPU enqueue publishes queue_snapshot before
++     * releasing the target runqueue lock, so this remains a safe hint; if a
++     * competitor exists, schedule() still performs the authoritative locked
++     * decision.
++     */
++    if ((current->sched_class == SCHED_CLASS_RT || delta != 0U) &&
++        sched_runnable_count() != 0U) {
++        schedule();
++    }
+ }

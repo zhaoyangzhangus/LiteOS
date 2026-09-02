@@ -620,7 +620,8 @@ $(BUILD)/kernel/storage-init.o: kernel/init/storage.c $(DEBUG_SERIAL_STAMP) | $(
 $(BUILD)/kernel/scheduler-init.o: kernel/init/scheduler.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/network-init.o: kernel/init/network.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
+$(BUILD)/kernel/network-init.o: kernel/init/network.c \
+		include/kernel/rtl8126.h $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/filesystem-init.o: kernel/init/filesystem.c \
@@ -1072,6 +1073,11 @@ $(BUILD)/kernel/e1000-queue.o: kernel/drivers/net/queue.c \
 
 $(BUILD)/kernel/e1000-recovery.o: kernel/drivers/net/recovery.c \
 		kernel/drivers/net/internal.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/rtl8126.o: kernel/drivers/net/rtl8126.c \
+		kernel/drivers/net/internal.h kernel/drivers/net/core_internal.h \
+		include/kernel/rtl8126.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/qemu-stdvga.o: kernel/drivers/display/qemu_stdvga.c | $(BUILD)/kernel
@@ -1560,6 +1566,7 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/e1000-pci.o \
                                     $(BUILD)/kernel/e1000-queue.o \
                                     $(BUILD)/kernel/e1000-recovery.o \
+                                    $(BUILD)/kernel/rtl8126.o \
                                     $(BUILD)/kernel/qemu-stdvga.o \
                                      $(BUILD)/kernel/usb-core.o $(BUILD)/kernel/usb-hub.o $(BUILD)/kernel/xhci-hub-runtime.o $(BUILD)/kernel/xhci-hub-transfer.o $(BUILD)/kernel/usb-storage.o \
                                      $(BUILD)/kernel/xhci.o $(BUILD)/kernel/xhci-interrupt.o $(BUILD)/kernel/xhci-runtime.o $(BUILD)/kernel/xhci-status.o $(BUILD)/kernel/xhci-self-test.o \

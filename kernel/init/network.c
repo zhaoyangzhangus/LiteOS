@@ -4,6 +4,7 @@
 #include <kernel/e1000.h>
 #include <kernel/net_core.h>
 #include <kernel/net_manager.h>
+#include <kernel/rtl8126.h>
 #include <kernel/socket.h>
 
 static BOOLEAN network_fail_at(const liteos_init_network_hooks_t *hooks,
@@ -58,29 +59,48 @@ BOOLEAN liteos_init_network(const liteos_init_network_hooks_t *hooks) {
     }
     liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
                        LITEOS_DEBUG_STEP_PROGRESS, 7U);
-    if (!e1000_self_test()) {
-        hooks->write("LITEOS_E1000_FAIL=");
-        hooks->write_u32(e1000_last_error());
-        return network_fail(hooks, "\r\n");
-    }
-    /* The interrupt lifecycle is now independently locatable in recovery.c. */
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
-                       LITEOS_DEBUG_STEP_PROGRESS, 18U);
-    if (e1000_hardware_present()) hooks->write("LITEOS_E1000_HW_OK\r\n");
-    else hooks->write("LITEOS_E1000_NONE\r\n");
-    if (e1000_hardware_present()) hooks->write("LITEOS_E1000_RESET_OK\r\n");
-    if (e1000_hardware_present() && !e1000_rss_self_test()) {
-        return network_fail(hooks, "LITEOS_E1000_RSS_FAIL\r\n");
-    }
-    if (e1000_hardware_present()) {
-        hooks->write("LITEOS_E1000_QUEUES_HW=");
-        hooks->write_u32(e1000_hardware_queue_count());
-        hooks->write(" SW=");
-        hooks->write_u32(e1000_software_queue_count());
-        hooks->write("\r\nLITEOS_E1000_RSS_OK\r\n");
-        hooks->write(e1000_interrupt_ready() ?
-                     "LITEOS_E1000_IRQ_OK\r\n" :
-                     "LITEOS_E1000_INTX_COMPAT\r\n");
+    if (rtl8126_hardware_present()) {
+        if (!rtl8126_self_test()) {
+            hooks->write("LITEOS_RTL8126_FAIL=");
+            hooks->write_u32(e1000_last_error());
+            return network_fail(hooks, "\r\n");
+        }
+        hooks->write("LITEOS_RTL8126_HW_OK\r\n");
+        hooks->write(rtl8126_firmware_required() ?
+                     "LITEOS_RTL8126_FIRMWARE_REQUIRED\r\n" :
+                     "LITEOS_RTL8126_FIRMWARE_OK\r\n");
+        hooks->write(rtl8126_interrupt_ready() ?
+                     "LITEOS_RTL8126_IRQ_OK\r\n" :
+                     "LITEOS_RTL8126_IRQ_FAIL\r\n");
+    } else {
+        if (!e1000_self_test()) {
+            hooks->write("LITEOS_E1000_FAIL=");
+            hooks->write_u32(e1000_last_error());
+            return network_fail(hooks, "\r\n");
+        }
+        /* The interrupt lifecycle is now independently locatable in
+         * recovery.c. */
+        liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
+                           LITEOS_DEBUG_STEP_PROGRESS, 18U);
+        if (e1000_intel_hardware_present()) {
+            hooks->write("LITEOS_E1000_HW_OK\r\n");
+            hooks->write("LITEOS_E1000_RESET_OK\r\n");
+        } else {
+            hooks->write("LITEOS_E1000_NONE\r\n");
+        }
+        if (e1000_intel_hardware_present() && !e1000_rss_self_test()) {
+            return network_fail(hooks, "LITEOS_E1000_RSS_FAIL\r\n");
+        }
+        if (e1000_intel_hardware_present()) {
+            hooks->write("LITEOS_E1000_QUEUES_HW=");
+            hooks->write_u32(e1000_hardware_queue_count());
+            hooks->write(" SW=");
+            hooks->write_u32(e1000_software_queue_count());
+            hooks->write("\r\nLITEOS_E1000_RSS_OK\r\n");
+            hooks->write(e1000_interrupt_ready() ?
+                         "LITEOS_E1000_IRQ_OK\r\n" :
+                         "LITEOS_E1000_INTX_COMPAT\r\n");
+        }
     }
     if (!net_manager_init() || !net_manager_self_test()) {
         return network_fail(hooks, "LITEOS_NET_MANAGER_FAIL\r\n");

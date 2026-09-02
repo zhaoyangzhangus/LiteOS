@@ -9,6 +9,8 @@
 #define PCI_STATUS_CAP_LIST   (1U << 4)
 #define PCI_CAP_ID_MSIX       0x11U
 #define PCI_CAP_ID_MSI        0x05U
+#define PCI_COMMAND_OFFSET    0x04U
+#define PCI_COMMAND_INTX_DISABLE (1U << 10)
 #define PCI_MSIX_ENABLE       (1U << 15)
 #define PCI_MSIX_FUNCTION_MASK (1U << 14)
 #define PCI_MSIX_ENTRY_MASK    (1U << 0)
@@ -370,6 +372,44 @@ kstatus_t pci_msix_table(const pci_device_t *device, paddr_t *physical,
     return K_OK;
 }
 
+kstatus_t pci_msix_read_entry(const pci_device_t *device, uint16_t entry,
+                              uint64_t *message_address,
+                              uint32_t *message_data,
+                              uint32_t *vector_control) {
+    paddr_t table;
+    uint16_t entry_count;
+    kstatus_t status;
+    uint64_t physical;
+    uint64_t page;
+    uint32_t offset;
+    paddr_t root;
+    volatile uint8_t *mapped;
+
+    if (message_address == 0 || message_data == 0 || vector_control == 0) {
+        return K_EINVAL;
+    }
+    status = pci_msix_table(device, &table, &entry_count);
+    if (status != K_OK) return status;
+    if (entry >= entry_count || table.value > UINT64_MAX -
+        (uint64_t)entry * 16ULL) return K_EINVAL;
+    physical = table.value + (uint64_t)entry * 16ULL;
+    page = physical & ~(uint64_t)(PAGE_SIZE - 1ULL);
+    offset = (uint32_t)(physical & (PAGE_SIZE - 1ULL));
+    if (offset + 16U > PAGE_SIZE) return K_EIO;
+    root = x86_current_root_table();
+    if (x86_map_page(root, (vaddr_t)PCI_MSIX_WINDOW_VA, paddr_make(page),
+                     X86_PAGE_WRITE | X86_PAGE_GLOBAL, X86_CACHE_UC) != K_OK) {
+        return K_EIO;
+    }
+    mapped = (volatile uint8_t *)(uintptr_t)PCI_MSIX_WINDOW_VA + offset;
+    *message_address = *(volatile uint64_t *)mapped;
+    *message_data = *(volatile uint32_t *)(mapped + 8U);
+    *vector_control = *(volatile uint32_t *)(mapped + 12U);
+    __asm__ volatile ("mfence" : : : "memory");
+    (void)x86_unmap_page(root, (vaddr_t)PCI_MSIX_WINDOW_VA, 0);
+    return K_OK;
+}
+
 static bool pci_device_segment(const pci_device_t *device,
                                x86_acpi_ecam_t *segment) {
     if (device == 0 || segment == 0 || device->ecam_start_bus > device->ecam_end_bus) {
@@ -408,7 +448,61 @@ static kstatus_t pci_device_config_write32(const pci_device_t *device,
     x86_acpi_ecam_t segment;
     if (!pci_device_segment(device, &segment)) return K_ENOENT;
     return pci_config_write32(&segment, device->bus, device->slot,
-                              device->function, offset, value);
+                             device->function, offset, value);
+}
+
+kstatus_t pci_read_config32(const pci_device_t *device, uint16_t offset,
+                             uint32_t *value) {
+    return pci_device_config_read32(device, offset, value);
+}
+
+static kstatus_t pci_set_intx_disabled(pci_device_t *device, bool disabled) {
+    uint32_t command_status;
+    uint16_t command;
+
+    if (device == 0) return K_EINVAL;
+    if (pci_device_config_read32(device, PCI_COMMAND_OFFSET,
+                                 &command_status) != K_OK) {
+        return K_EIO;
+    }
+    command = (uint16_t)command_status;
+    if (disabled) command |= (uint16_t)PCI_COMMAND_INTX_DISABLE;
+    else command &= (uint16_t)~PCI_COMMAND_INTX_DISABLE;
+    /* The upper half is PCI Status (write-1-to-clear); never write it back. */
+    return pci_device_config_write32(device, PCI_COMMAND_OFFSET, command);
+}
+
+static kstatus_t pci_set_msi_enabled(pci_device_t *device, bool enabled) {
+    uint32_t header;
+    uint16_t control;
+
+    if (device == 0 || device->msi_capability == 0U) return K_EINVAL;
+    if (pci_device_config_read32(device, device->msi_capability,
+                                 &header) != K_OK) return K_EIO;
+    control = (uint16_t)(header >> 16);
+    if (enabled) control |= 1U;
+    else control &= (uint16_t)~1U;
+    return pci_device_config_write32(
+        device, device->msi_capability,
+        (header & 0x0000FFFFU) | ((uint32_t)control << 16));
+}
+
+static kstatus_t pci_set_msix_enabled(pci_device_t *device, bool enabled,
+                                       bool function_masked) {
+    uint32_t header;
+    uint16_t control;
+
+    if (device == 0 || device->msix_capability == 0U) return K_EINVAL;
+    if (pci_device_config_read32(device, device->msix_capability,
+                                 &header) != K_OK) return K_EIO;
+    control = (uint16_t)(header >> 16);
+    if (enabled) control |= PCI_MSIX_ENABLE;
+    else control &= (uint16_t)~PCI_MSIX_ENABLE;
+    if (function_masked) control |= PCI_MSIX_FUNCTION_MASK;
+    else control &= (uint16_t)~PCI_MSIX_FUNCTION_MASK;
+    return pci_device_config_write32(
+        device, device->msix_capability,
+        (header & 0x0000FFFFU) | ((uint32_t)control << 16));
 }
 
 static kstatus_t pci_msix_write_entry(const pci_device_t *device, uint16_t entry,
@@ -487,21 +581,24 @@ kstatus_t pci_msix_configure(pci_device_t *device, uint16_t entry,
                              uint32_t apic_id, uint8_t vector) {
     if (device == 0 || device->msix_capability == 0 || vector < 32U ||
         apic_id > 0xFFU || entry >= device->msix_table_size) return K_EINVAL;
-    uint32_t capability;
-    kstatus_t status = pci_device_config_read32(device, device->msix_capability,
-                                                  &capability);
+    kstatus_t status;
+
+    /* A function must not have MSI and MSI-X active at the same time. */
+    if (device->msi_capability != 0U &&
+        pci_set_msi_enabled(device, false) != K_OK) return K_EIO;
+    status = pci_set_msix_enabled(device, false, true);
     if (status != K_OK) return status;
     uint64_t message_address = 0xFEE00000ULL | ((uint64_t)apic_id << 12);
     status = pci_msix_write_entry(device, entry, message_address, vector,
                                   PCI_MSIX_ENTRY_MASK);
     if (status != K_OK) return status;
+    status = pci_set_msix_enabled(device, true, true);
+    if (status != K_OK) return status;
     status = pci_msix_write_entry(device, entry, message_address, vector, 0U);
     if (status != K_OK) return status;
-    uint32_t control = (capability >> 16) & 0xFFFFU;
-    control |= PCI_MSIX_ENABLE;
-    control &= ~PCI_MSIX_FUNCTION_MASK;
-    capability = (capability & 0x0000FFFFU) | (control << 16);
-    return pci_device_config_write32(device, device->msix_capability, capability);
+    status = pci_set_msix_enabled(device, true, false);
+    if (status != K_OK) return status;
+    return pci_set_intx_disabled(device, true);
 }
 
 kstatus_t pci_msi_configure(pci_device_t *device, uint32_t apic_id,
@@ -513,6 +610,8 @@ kstatus_t pci_msi_configure(pci_device_t *device, uint32_t apic_id,
     uint32_t address_low;
     if (device == 0 || device->msi_capability == 0 || apic_id > 0xFFU ||
         vector < IRQ_VECTOR_FIRST || vector > IRQ_VECTOR_LAST) return K_EINVAL;
+    if (device->msix_capability != 0U &&
+        pci_set_msix_enabled(device, false, true) != K_OK) return K_EIO;
     if (pci_device_config_read32(device, device->msi_capability, &header) != K_OK) {
         return K_EIO;
     }
@@ -533,17 +632,11 @@ kstatus_t pci_msi_configure(pci_device_t *device, uint32_t apic_id,
                                   (header & 0x0000FFFFU) | ((uint32_t)control << 16)) != K_OK) {
         return K_EIO;
     }
-    uint32_t command_status;
-    if (pci_device_config_read32(device, 4U, &command_status) == K_OK) {
-        command_status |= (1U << 10);
-        (void)pci_device_config_write32(device, 4U, command_status);
-    }
-    return K_OK;
+    return pci_set_intx_disabled(device, true);
 }
 
 kstatus_t pci_msi_disable(pci_device_t *device) {
     uint32_t header;
-    uint32_t command_status;
     uint16_t control;
 
     if (device == 0 || device->msi_capability == 0U) return K_EINVAL;
@@ -556,11 +649,16 @@ kstatus_t pci_msi_disable(pci_device_t *device) {
             (header & 0x0000FFFFU) | ((uint32_t)control << 16)) != K_OK) {
         return K_EIO;
     }
-    if (pci_device_config_read32(device, 4U, &command_status) == K_OK) {
-        command_status &= ~(1U << 10);
-        (void)pci_device_config_write32(device, 4U, command_status);
-    }
-    return K_OK;
+    return pci_set_intx_disabled(device, false);
+}
+
+kstatus_t pci_msix_disable(pci_device_t *device) {
+    kstatus_t status;
+
+    if (device == 0 || device->msix_capability == 0U) return K_EINVAL;
+    status = pci_set_msix_enabled(device, false, true);
+    if (status != K_OK) return status;
+    return pci_set_intx_disabled(device, false);
 }
 
 kstatus_t pci_enable_memory_busmaster(pci_device_t *device) {
@@ -570,8 +668,7 @@ kstatus_t pci_enable_memory_busmaster(pci_device_t *device) {
     if (status != K_OK) return status;
     uint16_t command = (uint16_t)command_status;
     command |= (1U << 1) | (1U << 2);
-    status = pci_device_config_write32(device, 4U,
-                                       (command_status & 0xFFFF0000U) | command);
+    status = pci_device_config_write32(device, PCI_COMMAND_OFFSET, command);
     if (status == K_OK) device->command = command;
     return status;
 }

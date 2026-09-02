@@ -74,7 +74,7 @@ static bool e1000_send_tcp_reply6(e1000_state_t *state,
     return sent;
 }
 
-static bool e1000_dispatch_software_queues(e1000_state_t *state) {
+bool e1000_dispatch_software_queues(e1000_state_t *state) {
     bool received = false;
     if (state == 0) return false;
     for (uint32_t queue_index = 0; queue_index < state->software_queue_count;
@@ -216,23 +216,19 @@ static bool e1000_dispatch_software_queues(e1000_state_t *state) {
     return received;
 }
 
-bool e1000_poll_receive(e1000_state_t *state) {
+bool e1000_process_rx_frame(e1000_state_t *state, const uint8_t *buffer,
+                            uint16_t length) {
     bool received = false;
-    uint32_t processed = 0U;
-    while (processed < E1000_RX_BUDGET &&
-           (state->rx_ring[state->rx_clean].status & E1000_RX_STATUS_DD) != 0) {
-        e1000_descriptor_t *descriptor = &state->rx_ring[state->rx_clean];
-        uint8_t *buffer = (uint8_t *)phys_to_direct(page_to_phys(state->rx_pages[state->rx_clean]));
-        net_udp_view_t view;
-        net_ipv6_udp_view_t view6;
-        net_tcp_view_t tcp_view;
-        net_tcp_view_t tcp_view6;
-        net_arp_view_t arp_view;
-        net_ndp_view_t ndp_view;
-        e1000_rx_packet_t packet;
-        dma_sync_for_cpu(&state->rx_dma[state->rx_clean]);
-        if (descriptor->length != 0 &&
-            net_ndp_parse_neighbor_solicitation(buffer, descriptor->length,
+    net_udp_view_t view;
+    net_ipv6_udp_view_t view6;
+    net_tcp_view_t tcp_view;
+    net_tcp_view_t tcp_view6;
+    net_arp_view_t arp_view;
+    net_ndp_view_t ndp_view;
+    e1000_rx_packet_t packet;
+    if (state == 0 || buffer == 0 || length == 0U) return false;
+    if (length != 0U &&
+            net_ndp_parse_neighbor_solicitation(buffer, length,
                                                  &ndp_view) == K_OK) {
             if (!e1000_address6_zero(ndp_view.source_address)) {
                 received = net_ipv6_neighbor_cache_update(
@@ -245,14 +241,14 @@ bool e1000_poll_receive(e1000_state_t *state) {
                 e1000_record_error(26U);
                 received = true;
             }
-        } else if (descriptor->length != 0 &&
-            net_ndp_parse_neighbor_advertisement(buffer, descriptor->length,
+    } else if (length != 0U &&
+            net_ndp_parse_neighbor_advertisement(buffer, length,
                                                   &ndp_view) == K_OK) {
             received = net_ipv6_neighbor_cache_update(
                 &state->ndp_cache, ndp_view.target_address, ndp_view.target_mac,
                 telemetry_timestamp()) == K_OK || received;
-        } else if (descriptor->length != 0 &&
-                   net_arp_parse_ipv4(buffer, descriptor->length, &arp_view) == K_OK) {
+    } else if (length != 0U &&
+                   net_arp_parse_ipv4(buffer, length, &arp_view) == K_OK) {
             /* ARP 鍙洿鏂扮紦瀛橈紱鍥炲绛栫暐鐢变笂灞傜綉缁滅鐞嗗櫒鍐冲畾銆?*/
             received = net_arp_cache_update(&state->arp_cache, arp_view.sender_address,
                                             arp_view.sender_mac,
@@ -268,8 +264,8 @@ bool e1000_poll_receive(e1000_state_t *state) {
             /* The TSC cannot wrap during one packet dispatch in practice. */
             flush_now += flush_after + 1U;
             socket_tcp_poll(flush_now);
-        } else if (descriptor->length != 0 &&
-            net_udp_parse_ipv4(buffer, descriptor->length, &view) == K_OK) {
+    } else if (length != 0U &&
+            net_udp_parse_ipv4(buffer, length, &view) == K_OK) {
             e1000_runtime_zero(&packet, sizeof(packet));
             packet.family = OS_AF_INET4;
             packet.protocol = SOCKET_PROTOCOL_UDP;
@@ -286,8 +282,8 @@ bool e1000_poll_receive(e1000_state_t *state) {
                                          view.source_port, view.destination_port,
                                          SOCKET_PROTOCOL_UDP)) || received;
             }
-        } else if (descriptor->length != 0 &&
-                   net_udp_parse_ipv6(buffer, descriptor->length, &view6) == K_OK) {
+    } else if (length != 0U &&
+                   net_udp_parse_ipv6(buffer, length, &view6) == K_OK) {
             e1000_runtime_zero(&packet, sizeof(packet));
             packet.family = OS_AF_INET6;
             packet.protocol = SOCKET_PROTOCOL_UDP;
@@ -303,8 +299,8 @@ bool e1000_poll_receive(e1000_state_t *state) {
                     e1000_flow_hash_ipv6(view6.source_address, view6.destination_address,
                                          view6.source_port, view6.destination_port)) || received;
             }
-        } else if (descriptor->length != 0 &&
-                   net_tcp_parse_ipv4(buffer, descriptor->length, &tcp_view) == K_OK) {
+    } else if (length != 0U &&
+                   net_tcp_parse_ipv4(buffer, length, &tcp_view) == K_OK) {
             e1000_runtime_zero(&packet, sizeof(packet));
             packet.family = OS_AF_INET4;
             packet.protocol = SOCKET_PROTOCOL_TCP;
@@ -329,8 +325,8 @@ bool e1000_poll_receive(e1000_state_t *state) {
                                          tcp_view.destination_port,
                                          SOCKET_PROTOCOL_TCP)) || received;
             }
-        } else if (descriptor->length != 0 &&
-                   net_tcp_parse_ipv6(buffer, descriptor->length, &tcp_view6) == K_OK) {
+    } else if (length != 0U &&
+                   net_tcp_parse_ipv6(buffer, length, &tcp_view6) == K_OK) {
             e1000_runtime_zero(&packet, sizeof(packet));
             packet.family = OS_AF_INET6;
             packet.protocol = SOCKET_PROTOCOL_TCP;
@@ -355,14 +351,28 @@ bool e1000_poll_receive(e1000_state_t *state) {
                                          tcp_view6.destination_port)) || received;
             }
         }
-        descriptor->status = 0;
+    return received;
+}
+
+bool e1000_poll_receive(e1000_state_t *state) {
+    bool received = false;
+    uint32_t processed = 0U;
+    if (state == 0) return false;
+    while (processed < E1000_RX_BUDGET &&
+           (state->rx_ring[state->rx_clean].status & E1000_RX_STATUS_DD) != 0U) {
+        e1000_descriptor_t *descriptor = &state->rx_ring[state->rx_clean];
+        uint8_t *buffer = (uint8_t *)phys_to_direct(
+            page_to_phys(state->rx_pages[state->rx_clean]));
+        dma_sync_for_cpu(&state->rx_dma[state->rx_clean]);
+        received = e1000_process_rx_frame(state, buffer, descriptor->length) ||
+                   received;
+        descriptor->status = 0U;
         state->rx_clean = (state->rx_clean + 1U) % E1000_RING_COUNT;
-        e1000_write(state, E1000_REG_RDT, (state->rx_clean + E1000_RING_COUNT - 1U) %
-                                          E1000_RING_COUNT);
+        e1000_write(state, E1000_REG_RDT,
+                    (state->rx_clean + E1000_RING_COUNT - 1U) % E1000_RING_COUNT);
         ++processed;
     }
     bool dispatched = e1000_dispatch_software_queues(state);
     socket_tcp_poll(x86_read_tsc());
     return dispatched || received;
 }
-

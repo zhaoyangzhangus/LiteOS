@@ -5,6 +5,7 @@ param(
     [string]$DriveLetter = 'F',
     [string]$Build = 'build-realtest',
     [switch]$DiagnosticBot,
+    [switch]$Rtl8126FirmwareDownload,
     [switch]$ForceReboot,
     [switch]$NoReboot
 )
@@ -176,6 +177,15 @@ $buildArguments = @('-Build', $Build, '-Debug', '2', '-RealTest')
 if ($DiagnosticBot) { $buildArguments += '-DiagnosticBot' }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
 if ($LASTEXITCODE -ne 0) { throw "Physical real-test build failed ($LASTEXITCODE)." }
+
+if ($Rtl8126FirmwareDownload) {
+    $firmwareScript = Join-Path $projectRoot 'tools\stage-rtl8126-firmware.ps1'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $firmwareScript `
+        -Build $Build -Download
+    if ($LASTEXITCODE -ne 0) {
+        throw "RTL8126 firmware staging failed ($LASTEXITCODE)."
+    }
+}
 
 $espPath = Join-Path (Join-Path $projectRoot $Build) 'esp'
 foreach ($required in @(
