@@ -441,7 +441,7 @@ void schedule(void) {
 
         scheduler_reap_enqueue_locked(cpu, current);
     }
-    scheduler_unlock(&cpu->queue.lock, queue_flags);
+    scheduler_unlock_irq_disabled(&cpu->queue.lock);
 
     /*
      * 只有具备真实保存栈的线程才触发架构切换。这样早期纯数据结构自检仍可使用
