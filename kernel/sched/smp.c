@@ -553,8 +553,12 @@ void x86_smp_ipi_interrupt(void) {
     bool reschedule = false;
 
     if (cpu_index < g_discovered_count && cpu_index < MAX_CPUS) {
-        atomic_fetch_add_explicit(&g_ipi_acknowledgements[cpu_index], 1U,
-                                  memory_order_release);
+        uint64_t acknowledgements =
+            atomic_load_explicit(&g_ipi_acknowledgements[cpu_index],
+                                 memory_order_relaxed);
+        atomic_store_explicit(&g_ipi_acknowledgements[cpu_index],
+                              acknowledgements + 1U,
+                              memory_order_release);
 
         /*
          * idle CPU 的 reschedule IPI 只负责唤醒 HLT，不在中断栈上直接完成
@@ -634,21 +638,57 @@ bool x86_smp_request_reschedule(uint32_t cpu_index) {
     const x86_acpi_platform_t *platform = x86_acpi_platform();
     if (platform == 0 || cpu_index >= platform->cpu_count ||
         !x86_smp_cpu_online(cpu_index)) return false;
-    /* 同一目标 CPU 已有待处理请求时只保留一个 IPI，避免高频唤醒风暴。 */
-    if (atomic_exchange_explicit(&g_reschedule_pending[cpu_index], true,
-                                 memory_order_acq_rel)) return true;
+
+    /*
+     * Most wake bursts arrive while a request is already pending.
+     * Avoid an unconditional LOCK XCHG in that common case.
+     *
+     * The producer has already published its runqueue update before reaching
+     * this function. If the target concurrently consumes the old request, it
+     * will schedule after that publication; otherwise the CAS below installs
+     * a new request and sends the IPI.
+     */
+    if (atomic_load_explicit(&g_reschedule_pending[cpu_index],
+                             memory_order_relaxed)) {
+        return true;
+    }
+
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(
+            &g_reschedule_pending[cpu_index],
+            &expected,
+            true,
+            memory_order_release,
+            memory_order_relaxed)) {
+        return true;
+    }
+
     for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
         if (liteos_lapic_send_fixed(platform->cpus[cpu_index].apic_id,
-                                    X86_SMP_IPI_VECTOR)) return true;
+                                    X86_SMP_IPI_VECTOR)) {
+            return true;
+        }
         __asm__ volatile ("pause");
     }
-    /* 请求保持为 pending，目标 CPU 的周期定时器仍会执行一次调度。 */
+
+    /* pending remains set; the target timer/idle polling is the fallback. */
     return false;
 }
 
 bool x86_smp_take_reschedule_request(void) {
     uint32_t cpu_index = x86_current_cpu_index();
     if (cpu_index >= g_discovered_count || cpu_index >= MAX_CPUS) return false;
+
+    /*
+     * Fast path for the overwhelmingly common idle-poll case.
+     * A producer that races after this load still sends an IPI, and the
+     * runnable snapshot is checked by the idle loop as a second condition.
+     */
+    if (!atomic_load_explicit(&g_reschedule_pending[cpu_index],
+                              memory_order_relaxed)) {
+        return false;
+    }
+
     return atomic_exchange_explicit(&g_reschedule_pending[cpu_index], false,
                                     memory_order_acq_rel);
 }

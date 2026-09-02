@@ -103,11 +103,22 @@ bool scheduler_current_cpu(uint32_t *cpu_id) {
     return true;
 }
 
+static void scheduler_spin_lock_raw(spinlock_t *lock) {
+    for (;;) {
+        if (atomic_exchange_explicit(&lock->state, 1U,
+                                     memory_order_acquire) == 0U) {
+            return;
+        }
+
+        while (atomic_load_explicit(&lock->state,
+                                    memory_order_relaxed) != 0U) {
+            __asm__ volatile ("pause");
+        }
+    }
+}
 uint64_t scheduler_lock(spinlock_t *lock) {
     uint64_t flags = scheduler_irq_save();
-    while (atomic_exchange_explicit(&lock->state, 1U, memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    scheduler_spin_lock_raw(lock);
     return flags;
 }
 
@@ -116,10 +127,7 @@ uint64_t scheduler_lock(spinlock_t *lock) {
  * the local runqueue lock. Avoid a second IRQ-save/restore pair there.
  */
 static void scheduler_lock_irq_disabled(spinlock_t *lock) {
-    while (atomic_exchange_explicit(&lock->state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    scheduler_spin_lock_raw(lock);
 }
 
 static void scheduler_unlock_irq_disabled(spinlock_t *lock) {
