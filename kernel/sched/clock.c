@@ -34,7 +34,7 @@ void sched_tick(uint64_t now_ns) {
     if (current == 0) return;
     if (current == cpu->queue.idle) {
         if (sched_runnable_count() != 0U) {
-            atomic_store_explicit(&cpu->preempt_pending, true,
+            atomic_store_explicit(&cpu->need_resched, true,
                                   memory_order_release);
         }
         return;
@@ -59,7 +59,7 @@ void sched_tick(uint64_t now_ns) {
     if (runnable &&
         ((current->sched_class == SCHED_CLASS_FAIR && delta != 0U) ||
          timeslice_expired)) {
-        atomic_store_explicit(&cpu->preempt_pending, true,
+        atomic_store_explicit(&cpu->need_resched, true,
                               memory_order_release);
     }
 }
@@ -80,6 +80,6 @@ bool sched_fair_policy_self_test(void) {
 bool sched_tick_should_preempt(void) {
     uint32_t cpu_id;
     return scheduler_current_cpu(&cpu_id) &&
-           atomic_load_explicit(&g_cpus[cpu_id].preempt_pending,
+           atomic_load_explicit(&g_cpus[cpu_id].need_resched,
                                 memory_order_acquire);
 }

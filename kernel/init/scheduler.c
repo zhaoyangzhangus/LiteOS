@@ -1,5 +1,6 @@
 #include <kernel/init_scheduler.h>
 
+#include <arch/x86_64/cpu.h>
 #include "arch/x86_64/paging.h"
 #include <arch/x86_64/smp.h>
 #include <kernel/debug_stage.h>
@@ -26,6 +27,282 @@ static BOOLEAN scheduler_fail_at(const liteos_init_scheduler_hooks_t *hooks,
 
 #define scheduler_fail(hooks, message) \
     scheduler_fail_at((hooks), (message), __FILE__, __LINE__)
+
+#define SCHED_BENCH_SAMPLES 64U
+#define SCHED_BENCH_BATCH 256U
+
+static void scheduler_benchmark_sort(uint64_t *samples) {
+    for (uint32_t index = 1U; index < SCHED_BENCH_SAMPLES; ++index) {
+        uint64_t value = samples[index];
+        uint32_t position = index;
+        while (position != 0U && samples[position - 1U] > value) {
+            samples[position] = samples[position - 1U];
+            --position;
+        }
+        samples[position] = value;
+    }
+}
+
+static void scheduler_benchmark_emit_stats(
+    const char *base_name,
+    const char *min_name,
+    const char *median_name,
+    const char *average_name,
+    const char *p95_name,
+    uint64_t *samples) {
+    uint64_t total = 0U;
+    scheduler_benchmark_sort(samples);
+    for (uint32_t index = 0U; index < SCHED_BENCH_SAMPLES; ++index) {
+        total += samples[index];
+    }
+    uint32_t p95_index = (SCHED_BENCH_SAMPLES * 95U + 99U) / 100U - 1U;
+    uint64_t median = samples[SCHED_BENCH_SAMPLES / 2U];
+    uint64_t average = total / SCHED_BENCH_SAMPLES;
+    kernel_perf_emit_value(base_name, median);
+    kernel_perf_emit_value(min_name, samples[0]);
+    kernel_perf_emit_value(median_name, median);
+    kernel_perf_emit_value(average_name, average);
+    kernel_perf_emit_value(p95_name, samples[p95_index]);
+}
+
+static bool scheduler_benchmark_queue_class(uint8_t class_id,
+                                            uint8_t priority,
+                                            const char *enqueue_base,
+                                            const char *enqueue_min,
+                                            const char *enqueue_median,
+                                            const char *enqueue_average,
+                                            const char *enqueue_p95,
+                                            const char *dequeue_base,
+                                            const char *dequeue_min,
+                                            const char *dequeue_median,
+                                            const char *dequeue_average,
+                                            const char *dequeue_p95) {
+    static thread_t threads[SCHED_BENCH_BATCH];
+    uint64_t enqueue_samples[SCHED_BENCH_SAMPLES];
+    uint64_t dequeue_samples[SCHED_BENCH_SAMPLES];
+    uint32_t cpu_id = x86_current_cpu_index();
+
+    if (cpu_id >= MAX_CPUS) return false;
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        sched_initialize_test_thread(&threads[index],
+                                     0x100000U + index, class_id, priority);
+        threads[index].owner_cpu = (uint16_t)cpu_id;
+        threads[index].current_cpu = (uint16_t)cpu_id;
+    }
+
+    /* Warm the allocator, branch predictors, and queue metadata first. */
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        if (!sched_enqueue_bootstrap(&threads[index])) return false;
+    }
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        sched_remove(&threads[index]);
+    }
+
+    for (uint32_t sample = 0U; sample < SCHED_BENCH_SAMPLES; ++sample) {
+        uint64_t start = telemetry_timestamp();
+        for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+            if (!sched_enqueue_bootstrap(&threads[index])) return false;
+        }
+        enqueue_samples[sample] =
+            (telemetry_timestamp() - start) / SCHED_BENCH_BATCH;
+
+        start = telemetry_timestamp();
+        for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+            sched_remove(&threads[index]);
+        }
+        dequeue_samples[sample] =
+            (telemetry_timestamp() - start) / SCHED_BENCH_BATCH;
+    }
+
+    scheduler_benchmark_emit_stats(
+        enqueue_base, enqueue_min, enqueue_median, enqueue_average,
+        enqueue_p95, enqueue_samples);
+    scheduler_benchmark_emit_stats(
+        dequeue_base, dequeue_min, dequeue_median, dequeue_average,
+        dequeue_p95, dequeue_samples);
+    return sched_runnable_count() == 0U;
+}
+
+static bool scheduler_benchmark_queue_paths(void) {
+    return scheduler_benchmark_queue_class(
+               SCHED_CLASS_FAIR, 0U,
+               "scheduler.enqueue", "scheduler.enqueue.fair.min",
+               "scheduler.enqueue.fair.median",
+               "scheduler.enqueue.fair.average", "scheduler.enqueue.fair.p95",
+               "scheduler.dequeue", "scheduler.dequeue.fair.min",
+               "scheduler.dequeue.fair.median",
+               "scheduler.dequeue.fair.average", "scheduler.dequeue.fair.p95") &&
+           scheduler_benchmark_queue_class(
+               SCHED_CLASS_RT, 7U,
+               "scheduler.enqueue.rt", "scheduler.enqueue.rt.min",
+               "scheduler.enqueue.rt.median",
+               "scheduler.enqueue.rt.average", "scheduler.enqueue.rt.p95",
+               "scheduler.dequeue.rt", "scheduler.dequeue.rt.min",
+               "scheduler.dequeue.rt.median",
+               "scheduler.dequeue.rt.average", "scheduler.dequeue.rt.p95");
+}
+
+static bool scheduler_benchmark_schedule_single(void) {
+    static thread_t thread;
+    uint64_t samples[SCHED_BENCH_SAMPLES];
+    uint32_t cpu_id = x86_current_cpu_index();
+
+    if (cpu_id >= MAX_CPUS) return false;
+    sched_initialize_test_thread(&thread, 0x200000U, SCHED_CLASS_FAIR, 0U);
+    thread.owner_cpu = (uint16_t)cpu_id;
+    thread.current_cpu = (uint16_t)cpu_id;
+    if (!sched_enqueue_bootstrap(&thread)) return false;
+    schedule();
+
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        schedule();
+    }
+    for (uint32_t sample = 0U; sample < SCHED_BENCH_SAMPLES; ++sample) {
+        uint64_t start = telemetry_timestamp();
+        for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+            schedule();
+        }
+        samples[sample] =
+            (telemetry_timestamp() - start) / SCHED_BENCH_BATCH;
+    }
+    scheduler_benchmark_emit_stats(
+        "scheduler.schedule", "scheduler.schedule_same_thread.min",
+        "scheduler.schedule_same_thread.median",
+        "scheduler.schedule_same_thread.average",
+        "scheduler.schedule_same_thread.p95", samples);
+
+    if (!sched_publish_blocked(&thread)) return false;
+    schedule();
+    return sched_current_thread() != &thread;
+}
+
+static bool scheduler_benchmark_schedule_pair(uint8_t class_id,
+                                              const char *base_name,
+                                              const char *min_name,
+                                              const char *median_name,
+                                              const char *average_name,
+                                              const char *p95_name) {
+    static thread_t first;
+    static thread_t second;
+    uint64_t samples[SCHED_BENCH_SAMPLES];
+    uint32_t cpu_id = x86_current_cpu_index();
+
+    if (cpu_id >= MAX_CPUS) return false;
+    sched_initialize_test_thread(&first, 0x210000U, class_id, 7U);
+    sched_initialize_test_thread(&second, 0x210001U, class_id, 7U);
+    first.owner_cpu = second.owner_cpu = (uint16_t)cpu_id;
+    first.current_cpu = second.current_cpu = (uint16_t)cpu_id;
+    if (!sched_enqueue_bootstrap(&first) ||
+        !sched_enqueue_bootstrap(&second)) return false;
+    schedule();
+
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        if (class_id == SCHED_CLASS_FAIR) {
+            thread_t *current = sched_current_thread();
+            if (current == &first || current == &second) {
+                ++current->sched.vruntime;
+            }
+        }
+        schedule();
+    }
+    for (uint32_t sample = 0U; sample < SCHED_BENCH_SAMPLES; ++sample) {
+        uint64_t start = telemetry_timestamp();
+        for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+            if (class_id == SCHED_CLASS_FAIR) {
+                thread_t *current = sched_current_thread();
+                if (current == &first || current == &second) {
+                    ++current->sched.vruntime;
+                }
+            }
+            schedule();
+        }
+        samples[sample] =
+            (telemetry_timestamp() - start) / SCHED_BENCH_BATCH;
+    }
+    scheduler_benchmark_emit_stats(
+        base_name, min_name, median_name, average_name, p95_name, samples);
+
+    thread_t *current = sched_current_thread();
+    if (current == &first || current == &second) {
+        if (!sched_publish_blocked(current)) return false;
+        schedule();
+    }
+    current = sched_current_thread();
+    if (current == &first || current == &second) {
+        if (!sched_publish_blocked(current)) return false;
+        schedule();
+    }
+    sched_remove(&first);
+    sched_remove(&second);
+    return sched_current_thread() != &first &&
+           sched_current_thread() != &second;
+}
+
+static bool scheduler_benchmark_schedule_paths(void) {
+    return scheduler_benchmark_schedule_single() &&
+           scheduler_benchmark_schedule_pair(
+               SCHED_CLASS_FAIR, "scheduler.schedule_two_fair_threads",
+               "scheduler.schedule_two_fair_threads.min",
+               "scheduler.schedule_two_fair_threads.median",
+               "scheduler.schedule_two_fair_threads.average",
+               "scheduler.schedule_two_fair_threads.p95") &&
+           scheduler_benchmark_schedule_pair(
+               SCHED_CLASS_RT, "scheduler.schedule_rt",
+               "scheduler.schedule_rt.min", "scheduler.schedule_rt.median",
+               "scheduler.schedule_rt.average", "scheduler.schedule_rt.p95");
+}
+
+static bool scheduler_benchmark_local_wake(void) {
+    static thread_t threads[SCHED_BENCH_BATCH];
+    uint64_t samples[SCHED_BENCH_SAMPLES];
+    uint32_t cpu_id = x86_current_cpu_index();
+
+    if (cpu_id >= MAX_CPUS) return false;
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        sched_initialize_test_thread(&threads[index],
+                                     0x220000U + index,
+                                     SCHED_CLASS_FAIR, 0U);
+        threads[index].owner_cpu = (uint16_t)cpu_id;
+        threads[index].current_cpu = (uint16_t)cpu_id;
+        atomic_store_explicit(&threads[index].state, THREAD_BLOCKED,
+                              memory_order_relaxed);
+    }
+
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        sched_wake(&threads[index]);
+    }
+    for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+        sched_remove(&threads[index]);
+        atomic_store_explicit(&threads[index].state, THREAD_BLOCKED,
+                              memory_order_relaxed);
+    }
+
+    for (uint32_t sample = 0U; sample < SCHED_BENCH_SAMPLES; ++sample) {
+        uint64_t start = telemetry_timestamp();
+        for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+            if (atomic_load_explicit(&threads[index].state,
+                                     memory_order_relaxed) !=
+                    THREAD_BLOCKED) {
+                return false;
+            }
+            sched_wake(&threads[index]);
+        }
+        samples[sample] =
+            (telemetry_timestamp() - start) / SCHED_BENCH_BATCH;
+        for (uint32_t index = 0U; index < SCHED_BENCH_BATCH; ++index) {
+            sched_remove(&threads[index]);
+            atomic_store_explicit(&threads[index].state, THREAD_BLOCKED,
+                                  memory_order_relaxed);
+        }
+    }
+    scheduler_benchmark_emit_stats(
+        "scheduler.wake", "scheduler.wake.local_wake.min",
+        "scheduler.wake.local_wake.median",
+        "scheduler.wake.local_wake.average",
+        "scheduler.wake.local_wake.p95", samples);
+    schedule();
+    return sched_runnable_count() == 0U;
+}
 
 static BOOLEAN canonical_scheduler_self_test(void) {
     static thread_t fair_threads[300];
@@ -319,6 +596,16 @@ BOOLEAN liteos_init_scheduler(const LITEOS_BOOT_INFO *boot_info,
     liteos_realtest_checkpoint("SCHED_CORE_TEST_OK");
     liteos_realtest_checkpoint("SCHED_CORE_BENCH_BEGIN");
     kernel_perf_emit_scope("scheduler.core", benchmark_start);
+    if (!scheduler_benchmark_queue_paths()) {
+        return scheduler_fail(hooks, "LITEOS_SCHED_BENCH_FAIL\r\n");
+    }
+    if (!scheduler_benchmark_schedule_paths()) {
+        return scheduler_fail(hooks, "LITEOS_SCHED_PATH_BENCH_FAIL\r\n");
+    }
+    if (!scheduler_benchmark_local_wake()) {
+        return scheduler_fail(hooks, "LITEOS_SCHED_WAKE_BENCH_FAIL\r\n");
+    }
+    hooks->write("LITEOS_SCHED_BENCH_OK\r\n");
     liteos_realtest_checkpoint("SCHED_CORE_BENCH_OK");
     liteos_realtest_checkpoint("SCHED_CORE_REPORT_BEGIN");
     hooks->write("LITEOS_SCHED_CORE_OK\r\n");

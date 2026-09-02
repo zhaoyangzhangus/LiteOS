@@ -57,6 +57,17 @@ typedef struct thread {
     /* Process-owned execution-reference and reaping lifetime flags. */
     uint32_t flags;
 
+    /* Scheduler hot fields: kept before architecture and user-stack state. */
+    uint16_t owner_cpu;
+    uint16_t current_cpu;
+    uint16_t migration_target_cpu;
+    bool migration_pending;
+    uint8_t sched_class;
+    uint8_t rt_priority;
+    uint8_t base_sched_class;
+    uint8_t base_rt_priority;
+    sched_entity_t sched;
+
     /* Architecture-owned execution stack and saved CPU state. */
     void *kernel_stack_base;
     vaddr_t kernel_stack_top;
@@ -69,20 +80,8 @@ typedef struct thread {
     size_t user_stack_size;
     bool user_stack_owned;
 
-    /* Scheduler-owned accounting and queue membership. */
-    sched_entity_t sched;
+    /* Scheduler-owned CPU affinity is a migration-path field. */
     cpumask_t affinity;
-    /* Runqueue owner; only the owner may mutate queue linkage. */
-    uint16_t owner_cpu;
-    /* Current/last execution placement, kept separate from owner_cpu. */
-    uint16_t current_cpu;
-    /* Owner-local migration hand-off for a currently running thread. */
-    uint16_t migration_target_cpu;
-    bool migration_pending;
-    uint8_t sched_class;
-    uint8_t rt_priority;
-    uint8_t base_sched_class;
-    uint8_t base_rt_priority;
 
     /* Wait/synchronization-owned PI state. */
     list_head_t owned_mutexes;
@@ -121,14 +120,15 @@ typedef struct run_queue {
     thread_t *idle;
 
     rb_root_t fair_root;
+    thread_t *fair_leftmost;
     uint64_t min_vruntime;
+    uint64_t clock_ns;
     uint32_t fair_count;
-
-    list_head_t rt_queues[RT_PRIORITY_LEVELS];
     uint32_t rt_bitmap;
     uint32_t nr_running;
+    uint32_t hot_padding;
 
-    uint64_t clock_ns;
+    list_head_t rt_queues[RT_PRIORITY_LEVELS];
 } run_queue_t;
 
 void sched_init(void);

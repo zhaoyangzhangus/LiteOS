@@ -19,6 +19,7 @@ static paddr_t g_kernel_root;
 static arch_switch_context_t *g_context_test_from;
 static arch_switch_context_t *g_context_test_to;
 static volatile uint32_t g_context_test_ran;
+static volatile uint32_t g_context_test_rounds;
 
 void sched_mark_initial_placement(thread_t *thread) {
     if (thread != 0) {
@@ -184,7 +185,9 @@ void sched_cpu_init(uint32_t cpu_id) {
     scheduler_zero(cpu, sizeof(*cpu));
     atomic_init(&cpu->reap_lock.state, 0U);
     atomic_init(&cpu->queue_snapshot, 0U);
-    atomic_init(&cpu->preempt_pending, false);
+    atomic_init(&cpu->command_pending, false);
+    atomic_init(&cpu->need_resched, false);
+    atomic_init(&cpu->command_release_pending, false);
     atomic_init(&cpu->reap_deferred_queued, false);
     cpu->command_inbox =
         (sched_cmd_channel_t *)kzalloc(
@@ -255,6 +258,25 @@ static bool scheduler_current_thread_owner(
     return true;
 }
 
+static inline bool scheduler_publish_blocked_local(
+    uint32_t cpu_id,
+    scheduler_cpu_t *cpu,
+    thread_t *thread) {
+    if (cpu == 0 || thread == 0 || thread->owner_cpu != cpu_id ||
+        atomic_load_explicit(&thread->state, memory_order_relaxed) !=
+            THREAD_RUNNING) {
+        return false;
+    }
+
+    uint32_t epoch =
+        atomic_load_explicit(&thread->block_epoch, memory_order_relaxed) + 1U;
+    atomic_store_explicit(&thread->block_epoch, epoch,
+                          memory_order_relaxed);
+    atomic_store_explicit(&thread->state, THREAD_BLOCKED,
+                          memory_order_release);
+    return true;
+}
+
 static void scheduler_apply_priority_local(
     scheduler_cpu_t *cpu,
     thread_t *thread,
@@ -267,10 +289,10 @@ static void scheduler_apply_priority_local(
     }
 
     bool enqueued = (thread->sched.flags & SCHED_ENTITY_ENQUEUED) != 0;
-    if (enqueued) dequeue_local(cpu, thread);
+    if (enqueued) dequeue_local_raw(cpu, thread);
     thread->sched_class = class_id;
     thread->rt_priority = class_id == SCHED_CLASS_RT ? rt_priority : 0U;
-    if (enqueued) enqueue_local(cpu, thread);
+    if (enqueued) enqueue_local_raw(cpu, thread);
 }
 
 static bool sched_enqueue_internal(thread_t *thread, bool notify_local) {
@@ -424,20 +446,9 @@ kstatus_t sched_start_thread(thread_t *thread) {
 }
 
 bool sched_publish_blocked(thread_t *thread) {
-    if (thread == 0) return false;
-
-    if (!scheduler_current_thread_owner(thread, 0)) return false;
-
-    if (atomic_load_explicit(&thread->state,
-                             memory_order_acquire) != THREAD_RUNNING) {
-        return false;
-    }
-
-    uint32_t epoch =
-        atomic_load_explicit(&thread->block_epoch, memory_order_relaxed) + 1U;
-    atomic_store_explicit(&thread->block_epoch, epoch, memory_order_release);
-    atomic_store_explicit(&thread->state, THREAD_BLOCKED, memory_order_release);
-    return true;
+    uint32_t cpu_id;
+    return scheduler_current_thread_owner(thread, &cpu_id) &&
+           scheduler_publish_blocked_local(cpu_id, &g_cpus[cpu_id], thread);
 }
 
 bool sched_publish_running(thread_t *thread) {
@@ -515,7 +526,7 @@ static bool scheduler_complete_wake_local(
      * schedule() will observe READY and enqueue it on the same rq.
      */
     if (cpu->queue.current != thread) {
-        enqueue_local(cpu, thread);
+        enqueue_local_raw(cpu, thread);
     }
 
     return true;
@@ -658,7 +669,11 @@ static bool scheduler_remote_command_push(
             ++g_cpus[source_cpu].command_ring_full_count;
             counted_overflow = true;
         }
-        if (queued) return true;
+        if (queued) {
+            atomic_store_explicit(&target->command_pending, true,
+                                  memory_order_release);
+            return true;
+        }
 
         /* The target already owns the pending work and will drain it. */
         (void)x86_smp_request_reschedule(target_cpu);
@@ -702,7 +717,7 @@ static bool scheduler_transfer_local(
     if (source == 0 || thread == 0 || target_cpu >= g_cpu_count ||
         target_cpu == source_cpu) {
         if (source != 0 && thread != 0 && target_cpu == source_cpu) {
-            enqueue_local(source, thread);
+            enqueue_local_raw(source, thread);
             return true;
         }
         return false;
@@ -746,13 +761,13 @@ static void scheduler_migrate_local(
     }
 
     if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) != 0) {
-        dequeue_local(source, thread);
+        dequeue_local_raw(source, thread);
     }
     thread->migration_pending = false;
     if (state == THREAD_READY) {
         if (!scheduler_transfer_local(source_cpu, source, thread, target_cpu)) {
             thread->owner_cpu = (uint16_t)source_cpu;
-            enqueue_local(source, thread);
+            enqueue_local_raw(source, thread);
         }
     } else if (g_cpus[target_cpu].command_inbox != 0) {
         thread->owner_cpu = (uint16_t)target_cpu;
@@ -772,12 +787,19 @@ static void scheduler_command_release_enqueue_local(
         cpu->command_release_tail = thread;
     }
     ++thread->command_release_count;
+    atomic_store_explicit(&cpu->command_release_pending, true,
+                          memory_order_release);
 }
 
 static void scheduler_command_release_drain(uint32_t cpu_id) {
+    if (cpu_id >= g_cpu_count) return;
+    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+    if (SCHED_UNLIKELY(!atomic_exchange_explicit(
+            &cpu->command_release_pending, false, memory_order_acquire))) {
+        return;
+    }
+
     for (;;) {
-        if (cpu_id >= g_cpu_count) return;
-        scheduler_cpu_t *cpu = &g_cpus[cpu_id];
         uint64_t queue_flags = scheduler_irq_save();
         thread_t *thread = cpu->command_release_head;
         uint32_t count = 0U;
@@ -831,12 +853,12 @@ static void scheduler_command_consume_local(
                 thread->sched.flags &= (uint16_t)~SCHED_ENTITY_INITIAL_PLACEMENT;
                 atomic_store_explicit(&thread->state, THREAD_READY,
                                       memory_order_release);
-                enqueue_local(cpu, thread);
+                enqueue_local_raw(cpu, thread);
             }
             atomic_store_explicit(&thread->start_pending, false,
                                   memory_order_release);
         } else if (message.op == SCHED_CMD_ENQUEUE) {
-            enqueue_local(cpu, thread);
+            enqueue_local_raw(cpu, thread);
         } else if (message.op == SCHED_CMD_SET_PRIORITY) {
             scheduler_apply_priority_local(
                 cpu,
@@ -850,7 +872,7 @@ static void scheduler_command_consume_local(
         } else if (message.op == SCHED_CMD_REMOVE ||
                    message.op == SCHED_CMD_STOP ||
                    message.op == SCHED_CMD_EXIT) {
-            if (cpu->queue.current != thread) dequeue_local(cpu, thread);
+            if (cpu->queue.current != thread) dequeue_local_raw(cpu, thread);
             if (message.op == SCHED_CMD_EXIT) {
                 unsigned state = atomic_load_explicit(&thread->state,
                                                       memory_order_relaxed);
@@ -934,10 +956,15 @@ static void scheduler_command_drain_overflow_local(
     }
 }
 
-static void scheduler_command_drain_local(
+static bool scheduler_command_drain_local(
     uint32_t cpu_id,
-    scheduler_cpu_t *cpu) {
-    if (cpu == 0 || cpu->command_inbox == 0) return;
+    scheduler_cpu_t *cpu,
+    bool publish_snapshot) {
+    if (cpu == 0 || cpu->command_inbox == 0 ||
+        SCHED_UNLIKELY(!atomic_exchange_explicit(
+            &cpu->command_pending, false, memory_order_acquire))) {
+        return false;
+    }
 
     uint32_t source_limit =
         g_cpu_count < MAX_CPUS ? g_cpu_count : MAX_CPUS;
@@ -949,49 +976,24 @@ static void scheduler_command_drain_local(
         scheduler_command_drain_overflow_local(
             cpu_id, cpu, &channel->overflow);
     }
-}
-
-static bool scheduler_remote_command_pending(
-    uint32_t cpu_id,
-    scheduler_cpu_t *cpu) {
-    if (cpu == 0 || cpu->command_inbox == 0) return false;
-
-    uint32_t source_limit =
-        g_cpu_count < MAX_CPUS ? g_cpu_count : MAX_CPUS;
-
-    for (uint32_t source = 0U; source < source_limit; ++source) {
-        if (source == cpu_id) continue;
-
-        sched_cmd_channel_t *channel = &cpu->command_inbox[source];
-        uint32_t primary_head =
-            atomic_load_explicit(&channel->primary.head,
-                                 memory_order_relaxed);
-        uint32_t primary_tail =
-            atomic_load_explicit(&channel->primary.tail,
-                                 memory_order_acquire);
-        uint32_t overflow_head =
-            atomic_load_explicit(&channel->overflow.head,
-                                 memory_order_relaxed);
-        uint32_t overflow_tail =
-            atomic_load_explicit(&channel->overflow.tail,
-                                 memory_order_acquire);
-        if (primary_head != primary_tail || overflow_head != overflow_tail) {
-            return true;
-        }
+    if (publish_snapshot && cpu->queue_snapshot_dirty) {
+        scheduler_publish_queue_snapshot(cpu);
     }
-
-    return false;
+    return true;
 }
 
 static bool scheduler_should_preempt_local(const scheduler_cpu_t *cpu) {
     if (cpu == 0) return false;
     thread_t *current = cpu->queue.current;
     if (current == 0 || current == cpu->queue.idle) {
-        return cpu->queue.nr_running != 0U;
+        if (cpu->queue.nr_running == 0U) return false;
+        thread_t *next = pick_next_local((scheduler_cpu_t *)cpu);
+        return next != 0 && next != cpu->queue.idle &&
+               next->arch.switch_ctx.rsp != 0U;
     }
     unsigned state = atomic_load_explicit(&current->state, memory_order_relaxed);
     if (state != THREAD_RUNNING || current->migration_pending) return true;
-    if (atomic_load_explicit(&cpu->preempt_pending, memory_order_relaxed)) {
+    if (atomic_load_explicit(&cpu->need_resched, memory_order_relaxed)) {
         return true;
     }
     if (cpu->queue.rt_bitmap == 0U) return false;
@@ -1004,6 +1006,25 @@ static bool scheduler_should_preempt_local(const scheduler_cpu_t *cpu) {
             current->sched.slice_runtime_ns >= SCHED_RT_TIMESLICE_NS);
 }
 
+static void scheduler_schedule_internal(bool commands_already_drained);
+
+static bool scheduler_local_wake_requires_preempt(
+    const scheduler_cpu_t *cpu,
+    const thread_t *thread) {
+    if (cpu == 0 || thread == 0) return false;
+
+    const thread_t *current = cpu->queue.current;
+    if (current == 0 || current == cpu->queue.idle) return true;
+    unsigned current_state =
+        atomic_load_explicit(&current->state, memory_order_relaxed);
+    if (current == thread || current_state != THREAD_RUNNING) return true;
+    if (thread->sched_class != SCHED_CLASS_RT) return false;
+    if (current->sched_class != SCHED_CLASS_RT) return true;
+    return thread->rt_priority < current->rt_priority ||
+           (thread->rt_priority == current->rt_priority &&
+            current->sched.slice_runtime_ns >= SCHED_RT_TIMESLICE_NS);
+}
+
 void sched_handle_reschedule_request(void) {
     uint64_t irq_flags = scheduler_irq_save();
     uint32_t cpu_id;
@@ -1012,11 +1033,14 @@ void sched_handle_reschedule_request(void) {
         return;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    scheduler_command_drain_local(cpu_id, cpu);
+    scheduler_command_drain_local(cpu_id, cpu, false);
     bool should_preempt = scheduler_should_preempt_local(cpu);
+    if (!should_preempt && cpu->queue_snapshot_dirty) {
+        scheduler_publish_queue_snapshot(cpu);
+    }
     scheduler_command_release_drain(cpu_id);
     scheduler_irq_restore(irq_flags);
-    if (should_preempt) schedule();
+    if (should_preempt) scheduler_schedule_internal(true);
 }
 
 void sched_wake(thread_t *thread) {
@@ -1056,11 +1080,16 @@ void sched_wake(thread_t *thread) {
     uint64_t queue_flags = scheduler_irq_save();
     bool woke = scheduler_complete_wake_local(
         cpu, thread, 0U, false);
-    scheduler_irq_restore(queue_flags);
-
-    if (woke) {
-        (void)x86_smp_request_reschedule(cpu_id);
+    if (woke && cpu->queue_snapshot_dirty) {
+        scheduler_publish_queue_snapshot(cpu);
     }
+    bool need_preempt = woke &&
+                        scheduler_local_wake_requires_preempt(cpu, thread);
+    if (need_preempt) {
+        atomic_store_explicit(&cpu->need_resched, true,
+                              memory_order_release);
+    }
+    scheduler_irq_restore(queue_flags);
 }
 
 static void scheduler_reap_enqueue_local(scheduler_cpu_t *cpu,
@@ -1093,7 +1122,7 @@ static void scheduler_reap_enqueue_local(scheduler_cpu_t *cpu,
     cpu->reap_tail = thread;
 }
 
-void schedule(void) {
+static void scheduler_schedule_internal(bool commands_already_drained) {
     uint64_t irq_flags = scheduler_irq_save();
     if (sched_preempt_disabled()) {
         scheduler_irq_restore(irq_flags);
@@ -1105,14 +1134,31 @@ void schedule(void) {
         return;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    atomic_store_explicit(&cpu->preempt_pending, false, memory_order_relaxed);
-    scheduler_command_drain_local(cpu_id, cpu);
+    atomic_store_explicit(&cpu->need_resched, false, memory_order_relaxed);
+    if (!commands_already_drained ||
+        atomic_load_explicit(&cpu->command_pending, memory_order_acquire)) {
+        scheduler_command_drain_local(cpu_id, cpu, false);
+    }
     thread_t *current = cpu->queue.current;
     bool current_transferred = false;
+    unsigned current_state = THREAD_DEAD;
     if (current != 0 && current != cpu->queue.idle) {
-        unsigned current_state = atomic_load_explicit(&current->state,
-                                                       memory_order_relaxed);
-        if (current_state == THREAD_RUNNING && current->migration_pending) {
+        current_state = atomic_load_explicit(&current->state,
+                                             memory_order_relaxed);
+        if (current_state == THREAD_RUNNING &&
+            !current->migration_pending &&
+            (current->sched.flags & SCHED_ENTITY_ENQUEUED) == 0U &&
+            cpu->queue.nr_running == 0U) {
+            if (cpu->queue_snapshot_dirty) {
+                scheduler_publish_queue_snapshot(cpu);
+            }
+            scheduler_command_release_drain(cpu_id);
+            scheduler_irq_restore(irq_flags);
+            if (cpu->reap_head != 0) sched_finish_switch();
+            return;
+        }
+        if (current_state == THREAD_RUNNING &&
+            SCHED_UNLIKELY(current->migration_pending)) {
             uint32_t target_cpu = current->migration_target_cpu;
             if (target_cpu == cpu_id ||
                 !scheduler_cpu_available(target_cpu) ||
@@ -1132,19 +1178,23 @@ void schedule(void) {
                 atomic_store_explicit(&current->state, THREAD_READY,
                                       memory_order_relaxed);
             }
-            enqueue_local(cpu, current);
+            enqueue_local_raw(cpu, current);
         }
     }
     thread_t *next = pick_next_local(cpu);
     if (next != 0) {
-        dequeue_local(cpu, next);
+        dequeue_local_raw(cpu, next);
         atomic_store_explicit(&next->state, THREAD_RUNNING, memory_order_relaxed);
         next->owner_cpu = (uint16_t)cpu_id;
         next->current_cpu = (uint16_t)cpu_id;
         cpu->queue.current = next;
     }
     scheduler_publish_queue_snapshot(cpu);
-    scheduler_accounting_transition(&cpu->queue, current, next);
+    bool same_current = next == current && current_state == THREAD_RUNNING &&
+                        !current_transferred;
+    if (!same_current) {
+        scheduler_accounting_transition(&cpu->queue, current, next);
+    }
     /*
      * DEAD current 的 execution ref 只能在真正离开它的栈/CR3 后释放。
      *
@@ -1162,6 +1212,12 @@ void schedule(void) {
         scheduler_reap_enqueue_local(cpu, current);
     }
     scheduler_command_release_drain(cpu_id);
+
+    if (same_current) {
+        scheduler_irq_restore(irq_flags);
+        if (cpu->reap_head != 0) sched_finish_switch();
+        return;
+    }
 
     /*
      * 只有具备真实保存栈的线程才触发架构切换。这样早期纯数据结构自检仍可使用
@@ -1211,20 +1267,27 @@ bool sched_try_run_ready(void) {
         return false;
     }
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    scheduler_command_drain_local(cpu_id, cpu);
+    scheduler_command_drain_local(cpu_id, cpu, false);
     thread_t *next = pick_next_local(cpu);
     /* 丢弃没有真实上下文的早期自检线程，避免空闲 CPU 被假线程锁死。 */
     while (next != 0 && next != cpu->queue.idle &&
            next->arch.switch_ctx.rsp == 0) {
-        dequeue_local(cpu, next);
+        dequeue_local_raw(cpu, next);
         atomic_store_explicit(&next->state, THREAD_READY, memory_order_release);
         next = pick_next_local(cpu);
     }
     bool runnable = next != 0 && next != cpu->queue.idle;
+    if (!runnable && cpu->queue_snapshot_dirty) {
+        scheduler_publish_queue_snapshot(cpu);
+    }
     scheduler_command_release_drain(cpu_id);
     scheduler_irq_restore(irq_flags);
-    if (runnable) schedule();
+    if (runnable) scheduler_schedule_internal(true);
     return runnable;
+}
+
+void schedule(void) {
+    scheduler_schedule_internal(false);
 }
 
 void sched_preempt_disable(void) {
@@ -1440,8 +1503,9 @@ void sched_block_current(void) {
     uint32_t cpu_id;
     if (!scheduler_current_cpu(&cpu_id)) return;
     thread_t *current = g_cpus[cpu_id].queue.current;
-    if (current == 0 || current == g_cpus[cpu_id].queue.idle) return;
-    if (sched_publish_blocked(current)) schedule();
+    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+    if (current == 0 || current == cpu->queue.idle) return;
+    if (scheduler_publish_blocked_local(cpu_id, cpu, current)) schedule();
 }
 
 bool sched_state_transition_self_test(void) {
@@ -1469,6 +1533,8 @@ bool sched_state_transition_self_test(void) {
     }
     return true;
 }
+
+static bool scheduler_remote_wake_benchmark(void);
 
 bool sched_remote_wake_self_test(void) {
     sched_cmd_ring_t ring;
@@ -1526,32 +1592,289 @@ bool sched_remote_wake_self_test(void) {
         return false;
     }
 
-    return true;
+    return scheduler_remote_wake_benchmark();
 }
 
 static void sched_context_test_entry(void) {
     g_context_test_ran = 1U;
-    x86_switch_context(g_context_test_to, g_context_test_from);
+    for (uint32_t round = 0U; round < g_context_test_rounds; ++round) {
+        x86_switch_context(g_context_test_to, g_context_test_from);
+    }
     for (;;) __asm__ volatile ("cli; hlt" : : : "memory");
+}
+
+#define SCHED_REMOTE_BENCH_SAMPLES 32U
+
+#if LITEOS_REALTEST
+static atomic_bool g_remote_benchmark_stop;
+static atomic_bool g_remote_benchmark_waiting;
+static atomic_uint g_remote_benchmark_runs;
+
+static void scheduler_remote_benchmark_worker(void *argument) {
+    (void)argument;
+    for (;;) {
+        thread_t *thread = sched_current_thread();
+        if (thread == 0) {
+            for (;;) __asm__ volatile ("cli; hlt" : : : "memory");
+        }
+
+        atomic_store_explicit(&g_remote_benchmark_waiting, true,
+                              memory_order_release);
+        if (!sched_publish_blocked(thread)) {
+            schedule();
+            continue;
+        }
+        schedule();
+        atomic_store_explicit(&g_remote_benchmark_waiting, false,
+                              memory_order_release);
+        if (atomic_load_explicit(&g_remote_benchmark_stop,
+                                 memory_order_acquire)) {
+            (void)sched_publish_dead(thread);
+            schedule();
+            for (;;) __asm__ volatile ("cli; hlt" : : : "memory");
+        }
+        atomic_fetch_add_explicit(&g_remote_benchmark_runs, 1U,
+                                  memory_order_release);
+    }
+}
+
+static bool scheduler_remote_benchmark_wait_blocked(
+    thread_t *thread,
+    uint64_t deadline) {
+    for (;;) {
+        bool waiting = atomic_load_explicit(&g_remote_benchmark_waiting,
+                                            memory_order_acquire);
+        unsigned state = atomic_load_explicit(&thread->state,
+                                              memory_order_acquire);
+        if (waiting && state == THREAD_BLOCKED) return true;
+        if ((int64_t)(x86_read_tsc() - deadline) >= 0) return false;
+        __asm__ volatile ("pause");
+    }
+}
+
+static void scheduler_remote_benchmark_emit_stats(
+    const char *base_name,
+    const char *min_name,
+    const char *median_name,
+    const char *average_name,
+    const char *p95_name,
+    uint64_t *samples) {
+    uint64_t total = 0U;
+    for (uint32_t index = 1U; index < SCHED_REMOTE_BENCH_SAMPLES; ++index) {
+        uint64_t value = samples[index];
+        uint32_t position = index;
+        while (position != 0U && samples[position - 1U] > value) {
+            samples[position] = samples[position - 1U];
+            --position;
+        }
+        samples[position] = value;
+    }
+    for (uint32_t index = 0U; index < SCHED_REMOTE_BENCH_SAMPLES; ++index) {
+        total += samples[index];
+    }
+    uint32_t p95_index =
+        (SCHED_REMOTE_BENCH_SAMPLES * 95U + 99U) / 100U - 1U;
+    uint64_t median = samples[SCHED_REMOTE_BENCH_SAMPLES / 2U];
+    kernel_perf_emit_value(base_name, median);
+    kernel_perf_emit_value(min_name, samples[0]);
+    kernel_perf_emit_value(median_name, median);
+    kernel_perf_emit_value(average_name,
+                           total / SCHED_REMOTE_BENCH_SAMPLES);
+    kernel_perf_emit_value(p95_name, samples[p95_index]);
+}
+#endif
+
+static bool scheduler_remote_wake_benchmark(void) {
+#if !LITEOS_REALTEST
+    return true;
+#else
+    static thread_t thread;
+    static uint8_t stack[8192] __attribute__((aligned(16)));
+    uint64_t submit_samples[SCHED_REMOTE_BENCH_SAMPLES];
+    uint64_t ipi_samples[SCHED_REMOTE_BENCH_SAMPLES];
+    uint64_t ready_samples[SCHED_REMOTE_BENCH_SAMPLES];
+    uint64_t running_samples[SCHED_REMOTE_BENCH_SAMPLES];
+    uint32_t source_cpu;
+    uint32_t target_cpu = UINT32_MAX;
+
+    if (!scheduler_current_cpu(&source_cpu) || g_cpu_count < 2U) return true;
+    for (uint32_t cpu_id = 0U; cpu_id < g_cpu_count; ++cpu_id) {
+        if (cpu_id != source_cpu && scheduler_cpu_available(cpu_id)) {
+            target_cpu = cpu_id;
+            break;
+        }
+    }
+    if (target_cpu == UINT32_MAX) return true;
+
+    scheduler_zero(&thread, sizeof(thread));
+    refcount_init(&thread.object.refs, 1U);
+    sched_initialize_new_thread(&thread, target_cpu, true);
+    uintptr_t stack_top = ((uintptr_t)stack + sizeof(stack)) &
+                          ~(uintptr_t)15U;
+    uintptr_t switch_stack = stack_top - sizeof(uint64_t);
+    *(uint64_t *)switch_stack = (uint64_t)(uintptr_t)&x86_kernel_thread_start;
+    thread.kernel_stack_base = stack;
+    thread.kernel_stack_top = stack_top;
+    thread.kernel_stack_size = sizeof(stack);
+    thread.arch.switch_ctx.rsp = switch_stack;
+    thread.arch.switch_ctx.r12 =
+        (uint64_t)(uintptr_t)&scheduler_remote_benchmark_worker;
+    thread.arch.switch_ctx.r13 = 0U;
+    thread.arch.switch_ctx.r14 = stack_top;
+    atomic_init(&g_remote_benchmark_stop, false);
+    atomic_init(&g_remote_benchmark_waiting, false);
+    atomic_init(&g_remote_benchmark_runs, 0U);
+
+    bool started = sched_start_thread(&thread) == K_OK;
+    uint64_t timeout = x86_timeout_ns_to_tsc(1000000000ULL);
+    uint64_t deadline = x86_read_tsc() + timeout;
+    if (!started || !scheduler_remote_benchmark_wait_blocked(&thread,
+                                                              deadline)) {
+        if (started) {
+            atomic_store_explicit(&g_remote_benchmark_stop, true,
+                                  memory_order_release);
+            sched_wake(&thread);
+        }
+        return false;
+    }
+
+    for (uint32_t sample = 0U;
+         sample < SCHED_REMOTE_BENCH_SAMPLES; ++sample) {
+        uint32_t block_epoch =
+            atomic_load_explicit(&thread.block_epoch, memory_order_relaxed);
+        uint32_t run_before =
+            atomic_load_explicit(&g_remote_benchmark_runs,
+                                 memory_order_acquire);
+
+        uint64_t start = telemetry_timestamp();
+        if (!scheduler_remote_command_try_push(
+                source_cpu, target_cpu, &thread, SCHED_CMD_WAKE,
+                block_epoch)) {
+            started = false;
+            break;
+        }
+        submit_samples[sample] = telemetry_timestamp() - start;
+
+        start = telemetry_timestamp();
+        if (!x86_smp_request_reschedule(target_cpu)) {
+            started = false;
+            break;
+        }
+        ipi_samples[sample] = telemetry_timestamp() - start;
+
+        start = telemetry_timestamp();
+        timeout = x86_timeout_ns_to_tsc(1000000000ULL);
+        deadline = x86_read_tsc() + timeout;
+        while (atomic_load_explicit(&thread.state, memory_order_acquire) ==
+               THREAD_BLOCKED) {
+            if ((int64_t)(x86_read_tsc() - deadline) >= 0) {
+                started = false;
+                break;
+            }
+            __asm__ volatile ("pause");
+        }
+        if (!started) break;
+        ready_samples[sample] = telemetry_timestamp() - start;
+
+        start = telemetry_timestamp();
+        timeout = x86_timeout_ns_to_tsc(1000000000ULL);
+        deadline = x86_read_tsc() + timeout;
+        while (atomic_load_explicit(&g_remote_benchmark_runs,
+                                    memory_order_acquire) == run_before) {
+            if ((int64_t)(x86_read_tsc() - deadline) >= 0) {
+                started = false;
+                break;
+            }
+            __asm__ volatile ("pause");
+        }
+        if (!started) break;
+        running_samples[sample] = telemetry_timestamp() - start;
+
+        timeout = x86_timeout_ns_to_tsc(1000000000ULL);
+        if (!scheduler_remote_benchmark_wait_blocked(
+                &thread, x86_read_tsc() + timeout)) {
+            started = false;
+            break;
+        }
+    }
+
+    atomic_store_explicit(&g_remote_benchmark_stop, true,
+                          memory_order_release);
+    if (started) {
+        sched_wake(&thread);
+        timeout = x86_timeout_ns_to_tsc(1000000000ULL);
+        deadline = x86_read_tsc() + timeout;
+        while (atomic_load_explicit(&thread.state, memory_order_acquire) !=
+               THREAD_DEAD) {
+            if ((int64_t)(x86_read_tsc() - deadline) >= 0) {
+                started = false;
+                break;
+            }
+            __asm__ volatile ("pause");
+        }
+    }
+    if (!started) return false;
+
+    scheduler_remote_benchmark_emit_stats(
+        "scheduler.wake.remote_wake_submit",
+        "scheduler.wake.remote_wake_submit.min",
+        "scheduler.wake.remote_wake_submit.median",
+        "scheduler.wake.remote_wake_submit.average",
+        "scheduler.wake.remote_wake_submit.p95", submit_samples);
+    scheduler_remote_benchmark_emit_stats(
+        "scheduler.wake.remote_ipi_submit",
+        "scheduler.wake.remote_ipi_submit.min",
+        "scheduler.wake.remote_ipi_submit.median",
+        "scheduler.wake.remote_ipi_submit.average",
+        "scheduler.wake.remote_ipi_submit.p95", ipi_samples);
+    scheduler_remote_benchmark_emit_stats(
+        "scheduler.wake.remote_wake_to_ready",
+        "scheduler.wake.remote_wake_to_ready.min",
+        "scheduler.wake.remote_wake_to_ready.median",
+        "scheduler.wake.remote_wake_to_ready.average",
+        "scheduler.wake.remote_wake_to_ready.p95", ready_samples);
+    scheduler_remote_benchmark_emit_stats(
+        "scheduler.wake.remote_wake_to_running",
+        "scheduler.wake.remote_wake_to_running.min",
+        "scheduler.wake.remote_wake_to_running.median",
+        "scheduler.wake.remote_wake_to_running.average",
+        "scheduler.wake.remote_wake_to_running.p95", running_samples);
+    scheduler_remote_benchmark_emit_stats(
+        "scheduler.schedule_with_remote_command",
+        "scheduler.schedule_with_remote_command.min",
+        "scheduler.schedule_with_remote_command.median",
+        "scheduler.schedule_with_remote_command.average",
+        "scheduler.schedule_with_remote_command.p95", running_samples);
+    return true;
+#endif
 }
 
 bool sched_context_switch_self_test(void) {
     static uint8_t stack[4096] __attribute__((aligned(16)));
-    arch_switch_context_t from = {0};
-    arch_switch_context_t to = {0};
     uintptr_t stack_top = ((uintptr_t)stack + sizeof(stack)) & ~(uintptr_t)15U;
 
+    const uint32_t rounds = 10000U;
+    uint64_t benchmark_start = telemetry_timestamp();
+    uint64_t elapsed;
+    arch_switch_context_t from = {0};
+    arch_switch_context_t to = {0};
     stack_top -= sizeof(uint64_t);
     *(uint64_t *)stack_top = (uint64_t)(uintptr_t)&sched_context_test_entry;
     to.rsp = stack_top;
     g_context_test_from = &from;
     g_context_test_to = &to;
+    g_context_test_rounds = rounds;
     g_context_test_ran = 0U;
-    uint64_t benchmark_start = telemetry_timestamp();
-    x86_switch_context(&from, &to);
-    kernel_perf_emit_scope("scheduler.context_switch", benchmark_start);
+    for (uint32_t round = 0U; round < rounds; ++round) {
+        x86_switch_context(&from, &to);
+    }
+    elapsed = telemetry_timestamp() - benchmark_start;
+    kernel_perf_emit_value("scheduler.context_switch", elapsed / rounds);
+    kernel_perf_emit_value("scheduler.context_switch.average",
+                           elapsed / rounds);
     g_context_test_from = 0;
     g_context_test_to = 0;
+    g_context_test_rounds = 0U;
     return g_context_test_ran == 1U;
 }
 
@@ -1687,7 +2010,7 @@ uint32_t sched_runnable_count(void) {
      * This preserves the existing timer/idle fallback if an IPI is delayed.
      */
     if (runnable == 0U &&
-        scheduler_remote_command_pending(cpu_id, cpu)) {
+        atomic_load_explicit(&cpu->command_pending, memory_order_acquire)) {
         return 1U;
     }
 

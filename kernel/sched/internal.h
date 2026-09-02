@@ -27,6 +27,8 @@
 #define SCHED_CMD_REMOVE_NO_REF (1U << 31)
 #define SCHED_NICE_0_WEIGHT 1024U
 #define SCHED_RT_TIMESLICE_NS 4000000ULL
+#define SCHED_LIKELY(value) __builtin_expect(!!(value), 1)
+#define SCHED_UNLIKELY(value) __builtin_expect(!!(value), 0)
 
 _Static_assert((SCHED_CMD_SLOTS & (SCHED_CMD_SLOTS - 1U)) == 0U,
                "scheduler command ring size must be a power of two");
@@ -41,6 +43,9 @@ typedef struct sched_cmd {
     uint32_t op;
     uint32_t generation;
 } sched_cmd_t;
+
+_Static_assert(sizeof(sched_cmd_t) == 16U,
+               "scheduler command entry must remain compact");
 
 typedef struct sched_cmd_ring {
     /* Consumer-owned; producer only reads it. */
@@ -62,6 +67,12 @@ typedef struct sched_cmd_overflow_ring {
     sched_cmd_t slots[SCHED_CMD_OVERFLOW_SLOTS];
 } __aligned(CACHELINE_SIZE) sched_cmd_overflow_ring_t;
 
+_Static_assert(__builtin_offsetof(sched_cmd_ring_t, tail) >= CACHELINE_SIZE,
+               "command producer index must have its own cache line");
+_Static_assert(__builtin_offsetof(sched_cmd_overflow_ring_t, tail) >=
+                   CACHELINE_SIZE,
+               "overflow producer index must have its own cache line");
+
 typedef struct sched_cmd_channel {
     sched_cmd_ring_t primary;
     sched_cmd_overflow_ring_t overflow;
@@ -73,15 +84,18 @@ typedef struct sched_cmd_channel {
 /* Private scheduler state shared only by the scheduler implementation files. */
 typedef struct scheduler_cpu {
     run_queue_t queue;
+    bool queue_snapshot_dirty;
 
+    /* Published by producers when any incoming command becomes visible. */
+    atomic_bool command_pending;
+    /* Timer and local wake paths publish a local reschedule request. */
+    atomic_bool need_resched;
     /*
      * Read-mostly scheduler load snapshot.
      * low 32 bits: queued runnable threads.
      * high 32 bits: queued + current non-idle runnable thread.
      */
     atomic_uint_fast64_t queue_snapshot;
-    /* Timer accounting publishes preemption; the interrupt boundary consumes it. */
-    atomic_bool preempt_pending;
     /*
      * Array[MAX_CPUS] of incoming SPSC command channels.
      * Ring N has producer CPU N and this scheduler CPU as consumer.
@@ -97,6 +111,8 @@ typedef struct scheduler_cpu {
     /* Remote command references released outside the owner IRQ boundary. */
     thread_t *command_release_head;
     thread_t *command_release_tail;
+    /* Empty release queues must not enter the IRQ save/restore path. */
+    atomic_bool command_release_pending;
     /* Reaper may run from deferred context after the owner switched away. */
     spinlock_t reap_lock;
 
@@ -132,6 +148,7 @@ static inline void scheduler_publish_queue_snapshot(scheduler_cpu_t *cpu) {
     atomic_store_explicit(&cpu->queue_snapshot,
                           scheduler_make_queue_snapshot(cpu),
                           memory_order_release);
+    cpu->queue_snapshot_dirty = false;
 }
 
 static inline uint32_t scheduler_snapshot_runnable(
@@ -154,6 +171,8 @@ uint32_t scheduler_choose_cpu(thread_t *thread, uint32_t current_cpu);
 
 void initialize_thread(thread_t *thread, uint64_t tid, uint8_t class_id,
                        uint8_t priority);
+void enqueue_local_raw(scheduler_cpu_t *cpu, thread_t *thread);
+void dequeue_local_raw(scheduler_cpu_t *cpu, thread_t *thread);
 void enqueue_local(scheduler_cpu_t *cpu, thread_t *thread);
 void dequeue_local(scheduler_cpu_t *cpu, thread_t *thread);
 thread_t *pick_next_local(scheduler_cpu_t *cpu);

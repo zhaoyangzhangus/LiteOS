@@ -33,15 +33,22 @@ static void fair_insert(run_queue_t *queue, thread_t *thread) {
     *link = node;
     rb_tree_insert_rebalance(&queue->fair_root, node);
     ++queue->fair_count;
-    rb_node_t *first = rb_tree_first(&queue->fair_root);
-    queue->min_vruntime = fair_thread_from_node(first)->sched.vruntime;
+    if (queue->fair_leftmost == 0 ||
+        fair_before(thread, queue->fair_leftmost)) {
+        queue->fair_leftmost = thread;
+    }
+    queue->min_vruntime = queue->fair_leftmost->sched.vruntime;
 }
 
 static void fair_remove(run_queue_t *queue, thread_t *thread) {
     rb_tree_erase(&queue->fair_root, &thread->sched.fair_node);
     if (queue->fair_count != 0) --queue->fair_count;
-    rb_node_t *first = rb_tree_first(&queue->fair_root);
-    if (first != 0) queue->min_vruntime = fair_thread_from_node(first)->sched.vruntime;
+    if (thread == queue->fair_leftmost) {
+        rb_node_t *first = rb_tree_first(&queue->fair_root);
+        queue->fair_leftmost = first != 0 ? fair_thread_from_node(first) : 0;
+    }
+    queue->min_vruntime = queue->fair_leftmost != 0 ?
+                          queue->fair_leftmost->sched.vruntime : 0U;
 }
 
 bool validate_fair_node(rb_node_t *node, rb_node_t *parent,
@@ -139,7 +146,7 @@ void sched_initialize_test_thread(thread_t *thread, uint64_t tid,
     initialize_thread(thread, tid, class_id, priority);
 }
 
-void enqueue_local(scheduler_cpu_t *cpu, thread_t *thread) {
+void enqueue_local_raw(scheduler_cpu_t *cpu, thread_t *thread) {
     if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) != 0 ||
         atomic_load_explicit(&thread->state, memory_order_relaxed) != THREAD_READY) return;
     if (thread->sched_class == SCHED_CLASS_RT) {
@@ -153,10 +160,15 @@ void enqueue_local(scheduler_cpu_t *cpu, thread_t *thread) {
     }
     thread->sched.flags |= SCHED_ENTITY_ENQUEUED;
     ++cpu->queue.nr_running;
+    cpu->queue_snapshot_dirty = true;
+}
+
+void enqueue_local(scheduler_cpu_t *cpu, thread_t *thread) {
+    enqueue_local_raw(cpu, thread);
     scheduler_publish_queue_snapshot(cpu);
 }
 
-void dequeue_local(scheduler_cpu_t *cpu, thread_t *thread) {
+void dequeue_local_raw(scheduler_cpu_t *cpu, thread_t *thread) {
     if ((thread->sched.flags & SCHED_ENTITY_ENQUEUED) == 0) return;
     if (thread->sched_class == SCHED_CLASS_RT) {
         list_del(&thread->sched.rt_node);
@@ -168,6 +180,11 @@ void dequeue_local(scheduler_cpu_t *cpu, thread_t *thread) {
     }
     thread->sched.flags &= (uint16_t)~SCHED_ENTITY_ENQUEUED;
     if (cpu->queue.nr_running != 0) --cpu->queue.nr_running;
+    cpu->queue_snapshot_dirty = true;
+}
+
+void dequeue_local(scheduler_cpu_t *cpu, thread_t *thread) {
+    dequeue_local_raw(cpu, thread);
     scheduler_publish_queue_snapshot(cpu);
 }
 
@@ -176,8 +193,8 @@ thread_t *pick_next_local(scheduler_cpu_t *cpu) {
         uint32_t priority = (uint32_t)__builtin_ctz(cpu->queue.rt_bitmap);
         return rt_thread_from_node(cpu->queue.rt_queues[priority].next);
     }
-    rb_node_t *first = rb_tree_first(&cpu->queue.fair_root);
-    return first != 0 ? fair_thread_from_node(first) : cpu->queue.idle;
+    return cpu->queue.fair_leftmost != 0 ?
+           cpu->queue.fair_leftmost : cpu->queue.idle;
 }
 
 bool sched_rt_policy_self_test(void) {
