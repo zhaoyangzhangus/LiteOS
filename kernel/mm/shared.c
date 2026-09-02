@@ -17,6 +17,7 @@ kstatus_t vm_object_create_shared(size_t size, vm_object_t **out) {
     store->pages = 0;
     store->lookup_hint = 0;
     refcount_init(&object->refs, 1U);
+    vm_object_stats_init(object);
     object->type = VM_OBJECT_SHARED;
     object->flags = VM_OBJECT_INTERNAL;
     object->size = size;

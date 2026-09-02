@@ -188,6 +188,7 @@ static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
         liteos_serial_write("LITEOS_WINDOW_SERVER_KERNEL_FAIL\r\n");
         halt_forever();
     }
+    vm_fault_telemetry_reset();
     liteos_serial_write("LITEOS_WINDOW_SERVER_KERNEL_OK\r\n");
     liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_7A,
                        LITEOS_DEBUG_STEP_ENTER, 0U);
@@ -198,6 +199,8 @@ static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
     }
     kernel_perf_emit_scope("graphics.window", benchmark_start);
     liteos_serial_write("LITEOS_WINDOW_OK\r\n");
+    /* Exclude boot graphics self-tests from the first real window sample. */
+    vm_fault_telemetry_reset();
     liteos_init_userspace_hooks_t deferred_userspace_hooks = {
         .write = liteos_serial_write,
         .write_u32 = liteos_serial_write_u32,

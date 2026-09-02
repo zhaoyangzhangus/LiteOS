@@ -229,6 +229,11 @@ bool window_resize_locked(window_server_window_t *window,
     window->height = new_height;
     window->dirty = true;
     window->resize_pending = true;
+    uint64_t new_surface_span = window_surface_page_span(new_width, new_height);
+    if (new_surface_span > window->surface_populated_bytes &&
+        new_surface_span > window->surface_populate_pending_end) {
+        window->surface_populate_pending_end = new_surface_span;
+    }
     window_mark_window_locked(window);
     window_enqueue_resize_event_locked(window);
     return true;

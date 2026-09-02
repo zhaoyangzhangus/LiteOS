@@ -149,6 +149,10 @@ void window_server_pump_input_mode(bool compose_now) {
         window_unlock();
     }
 
+    /* Resize events are already published; populate their newly visible
+     * surface pages before waking the client or composing the next frame. */
+    window_surface_populate_pending();
+
     if (wake &&
         window_flush_event_wakes()) {
         (void)wake_all(&g_window_server.event_waitq);

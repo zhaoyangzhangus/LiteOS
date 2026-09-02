@@ -25,6 +25,8 @@ typedef struct anon_store {
     anon_page_node_t *lookup_hint;
 } anon_store_t;
 
+void vm_object_stats_init(vm_object_t *object);
+
 /* Private VMA helpers shared by the VM-space implementation units. */
 vm_area_t *area_from_list(list_head_t *node);
 vm_area_t *area_from_rb(rb_node_t *node);

@@ -21,6 +21,14 @@ static void memory_copy(void *destination, const void *source, size_t size) {
     while (size-- != 0) *out++ = *in++;
 }
 
+void vm_object_stats_init(vm_object_t *object) {
+    if (object == 0) return;
+    atomic_init(&object->fault_count, 0U);
+    atomic_init(&object->populated_pages, 0U);
+    atomic_init(&object->prefaulted_pages, 0U);
+    atomic_init(&object->fault_around_pages, 0U);
+}
+
 static void page_reference_put(page_t *page) {
     if (page != 0 && atomic_fetch_sub_explicit(&page->refs, 1U,
                                                memory_order_acq_rel) == 1U) {
@@ -67,6 +75,32 @@ void vm_object_put(vm_object_t *object) {
     if ((object->flags & VM_OBJECT_INTERNAL) != 0) kfree(object);
 }
 
+void vm_object_mark_window_surface(vm_object_t *object) {
+    if (object != 0 && object->type == VM_OBJECT_SHARED) {
+        object->flags |= VM_OBJECT_FLAG_WINDOW_SURFACE;
+    }
+}
+
+uint64_t vm_object_fault_count(const vm_object_t *object) {
+    return object != 0 ?
+           atomic_load_explicit(&object->fault_count, memory_order_relaxed) : 0U;
+}
+
+uint64_t vm_object_populated_pages(const vm_object_t *object) {
+    return object != 0 ?
+           atomic_load_explicit(&object->populated_pages, memory_order_relaxed) : 0U;
+}
+
+uint64_t vm_object_prefaulted_pages(const vm_object_t *object) {
+    return object != 0 ?
+           atomic_load_explicit(&object->prefaulted_pages, memory_order_relaxed) : 0U;
+}
+
+uint64_t vm_object_fault_around_pages(const vm_object_t *object) {
+    return object != 0 ?
+           atomic_load_explicit(&object->fault_around_pages, memory_order_relaxed) : 0U;
+}
+
 kstatus_t vm_object_create_anon(size_t size, vm_object_t **out) {
     if (out == 0 || size == 0) return K_EINVAL;
     vm_object_t *object = (vm_object_t *)kzalloc(sizeof(vm_object_t), 0);
@@ -79,6 +113,7 @@ kstatus_t vm_object_create_anon(size_t size, vm_object_t **out) {
     atomic_init(&store->lock.state, 0U);
     store->pages = 0;
     refcount_init(&object->refs, 1U);
+    vm_object_stats_init(object);
     object->type = VM_OBJECT_ANON;
     object->flags = VM_OBJECT_INTERNAL;
     object->size = size;
@@ -101,6 +136,7 @@ kstatus_t vm_object_create_file(void *mapping, const vm_file_ops_t *ops,
     vm_object_t *object = (vm_object_t *)kzalloc(sizeof(*object), 0);
     if (object == 0) return K_ENOMEM;
     refcount_init(&object->refs, 1U);
+    vm_object_stats_init(object);
     object->type = VM_OBJECT_FILE;
     object->flags = VM_OBJECT_INTERNAL;
     object->size = size;
@@ -122,6 +158,7 @@ kstatus_t vm_object_create_device(paddr_t phys, uint64_t length,
     vm_object_t *object = (vm_object_t *)kzalloc(sizeof(*object), 0);
     if (object == 0) return K_ENOMEM;
     refcount_init(&object->refs, 1U);
+    vm_object_stats_init(object);
     object->type = VM_OBJECT_DEVICE;
     object->flags = VM_OBJECT_INTERNAL;
     object->size = length;
@@ -312,6 +349,9 @@ kstatus_t anon_page_get(vm_object_t *object,
         store->lookup_hint =
             new_node;
     }
+
+    atomic_fetch_add_explicit(&object->populated_pages, 1U,
+                              memory_order_relaxed);
 
     *out = page;
 

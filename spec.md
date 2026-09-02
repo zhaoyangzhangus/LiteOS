@@ -1,1287 +1,1740 @@
-# LiteOS Scheduler Performance Optimization Tasks
+# LiteOS Page Fault / Window Surface Performance Optimization Specification
 
-目标：基于当前最新调度器 ownership/SPSC 架构，在不回退架构设计的前提下，解决当前 benchmark 回退：
+## 1. 背景
+
+当前现象：
 
 ```text
-改善：
-enqueue          -7.6%
-wake             -6.6%
-context_switch  -46.5%   # 暂不视为可信收益
-
-回退：
-schedule         +14.7%
-block            +39.1%
-wake_to_running   +8.4%
-dequeue           +6.2%
+每次打开窗口
+    ↓
+出现短暂停顿 / 卡顿
+    ↓
+窗口显示后恢复正常
 ```
 
-核心原则：
+当前怀疑主要不是 compositor 本身，而是：
 
 ```text
-不要推翻 owner CPU + SPSC 架构。
+窗口 surface 使用 demand paging
+        ↓
+第一次绘制/清屏
+        ↓
+大量连续 4 KiB page fault
+        ↓
+每个 fault 都执行较重 VM 路径
+        ↓
+形成 page-fault storm
+```
 
-当前主要问题不是 SPSC 本身，
-而是太多跨 CPU bookkeeping 被塞进了普通 schedule() 热路径。
+当前窗口场景非常典型：
+
+```text
+创建窗口
+    ↓
+reserve 较大的虚拟 surface
+    ↓
+物理页暂未全部分配
+    ↓
+第一次 memset / clear / draw
+    ↓
+逐页 #PF
+```
+
+如果一个 surface 为：
+
+```text
+1920 × 1080 × 4 bytes
+≈ 8 MiB
+```
+
+4 KiB page 数约为：
+
+```text
+8 MiB / 4 KiB
+≈ 2048 faults
+```
+
+即使每次 fault 只有几微秒，也足以造成明显的一次性停顿。
+
+---
+
+# 2. 当前主要问题
+
+当前 page fault 路径大致为：
+
+```text
+#PF
+ ↓
+vm_handle_fault()
+ ↓
+map_lock(vm_space)
+ ↓
+VMA RB-tree lookup
+ ↓
+x86_translate_page()
+ ↓
+global page-table lock
+ ↓
+backing object lookup
+ ↓
+page_alloc()
+ ↓
+zero 4 KiB
+ ↓
+kmalloc page metadata
+ ↓
+x86_map_page()
+ ↓
+global page-table lock AGAIN
+ ↓
+PTE walk/create
+ ↓
+RSS / generation update
+ ↓
+map_unlock()
+```
+
+主要问题：
+
+```text
+1 page = 1 exception
+       + 1 VMA lookup
+       + multiple locks
+       + 1 physical allocation
+       + 1 zero
+       + metadata allocation
+       + 1 PTE mapping
+```
+
+对稀疏匿名内存可以接受。
+
+对窗口 framebuffer：
+
+```text
+连续
+密集
+顺序写入
+```
+
+非常不合适。
+
+---
+
+# 3. 总体目标
+
+目标不是取消 demand paging。
+
+而是将：
+
+```text
+逐页异常分配
+```
+
+优化成：
+
+```text
+窗口创建时适量预分配
++
+page fault 时批量 fault-around
++
+shared surface 使用密集 page table
++
+缩短锁持有时间
++
+减少重复 page-table walk
+```
+
+最终窗口创建应做到：
+
+```text
+virtual reserve 很便宜
+current visible surface 快速 ready
+resize 只增量 populate
+首次绘制不产生大规模 #PF storm
 ```
 
 ---
 
-# P0 — 先修 benchmark
+# Phase 0 — 先建立 Page Fault Telemetry
 
-在继续优化前，先把 benchmark 改成有统计意义的测试。
+在修改算法以前必须先测量。
 
-## schedule
+## 0.1 增加 fault 分类计数
 
-不要只测单次：
-
-```c
-start();
-schedule();
-stop();
-```
-
-改成：
+记录：
 
 ```text
-warmup
-+
-10000~100000 次
-+
-total cycles / operations
+page_fault_total
+
+page_fault_user
+page_fault_kernel
+
+page_fault_not_present
+page_fault_protection
+
+page_fault_anon
+page_fault_shared
+page_fault_file
+page_fault_cow
+page_fault_stack
+
+page_fault_window_surface
 ```
 
-分别测试：
+窗口 surface 最好给 VM object 增加明确 flag/type：
 
 ```text
-schedule_same_thread
-schedule_two_fair_threads
-schedule_rt
-schedule_with_remote_command
-schedule_without_remote_command
+VM_OBJECT_WINDOW_SURFACE
 ```
+
+方便单独统计。
 
 ---
 
-## enqueue/dequeue
+## 0.2 记录每个 fault 时间
 
-不要只测 300 个线程中的第 1 次。
-
-分别测试：
+使用 TSC：
 
 ```text
-FAIR enqueue x 10000
-FAIR dequeue x 10000
+T0 = page fault entry
+T1 = VMA lookup complete
+T2 = backing page ready
+T3 = PTE installed
+T4 = page fault return
+```
 
-RT enqueue x 10000
-RT dequeue x 10000
+得到：
+
+```text
+A = VMA lookup
+B = backing allocation
+C = page-table mapping
+D = remaining fault overhead
+TOTAL
 ```
 
 输出：
 
 ```text
-min
-median
 average
+p50
+p90
 p95
+p99
+max
 ```
 
-至少输出 average。
+不要每次 fault 打 log。
+
+只统计。
+
+窗口测试结束后统一输出。
 
 ---
 
-## wake
+## 0.3 统计一次窗口打开产生多少 fault
 
-必须拆成：
+记录：
 
 ```text
-local_wake
-remote_wake_submit
-remote_wake_to_ready
-remote_wake_to_running
+window_create_begin_fault_count
+window_first_present_fault_count
 ```
 
-现在的 `scheduler.wake` 基本是 local wake，不能代表 SPSC remote wake。
+输出：
+
+```text
+window_surface_faults = delta
+```
+
+这是最重要的数据之一。
+
+例如：
+
+```text
+Window 800x600:
+shared faults = 469
+
+Window 1920x1080:
+shared faults = 2031
+```
+
+如果数量基本符合：
+
+```text
+surface_size / PAGE_SIZE
+```
+
+就可以确认存在 page-fault storm。
 
 ---
 
-## context_switch
+# Phase 1 — 做 A/B 验证
 
-当前单次 raw round-trip 数据噪声过大。
+先不要大改 VM。
 
-改成：
+比较：
 
 ```text
-连续执行 10000~100000 次 context switch round-trip
+resizable window
+vs
+fixed-size window
 ```
 
-再平均。
+如果当前 resizable window reserve 更大的 surface：
 
-在 benchmark 修复前：
+```text
+resizable
+    ↓
+更高首次 fault 数
+    ↓
+更明显卡顿
+```
 
-> 不把 context_switch -46.5% 视为真实优化结果。
+则进一步证明瓶颈来源。
+
+同时测试：
+
+```text
+window created
+但不 clear surface
+```
+
+和：
+
+```text
+window created
+立即 memset whole visible buffer
+```
+
+如果后者才产生停顿：
+
+> 基本确定是首次 surface page population。
 
 ---
 
-# P1 — schedule() 不再无条件扫描所有 SPSC inbox
+# Phase 2 — Window Surface Initial Populate
 
-这是最高优先级。
+这是第一项实际性能优化。
 
-当前普通：
-
-```c
-schedule()
-```
-
-会无条件：
-
-```c
-scheduler_command_drain_local(cpu_id, cpu);
-```
-
-而 drain 会：
+当前应该继续允许：
 
 ```text
-遍历所有 source CPU
-
-primary ring:
-    head
-    tail
-
-overflow ring:
-    head
-    tail
+reserve maximum virtual surface
 ```
 
-因此即使：
+例如：
 
 ```text
-没有任何 remote command
+最大 resize 空间
 ```
 
-也会执行：
-
-```text
-O(NCPU)
-```
-
-的 cacheline / atomic load。
-
-这是 `schedule +14.7%` 的第一嫌疑。
+但不要等待应用逐页 fault 当前窗口可见区域。
 
 ---
 
-## 修改目标
+## 2.1 创建窗口时只 populate 当前尺寸
 
-普通 schedule：
-
-```c
-schedule()
-{
-    if (scheduler_commands_pending(cpu_id))
-        scheduler_command_drain_local(cpu_id, cpu);
-
-    ...
-}
-```
-
-但：
-
-```c
-scheduler_commands_pending()
-```
-
-不能扫描所有 ring。
-
-应增加 per-CPU：
-
-```c
-atomic_bool command_pending;
-```
-
-或者更适合单写架构的：
-
-```c
-uint32_t command_pending;
-```
-
-由 producer 在：
+例如：
 
 ```text
-empty -> non-empty
+maximum virtual size:
+2560 × 1440 × 4
 ```
 
-时发布。
+当前窗口：
 
-consumer drain 完全部 command 后清除。
+```text
+800 × 600 × 4
+```
+
+只分配：
+
+```text
+800 × 600 × 4
+```
+
+对应物理页。
+
+其余仍保持：
+
+```text
+virtual reservation only
+```
 
 ---
 
-## 最终目标
+## 2.2 Populate 时使用批量页分配
 
-普通 local schedule：
+不要：
 
 ```text
-1 个 pending load
+for each page:
+    fault-like path
+```
+
+建议：
+
+```text
+surface_populate(
+    object,
+    page_start,
+    page_count
+);
+```
+
+内部：
+
+```text
+allocate N pages
+initialize backing entries
+map N pages
+```
+
+避免人为触发 page fault handler。
+
+---
+
+## 2.3 创建窗口完成后再 visible
+
+顺序：
+
+```text
+window object create
+ ↓
+virtual map
+ ↓
+populate initial visible area
+ ↓
+surface clear
+ ↓
+publish/show window
 ```
 
 而不是：
 
 ```text
-扫描 NCPU 个 SPSC ring
+publish window
+ ↓
+application starts drawing
+ ↓
+大量 page fault
+ ↓
+用户看见卡顿
 ```
 
 ---
 
-# P2 — 避免 IPI handler -> schedule() 重复 drain
+# Phase 3 — Resize Incremental Populate
 
-当前可能出现：
+resize 时：
 
 ```text
-IPI
- ↓
-sched_handle_reschedule_request()
- ↓
-scheduler_command_drain_local()
- ↓
-schedule()
- ↓
-scheduler_command_drain_local() AGAIN
+old_size
+    ↓
+new_size
 ```
 
-这会把同一个 scheduler boundary 的 command fabric 扫两遍。
-
----
-
-## 修改方案
-
-让：
-
-```c
-scheduler_command_drain_local()
-```
-
-返回：
-
-```c
-uint32_t consumed;
-```
-
-或者 schedule 接受：
-
-```c
-schedule_flags
-```
+只 populate 新增加区域。
 
 例如：
 
-```c
-schedule_internal(bool commands_already_drained);
+```text
+800 × 600
+    ↓
+1200 × 800
 ```
 
-IPI handler：
+不要重新处理整个 buffer。
 
-```c
-drain();
-schedule_internal(true);
-```
-
-普通路径：
-
-```c
-schedule_internal(false);
-```
-
-原则：
-
-> 一个 scheduling boundary 最多 drain 一次。
-
----
-
-# P3 — command drain 空路径必须极轻
-
-当前：
-
-```c
-scheduler_command_release_drain()
-```
-
-在 schedule 中即使没有 release item，也可能执行：
+只计算新覆盖 pages：
 
 ```text
-IRQ save
-IRQ restore
-```
-
-或者进入额外循环。
-
-应改成：
-
-```c
-if (release_head != NULL)
-    scheduler_command_release_drain(...);
-```
-
-或者维护：
-
-```c
-release_pending
-```
-
-确保：
-
-```text
-empty path = 1 个 predictable branch
+new_pages - already_populated_pages
 ```
 
 ---
 
-# P4 — schedule() 内 snapshot 只发布一次
+# Phase 4 — Fault-Around / Batch Fault
+
+即使有 initial populate，普通 shared/anon memory 仍需要高效 fault。
 
 当前：
 
 ```text
-enqueue_local()
-    -> publish snapshot
-
-dequeue_local()
-    -> publish snapshot
-
-schedule()
-    -> publish snapshot again
+one #PF
+    ↓
+one 4 KiB page
 ```
 
-一次 schedule 可能发布 2~3 次 snapshot。
+改为：
+
+```text
+one #PF
+    ↓
+populate nearby pages
+```
 
 ---
 
-## 改成 raw/local 两层 API
+## 4.1 首先测试 batch size
+
+建议：
+
+```text
+8 pages   = 32 KiB
+16 pages  = 64 KiB
+32 pages  = 128 KiB
+64 pages  = 256 KiB
+```
+
+窗口 framebuffer 推荐先测：
+
+```text
+16
+32
+```
+
+---
+
+## 4.2 顺序访问优先向前 fault-around
+
+例如 fault：
+
+```text
+page index = 100
+```
+
+可 populate：
+
+```text
+100 ... 115
+```
+
+而不是：
+
+```text
+92 ... 107
+```
+
+因为 framebuffer 第一次 clear 通常是向前顺序访问。
+
+---
+
+## 4.3 边界限制
+
+batch 不能越过：
+
+```text
+VMA end
+VM object size
+permission boundary
+guard page
+```
+
+---
+
+## 4.4 已存在 page 直接跳过
+
+batch 内：
+
+```text
+if page already populated:
+    continue
+```
+
+不要重复分配。
+
+---
+
+# Phase 5 — Shared Surface Backing Store 改成 Dense Array
+
+当前 shared anonymous backing 如果是：
+
+```text
+linked list of page nodes
+```
+
+例如：
+
+```text
+anon_page_node {
+    page_index
+    page
+    next
+}
+```
+
+那么窗口 surface 并不适合这种结构。
+
+窗口 surface 是：
+
+```text
+固定最大页数
+密集
+连续 page index
+```
+
+应该直接：
+
+```c
+struct vm_dense_pages {
+    page_t **pages;
+    uint32_t page_count;
+};
+```
+
+访问：
+
+```c
+page = pages[index];
+```
+
+O(1)。
+
+---
+
+# Phase 6 — 创建 Object 时一次分配 Page Pointer Table
+
+例如最大 surface：
+
+```text
+2560 × 1440 × 4
+≈ 14 MiB
+≈ 3600 pages
+```
+
+pointer table：
+
+```text
+3600 × 8
+≈ 28 KiB
+```
+
+非常小。
+
+比：
+
+```text
+每个新 page
+    ↓
+kmalloc anon_page_node
+```
+
+更适合。
+
+---
+
+# Phase 7 — Window Surface 专用 VM Object
+
+建议不要强迫窗口 framebuffer 与普通 sparse anonymous object 完全共用 backing 实现。
+
+增加：
+
+```text
+VM_OBJECT_ANON_SPARSE
+VM_OBJECT_SHARED_SPARSE
+
+VM_OBJECT_DENSE_SHARED
+VM_OBJECT_WINDOW_SURFACE
+```
+
+窗口 surface：
+
+```text
+dense page pointer array
++
+batch populate
++
+fault-around
+```
+
+普通 mmap 大型稀疏区域继续使用 sparse backing。
+
+---
+
+# Phase 8 — 物理页分配移出 Backing Spinlock
+
+当前如果是：
+
+```text
+lock backing
+ ↓
+lookup
+ ↓
+page_alloc()
+ ↓
+zero page
+ ↓
+kmalloc metadata
+ ↓
+insert
+ ↓
+unlock
+```
+
+则 lock 持有时间过长。
+
+改成 double-check。
+
+---
+
+## 8.1 推荐流程
+
+```text
+lock
+ ↓
+lookup(index)
+
+if exists:
+    return
+
+unlock
+
+allocate page
+zero/init page
+allocate metadata if needed
+
+lock
+ ↓
+lookup(index) AGAIN
+
+if another CPU inserted:
+    unlock
+    free temporary page
+    return existing
+
+insert new page
+unlock
+```
+
+---
+
+## 8.2 优点
+
+spinlock critical section 从：
+
+```text
+page allocation
+zeroing
+kmalloc
+list manipulation
+```
+
+缩成：
+
+```text
+lookup
+insert
+```
+
+显著降低：
+
+```text
+preempt-off
+IRQ/lock latency
+cross-core contention
+```
+
+---
+
+# Phase 9 — Dense Object 可完全避免 Metadata kmalloc
+
+如果使用：
+
+```c
+page_t **pages;
+```
+
+则 fault 时：
+
+```text
+allocate page
+pages[index] = page
+```
+
+完全没有：
+
+```text
+kmalloc anon_page_node
+```
+
+这是窗口路径很值得做的一项。
+
+---
+
+# Phase 10 — 合并 Translate + Map Page Table Walk
+
+当前 page fault 可能执行：
+
+```text
+x86_translate_page()
+    ↓
+page-table lock
+4-level walk
+unlock
+```
+
+然后：
+
+```text
+x86_map_page()
+    ↓
+page-table lock
+4-level walk AGAIN
+create/map
+unlock
+```
+
+这属于明显重复。
+
+---
+
+## 10.1 新增 Fault 专用接口
 
 例如：
 
 ```c
-enqueue_local_raw(cpu, thread);
-dequeue_local_raw(cpu, thread);
+x86_fault_map_page(
+    vm_space_t *space,
+    vaddr_t va,
+    paddr_t pa,
+    uint64_t flags,
+    bool *already_present
+);
 ```
 
-不 publish。
+一次：
 
-普通外部 local enqueue：
-
-```c
-enqueue_local()
-{
-    enqueue_local_raw();
-    scheduler_publish_queue_snapshot();
-}
-```
-
-schedule：
-
-```c
-schedule()
-{
-    ...
-    enqueue_local_raw(current);
-    ...
-    dequeue_local_raw(next);
-    ...
-    scheduler_publish_queue_snapshot(cpu); // exactly once
-}
+```text
+take PT lock
+ ↓
+walk
+ ↓
+if existing PTE:
+    report existing
+else:
+    create intermediate tables
+    install PTE
+ ↓
+unlock
 ```
 
 ---
 
-## 目标
+## 10.2 目标
 
-每个 schedule：
+正常 not-present fault：
 
 ```text
-最多一次 snapshot calculation
-最多一次 snapshot store
+one PT lock acquisition
+one page-table walk
+```
+
+而不是：
+
+```text
+two locks
+two walks
 ```
 
 ---
 
-# P5 — `sched_block_current()` 做 owner-local fast path
+# Phase 11 — Batch Page Table Mapping
 
-当前 block 路径存在重复：
-
-```text
-sched_block_current()
-    ↓
-已经知道 current CPU/current thread
-    ↓
-sched_publish_blocked()
-    ↓
-再次 current CPU lookup
-再次 owner validation
-再次 CPU available 检查
-```
-
-这是不必要的。
-
----
-
-## 新增
+配合 fault-around：
 
 ```c
-static inline bool sched_publish_blocked_local(
-    uint32_t cpu_id,
-    thread_t *thread);
+x86_map_pages(
+    space,
+    virtual_start,
+    pages[],
+    count,
+    flags
+);
 ```
 
-假设调用者已经确认：
+一次 page-table lock 下安装多个连续 PTE。
+
+例如：
 
 ```text
-thread == cpu->queue.current
-thread->owner_cpu == cpu_id
+32-page fault-around
 ```
-
-只执行：
-
-```c
-if (state != THREAD_RUNNING)
-    return false;
-
-epoch++;
-
-state = THREAD_BLOCKED;
-```
-
----
-
-# P6 — block_epoch 内存序优化
-
-当前 block：
-
-```text
-block_epoch update
-state -> BLOCKED
-```
-
-无需两个 release。
-
-推荐：
-
-```c
-atomic_store_explicit(
-    &thread->block_epoch,
-    new_epoch,
-    memory_order_relaxed);
-
-atomic_store_explicit(
-    &thread->state,
-    THREAD_BLOCKED,
-    memory_order_release);
-```
-
-remote wake：
-
-```c
-state acquire
-```
-
-即可看到 epoch publication。
-
-原则：
-
-```text
-epoch = relaxed
-state BLOCKED = release
-remote state = acquire
-```
-
----
-
-# P7 — owner CPU 写 thread state 时减少 CAS
-
-ownership 已经建立后，重新审计：
-
-```text
-thread->state
-```
-
-所有 mutation。
-
-如果确认：
-
-```text
-只有 owner CPU 写
-```
-
-则：
-
-```c
-CAS(RUNNING, BLOCKED)
-CAS(BLOCKED, READY)
-CAS(READY, ...)
-```
-
-逐步替换成：
-
-```text
-owner-side load/check
-+
-plain/atomic store
-```
-
-remote CPU：
-
-```text
-禁止写 state
-只发 scheduler command
-```
-
-保留 acquire reader 即可。
-
-不要一次全部替换。
-
-按：
-
-```text
-block
-wake
-enqueue
-migration
-exit
-```
-
-逐路径验证。
-
----
-
-# P8 — local wake 不要给自己发 LAPIC IPI
-
-当前 local wake 成功后如果仍然：
-
-```c
-x86_smp_request_reschedule(cpu_id);
-```
-
-且：
-
-```text
-cpu_id == caller_cpu
-```
-
-就可能产生 self IPI。
-
-这不合理。
-
----
-
-## 改成
-
-per-CPU：
-
-```c
-bool need_resched;
-```
-
-local wake：
-
-```c
-cpu->need_resched = true;
-```
-
-remote wake：
-
-```text
-SPSC
-+
-IPI
-```
-
----
-
-## 但必须先确认这些路径消费 need_resched
-
-```text
-syscall exit
-interrupt exit
-scheduler boundary
-preempt enable
-idle loop
-```
-
-必须全部覆盖后才能删 self IPI。
-
----
-
-# P9 — need_resched 成为核心调度条件
 
 不要：
 
 ```text
-timer tick == schedule()
+32 × x86_map_page()
+```
+
+---
+
+# Phase 12 — Page Table Lock 从 Global 改为 Per Address Space
+
+这是后期优化。
+
+如果当前：
+
+```text
+g_page_table_lock
+```
+
+保护所有 address spaces，
+
+则：
+
+```text
+Process A fault
+Process B fault
+kernel map
+window process fault
+```
+
+全部竞争一个 lock。
+
+---
+
+## 12.1 推荐
+
+每个：
+
+```c
+vm_space_t
+```
+
+拥有：
+
+```c
+spinlock_t page_table_lock;
+```
+
+只保护：
+
+```text
+自己的 user page table
+```
+
+kernel shared page table 单独锁。
+
+---
+
+## 12.2 不要一开始做 hashed PT locks
+
+先完成：
+
+```text
+global
+    ↓
+per-vm_space
+```
+
+通常已经能去掉绝大多数无关 contention。
+
+只有 profile 表明单个地址空间 page-table lock 成热点以后再考虑：
+
+```text
+per-PML4
+hashed page-table locks
+```
+
+---
+
+# Phase 13 — 缩短 vm_space map_lock 持有范围
+
+当前如果：
+
+```text
+map_lock
+ ↓
+VMA lookup
+ ↓
+backing allocation
+ ↓
+page zeroing
+ ↓
+page table mapping
+ ↓
+unlock
+```
+
+则锁粒度过大。
+
+---
+
+## 推荐流程
+
+```text
+map read lock
+ ↓
+lookup VMA
+ ↓
+validate permission
+ ↓
+pin/reference VM object
+ ↓
+capture:
+    object
+    offset
+    protection
+ ↓
+unlock map
+
+backing page lookup/allocation
+
+map PTE
+
+release object reference
+```
+
+---
+
+# Phase 14 — VMA Lookup 本身暂时不要重写
+
+当前如果已经使用 RB-tree：
+
+```text
+VMA lookup = O(logN)
+```
+
+这通常不是窗口卡顿的主要来源。
+
+不要为了性能立即换：
+
+```text
+Maple Tree
+interval tree
+custom radix tree
+```
+
+先 profile。
+
+只有：
+
+```text
+VMA lookup 占 fault latency 很高
+```
+
+才考虑替换。
+
+---
+
+# Phase 15 — Zero Page / Demand-Zero Optimization
+
+窗口 framebuffer 第一次访问通常需要零初始化。
+
+目前可能是：
+
+```text
+page_alloc(PAGE_ALLOC_ZERO)
+```
+
+意味着每页：
+
+```text
+4 KiB memset
+```
+
+---
+
+## 15.1 如果窗口创建后必定 clear 全 buffer
+
+那么：
+
+> 内核先 zero page，应用马上再写满一次，相当于重复写内存。
+
+这会浪费大量 bandwidth。
+
+---
+
+## 15.2 增加 no-zero populate 模式
+
+仅在安全情况下允许：
+
+```text
+WINDOW_SURFACE_DISCARD_CONTENT
+```
+
+创建新的 window surface：
+
+```text
+physical page allocate
+不清零
+```
+
+然后要求：
+
+```text
+surface 在暴露给用户/显示系统以前必须被完整 clear
+```
+
+---
+
+## 安全要求
+
+不能让应用读取到其他进程旧内存。
+
+所以只能在：
+
+```text
+kernel guarantees full overwrite before user-readable
+```
+
+的路径使用。
+
+如果无法严格保证：
+
+> 继续 zero。
+
+不要为了性能破坏内存隔离。
+
+---
+
+# Phase 16 — 可选 Shared Zero Page
+
+对普通匿名只读零页可以：
+
+```text
+all fresh anon pages
+    ↓
+map shared global zero page read-only
+```
+
+第一次 write：
+
+```text
+write fault
+ ↓
+allocate private page
+```
+
+但对于窗口 framebuffer：
+
+```text
+马上会整块写入
+```
+
+通常收益不大，甚至增加一次额外 write fault。
+
+所以：
+
+> 不作为窗口优化重点。
+
+---
+
+# Phase 17 — 2 MiB Huge Page
+
+窗口 buffer 足够大且连续时可探索：
+
+```text
+2 MiB huge page
+```
+
+但这是后期优化。
+
+需要：
+
+```text
+2 MiB physical contiguous allocation
+2 MiB alignment
+surface layout compatibility
+```
+
+不要作为第一轮解决方案。
+
+---
+
+# Phase 18 — Window Surface Memory Pool
+
+如果窗口频繁：
+
+```text
+create
+destroy
+create
+destroy
+```
+
+可以建立：
+
+```text
+window surface page pool
+```
+
+缓存近期释放的 clean pages。
+
+减少：
+
+```text
+buddy alloc
+page metadata
+zero path
+```
+
+---
+
+## Pool 规则
+
+只缓存：
+
+```text
+已安全清零
+```
+
+或者进入 pool 后统一清零。
+
+不能跨进程泄漏内容。
+
+---
+
+# Phase 19 — Zeroing 批处理
+
+如果必须 zero：
+
+不要每次 page fault：
+
+```text
+allocate one
+zero one
+```
+
+batch populate 时：
+
+```text
+allocate N pages
+ ↓
+zero N pages
+```
+
+允许：
+
+```text
+SIMD
+rep stosq
+non-temporal store
+```
+
+以后再 benchmark。
+
+先保证 batch 架构。
+
+---
+
+# Phase 20 — Prefault API
+
+为明确知道即将访问范围的内核/用户对象提供：
+
+```c
+vm_prefault(
+    address,
+    length,
+    flags
+);
+```
+
+或者内核内部：
+
+```c
+vm_populate_range(
+    space,
+    start,
+    length
+);
+```
+
+窗口创建直接调用：
+
+```text
+vm_populate_range(initial visible surface)
+```
+
+---
+
+# Phase 21 — Window Resize 策略
+
+resize 不要：
+
+```text
+resize
+ ↓
+第一次 repaint
+ ↓
+大量 page fault
 ```
 
 应该：
 
 ```text
-timer
+resize request
  ↓
-accounting
+compute newly visible pages
  ↓
-policy decision
+populate range
  ↓
-need_resched = true/false
-```
-
-只有：
-
-```text
-need_resched
-```
-
-才进入 schedule。
-
----
-
-## FAIR
-
-如果：
-
-```text
-nr_running == 0
-```
-
-当前线程就是唯一 runnable：
-
-```text
-不 schedule
+update geometry
+ ↓
+repaint
 ```
 
 ---
 
-## RT
+# Phase 22 — Surface Growth Granularity
 
-只有：
+不要每次 resize 只扩展精确像素对应的 pages。
 
-```text
-更高优先级 thread
-RR slice expired
-policy requires preemption
-```
-
-才设置 need_resched。
-
----
-
-# P10 — FAIR RB-tree 增加 cached leftmost
-
-当前 FAIR 经常：
-
-```c
-rb_tree_first(&rq->fair_root);
-```
-
-沿左边遍历。
-
-增加：
-
-```c
-rb_node_t *fair_leftmost;
-```
-
-或：
-
-```c
-thread_t *fair_leftmost;
-```
-
----
-
-## insert
-
-如果：
+可以按：
 
 ```text
-new vruntime < leftmost
+64 KiB
+256 KiB
+1 MiB
 ```
 
-更新 leftmost。
-
----
-
-## remove
-
-只有：
-
-```text
-removed == leftmost
-```
-
-才计算 successor/new leftmost。
-
----
-
-## pick
-
-直接：
-
-```c
-return rq->fair_leftmost;
-```
-
-目标：
-
-```text
-FAIR pick O(1)
-```
-
-保持 RB-tree insert/remove O(logN)。
-
----
-
-# P11 — schedule fast path
-
-最终普通 local schedule 应接近：
-
-```c
-schedule()
-{
-    irq_disable();
-
-    if (unlikely(command_pending))
-        drain_commands();
-
-    current = cpu->current;
-
-    if (current_should_requeue)
-        enqueue_raw(current);
-
-    next = pick_next_fast();
-
-    if (next != current)
-        dequeue_raw(next);
-
-    publish_snapshot_once();
-
-    if (next == current) {
-        irq_restore();
-        return;
-    }
-
-    context_switch();
-}
-```
-
----
-
-## 重点增加 `next == current` fast path
-
-如果最终：
-
-```text
-next == current
-```
-
-尽量不要继续：
-
-```text
-FPU switch bookkeeping
-CR3 bookkeeping
-TSS update
-context switch preparation
-```
-
-直接返回。
-
----
-
-# P12 — command fabric 不允许 O(NCPU) common scan
-
-长期优化。
-
-当前：
-
-```text
-destination CPU
-遍历所有 source ring
-```
-
-即使增加 `command_pending`，真的有 command 时仍然 O(NCPU)。
-
-进一步增加：
-
-```text
-active source bitmap
-```
-
-例如：
-
-```c
-uint64_t active_sources;
-```
-
-如果 CPU 数 <=64。
-
-producer：
-
-```text
-ring empty -> non-empty
-    ↓
-set source bit
-```
-
-consumer：
-
-```text
-while bitmap:
-    source = ctz(bitmap)
-    drain source ring
-```
-
-但注意：
-
-> 不要用一个所有 producer 竞争的全局 atomic bitmap，重新制造 MPSC cacheline contention。
-
-更适合：
-
-```text
-每 source 一个 pending byte/cacheline-friendly flag
-+
-destination 维护 cached active list
-```
-
-或者保留 O(N) drain，仅保证：
-
-```text
-没有 command 时不扫描
-```
-
-先做 P1，之后测量再决定。
-
----
-
-# P13 — SPSC ring entry 尽量紧凑
-
-当前 command struct 如果过大，检查能否缩成：
-
-```c
-struct sched_cmd {
-    uintptr_t thread;
-    uint32_t generation;
-    uint16_t op;
-    uint16_t data;
-};
-```
-
-优先控制到：
-
-```text
-16 bytes
-```
-
-甚至后期考虑：
-
-```text
-8 bytes
-```
-
-但：
-
-> 不允许为了压结构破坏 generation/ownership correctness。
-
----
-
-# P14 — ring head/tail cacheline 与 layout
-
-确认：
-
-```text
-producer tail
-consumer head
-```
-
-不在同 cacheline。
-
-检查：
-
-```c
-_Static_assert(offsetof(...tail...) ...)
-```
-
-必要时：
-
-```c
-alignas(64)
-```
-
-但避免每个 8-entry ring 膨胀过大。
-
-如果：
-
-```text
-MAX_CPU = 256
-```
-
-每 CPU pair 都做 128B header 会非常浪费。
-
-应评估真实 CPU 上限。
-
----
-
-# P15 — release queue 与 command refs 优化
-
-ownership 重构后增加的：
-
-```text
-command reference
-release queue
-deferred release
-```
-
-不要让它们进入每次 schedule common path。
-
-目标：
-
-```text
-只有真的 command ref -> 0
-```
-
-才进入 release handling。
-
-空 schedule：
-
-```text
-0 release bookkeeping
-```
-
----
-
-# P16 — migration 不进普通 schedule common path
-
-检查：
-
-```text
-migration_pending
-migration_complete
-owner transfer
-```
-
-是否每次 schedule 都检查。
-
-如果是：
-
-```text
-unlikely()
-```
-
-并用：
-
-```c
-if (unlikely(cpu->migration_pending))
-```
-
-保护。
-
-普通线程：
-
-```text
-0 migration work
-```
-
----
-
-# P17 — branch hint
-
-对明确冷路径使用：
-
-```c
-likely()
-unlikely()
-```
+增长。
 
 例如：
 
 ```text
-remote command pending
-migration
-thread DEAD
-reaper
-ring overflow
-fallback
+需要 +80 KiB
 ```
 
-不要滥用。
-
-schedule common path应是：
+直接 populate：
 
 ```text
-running FAIR thread
-无 remote command
-无 migration
-无 death
++256 KiB
+```
+
+减少连续 resize 时反复 fault/populate。
+
+需要 benchmark 内存占用与 latency。
+
+---
+
+# Phase 23 — Page Fault Fast Path
+
+最终普通匿名 not-present fault 应接近：
+
+```text
+#PF
+ ↓
+lookup VMA
+ ↓
+lookup backing
+ ↓
+page exists?
+   ├─ yes -> map
+   └─ no  -> allocate
+ ↓
+install PTE
+ ↓
+return
+```
+
+不要进入：
+
+```text
+复杂 generic object dispatch
+重复页表查询
+多个 global lock
+多次 metadata allocation
+跨 CPU synchronization
 ```
 
 ---
 
-# P18 — struct scheduler_cpu 热冷分离
+# Phase 24 — Window Surface Fast Path
 
-重新看：
-
-```c
-scheduler_cpu_t
-```
-
-把 schedule 每次访问的放前面：
+最终窗口首次显示：
 
 ```text
-current
-rq hot fields
-nr_running
-need_resched
-fair_leftmost
-snapshot
+window_create
+ ↓
+reserve max VA
+ ↓
+allocate current visible page batch
+ ↓
+map current range batch
+ ↓
+clear once
+ ↓
+publish window
 ```
 
-冷字段：
+理想情况下：
 
 ```text
-reaper
-migration diagnostics
-command stats
-overflow
-debug counters
-```
-
-放后面甚至单独 cold struct。
-
-目标：
-
-```text
-schedule hot fields 尽可能落在 1~2 cacheline
+first draw page faults ≈ 0
 ```
 
 ---
 
-# P19 — thread_t scheduler hot fields聚合
+# Phase 25 — Benchmark 场景
 
-将 schedule 高频字段尽量放一起：
+必须建立以下测试。
 
-```text
-state
-owner_cpu
-sched_class
-priority
-flags
-vruntime
-rq linkage
-```
-
-避免：
+## A. Fixed 800×600
 
 ```text
-schedule()
-```
-
-访问 thread_t 多个远距离 cacheline。
-
-block_epoch/migration/debug 等低频字段可以分离。
-
-重新 benchmark `dequeue +6.2%`，因为这次 thread_t 变大很可能影响 cache locality。
-
----
-
-# P20 — dequeue benchmark 后再决定算法改动
-
-不要为了现在的：
-
-```text
-dequeue +6.2%
-```
-
-立即换 RB-tree。
-
-先完成：
-
-```text
-P0 benchmark fix
-P10 cached leftmost
-P18/P19 cache layout
-```
-
-再测。
-
-只有确认 RB erase 真的是热点，再做更深入优化。
-
----
-
-# P21 — remote wake benchmark
-
-新增真正的跨核测试：
-
-```text
-CPU0:
-    wake thread owned by CPU1
-
-CPU1:
-    consume SPSC
-    READY
-    RUNNING
+create
+first clear
+first present
 ```
 
 记录：
 
 ```text
-submit cycles
-IPI latency
-queue wait
-drain cycles
-READY latency
-RUNNING latency
+fault count
+create latency
+first draw latency
 ```
-
-必须区分：
-
-```text
-ring submit
-IPI
-scheduler
-context switch
-```
-
-否则无法知道 remote wake 慢在哪里。
 
 ---
 
-# P22 — scheduler telemetry 不进入 hot measurement
+## B. Resizable 800×600
 
-确认 telemetry：
-
-```text
-timestamp
-emit
-buffer
-atomic counter
-```
-
-不污染被测范围。
-
-正确：
+最大 surface 可设：
 
 ```text
-start
-operation repeated N times
-end
-
-emit once
+2560×1440
 ```
+
+但当前只显示：
+
+```text
+800×600
+```
+
+验证：
+
+```text
+物理页只分配当前区域
+```
+
+---
+
+## C. 1920×1080
+
+验证大 surface。
+
+---
+
+## D. 连续创建 10/100 个窗口
+
+查看：
+
+```text
+allocator pressure
+page pool
+fault p95
+```
+
+---
+
+## E. Resize stress
+
+```text
+640x480
+ ↓
+800x600
+ ↓
+1024x768
+ ↓
+1280x720
+ ↓
+1920x1080
+```
+
+测：
+
+```text
+resize latency
+new faults
+new pages allocated
+```
+
+---
+
+# Phase 26 — 输出指标
+
+每个窗口输出：
+
+```text
+window_create_us
+surface_populate_us
+first_clear_us
+first_present_us
+
+fault_count
+shared_fault_count
+
+pages_allocated
+pages_prefaulted
+pages_fault_around
+
+page_fault_avg_ns
+page_fault_p95_ns
+page_fault_p99_ns
+```
+
+---
+
+# Phase 27 — 第一轮优化执行顺序
+
+第一轮只做：
+
+```text
+P0  telemetry
+
+P1  确认窗口打开时 fault 数
+
+P2  initial visible surface populate
+
+P3  resize incremental populate
+
+P4  fault-around 16/32 pages
+```
+
+然后 benchmark。
+
+不要同时重构：
+
+```text
+page-table locks
+VM object storage
+VMA locking
+huge page
+```
+
+---
+
+# Phase 28 — 第二轮
+
+如果第一次窗口卡顿明显下降，再做：
+
+```text
+P5  dense shared/window surface backing
+
+P6  删除 per-page metadata kmalloc
+
+P8  backing allocation 移出 spinlock
+
+P10 translate+map 合并
+
+P11 batch page table mapping
+```
+
+---
+
+# Phase 29 — 第三轮
+
+只有 profile 仍显示锁 contention 时：
+
+```text
+P12 global PT lock -> per-vm-space
+
+P13 缩短 map_lock
+
+P18 window page pool
+
+P19 batch zero
+```
+
+---
+
+# Phase 30 — 最后再考虑
+
+```text
+huge pages
+zero page
+advanced VMA tree
+hashed PT locks
+NUMA allocation
+```
+
+这些不是当前窗口卡顿的第一优先级。
+
+---
+
+# 31. 第一轮预期效果
+
+当前：
+
+```text
+window first draw
+    ↓
+hundreds/thousands of #PF
+```
+
+第一轮后目标：
+
+```text
+window create
+    ↓
+populate current visible surface
+```
+
+因此：
+
+```text
+first draw shared faults
+≈ 0
+```
+
+或者极少。
+
+resize：
+
+```text
+只 fault/populate 新增区域
+```
+
+---
+
+# 32. 架构原则
+
+保留 demand paging。
+
+但 demand paging 主要用于：
+
+```text
+未知访问模式
+稀疏内存
+普通 mmap
+heap
+stack
+```
+
+窗口 framebuffer 属于：
+
+```text
+已知会很快连续写入
+```
+
+应采用：
+
+```text
+eager initial population
++
+incremental resize
++
+fault-around fallback
+```
+
+而不是纯逐页 lazy allocation。
+
+---
+
+# 33. 禁止事项
 
 不要：
 
+1. 直接把所有预留 surface 全部物理分配。
+2. 为了窗口性能关闭内存隔离。
+3. 把所有匿名内存都改成 dense array。
+4. 在持有 spinlock 时做大量 page_alloc/zero/kmalloc。
+5. 一个 32-page batch 调用 32 次完整 x86_map_page。
+6. 未 benchmark 就直接上 huge page。
+7. 为解决卡顿重写整个 VMA subsystem。
+8. 在每次 page fault 打串口日志。
+9. 让 page fault 路径参与不必要的 scheduler/跨 CPU 消息。
+10. 同一个 commit 同时修改所有 VM 子系统。
+
+---
+
+# 34. 最终期望架构
+
 ```text
-每次 operation 都 emit
+                 VM
+                  │
+       ┌──────────┴──────────┐
+       │                     │
+ sparse anonymous       dense shared
+       │                     │
+ demand paging          window surface
+       │                     │
+  one/batch fault       initial populate
+                             │
+                        incremental resize
+                             │
+                         fault-around
+```
+
+窗口路径：
+
+```text
+Window Create
+     │
+     ├─ reserve maximum VA
+     │
+     ├─ create dense surface object
+     │
+     ├─ populate visible pages
+     │
+     ├─ batch map
+     │
+     └─ publish window
+```
+
+page fault 变成：
+
+```text
+正常 fallback
+```
+
+而不是：
+
+```text
+窗口初始化的主要内存分配机制
 ```
 
 ---
 
-# 执行优先级
+# 35. Codex 第一阶段任务
 
-## 第一批：必须马上做
+Codex 先只执行：
 
 ```text
-P0  benchmark 修复
-P1  schedule 不再无条件扫描 command rings
-P2  消除重复 drain
-P3  release empty fast-path
-P4  snapshot 一次发布
-P5  block owner-local fast path
-P6  block_epoch 内存序优化
+1. 增加 page fault 分段 telemetry
+
+2. 增加 window_surface fault counter
+
+3. 测试打开一个窗口触发的 fault 数量
+
+4. 为窗口当前可见 surface 实现
+   vm_populate_range()
+
+5. 创建窗口时 populate 当前 width × height
+
+6. resize 时只 populate newly exposed pages
+
+7. 增加 16/32-page fault-around
+
+8. Windows build + QEMU
+
+9. 输出优化前后：
+   window create latency
+   first draw latency
+   fault count
+   fault avg/p95/p99
 ```
 
-目标首先解决：
+第一阶段结束后先提交数据。
+
+暂时不要继续：
 
 ```text
-schedule +14.7%
-block    +39.1%
-wake_to_running +8.4%
-```
-
----
-
-## 第二批
-
-```text
-P8  local wake 去 self IPI
-P9  need_resched
-P10 FAIR cached leftmost
-P11 schedule fast path
-P15 release bookkeeping cold path
-P16 migration cold path
-```
-
----
-
-## 第三批
-
-```text
-P7  state CAS -> owner store
-P12 command fabric进一步优化
-P13 command压缩
-P14 SPSC layout
-P18 scheduler_cpu cache layout
-P19 thread_t cache layout
-P20 dequeue专项
-P21 remote wake专项benchmark
-```
-
----
-
-# 阶段验收目标
-
-第一阶段完成后，希望至少看到：
-
-```text
-schedule          < baseline
-block             接近或低于 baseline
-wake_to_running   接近 schedule 的改善
-enqueue           保持当前 -7.6% 左右
-wake              保持当前 -6.6% 或更好
+dense backing rewrite
+global page-table lock rewrite
+VMA lock rewrite
+huge page
 ```
 
 如果：
 
 ```text
-schedule 仍 > baseline
+window first fault count
 ```
 
-不要继续扩大 SPSC 架构，继续 profile schedule。
+和卡顿已经大幅下降，
 
----
-
-# 最重要的架构要求
-
-不要因为 benchmark 回退重新引入：
-
-```text
-remote rq lock
-remote thread state writer
-global MPSC scheduler queue
-```
-
-当前 ownership/SPSC 方向保留。
-
-现在需要做的是：
-
-> 把 ownership 架构的管理成本从 common path 移到真正发生 remote event 的 cold path。
-
-最终 common local schedule 应该几乎完全不知道：
-
-```text
-其他 CPU
-SPSC
-migration
-command release
-remote ownership
-```
-
-除非：
-
-```text
-pending flag != 0
-```
-
-才进入这些路径。
+再进入第二阶段。

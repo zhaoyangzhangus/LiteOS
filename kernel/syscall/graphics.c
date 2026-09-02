@@ -7,6 +7,8 @@
 #include <kernel/gpu.h>
 #include <kernel/input.h>
 #include <kernel/mm.h>
+#include <kernel/perf.h>
+#include <kernel/telemetry.h>
 #include <kernel/vm.h>
 #include <kernel/window_server.h>
 #include <uapi/display.h>
@@ -382,6 +384,7 @@ int64_t syscall_window_create(uint64_t arguments_pointer, uint64_t unused1,
     window_server_window_t *window = 0;
     handle_t handle = OS_INVALID_HANDLE;
     kstatus_t status;
+    uint64_t create_tsc = telemetry_timestamp();
     (void)unused1;
     (void)unused2;
     (void)unused3;
@@ -410,6 +413,9 @@ int64_t syscall_window_create(uint64_t arguments_pointer, uint64_t unused1,
     if (status == K_OK) {
         status = window_server_set_owner_address(window, arguments.address);
     }
+    if (status == K_OK && (arguments.flags & OS_WINDOW_VISIBLE) != 0U) {
+        status = window_server_set(window, arguments.x, arguments.y, 1U);
+    }
     if (status == K_OK) {
         arguments.window = handle;
         arguments.identifier = window_server_window_identifier(window);
@@ -419,6 +425,14 @@ int64_t syscall_window_create(uint64_t arguments_pointer, uint64_t unused1,
     }
     if (status != K_OK && handle != OS_INVALID_HANDLE) {
         (void)handle_close(&process->handles, handle);
+    }
+    if (status == K_OK) {
+        uint64_t elapsed_tsc = telemetry_timestamp() - create_tsc;
+        kernel_perf_emit_scope("window.create", create_tsc);
+        kernel_perf_emit_value(
+            "window_create_us",
+            x86_boot_cpu_features.tsc_hz == 0U ? 0U :
+                x86_tsc_to_ns(elapsed_tsc) / 1000U);
     }
     object_put(window);
     return status;

@@ -89,6 +89,13 @@ struct window_server_window {
     uint64_t buffer_size;
     uint64_t owner_address;
 
+    /* Surface population/first-present telemetry and deferred resize work. */
+    uint64_t create_tsc;
+    uint64_t surface_fault_count_at_create;
+    uint64_t surface_populated_bytes;
+    uint64_t surface_populate_pending_end;
+    bool surface_metrics_reported;
+
     void *compositor_cache;
 
     /* Geometry committed by the retained scene/scanout. */
@@ -510,6 +517,8 @@ bool window_route_drag_motion_batch_locked(
     const window_motion_batch_t *batch);
 void window_flush_motion_batch_locked(window_motion_batch_t *batch);
 void window_route_pointer_transaction_locked(const input_event_t *event);
+uint64_t window_surface_page_span(uint32_t width, uint32_t height);
+void window_surface_populate_pending(void);
 void desktop_cycle_window_focus(void);
 bool desktop_restore_minimized_app(uint32_t app);
 kstatus_t desktop_launch_program(uint32_t app);

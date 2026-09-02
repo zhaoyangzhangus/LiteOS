@@ -32,6 +32,10 @@ enum vm_object_type {
     VM_OBJECT_DEVICE,
 };
 
+enum vm_object_flags {
+    VM_OBJECT_FLAG_WINDOW_SURFACE = 1u << 0,
+};
+
 /* File-backed VM objects consume this lower-level mapping contract.  VFS (or
  * another file provider) owns the concrete mapping and page-cache policy. */
 typedef struct vm_file_ops {
@@ -61,6 +65,12 @@ typedef struct vm_object {
     } u;
     void *private_data;
     void (*private_release)(void *private_data);
+
+    /* Window-surface accounting stays on the object so aliases share it. */
+    atomic_uint_fast64_t fault_count;
+    atomic_uint_fast64_t populated_pages;
+    atomic_uint_fast64_t prefaulted_pages;
+    atomic_uint_fast64_t fault_around_pages;
 } vm_object_t;
 
 typedef struct vm_area {
@@ -129,6 +139,8 @@ bool vm_range_is_mapped(vm_space_t *mm, vaddr_t addr, size_t size);
 kstatus_t vm_sync(vm_space_t *mm, vaddr_t addr, size_t size, uint32_t flags);
 kstatus_t vm_advise(vm_space_t *mm, vaddr_t addr, size_t size, uint32_t advice);
 kstatus_t vm_handle_fault(vm_space_t *mm, const vm_fault_info_t *fault);
+/* Populate an already mapped, page-aligned range without entering user mode. */
+kstatus_t vm_populate_range(vm_space_t *mm, vaddr_t start, size_t length);
 /* Resolve the current thread's user page fault.  The architecture layer only
  * supplies CR2, the CPU error code, and whether the entry came from user or
  * uaccess code; VM owns address-space and permission policy. */
@@ -162,4 +174,13 @@ kstatus_t vm_object_shared_page_direct(vm_object_t *object,
                                        uint64_t offset,
                                        bool create,
                                        uint8_t **out);
+void vm_object_mark_window_surface(vm_object_t *object);
+uint64_t vm_object_fault_count(const vm_object_t *object);
+uint64_t vm_object_populated_pages(const vm_object_t *object);
+uint64_t vm_object_prefaulted_pages(const vm_object_t *object);
+uint64_t vm_object_fault_around_pages(const vm_object_t *object);
+
+/* Page-fault telemetry is emitted once per measurement window, never per PF. */
+void vm_fault_telemetry_reset(void);
+void vm_fault_telemetry_report(void);
 kstatus_t vm_space_clone_cow(vm_space_t *source, vm_space_t **out);
