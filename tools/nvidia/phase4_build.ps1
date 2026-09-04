@@ -78,6 +78,10 @@ if ($RealTest) {
     # Real-test images need serial evidence and the FAT32 log path.  Keep this
     # opt-in so the normal LiteOS build remains byte-for-byte out of scope for
     # the Phase 4 hardware preparation path.
+    # LITEOS_REALTEST changes compiled code, while the shared make dependency
+    # stamps do not encode every CFLAGS value.  Force a clean target rebuild so
+    # a reused Build directory cannot mix ordinary and real-test objects.
+    $makeArguments = @('-B') + $makeArguments
     $makeArguments += @('DEBUG=2', 'LITEOS_DEBUG_SERIAL=1', 'LITEOS_REALTEST=1')
     $makeArguments += 'esp'
 }
