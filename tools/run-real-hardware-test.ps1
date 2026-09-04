@@ -4,6 +4,7 @@ param(
     [ValidatePattern('^[A-Za-z]:?$')]
     [string]$DriveLetter = 'F',
     [string]$Build = 'build-realtest',
+    [switch]$NvidiaPhase4,
     [switch]$DiagnosticBot,
     [switch]$Rtl8126FirmwareDownload,
     [switch]$ForceReboot,
@@ -172,11 +173,25 @@ if (-not $firmwareId) {
     throw "No UEFI firmware entry for $letter`: \\EFI\\BOOT\\BOOTX64.EFI was found."
 }
 
-$buildScript = Join-Path $projectRoot 'tools\build-windows.ps1'
-$buildArguments = @('-Build', $Build, '-Debug', '2', '-RealTest')
-if ($DiagnosticBot) { $buildArguments += '-DiagnosticBot' }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
-if ($LASTEXITCODE -ne 0) { throw "Physical real-test build failed ($LASTEXITCODE)." }
+$espPath = $null
+if ($NvidiaPhase4) {
+    # This switch is intentionally opt-in.  The ordinary real-test path keeps
+    # building the production LiteOS image; the NVIDIA path must use the
+    # strong Phase 4 vendor-RM link produced by phase4_build.ps1.
+    $buildScript = Join-Path $projectRoot 'tools\nvidia\phase4_build.ps1'
+    $buildArguments = @('-Build', $Build, '-RealTest')
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
+    if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 4 build failed ($LASTEXITCODE)." }
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase4\esp'
+}
+else {
+    $buildScript = Join-Path $projectRoot 'tools\build-windows.ps1'
+    $buildArguments = @('-Build', $Build, '-Debug', '2', '-RealTest')
+    if ($DiagnosticBot) { $buildArguments += '-DiagnosticBot' }
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
+    if ($LASTEXITCODE -ne 0) { throw "Physical real-test build failed ($LASTEXITCODE)." }
+    $espPath = Join-Path (Join-Path $projectRoot $Build) 'esp'
+}
 
 if ($Rtl8126FirmwareDownload) {
     $firmwareScript = Join-Path $projectRoot 'tools\stage-rtl8126-firmware.ps1'
@@ -187,7 +202,6 @@ if ($Rtl8126FirmwareDownload) {
     }
 }
 
-$espPath = Join-Path (Join-Path $projectRoot $Build) 'esp'
 foreach ($required in @(
     'EFI\BOOT\BOOTX64.EFI',
     'EFI\LITEOS\kernel.elf',

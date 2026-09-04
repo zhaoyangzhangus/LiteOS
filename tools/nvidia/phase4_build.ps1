@@ -1,12 +1,23 @@
 [CmdletBinding()]
 param(
-    [string]$Make = 'make'
+    [string]$Make = 'make',
+    [string]$Build = 'build',
+    [switch]$RealTest
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-RelativeBuild([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name) -or
+        [IO.Path]::IsPathRooted($Name) -or
+        $Name -match '(^|[\\/])\.\.(?:[\\/]|$)') {
+        throw "Build directory must be relative to the project: $Name"
+    }
+}
+
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+Assert-RelativeBuild $Build
 $vendorRoot = Join-Path $repoRoot 'third_party\nvidia\595.84'
 $vendorSourceRoot = Join-Path $vendorRoot 'open-gpu-kernel-modules'
 $abiSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi'
@@ -62,11 +73,35 @@ Require-File (Join-Path $phase3Root 'vendor_abi_link_objects.list') 'Phase 3 ABI
 Require-File (Join-Path $phase3Root 'liteos_probe_objects.list') 'Phase 3 LiteOS object list'
 Require-File $linkerScript 'Phase 4 linker script'
 
-$makeOutput = @(& $Make 'loader' 'kernel' 2>&1 |
-    ForEach-Object { $_.ToString() })
-$makeExitCode = $LASTEXITCODE
+$makeArguments = @("BUILD=$Build")
+if ($RealTest) {
+    # Real-test images need serial evidence and the FAT32 log path.  Keep this
+    # opt-in so the normal LiteOS build remains byte-for-byte out of scope for
+    # the Phase 4 hardware preparation path.
+    $makeArguments += @('DEBUG=2', 'LITEOS_DEBUG_SERIAL=1', 'LITEOS_REALTEST=1')
+    $makeArguments += 'esp'
+}
+else {
+    $makeArguments += @('loader', 'kernel')
+}
+$previousMakeErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    # Windows PowerShell can surface native stderr warnings as terminating
+    # NativeCommandError records under Stop.  Capture them and judge the
+    # production build by make's exit code, as done for the ABI compilers.
+    $makeOutput = @(& $Make @makeArguments 2>&1 |
+        ForEach-Object { $_.ToString() })
+    $makeExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousMakeErrorActionPreference
+}
 foreach ($line in $makeOutput) { Write-Output $line }
-if ($makeExitCode -ne 0) { throw 'production loader/kernel build failed' }
+if ($makeExitCode -ne 0) {
+    $buildKind = if ($RealTest) { 'real-test ESP' } else { 'production loader/kernel' }
+    throw "$buildKind build failed"
+}
 
 $gccCommand = Get-Command x86_64-elf-gcc -ErrorAction Stop
 $linkerCommand = Get-Command x86_64-elf-ld -ErrorAction Stop
@@ -79,7 +114,11 @@ New-Item -ItemType Directory -Path $liteosObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $abiObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-$liteosInputRoot = Join-Path $repoRoot 'build\kernel'
+$liteosBuildRoot = Join-Path $repoRoot $Build
+$liteosInputRoot = Join-Path $liteosBuildRoot 'kernel'
+$liteosEspRoot = Join-Path $liteosBuildRoot 'esp'
+$liteosBuildDescription = if ($RealTest) { 'real-test' } else { 'production' }
+Require-File (Join-Path $liteosInputRoot 'entry.o') "$liteosBuildDescription kernel objects"
 $liteosFiles = @(Get-ChildItem -LiteralPath $liteosInputRoot -File -Filter '*.o' |
     Sort-Object Name)
 if ($liteosFiles.Count -eq 0) { throw 'production kernel object directory is empty' }
@@ -309,7 +348,10 @@ if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $kernelElf -PathType Le
 }
 
 New-Item -ItemType Directory -Path $phase4Esp -Force | Out-Null
-Copy-Item -Path (Join-Path $repoRoot 'build\esp\*') -Destination $phase4Esp -Recurse -Force
+if (-not (Test-Path -LiteralPath $liteosEspRoot -PathType Container)) {
+    throw "$liteosBuildDescription ESP directory is missing: $liteosEspRoot"
+}
+Copy-Item -Path (Join-Path $liteosEspRoot '*') -Destination $phase4Esp -Recurse -Force
 New-Item -ItemType Directory -Path (Join-Path $phase4Esp 'EFI\LITEOS') -Force |
     Out-Null
 Copy-Item -LiteralPath $kernelElf -Destination (Join-Path $phase4Esp 'EFI\LITEOS\kernel.elf') -Force
@@ -318,4 +360,6 @@ Write-Output ('PHASE4_KERNEL={0}' -f $kernelElf)
 Write-Output ('PHASE4_ESP={0}' -f $phase4Esp)
 Write-Output ('PHASE4_LITEOS_OBJECTS={0}' -f $liteosObjects.Count)
 Write-Output ('PHASE4_LINK_OBJECTS={0}' -f $linkObjects.Count)
+Write-Output ('PHASE4_LITEOS_BUILD={0}' -f $Build)
+Write-Output ('PHASE4_REALTEST={0}' -f ($(if ($RealTest) { '1' } else { '0' })))
 Write-Output 'PHASE4_BUILD=PASS'
