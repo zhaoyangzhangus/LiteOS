@@ -137,6 +137,11 @@ KERNEL_PE = $(BUILD)/kernel/kernel.pe
 KERNEL_ELF = $(BUILD)/esp/EFI/LITEOS/kernel.elf
 KERNEL_BUILD_ID = $(BUILD)/esp/EFI/LITEOS/kernel.build-id
 KERNEL_SYMBOLS = $(BUILD)/kernel/kernel.sym
+NVIDIA_PORT_DIR = kernel/drivers/gpu/nvidia/port
+NVIDIA_PORT_NAMES = memory atomic cache sync time thread worker vm pci mmio vbios dma irq firmware registry
+NVIDIA_PORT_SOURCES = $(addprefix $(NVIDIA_PORT_DIR)/nv_port_,$(addsuffix .c,$(NVIDIA_PORT_NAMES)))
+NVIDIA_PORT_OBJECTS = $(addprefix $(BUILD)/kernel/nvidia-port-,$(addsuffix .o,$(NVIDIA_PORT_NAMES)))
+NVIDIA_PORT_HOST_OBJECTS = $(addprefix $(BUILD)/nvidia/host-test/nv_port_,$(addsuffix .o,$(NVIDIA_PORT_NAMES)))
 USER_AUDIOD_PE = $(BUILD)/user/audiod.pe
 USER_AUDIOD_ELF = $(BUILD)/user/audiod.elf
 USER_AUDIOD_OBJECTS = $(BUILD)/user/audiod-service.o $(BUILD)/user/audiod-mixer.o
@@ -262,7 +267,7 @@ USER_NETD_LDFLAGS = -nostdlib -Wl,--entry,netd_entry -Wl,--subsystem,0 \
                     -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                     -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
-.PHONY: all clean esp loader kernel openssl blend2d nasm ndisasm wget debug-image debug-locations roadmap-stage-layout roadmap-stages qemu-matrix refactor-benchmark refactor-layout test header-sanity stage-sanity abi-sanity dynamic-loader-sanity libc-sanity libc-header-sanity bluetooth-test firmware-test audiod-test release-metadata FORCE \
+.PHONY: all clean esp loader kernel openssl blend2d nasm ndisasm wget debug-image debug-locations roadmap-stage-layout roadmap-stages qemu-matrix refactor-benchmark refactor-layout test header-sanity stage-sanity abi-sanity dynamic-loader-sanity libc-sanity libc-header-sanity bluetooth-test firmware-test audiod-test nvidia-port-test release-metadata FORCE \
         $(BUILD)/build-id.exe $(BUILD)/sha256-test.exe $(BUILD)/mm-api-test.exe \
         $(BUILD)/memory-map-test.exe $(BUILD)/fat32-test.exe $(BUILD)/cache-test.exe \
         $(BUILD)/primitives-test.exe \
@@ -1009,6 +1014,33 @@ $(BUILD)/kernel/device-core.o: kernel/drivers/core/device.c | $(BUILD)/kernel
 $(BUILD)/kernel/pci-core.o: kernel/drivers/pci/enumerate.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD)/kernel/nvidia-port-%.o: $(NVIDIA_PORT_DIR)/nv_port_%.c \
+		$(NVIDIA_PORT_DIR)/include/nv_port.h $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -I$(NVIDIA_PORT_DIR)/include -c $< -o $@
+
+$(BUILD)/nvidia/host-test:
+	mkdir -p $@
+
+$(BUILD)/nvidia/host-test/nv_port_%.o: $(NVIDIA_PORT_DIR)/nv_port_%.c \
+		$(NVIDIA_PORT_DIR)/include/nv_port.h | $(BUILD)/nvidia/host-test
+	$(HOSTCC) -DNV_PORT_HOST_TEST -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+		-ffunction-sections -fdata-sections -Iinclude -I$(NVIDIA_PORT_DIR)/include \
+		-c $< -o $@
+
+$(BUILD)/nvidia/host-test/nv_port_test.o: tests/kernel/nv_port_test.c \
+		$(NVIDIA_PORT_DIR)/include/nv_port.h | $(BUILD)/nvidia/host-test
+	$(HOSTCC) -DNV_PORT_HOST_TEST -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+		-ffunction-sections -fdata-sections -Iinclude -I$(NVIDIA_PORT_DIR)/include \
+		-c $< -o $@
+
+$(BUILD)/nvidia-port-test.exe: $(NVIDIA_PORT_HOST_OBJECTS) \
+		$(BUILD)/nvidia/host-test/nv_port_test.o kernel/drivers/core/firmware.c | $(BUILD)
+	$(HOSTCC) -DNV_PORT_HOST_TEST -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+		-Iinclude -Wl,--gc-sections $^ -o $@
+
+nvidia-port-test: $(BUILD)/nvidia-port-test.exe
+	./$(BUILD)/nvidia-port-test.exe
+
 $(BUILD)/kernel/nvme-core.o: kernel/drivers/nvme/core.c \
 		kernel/drivers/nvme/internal.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -1552,6 +1584,7 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/iommu-core.o \
                                      $(BUILD)/kernel/device-core.o \
                                     $(BUILD)/kernel/pci-core.o \
+                                    $(NVIDIA_PORT_OBJECTS) \
                                      $(BUILD)/kernel/nvme-core.o $(BUILD)/kernel/nvme-completion.o \
                                      $(BUILD)/kernel/nvme-timing.o \
                                      $(BUILD)/kernel/nvme-pci.o \
@@ -1858,7 +1891,7 @@ endif
 test: $(BUILD)/sha256-test.exe $(BUILD)/mm-api-test.exe $(BUILD)/memory-map-test.exe \
       $(BUILD)/fat32-test.exe $(BUILD)/cache-test.exe $(BUILD)/primitives-test.exe \
       $(BUILD)/bluetooth-test.exe $(BUILD)/firmware-test.exe $(BUILD)/audiod-test.exe \
-      $(BUILD)/abi-sanity.exe
+      $(BUILD)/abi-sanity.exe $(BUILD)/nvidia-port-test.exe
 	./$(BUILD)/sha256-test.exe
 	./$(BUILD)/mm-api-test.exe
 	./$(BUILD)/memory-map-test.exe
@@ -1869,6 +1902,7 @@ test: $(BUILD)/sha256-test.exe $(BUILD)/mm-api-test.exe $(BUILD)/memory-map-test
 	./$(BUILD)/firmware-test.exe
 	./$(BUILD)/audiod-test.exe
 	./$(BUILD)/abi-sanity.exe
+	./$(BUILD)/nvidia-port-test.exe
 
 clean:
 	rm -rf $(BUILD)

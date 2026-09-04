@@ -453,7 +453,67 @@ static kstatus_t pci_device_config_write32(const pci_device_t *device,
 
 kstatus_t pci_read_config32(const pci_device_t *device, uint16_t offset,
                              uint32_t *value) {
+    if (value == 0 || offset >= PCI_CONFIG_SPACE_SIZE ||
+        (offset & 3U) != 0U) return K_EINVAL;
     return pci_device_config_read32(device, offset, value);
+}
+
+kstatus_t pci_write_config32(const pci_device_t *device, uint16_t offset,
+                              uint32_t value) {
+    if (offset >= PCI_CONFIG_SPACE_SIZE || (offset & 3U) != 0U) {
+        return K_EINVAL;
+    }
+    return pci_device_config_write32(device, offset, value);
+}
+
+kstatus_t pci_read_config16(const pci_device_t *device, uint16_t offset,
+                             uint16_t *value) {
+    uint32_t word;
+    uint16_t aligned;
+    if (value == 0 || offset >= PCI_CONFIG_SPACE_SIZE - 1U) return K_EINVAL;
+    aligned = (uint16_t)(offset & ~3U);
+    kstatus_t status = pci_read_config32(device, aligned, &word);
+    if (status != K_OK) return status;
+    *value = (uint16_t)(word >> ((offset & 2U) * 8U));
+    return K_OK;
+}
+
+kstatus_t pci_read_config8(const pci_device_t *device, uint16_t offset,
+                            uint8_t *value) {
+    uint32_t word;
+    if (value == 0 || offset >= PCI_CONFIG_SPACE_SIZE) return K_EINVAL;
+    kstatus_t status = pci_read_config32(device, (uint16_t)(offset & ~3U),
+                                          &word);
+    if (status != K_OK) return status;
+    *value = (uint8_t)(word >> ((offset & 3U) * 8U));
+    return K_OK;
+}
+
+static kstatus_t pci_write_config_partial(const pci_device_t *device,
+                                          uint16_t offset, uint32_t value,
+                                          uint32_t mask) {
+    uint32_t word;
+    uint16_t aligned = (uint16_t)(offset & ~3U);
+    kstatus_t status = pci_read_config32(device, aligned, &word);
+    if (status != K_OK) return status;
+    word = (word & ~mask) | (value & mask);
+    return pci_write_config32(device, aligned, word);
+}
+
+kstatus_t pci_write_config16(const pci_device_t *device, uint16_t offset,
+                              uint16_t value) {
+    if (offset >= PCI_CONFIG_SPACE_SIZE - 1U) return K_EINVAL;
+    uint32_t shift = (uint32_t)(offset & 2U) * 8U;
+    return pci_write_config_partial(device, offset, (uint32_t)value << shift,
+                                    0xFFFFU << shift);
+}
+
+kstatus_t pci_write_config8(const pci_device_t *device, uint16_t offset,
+                             uint8_t value) {
+    if (offset >= PCI_CONFIG_SPACE_SIZE) return K_EINVAL;
+    uint32_t shift = (uint32_t)(offset & 3U) * 8U;
+    return pci_write_config_partial(device, offset, (uint32_t)value << shift,
+                                    0xFFU << shift);
 }
 
 static kstatus_t pci_set_intx_disabled(pci_device_t *device, bool disabled) {

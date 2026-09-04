@@ -69,6 +69,16 @@ kstatus_t pci_msix_read_entry(const pci_device_t *device, uint16_t entry,
                               uint32_t *vector_control);
 kstatus_t pci_read_config32(const pci_device_t *device, uint16_t offset,
                              uint32_t *value);
+kstatus_t pci_read_config16(const pci_device_t *device, uint16_t offset,
+                             uint16_t *value);
+kstatus_t pci_read_config8(const pci_device_t *device, uint16_t offset,
+                            uint8_t *value);
+kstatus_t pci_write_config32(const pci_device_t *device, uint16_t offset,
+                              uint32_t value);
+kstatus_t pci_write_config16(const pci_device_t *device, uint16_t offset,
+                              uint16_t value);
+kstatus_t pci_write_config8(const pci_device_t *device, uint16_t offset,
+                             uint8_t value);
 kstatus_t pci_msix_configure(pci_device_t *device, uint16_t entry,
                              uint32_t apic_id, uint8_t vector);
 kstatus_t pci_msix_disable(pci_device_t *device);
