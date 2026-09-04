@@ -141,6 +141,8 @@ NVIDIA_PORT_DIR = kernel/drivers/gpu/nvidia/port
 NVIDIA_PORT_NAMES = memory atomic cache sync time thread worker vm pci mmio vbios dma irq firmware registry
 NVIDIA_PORT_SOURCES = $(addprefix $(NVIDIA_PORT_DIR)/nv_port_,$(addsuffix .c,$(NVIDIA_PORT_NAMES)))
 NVIDIA_PORT_OBJECTS = $(addprefix $(BUILD)/kernel/nvidia-port-,$(addsuffix .o,$(NVIDIA_PORT_NAMES)))
+NVIDIA_RM_DIR = kernel/drivers/gpu/nvidia/rm
+NVIDIA_RM_DRIVER_OBJECTS = $(BUILD)/kernel/nvidia-rm-driver.o
 NVIDIA_PORT_HOST_OBJECTS = $(addprefix $(BUILD)/nvidia/host-test/nv_port_,$(addsuffix .o,$(NVIDIA_PORT_NAMES)))
 USER_AUDIOD_PE = $(BUILD)/user/audiod.pe
 USER_AUDIOD_ELF = $(BUILD)/user/audiod.elf
@@ -617,6 +619,13 @@ $(BUILD)/kernel/memory-init.o: kernel/init/memory.c $(DEBUG_SERIAL_STAMP) | $(BU
 $(BUILD)/kernel/devices-init.o: kernel/init/devices.c include/kernel/realtest.h \
 		$(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/nvidia-rm-driver.o: $(NVIDIA_RM_DIR)/nv_rm_driver.c \
+		$(NVIDIA_RM_DIR)/include/nv_rm_driver.h \
+		$(NVIDIA_RM_DIR)/include/nv_rm_vendor_bridge.h \
+		$(NVIDIA_PORT_DIR)/include/nv_port.h $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -I$(NVIDIA_PORT_DIR)/include \
+		-I$(NVIDIA_RM_DIR)/include -c $< -o $@
 
 $(BUILD)/kernel/core-init.o: kernel/init/core.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -1582,9 +1591,10 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/telemetry.o \
                                     $(BUILD)/kernel/perf.o \
                                     $(BUILD)/kernel/iommu-core.o \
-                                     $(BUILD)/kernel/device-core.o \
+                                    $(BUILD)/kernel/device-core.o \
                                     $(BUILD)/kernel/pci-core.o \
                                     $(NVIDIA_PORT_OBJECTS) \
+                                    $(NVIDIA_RM_DRIVER_OBJECTS) \
                                      $(BUILD)/kernel/nvme-core.o $(BUILD)/kernel/nvme-completion.o \
                                      $(BUILD)/kernel/nvme-timing.o \
                                      $(BUILD)/kernel/nvme-pci.o \

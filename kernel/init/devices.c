@@ -9,6 +9,8 @@
 #include <kernel/realtest.h>
 #include <kernel/xhci.h>
 
+#include "../drivers/gpu/nvidia/rm/include/nv_rm_driver.h"
+
 static BOOLEAN devices_fail_at(const liteos_init_devices_hooks_t *hooks,
                                const CHAR8 *message, const char *file,
                                uint32_t line) {
@@ -50,6 +52,11 @@ BOOLEAN liteos_init_devices(LITEOS_BOOT_INFO *info,
         return devices_fail(hooks, "\r\n");
     }
     hooks->write("LITEOS_PCI_ECAM_OK\r\n");
+
+    /* NVIDIA RM is optional for non-NVIDIA boots.  A matching device is
+     * never reported as ready unless the real vendor bridge completes. */
+    if (nv_rm_driver_probe() != K_OK)
+        hooks->write("LITEOS_NVIDIA_PROBE_FAIL\r\n");
 
     liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_11);
     if (!input_core_init() || !input_core_self_test()) {
