@@ -13,8 +13,11 @@ $vendorSourceRoot = Join-Path $vendorRoot 'open-gpu-kernel-modules'
 $phase3Gate = Join-Path $PSScriptRoot 'phase3_gate.ps1'
 $bridgeSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_vendor_bridge.c'
 $driverSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_driver.c'
+$workQueueSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_workqueue.c'
 $kernelElf = Join-Path $repoRoot 'build\nvidia\phase4\kernel.elf'
 $linkList = Join-Path $repoRoot 'build\nvidia\phase4\phase4_link_objects.list'
+$workQueueObject = Join-Path $repoRoot 'build\nvidia\phase4\objects\nv_rm_workqueue.o'
+$abiWorkQueueObject = Join-Path $repoRoot 'build\nvidia\phase4\objects\vendor_abi\0010.o'
 
 function Fail-Gate([string]$Message) {
     throw "P4 Gate failed: $Message"
@@ -45,6 +48,7 @@ Require-File $kernelElf 'Phase 4 kernel image'
 Require-File $linkList 'Phase 4 link list'
 Require-File $bridgeSource 'vendor bridge source'
 Require-File $driverSource 'LiteOS RM driver source'
+Require-File $workQueueSource 'LiteOS RM workqueue adapter source'
 
 $readelfCommand = Get-Command x86_64-elf-readelf -ErrorAction SilentlyContinue
 if ($null -eq $readelfCommand) { $readelfCommand = Get-Command readelf -ErrorAction Stop }
@@ -97,9 +101,62 @@ if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -
         $_ -like '*phase4/objects/nv_rm_vendor_bridge.o'
     }).Count -ne 1 -or
     @($linkRows | Where-Object {
+        $_ -like '*phase4/objects/nv_rm_workqueue.o'
+    }).Count -ne 1 -or
+    @($linkRows | Where-Object {
         $_ -like '*phase4/objects/vendor_abi/*.o'
     }).Count -ne 11) {
     Fail-Gate 'Phase 4 link list does not contain the expected RM/ABI closure'
+}
+Require-File $workQueueObject 'compiled LiteOS RM workqueue adapter'
+Require-File $abiWorkQueueObject 'compiled fail-closed OS ABI object'
+
+$workQueueNmArgs = @('-g', '-S', '--defined-only', '--', $workQueueObject)
+$workQueueSymbols = @(& $nmCommand.Source @workQueueNmArgs 2>&1 |
+    ForEach-Object { $_.ToString() })
+if ($LASTEXITCODE -ne 0) { Fail-Gate 'workqueue adapter symbol scan failed' }
+$abiWorkQueueNmArgs = @('-g', '-S', '--defined-only', '--', $abiWorkQueueObject)
+$abiWorkQueueSymbols = @(& $nmCommand.Source @abiWorkQueueNmArgs 2>&1 |
+    ForEach-Object { $_.ToString() })
+if ($LASTEXITCODE -ne 0) { Fail-Gate 'fail-closed OS ABI symbol scan failed' }
+$finalWorkQueueNmArgs = @('-g', '-S', '--defined-only', '--', $kernelElf)
+$finalWorkQueueSymbols = @(& $nmCommand.Source @finalWorkQueueNmArgs 2>&1 |
+    ForEach-Object { $_.ToString() })
+if ($LASTEXITCODE -ne 0) { Fail-Gate 'final workqueue symbol scan failed' }
+foreach ($workQueueSymbol in @(
+        'os_queue_work_item', 'os_flush_work_queue',
+        'os_is_queue_flush_ongoing')) {
+    $adapterRow = @($workQueueSymbols | Where-Object {
+        $_ -match ('\s{0}\s*$' -f [regex]::Escape($workQueueSymbol))
+    })
+    $unsupportedRow = @($abiWorkQueueSymbols | Where-Object {
+        $_ -match ('\s{0}\s*$' -f [regex]::Escape($workQueueSymbol))
+    })
+    $finalRow = @($finalWorkQueueSymbols | Where-Object {
+        $_ -match ('\s{0}\s*$' -f [regex]::Escape($workQueueSymbol))
+    })
+    if ($adapterRow.Count -ne 1 -or $unsupportedRow.Count -ne 1 -or
+        $finalRow.Count -ne 1) {
+        Fail-Gate "workqueue symbol closure is incomplete: $workQueueSymbol"
+    }
+
+    $adapterMatch = [regex]::Match($adapterRow[0],
+        '^\s*[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s+[A-Za-z]\s+')
+    $unsupportedMatch = [regex]::Match($unsupportedRow[0],
+        '^\s*[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s+[A-Za-z]\s+')
+    $finalMatch = [regex]::Match($finalRow[0],
+        '^\s*[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s+[A-Za-z]\s+')
+    if (-not $adapterMatch.Success -or -not $unsupportedMatch.Success -or
+        -not $finalMatch.Success) {
+        Fail-Gate "workqueue symbol sizes are unreadable: $workQueueSymbol"
+    }
+
+    $adapterSize = [Convert]::ToUInt64($adapterMatch.Groups[1].Value, 16)
+    $unsupportedSize = [Convert]::ToUInt64($unsupportedMatch.Groups[1].Value, 16)
+    $finalSize = [Convert]::ToUInt64($finalMatch.Groups[1].Value, 16)
+    if ($finalSize -ne $adapterSize -or $adapterSize -le $unsupportedSize) {
+        Fail-Gate "final image does not select the real workqueue adapter: $workQueueSymbol"
+    }
 }
 
 $bridgeText = Get-Content -LiteralPath $bridgeSource -Raw
@@ -120,6 +177,20 @@ if ($bridgeText -match '(?im)(chipInfo\.(platformId|implementationId)|pGpuArch)\
 }
 if ($bridgeText -match '(?im)\b(gsp|gmmu|pma|gpu\s*va)\b\s*[:=]') {
     Fail-Gate 'Phase 4 bridge contains a LiteOS-side GPU-owned implementation'
+}
+
+$workQueueText = Get-Content -LiteralPath $workQueueSource -Raw
+foreach ($requiredWorkQueueText in @(
+        'os_queue_work_item(', 'os_flush_work_queue(',
+        'os_is_queue_flush_ongoing(', 'rm_execute_work_item(',
+        'nv_port_work_queue(', 'nv_port_work_drain(',
+        'deferred worker')) {
+    if ($workQueueText -notmatch [regex]::Escape($requiredWorkQueueText)) {
+        Fail-Gate "workqueue adapter evidence is absent: $requiredWorkQueueText"
+    }
+}
+if ($workQueueText -match '(?im)\b(scheduler|gsp|gmmu|pma|gpu\s*va)\b\s*[:=]') {
+    Fail-Gate 'workqueue adapter contains a forbidden private subsystem'
 }
 
 $driverText = Get-Content -LiteralPath $driverSource -Raw

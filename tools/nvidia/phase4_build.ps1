@@ -17,6 +17,9 @@ $objectRoot = Join-Path $outputRoot 'objects'
 $liteosObjectRoot = Join-Path $objectRoot 'liteos'
 $abiObjectRoot = Join-Path $objectRoot 'vendor_abi'
 $strongBridgeObject = Join-Path $objectRoot 'nv_rm_vendor_bridge.o'
+$workQueueObject = Join-Path $objectRoot 'nv_rm_workqueue.o'
+$workQueueStdoutLog = Join-Path $outputRoot 'workqueue_compile.stdout.log'
+$workQueueStderrLog = Join-Path $outputRoot 'workqueue_compile.stderr.log'
 $linkList = Join-Path $outputRoot 'phase4_link_objects.list'
 $abiLinkList = Join-Path $outputRoot 'phase4_abi_link_objects.list'
 $kernelElf = Join-Path $outputRoot 'kernel.elf'
@@ -182,6 +185,31 @@ if ($LASTEXITCODE -ne 0 -or
     throw 'strong Phase 4 vendor bridge compilation failed'
 }
 
+$workQueueArgs = @($bridgeFlags) + @(
+    '-c', (Join-Path $rmSourceRoot 'nv_rm_workqueue.c'),
+    '-o', $workQueueObject
+)
+$workQueueProcess = Start-Process -FilePath $gcc `
+    -ArgumentList ([string[]]$workQueueArgs) `
+    -RedirectStandardOutput $workQueueStdoutLog `
+    -RedirectStandardError $workQueueStderrLog `
+    -Wait -PassThru
+$workQueueExitCode = $workQueueProcess.ExitCode
+$workQueueDiagnostics = @()
+if (Test-Path -LiteralPath $workQueueStdoutLog -PathType Leaf) {
+    $workQueueDiagnostics += @(Get-Content -LiteralPath $workQueueStdoutLog |
+        ForEach-Object { $_.ToString() })
+}
+if (Test-Path -LiteralPath $workQueueStderrLog -PathType Leaf) {
+    $workQueueDiagnostics += @(Get-Content -LiteralPath $workQueueStderrLog |
+        ForEach-Object { $_.ToString() })
+}
+foreach ($line in $workQueueDiagnostics) { Write-Output $line }
+if ($workQueueExitCode -ne 0 -or
+    -not (Test-Path -LiteralPath $workQueueObject -PathType Leaf)) {
+    throw 'Phase 4 LiteOS workqueue adapter compilation failed'
+}
+
 # Recompile the 11 linkable ABI adapters with the kernel code model.  Phase 3
 # intentionally compiles them as a relocatable ABI probe; their absolute
 # diagnostic-string relocations are not valid once the final Phase 4 image is
@@ -264,6 +292,7 @@ Write-AsciiLines $abiLinkList $abiObjects
 $linkObjects = New-Object 'System.Collections.Generic.List[string]'
 foreach ($object in $liteosObjects) { [void]$linkObjects.Add($object) }
 [void]$linkObjects.Add((Join-Path $phase3Root 'vendor-rm.o').Replace('\', '/'))
+[void]$linkObjects.Add($workQueueObject.Replace('\', '/'))
 foreach ($object in $abiObjects) { [void]$linkObjects.Add($object) }
 [void]$linkObjects.Add($strongBridgeObject.Replace('\', '/'))
 Write-AsciiLines $linkList $linkObjects
