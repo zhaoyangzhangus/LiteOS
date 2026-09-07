@@ -9,6 +9,25 @@ static bool nv_port_power_of_two(size_t value) {
     return value != 0U && (value & (value - 1U)) == 0U;
 }
 
+static bool nv_port_get_order(size_t page_size, uint8_t *order_out) {
+    uint64_t pages;
+    uint8_t order = 0U;
+    uint64_t block_pages = 1U;
+
+    if (page_size < PAGE_SIZE || order_out == 0) return false;
+    if ((uint64_t)page_size > UINT64_MAX - (PAGE_SIZE - 1ULL)) {
+        return false;
+    }
+    pages = ((uint64_t)page_size + PAGE_SIZE - 1ULL) >> PAGE_SHIFT;
+    while (block_pages < pages) {
+        if (order >= BUDDY_MAX_ORDER) return false;
+        ++order;
+        block_pages <<= 1U;
+    }
+    *order_out = order;
+    return true;
+}
+
 static bool nv_port_round_pages(size_t size, uint32_t *page_count) {
     uint64_t rounded;
 
@@ -46,14 +65,14 @@ static void nv_port_mem_release_pages(nv_port_mem_t *memory) {
         return;
     }
 
-    if (memory->contiguous) {
-        if (memory->page_objects[0] != 0) page_free(memory->page_objects[0]);
-    } else {
-        for (uint32_t index = 0U; index < memory->page_count; ++index) {
-            if (memory->page_objects[index] != 0) {
-                page_free(memory->page_objects[index]);
-            }
+    uint32_t block_pages = memory->allocation_block_pages;
+    if (block_pages == 0U) block_pages = 1U;
+    for (uint32_t index = 0U; index < memory->page_count;) {
+        if (memory->page_objects[index] != 0) {
+            page_free(memory->page_objects[index]);
         }
+        if (block_pages > memory->page_count - index) break;
+        index += block_pages;
     }
 }
 
@@ -143,8 +162,11 @@ static bool nv_port_mem_is_contiguous(const nv_port_mem_t *memory) {
     return true;
 }
 
-kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
-                            uint32_t cache_type, nv_port_mem_t *out) {
+static kstatus_t nv_port_mem_alloc_internal(size_t size, size_t alignment,
+                                             uint32_t flags,
+                                             uint32_t cache_type,
+                                             uint8_t requested_order,
+                                             nv_port_mem_t *out) {
     uint32_t page_count;
     size_t normalized_alignment = alignment == 0U ? PAGE_SIZE : alignment;
     nv_port_mem_t memory = {0};
@@ -165,6 +187,8 @@ kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
     memory.cache_type = cache_type;
     memory.owns_pages = true;
     memory.contiguous = (flags & NV_PORT_MEM_CONTIGUOUS) != 0U;
+    memory.allocation_order = requested_order == UINT8_MAX ? 0U : requested_order;
+    memory.allocation_block_pages = 1U << memory.allocation_order;
 
 #ifdef NV_PORT_HOST_TEST
     nv_port_host_memory_t *backend =
@@ -195,7 +219,7 @@ kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
 #else
     memory.phys_pages = (uint64_t *)kmalloc(
         (size_t)page_count * sizeof(*memory.phys_pages), 0U);
-    memory.page_objects = (page_t **)kmalloc(
+    memory.page_objects = (page_t **)kzalloc(
         (size_t)page_count * sizeof(*memory.page_objects), 0U);
     if (memory.phys_pages == 0 || memory.page_objects == 0) {
         kfree(memory.phys_pages);
@@ -236,16 +260,37 @@ kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
             }
         }
         memory.allocation_order = order;
+        memory.allocation_block_pages = 1U << order;
     } else {
-        for (uint32_t index = 0U; index < page_count; ++index) {
-            memory.page_objects[index] = page_alloc(0U, page_flags);
-            if (memory.page_objects[index] == 0) {
-                for (uint32_t release = 0U; release < index; ++release) {
-                    page_free(memory.page_objects[release]);
-                }
+        uint8_t order = requested_order == UINT8_MAX ? 0U : requested_order;
+        uint32_t block_pages = 1U << order;
+        uint32_t block_count =
+            (page_count - 1U) / block_pages + 1U;
+
+        memory.allocation_order = order;
+        memory.allocation_block_pages = block_pages;
+        for (uint32_t block = 0U; block < block_count; ++block) {
+            uint32_t base = block * block_pages;
+            uint32_t remaining = page_count - base;
+            uint32_t pages_in_block = remaining < block_pages ?
+                                      remaining : block_pages;
+            page_t *head = page_alloc(order, page_flags);
+            if (head == 0) {
+                nv_port_mem_release_pages(&memory);
                 kfree(memory.phys_pages);
                 kfree(memory.page_objects);
                 return K_ENOMEM;
+            }
+            uint64_t head_physical = page_to_phys(head).value;
+            for (uint32_t offset = 0U; offset < pages_in_block; ++offset) {
+                memory.page_objects[base + offset] = phys_to_page(
+                    paddr_make(head_physical + (uint64_t)offset * PAGE_SIZE));
+                if (memory.page_objects[base + offset] == 0) {
+                    nv_port_mem_release_pages(&memory);
+                    kfree(memory.phys_pages);
+                    kfree(memory.page_objects);
+                    return K_EIO;
+                }
             }
         }
     }
@@ -266,6 +311,21 @@ kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
 
     *out = memory;
     return K_OK;
+}
+
+kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
+                            uint32_t cache_type, nv_port_mem_t *out) {
+    return nv_port_mem_alloc_internal(size, alignment, flags, cache_type,
+                                      UINT8_MAX, out);
+}
+
+kstatus_t nv_port_mem_alloc_ordered(size_t size, size_t page_size,
+                                    size_t alignment, uint32_t flags,
+                                    uint32_t cache_type, nv_port_mem_t *out) {
+    uint8_t order;
+    if (!nv_port_get_order(page_size, &order)) return K_EINVAL;
+    return nv_port_mem_alloc_internal(size, alignment, flags, cache_type,
+                                      order, out);
 }
 
 kstatus_t nv_port_mem_wrap_pages(page_t **pages, uint32_t page_count,
@@ -305,6 +365,8 @@ kstatus_t nv_port_mem_wrap_pages(page_t **pages, uint32_t page_count,
     memory.page_count = page_count;
     memory.page_shift = PAGE_SHIFT;
     memory.cache_type = cache_type;
+    memory.allocation_order = 0U;
+    memory.allocation_block_pages = 1U;
     memory.owns_pages = false;
     if (!nv_port_mem_set_physical_pages(&memory)
 #ifdef NV_PORT_HOST_TEST
@@ -405,6 +467,7 @@ void nv_port_mem_free(nv_port_mem_t *memory) {
 
 bool nv_port_memory_self_test(void) {
     nv_port_mem_t memory;
+    nv_port_mem_t ordered = {0};
     uint8_t *bytes;
 
     if (nv_port_mem_alloc(PAGE_SIZE + 17U, PAGE_SIZE,
@@ -424,5 +487,17 @@ bool nv_port_memory_self_test(void) {
         return false;
     }
     nv_port_mem_free(&memory);
-    return memory.cpu_va == 0 && memory.phys_pages == 0;
+    if (memory.cpu_va != 0 || memory.phys_pages != 0) return false;
+
+    if (nv_port_mem_alloc_ordered(PAGE_SIZE * 3U, PAGE_SIZE * 2U,
+                                  PAGE_SIZE, NV_PORT_MEM_ZERO,
+                                  NV_PORT_CACHE_WB, &ordered) != K_OK ||
+        ordered.page_count != 3U || ordered.allocation_order != 1U ||
+        ordered.allocation_block_pages != 2U ||
+        nv_port_mem_page_cpu_ptr(&ordered, 2U) == 0) {
+        nv_port_mem_free(&ordered);
+        return false;
+    }
+    nv_port_mem_free(&ordered);
+    return ordered.cpu_va == 0 && ordered.phys_pages == 0;
 }

@@ -48,7 +48,7 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
     kstatus_t status;
 
     (void)nv;
-    if (page_count == 0U || page_size != NVABI_PAGE_SIZE ||
+    if (page_count == 0U || page_size < NVABI_PAGE_SIZE ||
         pte_array == NULL || priv_data == NULL || unencrypted ||
         node_id >= 0) {
         liteos_serial_printf_serial_only(
@@ -71,9 +71,14 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
     if (zeroed) flags |= NV_PORT_MEM_ZERO;
     allocation = (nvabi_page_allocation_t *)kzalloc(sizeof(*allocation), 0U);
     if (allocation == NULL) return NV_ERR_NO_MEMORY;
-    size = (uint64_t)page_count * page_size;
-    status = nv_port_mem_alloc((size_t)size, PAGE_SIZE, flags, port_cache,
-                               &allocation->memory);
+    size = (uint64_t)page_count * NVABI_PAGE_SIZE;
+    if (size > (uint64_t)SIZE_MAX) {
+        kfree(allocation);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    status = nv_port_mem_alloc_ordered((size_t)size, (size_t)page_size,
+                                       PAGE_SIZE, flags, port_cache,
+                                       &allocation->memory);
     if (status != K_OK) {
         kfree(allocation);
         return nvabi_status_from_kstatus(status);
@@ -90,6 +95,10 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
         }
     }
     *priv_data = allocation;
+    liteos_serial_printf_serial_only(
+        "LITEOS_NVIDIA_NV_ALLOC_OK pages=%u page_size=%llx phys0=%llx\r\n",
+        (unsigned)page_count, (unsigned long long)page_size,
+        (unsigned long long)allocation->memory.phys_pages[0]);
     return NV_OK;
 }
 

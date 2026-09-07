@@ -57,12 +57,16 @@ typedef struct nv_port_mem {
     /* Port-private lifetime state; callers must treat these fields as opaque. */
     page_t **page_objects;
     uint32_t allocation_order;
+    uint32_t allocation_block_pages;
     bool owns_pages;
     void *backend_data;
 } nv_port_mem_t;
 
 kstatus_t nv_port_mem_alloc(size_t size, size_t alignment, uint32_t flags,
                             uint32_t cache_type, nv_port_mem_t *out);
+kstatus_t nv_port_mem_alloc_ordered(size_t size, size_t page_size,
+                                    size_t alignment, uint32_t flags,
+                                    uint32_t cache_type, nv_port_mem_t *out);
 kstatus_t nv_port_mem_wrap_pages(page_t **pages, uint32_t page_count,
                                  size_t size, uint32_t cache_type,
                                  nv_port_mem_t *out);

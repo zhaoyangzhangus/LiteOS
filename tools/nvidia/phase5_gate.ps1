@@ -23,6 +23,7 @@ $firmwareSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvab
 $unsupportedSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_nv_unsupported.S'
 $phase5UnsupportedObject = Join-Path $phase5Root 'objects\vendor_abi\0006.o'
 $phase5MemoryObject = Join-Path $phase5Root 'objects\vendor_abi\0003.o'
+$phase5PortMemoryObject = Join-Path $phase5Root 'objects\nvidia-port-memory.o'
 $runtimeSource = Join-Path $repoRoot 'kernel\init\runtime.c'
 $devicesSource = Join-Path $repoRoot 'kernel\init\devices.c'
 
@@ -53,6 +54,7 @@ Require-File $firmwareSource 'Phase 5 firmware adapter source'
 Require-File $unsupportedSource 'vendor ABI source'
 Require-File $phase5UnsupportedObject 'Phase 5 ABI object without firmware fallback'
 Require-File $phase5MemoryObject 'Phase 5 incremental memory ABI object'
+Require-File $phase5PortMemoryObject 'Phase 5 incremental port memory object'
 Require-File $runtimeSource 'Phase 5 runtime source'
 Require-File $devicesSource 'Phase 5 device-init source'
 
@@ -134,6 +136,7 @@ $linkRows = @(Get-Content -LiteralPath $linkList |
     Where-Object { $_ -and $_[0] -ne '#' })
 if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase4/objects/nv_rm_workqueue.o' }).Count -ne 1 -or
+    @($linkRows | Where-Object { $_ -like '*phase5/objects/nvidia-port-memory.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/nv_rm_vendor_bridge.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/nvabi_firmware.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/sha256.o' }).Count -ne 1 -or

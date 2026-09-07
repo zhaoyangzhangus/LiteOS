@@ -12,6 +12,7 @@ $vendorRoot = Join-Path $repoRoot 'third_party\nvidia\595.84'
 $vendorSourceRoot = Join-Path $vendorRoot 'open-gpu-kernel-modules'
 $abiSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi'
 $rmSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm'
+$portSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\port'
 $phase3Root = Join-Path $repoRoot 'build\nvidia\phase3'
 $phase4Root = Join-Path $repoRoot 'build\nvidia\phase4'
 $phase5Root = Join-Path $repoRoot 'build\nvidia\phase5'
@@ -271,6 +272,8 @@ Invoke-CompileIfChanged (Join-Path $repoRoot 'kernel\init\runtime.c') `
     (Join-Path $phase5LiteosRoot 'runtime-init.o') $liteosFlags
 Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_driver.c') `
     (Join-Path $phase5LiteosRoot 'nvidia-rm-driver.o') $driverLiteosFlags
+Invoke-CompileIfChanged (Join-Path $portSourceRoot 'nv_port_memory.c') `
+    (Join-Path $phase5ObjectRoot 'nvidia-port-memory.o') $driverLiteosFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_nv_unsupported.S') `
     (Join-Path $phase5AbiRoot '0006.o') $abiAsmFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_memory.c') `
@@ -286,6 +289,7 @@ $replacementObjects = @{
     'devices-init.o' = (Join-Path $phase5LiteosRoot 'devices-init.o').Replace('\', '/')
     'runtime-init.o' = (Join-Path $phase5LiteosRoot 'runtime-init.o').Replace('\', '/')
     'nvidia-rm-driver.o' = (Join-Path $phase5LiteosRoot 'nvidia-rm-driver.o').Replace('\', '/')
+    'nvidia-port-memory.o' = (Join-Path $phase5ObjectRoot 'nvidia-port-memory.o').Replace('\', '/')
 }
 $phase4Rows = @(Get-Content -LiteralPath $phase4LinkList |
     Where-Object { $_ -and $_[0] -ne '#' })
