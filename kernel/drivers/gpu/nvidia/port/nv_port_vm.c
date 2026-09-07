@@ -39,6 +39,35 @@ static void nv_port_vm_host_free(void *storage) {
 }
 #endif
 
+kstatus_t nv_port_mem_map_kernel_pages(const nv_port_mem_t *memory,
+                                       uint32_t page_index,
+                                       uint32_t page_count,
+                                       uint32_t cache_type,
+                                       bool unencrypted, void **out) {
+    if (memory == 0 || out == 0 || page_count == 0U ||
+        memory->page_objects == 0 || page_index > memory->page_count ||
+        page_count > memory->page_count - page_index ||
+        !nv_port_vm_cache_valid(cache_type)) return K_EINVAL;
+    if (unencrypted) return K_ENOSYS;
+#ifdef NV_PORT_HOST_TEST
+    (void)page_index;
+    (void)page_count;
+    return K_ENOSYS;
+#else
+    return vmalloc_map_pages(&memory->page_objects[page_index], page_count,
+                             cache_type, out);
+#endif
+}
+
+void nv_port_mem_unmap_kernel_pages(void *address, uint32_t page_count) {
+    (void)page_count;
+#ifdef NV_PORT_HOST_TEST
+    (void)address;
+#else
+    if (address != 0) vfree(address);
+#endif
+}
+
 kstatus_t nv_port_vm_map_device(vm_space_t *space, paddr_t physical,
                                 uint64_t length, vaddr_t requested_address,
                                 uint32_t prot, uint32_t flags,

@@ -80,3 +80,8 @@ void *kzalloc(size_t size, uint32_t flags);
 void kfree(void *ptr);
 void *vmalloc(size_t size);
 void vfree(void *ptr);
+/* Map caller-owned physical pages into the kernel vmalloc arena.  The
+ * mapping does not take ownership of the pages; vfree only tears down the
+ * virtual mapping for this form. */
+kstatus_t vmalloc_map_pages(page_t *const *pages, uint32_t page_count,
+                            uint32_t cache_mode, void **out);

@@ -20,10 +20,15 @@ $firmwareRoot = Join-Path $repoRoot 'build\nvidia\official-595.84\extracted-gitb
 $bridgeSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_vendor_bridge.c'
 $driverSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_driver.c'
 $firmwareSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_firmware.c'
+$memorySource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_memory.c'
 $unsupportedSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_nv_unsupported.S'
+$portVmSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\port\nv_port_vm.c'
+$vmallocSource = Join-Path $repoRoot 'kernel\mm\vmalloc.c'
 $phase5UnsupportedObject = Join-Path $phase5Root 'objects\vendor_abi\0006.o'
 $phase5MemoryObject = Join-Path $phase5Root 'objects\vendor_abi\0003.o'
 $phase5PortMemoryObject = Join-Path $phase5Root 'objects\nvidia-port-memory.o'
+$phase5PortVmObject = Join-Path $phase5Root 'objects\nvidia-port-vm.o'
+$phase5VmallocObject = Join-Path $phase5Root 'objects\vmalloc.o'
 $runtimeSource = Join-Path $repoRoot 'kernel\init\runtime.c'
 $devicesSource = Join-Path $repoRoot 'kernel\init\devices.c'
 
@@ -51,10 +56,15 @@ Require-File (Join-Path $phase3Root 'vendor-rm.o') 'Phase 3 vendor object'
 Require-File $bridgeSource 'Phase 5 vendor bridge source'
 Require-File $driverSource 'Phase 5 driver source'
 Require-File $firmwareSource 'Phase 5 firmware adapter source'
+Require-File $memorySource 'Phase 5 memory ABI source'
 Require-File $unsupportedSource 'vendor ABI source'
+Require-File $portVmSource 'Phase 5 kernel mapping port source'
+Require-File $vmallocSource 'Phase 5 vmalloc source'
 Require-File $phase5UnsupportedObject 'Phase 5 ABI object without firmware fallback'
 Require-File $phase5MemoryObject 'Phase 5 incremental memory ABI object'
 Require-File $phase5PortMemoryObject 'Phase 5 incremental port memory object'
+Require-File $phase5PortVmObject 'Phase 5 incremental kernel mapping port object'
+Require-File $phase5VmallocObject 'Phase 5 incremental vmalloc object'
 Require-File $runtimeSource 'Phase 5 runtime source'
 Require-File $devicesSource 'Phase 5 device-init source'
 
@@ -118,6 +128,7 @@ if ($LASTEXITCODE -ne 0) { Fail-Gate 'Phase 5 symbol scan failed' }
 foreach ($requiredSymbol in @(
         'kernel_entry', 'nv_rm_driver_probe', 'nv_rm_vendor_start',
         'rm_init_adapter', 'nv_get_firmware', 'nv_put_firmware',
+        'nv_alloc_kernel_mapping', 'nv_free_kernel_mapping',
         'sha256_compute')) {
     if (@($symbols | Where-Object {
             $_ -match ('\s{0}\s*$' -f [regex]::Escape($requiredSymbol))
@@ -137,6 +148,8 @@ $linkRows = @(Get-Content -LiteralPath $linkList |
 if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase4/objects/nv_rm_workqueue.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/nvidia-port-memory.o' }).Count -ne 1 -or
+    @($linkRows | Where-Object { $_ -like '*phase5/objects/nvidia-port-vm.o' }).Count -ne 1 -or
+    @($linkRows | Where-Object { $_ -like '*phase5/objects/vmalloc.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/nv_rm_vendor_bridge.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/nvabi_firmware.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/sha256.o' }).Count -ne 1 -or
@@ -163,6 +176,9 @@ if ($bridgeText -notmatch '(?s)if\s*\(!rm_init_adapter\([^)]*\)\)') {
 }
 
 $firmwareText = Get-Content -LiteralPath $firmwareSource -Raw
+$memoryText = Get-Content -LiteralPath $memorySource -Raw
+$portVmText = Get-Content -LiteralPath $portVmSource -Raw
+$vmallocText = Get-Content -LiteralPath $vmallocSource -Raw
 foreach ($requiredFirmwareText in @(
         'vfs_open_kernel(', 'vfs_read_kernel(', 'sha256_compute(',
         'nvabi_firmware_hash_matches(', 'kfree(data)',
@@ -174,13 +190,25 @@ foreach ($requiredFirmwareText in @(
 if ($firmwareText -match '(?im)\b(gmmu|pma|gpu\s*va|rpc)\b\s*[:=]') {
     Fail-Gate 'firmware adapter contains a forbidden GPU-owned implementation'
 }
+foreach ($requiredMemoryText in @(
+        'nv_alloc_kernel_mapping(', 'nv_free_kernel_mapping(',
+        'nv_port_mem_map_kernel_pages(',
+        'nv_port_mem_unmap_kernel_pages(')) {
+    Require-Text $memoryText $requiredMemoryText 'kernel system-memory mapping ABI'
+}
+foreach ($requiredMappingText in @(
+        'vmalloc_map_pages(', 'x86_map_page(', 'x86_unmap_page(')) {
+    Require-Text $vmallocText $requiredMappingText 'LiteOS vmalloc page mapping'
+}
+Require-Text $portVmText 'vmalloc_map_pages(' 'kernel mapping port adapter'
 if ($unsupportedSource) {
     $phase5UnsupportedSymbols = @(& $nm.Source '-g' '--defined-only' '--' $phase5UnsupportedObject 2>&1 |
         ForEach-Object { $_.ToString() })
     if ($LASTEXITCODE -ne 0 -or @($phase5UnsupportedSymbols | Where-Object {
-            $_ -match '\s+nv_(get|put)_firmware\s*$'
+            $_ -match '\s+nv_(get|put)_firmware\s*$' -or
+            $_ -match '\s+nv_(alloc|free)_kernel_mapping\s*$'
         }).Count -ne 0) {
-        Fail-Gate 'Phase 5 ABI object still defines a fail-closed firmware entry point'
+        Fail-Gate 'Phase 5 ABI object still defines a fail-closed Phase 5 entry point'
     }
 }
 

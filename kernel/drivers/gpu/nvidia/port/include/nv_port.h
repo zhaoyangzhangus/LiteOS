@@ -77,6 +77,12 @@ void *nv_port_mem_cpu_ptr(const nv_port_mem_t *memory, uint64_t offset,
 void *nv_port_mem_page_cpu_ptr(const nv_port_mem_t *memory, uint32_t index);
 void nv_port_mem_free(nv_port_mem_t *memory);
 bool nv_port_memory_self_test(void);
+kstatus_t nv_port_mem_map_kernel_pages(const nv_port_mem_t *memory,
+                                       uint32_t page_index,
+                                       uint32_t page_count,
+                                       uint32_t cache_type,
+                                       bool unencrypted, void **out);
+void nv_port_mem_unmap_kernel_pages(void *address, uint32_t page_count);
 
 typedef struct nv_port_atomic32 {
     atomic_uint value;

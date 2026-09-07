@@ -186,6 +186,7 @@ nv_alias_pages:
     ret
     .size nv_alias_pages, .-nv_alias_pages
 
+#ifndef LITEOS_NVIDIA_PHASE5
     .globl nv_alloc_kernel_mapping
     .type nv_alloc_kernel_mapping, @function
 nv_alloc_kernel_mapping:
@@ -198,6 +199,7 @@ nv_alloc_kernel_mapping:
     popq %rbp
     ret
     .size nv_alloc_kernel_mapping, .-nv_alloc_kernel_mapping
+#endif
 
     .globl nv_alloc_user_mapping
     .type nv_alloc_user_mapping, @function
@@ -550,6 +552,7 @@ nv_flush_coherent_cpu_cache_range:
     ret
     .size nv_flush_coherent_cpu_cache_range, .-nv_flush_coherent_cpu_cache_range
 
+#ifndef LITEOS_NVIDIA_PHASE5
     .globl nv_free_kernel_mapping
     .type nv_free_kernel_mapping, @function
 nv_free_kernel_mapping:
@@ -562,6 +565,7 @@ nv_free_kernel_mapping:
     popq %rbp
     ret
     .size nv_free_kernel_mapping, .-nv_free_kernel_mapping
+#endif
 
     .globl nv_free_user_mapping
     .type nv_free_user_mapping, @function

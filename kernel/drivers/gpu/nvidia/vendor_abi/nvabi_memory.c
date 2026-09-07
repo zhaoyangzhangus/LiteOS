@@ -22,7 +22,9 @@ static bool nvabi_page_allocation_valid(const nvabi_page_allocation_t *allocatio
                                         const char *function) {
     if (allocation == NULL || allocation->magic !=
         NVABI_PAGE_ALLOCATION_MAGIC || allocation->page_count == 0U ||
-        allocation->memory.page_count != allocation->page_count) {
+        allocation->memory.page_count != allocation->page_count ||
+        allocation->memory.phys_pages == NULL ||
+        allocation->memory.page_objects == NULL) {
         nvabi_log_invalid(function, "nv-memory");
         return false;
     }
@@ -159,4 +161,89 @@ NV_STATUS NV_API_CALL nv_get_phys_pages(void *memory, void *pages,
 NvU64 NV_API_CALL nv_get_kern_phys_address(NvU64 address) {
     paddr_t physical = direct_to_phys((const void *)(uintptr_t)address);
     return physical.value;
+}
+
+void *NV_API_CALL nv_alloc_kernel_mapping(
+    nv_state_t *nv,
+    void *pAllocPrivate,
+    NvU64 pageIndex,
+    NvU32 pageOffset,
+    NvU64 size,
+    void **pPrivate) {
+    nvabi_page_allocation_t *allocation =
+        (nvabi_page_allocation_t *)pAllocPrivate;
+    uint64_t span;
+    uint64_t map_pages;
+    bool valid_cache;
+    uint32_t port_cache;
+    void *mapped = NULL;
+
+    (void)nv;
+    if (pPrivate == NULL) {
+        nvabi_log_invalid("nv_alloc_kernel_mapping", "nv-memory-map");
+        return NULL;
+    }
+    *pPrivate = NULL;
+    if (!nvabi_page_allocation_valid(allocation, "nv_alloc_kernel_mapping") ||
+        pageOffset >= NVABI_PAGE_SIZE ||
+        pageIndex >= allocation->page_count ||
+        size > UINT64_MAX - (uint64_t)pageOffset) {
+        nvabi_log_invalid("nv_alloc_kernel_mapping", "nv-memory-map");
+        return NULL;
+    }
+
+    span = size + (uint64_t)pageOffset;
+    map_pages = (span >> PAGE_SHIFT) +
+                ((span & (PAGE_SIZE - 1ULL)) != 0U ? 1ULL : 0ULL);
+    if (span <= NVABI_PAGE_SIZE) {
+        void *direct = phys_to_direct(paddr_make(
+            allocation->memory.phys_pages[(uint32_t)pageIndex]));
+        if (direct == NULL) {
+            nvabi_log_invalid("nv_alloc_kernel_mapping", "nv-memory-direct");
+            return NULL;
+        }
+        return (void *)((uint8_t *)direct + pageOffset);
+    }
+    if (map_pages == 0U || map_pages > UINT32_MAX ||
+        map_pages > (uint64_t)allocation->page_count - pageIndex) {
+        nvabi_log_invalid("nv_alloc_kernel_mapping", "nv-memory-map");
+        return NULL;
+    }
+    port_cache = nvabi_cache_type(allocation->cache_type, &valid_cache);
+    if (!valid_cache) {
+        nvabi_log_invalid("nv_alloc_kernel_mapping", "nv-memory-cache");
+        return NULL;
+    }
+    if (nv_port_mem_map_kernel_pages(
+            &allocation->memory, (uint32_t)pageIndex, (uint32_t)map_pages,
+            port_cache, false, &mapped) != K_OK || mapped == NULL) {
+        nvabi_log_invalid("nv_alloc_kernel_mapping", "nv-memory-map");
+        return NULL;
+    }
+    *pPrivate = (void *)(uintptr_t)map_pages;
+    return (void *)((uint8_t *)mapped + pageOffset);
+}
+
+void NV_API_CALL nv_free_kernel_mapping(
+    nv_state_t *nv,
+    void *pAllocPrivate,
+    void *address,
+    void *pPrivate) {
+    uintptr_t page_count;
+    void *base;
+
+    (void)nv;
+    (void)pAllocPrivate;
+    if (pPrivate == NULL) return;
+    if (address == NULL) {
+        nvabi_log_invalid("nv_free_kernel_mapping", "nv-memory-map");
+        return;
+    }
+    page_count = (uintptr_t)pPrivate;
+    if (page_count == 0U || page_count > UINT32_MAX) {
+        nvabi_log_invalid("nv_free_kernel_mapping", "nv-memory-map");
+        return;
+    }
+    base = (void *)((uintptr_t)address & ~(uintptr_t)NVABI_PAGE_MASK);
+    nv_port_mem_unmap_kernel_pages(base, (uint32_t)page_count);
 }

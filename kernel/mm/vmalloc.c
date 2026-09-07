@@ -12,6 +12,7 @@
 
 typedef struct {
     bool used;
+    bool owns_pages;
     uint32_t bitmap_start;
     uint32_t total_pages;
     uint32_t data_pages;
@@ -119,6 +120,7 @@ void *vmalloc(size_t size) {
     }
     bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, true);
     area->used = true;
+    area->owns_pages = true;
     area->bitmap_start = bitmap_start;
     area->total_pages = total_pages;
     area->data_pages = data_pages;
@@ -158,6 +160,7 @@ void *vmalloc(size_t size) {
         }
         bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, false);
         area->used = false;
+        area->owns_pages = false;
         area->root_table = paddr_make(0);
         vmalloc_unlock_irqrestore(irq_flags);
         return 0;
@@ -197,7 +200,7 @@ void vfree(void *pointer) {
                                            &physical);
         if (status == K_OK) {
             page_t *page = phys_to_page(physical);
-            if (page != 0) page_free(page);
+            if (area->owns_pages && page != 0) page_free(page);
         } else if (status != K_ENOENT) {
             /* shootdown 失败时 x86_unmap_page 会恢复 PTE，地址仍然必须保留。 */
             complete = false;
@@ -211,8 +214,84 @@ void vfree(void *pointer) {
     bitmap_set_range(g_vmalloc_bitmap, area->bitmap_start, area->total_pages,
                      false);
     area->used = false;
+    area->owns_pages = false;
     area->root_table = paddr_make(0);
     vmalloc_unlock_irqrestore(irq_flags);
+}
+
+kstatus_t vmalloc_map_pages(page_t *const *pages, uint32_t page_count,
+                            uint32_t cache_mode, void **out) {
+    if (pages == 0 || page_count == 0U || out == 0 ||
+        cache_mode > X86_CACHE_UC || page_count > VMALLOC_PAGE_COUNT - 2U) {
+        return K_EINVAL;
+    }
+    for (uint32_t index = 0U; index < page_count; ++index) {
+        if (pages[index] == 0 || (pages[index]->flags & PAGE_FREE) != 0U ||
+            page_to_phys(pages[index]).value == UINT64_MAX) {
+            return K_EINVAL;
+        }
+    }
+
+    vmalloc_initialize();
+    uint64_t irq_flags = vmalloc_lock_irqsave();
+    vmalloc_area_t *area = 0;
+    for (uint32_t index = 0U; index < VMALLOC_MAX_AREAS; ++index) {
+        if (!g_vmalloc_areas[index].used) {
+            area = &g_vmalloc_areas[index];
+            break;
+        }
+    }
+    uint32_t bitmap_start;
+    uint32_t total_pages = page_count + 2U;
+    if (area == 0 || !find_virtual_run(total_pages, &bitmap_start)) {
+        g_vmalloc_failure = 1U;
+        vmalloc_unlock_irqrestore(irq_flags);
+        return K_ENOMEM;
+    }
+
+    bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, true);
+    area->used = true;
+    area->owns_pages = false;
+    area->bitmap_start = bitmap_start;
+    area->total_pages = total_pages;
+    area->data_pages = page_count;
+    area->requested_size = (size_t)page_count * PAGE_SIZE;
+    area->address = (vaddr_t)(X86_64_VMALLOC_BASE +
+                    ((uint64_t)bitmap_start + 1ULL) * PAGE_SIZE);
+    area->root_table = x86_current_root_table();
+
+    uint32_t mapped = 0U;
+    kstatus_t status = K_OK;
+    while (mapped < page_count) {
+        paddr_t physical = page_to_phys(pages[mapped]);
+        status = x86_map_page(
+            area->root_table,
+            area->address + (vaddr_t)mapped * PAGE_SIZE,
+            physical, X86_PAGE_WRITE | X86_PAGE_GLOBAL,
+            (enum x86_cache_mode)cache_mode);
+        if (status != K_OK) break;
+        ++mapped;
+    }
+    if (mapped != page_count) {
+        while (mapped != 0U) {
+            --mapped;
+            paddr_t ignored;
+            (void)x86_unmap_page(
+                area->root_table,
+                area->address + (vaddr_t)mapped * PAGE_SIZE,
+                &ignored);
+        }
+        bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, false);
+        area->used = false;
+        area->owns_pages = false;
+        area->root_table = paddr_make(0);
+        vmalloc_unlock_irqrestore(irq_flags);
+        return status == K_OK ? K_EIO : status;
+    }
+
+    *out = (void *)(uintptr_t)area->address;
+    vmalloc_unlock_irqrestore(irq_flags);
+    return K_OK;
 }
 
 bool vmalloc_self_test(void) {
