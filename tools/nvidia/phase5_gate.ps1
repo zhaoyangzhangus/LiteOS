@@ -6,6 +6,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# When this script is launched through powershell.exe -File, a string array
+# is passed as one command-line value.  Real-test paths are rooted under the
+# repository and cannot contain a comma, so accept that form as well as a
+# native PowerShell array invocation.
+if ($HardwareLog.Count -eq 1 -and $HardwareLog[0].Contains(',')) {
+    $HardwareLog = @($HardwareLog[0] -split ',')
+}
+
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $vendorRelative = 'third_party/nvidia/595.84/open-gpu-kernel-modules'
 $vendorRoot = Join-Path $repoRoot 'third_party\nvidia\595.84'
@@ -288,9 +296,23 @@ foreach ($path in $usableLogs) {
     if ($text -match '(?i)fake|override|hard.?code|not_linked|probe_fail|GSP_BOOT_FAIL') {
         Fail-Gate "hardware log contains a fake/override/failure marker: $path"
     }
-    $runMatch = [regex]::Match($text, '(?m)^run_id=(\S+)$')
+    # The serial stream is the guest evidence and does not contain the host
+    # collector's run id.  The collector writes the authoritative run id and
+    # status beside that stream in realtest.result; bind the two files by
+    # directory instead of requiring host metadata inside guest output.
+    $resultPath = Join-Path (Split-Path -Parent $path) 'realtest.result'
+    Require-File $resultPath 'real hardware result metadata'
+    $resultText = Get-Content -LiteralPath $resultPath -Raw
+    $runMatch = [regex]::Match($text, '(?m)^run_id=([^\r\n]+)')
+    if (-not $runMatch.Success) {
+        $runMatch = [regex]::Match($resultText, '(?m)^run_id=([^\r\n]+)')
+    }
+    $statusMatch = [regex]::Match($resultText, '(?m)^status=([^\r\n]+)')
+    if (-not $statusMatch.Success -or $statusMatch.Groups[1].Value.Trim() -ne 'pass') {
+        Fail-Gate "real hardware result is not pass: $resultPath"
+    }
     if (-not $runMatch.Success -or
-        -not $seenRuns.Add($runMatch.Groups[1].Value)) {
+        -not $seenRuns.Add($runMatch.Groups[1].Value.Trim())) {
         Fail-Gate "hardware log does not identify a unique cold boot: $path"
     }
 }

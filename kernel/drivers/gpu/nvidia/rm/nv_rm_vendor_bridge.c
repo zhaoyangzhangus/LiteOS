@@ -6,6 +6,11 @@
 #define LITEOS_NVIDIA_PHASE5 0
 #endif
 
+/* 595.84's immutable Linux MSI-X path caps the GPU at this many vectors
+ * (NV_RM_MAX_MSIX_LINES).  The RM ISR is shared here because the vendor
+ * entry point does not consume the Linux IRQ number. */
+#define LITEOS_NVIDIA_PHASE5_MSIX_ENTRIES 8U
+
 #include <arch/x86_64/cpu.h>
 #include <kernel/console.h>
 #include <kernel/deferred.h>
@@ -44,6 +49,9 @@ typedef struct nv_rm_vendor_context {
     atomic_bool irq_bottom_pending;
     atomic_bool irq_bottom_queued;
     atomic_bool irq_bottom_schedule_failed;
+    atomic_uint irq_top_hits;
+    atomic_uint irq_rm_handled_hits;
+    atomic_uint irq_bottom_hits;
     uint32_t irq_flags;
     bool irq_started;
     bool rm_initialized;
@@ -84,10 +92,16 @@ static void nv_rm_vendor_irq_top(void *argument)
         context->isr_stack == NULL || !context->irq_started)
         return;
 
+    atomic_fetch_add_explicit(&context->irq_top_hits, 1U,
+                              memory_order_relaxed);
+
     /* rm_isr() is the vendor top-half entry.  It owns interrupt pending
      * inspection and returns the exact bottom-half requirement. */
-    if (rm_isr(context->isr_stack, context->state, &need_bottom_half) &&
-        need_bottom_half != NV_FALSE) {
+    if (rm_isr(context->isr_stack, context->state, &need_bottom_half)) {
+        atomic_fetch_add_explicit(&context->irq_rm_handled_hits, 1U,
+                                  memory_order_relaxed);
+    }
+    if (need_bottom_half != NV_FALSE) {
         atomic_store_explicit(&context->irq_bottom_pending, true,
                               memory_order_release);
         nv_rm_vendor_schedule_irq_bottom_half(context);
@@ -108,6 +122,8 @@ static void nv_rm_vendor_irq_bottom_half(void *argument)
         if (!atomic_exchange_explicit(&context->irq_bottom_pending, false,
                                       memory_order_acq_rel))
             break;
+        atomic_fetch_add_explicit(&context->irq_bottom_hits, 1U,
+                                  memory_order_relaxed);
         if (context->state != NULL && context->isr_bh_stack != NULL)
             rm_isr_bh(context->isr_bh_stack, context->state);
     }
@@ -182,9 +198,61 @@ static kstatus_t nv_rm_vendor_start_irq(
         if (status == K_OK)
             status = nv_port_irq_start(&context->irq);
         if (status == K_OK) {
+            /* NVIDIA's 595.84 Linux path enables all supported MSI-X table
+             * entries before registering the RM ISR.  Keep the LiteOS
+             * handler shared, but program every entry that the vendor path
+             * would request so any GPU interrupt source can reach it. */
+            paddr_t table = {0};
+            uint16_t entries = 0U;
+            uint16_t active_entries = 0U;
+            if (pci_msix_table(device, &table, &entries) != K_OK ||
+                entries == 0U) {
+                (void)nv_port_irq_stop(&context->irq);
+                (void)pci_msix_disable((pci_device_t *)device);
+                status = K_EIO;
+            } else {
+                active_entries = entries < LITEOS_NVIDIA_PHASE5_MSIX_ENTRIES ?
+                    entries : LITEOS_NVIDIA_PHASE5_MSIX_ENTRIES;
+                for (uint16_t entry = 1U; entry < active_entries; ++entry) {
+                    status = pci_msix_configure((pci_device_t *)device, entry,
+                                                apic_id, context->irq.vector);
+                    if (status != K_OK) break;
+                }
+                if (status != K_OK) {
+                    (void)nv_port_irq_stop(&context->irq);
+                    (void)pci_msix_disable((pci_device_t *)device);
+                }
+            }
+        }
+        if (status == K_OK) {
             context->irq_flags = NV_FLAG_USES_MSIX;
             context->state->flags |= context->irq_flags;
             context->irq_started = true;
+            {
+                paddr_t table = {0};
+                uint16_t entries = 0U;
+                uint64_t message_address = 0U;
+                uint32_t message_data = 0U;
+                uint32_t vector_control = 0U;
+                if (pci_msix_table(device, &table, &entries) == K_OK &&
+                    pci_msix_read_entry(device, context->irq.msix_entry,
+                                        &message_address, &message_data,
+                                        &vector_control) == K_OK) {
+                    liteos_serial_printf_serial_only(
+                        "LITEOS_NVIDIA_IRQ_CONFIG mode=msix table=%llx entries=%u "
+                        "active=%u entry=%u addr=%llx data=%x ctl=%x apic=%u vector=%u\r\n",
+                        (unsigned long long)table.value,
+                        (unsigned)entries,
+                        (unsigned)(entries < LITEOS_NVIDIA_PHASE5_MSIX_ENTRIES ?
+                                   entries : LITEOS_NVIDIA_PHASE5_MSIX_ENTRIES),
+                        (unsigned)context->irq.msix_entry,
+                        (unsigned long long)message_address,
+                        (unsigned)message_data,
+                        (unsigned)vector_control,
+                        (unsigned)context->irq.apic_id,
+                        (unsigned)context->irq.vector);
+                }
+            }
             liteos_serial_printf_serial_only(
                 "LITEOS_NVIDIA_IRQ_READY MSI-X vector=%u\r\n",
                 (unsigned)context->irq.vector);
@@ -594,6 +662,9 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
     atomic_init(&context->irq_bottom_pending, false);
     atomic_init(&context->irq_bottom_queued, false);
     atomic_init(&context->irq_bottom_schedule_failed, false);
+    atomic_init(&context->irq_top_hits, 0U);
+    atomic_init(&context->irq_rm_handled_hits, 0U);
+    atomic_init(&context->irq_bottom_hits, 0U);
     if (context->stack == NULL || context->state == NULL ||
         context->isr_stack == NULL || context->isr_bh_stack == NULL) {
         nv_rm_vendor_cleanup(context);
@@ -678,6 +749,16 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
     }
     liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_BOOT_START\r\n");
     if (!rm_init_adapter(context->stack, context->state)) {
+        liteos_serial_printf_serial_only(
+            "LITEOS_NVIDIA_IRQ_DIAG top=%u handled=%u bottom=%u mode=%s vector=%u\r\n",
+            (unsigned)atomic_load_explicit(&context->irq_top_hits,
+                                           memory_order_acquire),
+            (unsigned)atomic_load_explicit(&context->irq_rm_handled_hits,
+                                           memory_order_acquire),
+            (unsigned)atomic_load_explicit(&context->irq_bottom_hits,
+                                           memory_order_acquire),
+            context->irq.use_msix ? "msix" : "msi",
+            (unsigned)context->irq.vector);
         liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_BOOT_FAIL\r\n");
         nv_rm_vendor_cleanup(context);
         *result = (nv_rm_vendor_result_t){0};
