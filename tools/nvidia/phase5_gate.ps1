@@ -21,6 +21,8 @@ $bridgeSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_vendor_b
 $driverSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_driver.c'
 $firmwareSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_firmware.c'
 $unsupportedSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_nv_unsupported.S'
+$phase5UnsupportedObject = Join-Path $phase5Root 'objects\vendor_abi\0006.o'
+$phase5MemoryObject = Join-Path $phase5Root 'objects\vendor_abi\0003.o'
 $runtimeSource = Join-Path $repoRoot 'kernel\init\runtime.c'
 $devicesSource = Join-Path $repoRoot 'kernel\init\devices.c'
 
@@ -49,6 +51,8 @@ Require-File $bridgeSource 'Phase 5 vendor bridge source'
 Require-File $driverSource 'Phase 5 driver source'
 Require-File $firmwareSource 'Phase 5 firmware adapter source'
 Require-File $unsupportedSource 'vendor ABI source'
+Require-File $phase5UnsupportedObject 'Phase 5 ABI object without firmware fallback'
+Require-File $phase5MemoryObject 'Phase 5 incremental memory ABI object'
 Require-File $runtimeSource 'Phase 5 runtime source'
 Require-File $devicesSource 'Phase 5 device-init source'
 
@@ -133,7 +137,8 @@ if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -
     @($linkRows | Where-Object { $_ -like '*phase5/objects/nv_rm_vendor_bridge.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/nvabi_firmware.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/sha256.o' }).Count -ne 1 -or
-    @($linkRows | Where-Object { $_ -like '*phase4/objects/vendor_abi/*.o' }).Count -ne 10 -or
+    @($linkRows | Where-Object { $_ -like '*phase4/objects/vendor_abi/*.o' }).Count -ne 9 -or
+    @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0003.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0006.o' }).Count -ne 1) {
     Fail-Gate 'Phase 5 link list does not contain the incremental RM/firmware closure'
 }
@@ -166,9 +171,14 @@ foreach ($requiredFirmwareText in @(
 if ($firmwareText -match '(?im)\b(gmmu|pma|gpu\s*va|rpc)\b\s*[:=]') {
     Fail-Gate 'firmware adapter contains a forbidden GPU-owned implementation'
 }
-if ($unsupportedSource -and
-    (Get-Content -LiteralPath $unsupportedSource -Raw) -match '(?m)^\s*nv_(get|put)_firmware\s*:') {
-    Fail-Gate 'fail-closed firmware assembly entry point remains'
+if ($unsupportedSource) {
+    $phase5UnsupportedSymbols = @(& $nm.Source '-g' '--defined-only' '--' $phase5UnsupportedObject 2>&1 |
+        ForEach-Object { $_.ToString() })
+    if ($LASTEXITCODE -ne 0 -or @($phase5UnsupportedSymbols | Where-Object {
+            $_ -match '\s+nv_(get|put)_firmware\s*$'
+        }).Count -ne 0) {
+        Fail-Gate 'Phase 5 ABI object still defines a fail-closed firmware entry point'
+    }
 }
 
 $driverText = Get-Content -LiteralPath $driverSource -Raw

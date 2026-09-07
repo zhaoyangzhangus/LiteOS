@@ -218,7 +218,7 @@ $abiCFlags = @('-include', $cpuOpsysHeader.Replace('\', '/')) +
 $abiAsmFlags = @(
     '-ffreestanding', '-fno-stack-protector', '-fno-common', '-fno-pic',
     '-mno-red-zone', '-mno-mmx', '-mno-sse', '-mno-sse2', '-mno-3dnow',
-    '-mcmodel=kernel')
+    '-mcmodel=kernel', '-DLITEOS_NVIDIA_PHASE5=1')
 $bridgeIncludes = @(
     ('-I' + (Join-Path $repoRoot 'include').Replace('\', '/')),
     ('-I' + (Join-Path $rmSourceRoot 'include').Replace('\', '/'))) +
@@ -273,6 +273,8 @@ Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_driver.c') `
     (Join-Path $phase5LiteosRoot 'nvidia-rm-driver.o') $driverLiteosFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_nv_unsupported.S') `
     (Join-Path $phase5AbiRoot '0006.o') $abiAsmFlags
+Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_memory.c') `
+    (Join-Path $phase5AbiRoot '0003.o') $abiCFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_firmware.c') `
     (Join-Path $phase5AbiRoot 'nvabi_firmware.o') $abiCFlags
 Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_vendor_bridge.c') `
@@ -298,6 +300,9 @@ foreach ($row in $phase4Rows) {
     }
     elseif ($row -match '/phase4/objects/vendor_abi/0006\.o$') {
         [void]$linkRows.Add((Join-Path $phase5AbiRoot '0006.o').Replace('\', '/'))
+    }
+    elseif ($row -match '/phase4/objects/vendor_abi/0003\.o$') {
+        [void]$linkRows.Add((Join-Path $phase5AbiRoot '0003.o').Replace('\', '/'))
     }
     else {
         [void]$linkRows.Add($row)

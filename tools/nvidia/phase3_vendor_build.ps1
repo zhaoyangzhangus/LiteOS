@@ -357,8 +357,19 @@ Write-AsciiLines $objectList @($compiledRecords | ForEach-Object { $_.Object.Rep
 # nvabi_contracts.c.
 $abiRecords = New-Object 'System.Collections.Generic.List[object]'
 $abiIndex = 0
+# Phase 3 is the closed, baseline ABI graph.  Phase 5-only adapters are
+# linked by phase5_build.ps1 so that adding firmware/timer/DMA support cannot
+# silently change the earlier Phase 3 Gate input.
+$phase5OnlyAbiNames = @(
+    'nvabi_firmware.c',
+    'nvabi_dma.c',
+    'nvabi_timer.c'
+)
 $abiFiles = @(Get-ChildItem -LiteralPath $abiSourceRoot -Recurse -File |
-    Where-Object { $_.Extension -in @('.c', '.S') } | Sort-Object FullName)
+    Where-Object {
+        $_.Extension -in @('.c', '.S') -and
+        $_.Name -notin $phase5OnlyAbiNames
+    } | Sort-Object FullName)
 foreach ($abiFile in $abiFiles) {
     $abiIndex++
     $abiRecords.Add([PSCustomObject]@{
@@ -379,6 +390,7 @@ if ($abiRecords.Count -eq 0) { throw 'no vendor ABI source found' }
 $abiSourceReportLines = New-Object 'System.Collections.Generic.List[string]'
 $abiSourceReportLines.Add('# LiteOS Phase 3 vendor ABI source selection')
 $abiSourceReportLines.Add('# C prototypes are imported from immutable NVIDIA 595.84 headers')
+$abiSourceReportLines.Add('# Phase 5-only adapters are intentionally excluded from this baseline graph')
 $abiSourceReportLines.Add(('# id{0}component{0}language{0}source' -f $tab))
 foreach ($record in $abiRecords) {
     $abiSourceReportLines.Add(('{0}{4}{1}{4}{2}{4}{3}' -f $record.Id, $record.Component, $record.Language, $record.Source, $tab))
