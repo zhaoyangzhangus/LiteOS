@@ -162,7 +162,8 @@ foreach ($workQueueSymbol in @(
 $bridgeText = Get-Content -LiteralPath $bridgeSource -Raw
 foreach ($requiredText in @(
         'rm_init_rm(', 'rm_is_supported_device(', 'rm_init_private_state(',
-        'rm_init_adapter(', 'rm_shutdown_adapter(', 'rm_free_private_state(',
+        'rm_init_adapter(', 'rm_disable_adapter(', 'rm_shutdown_adapter(',
+        'rm_free_private_state(',
         'rm_shutdown_rm(', 'os_pci_init_handle(',
         'gpu->chipInfo.platformId', 'gpu->chipInfo.implementationId',
         'GPU_ARCHITECTURE_BLACKWELL_GB2XX', 'GPU_IMPLEMENTATION_GB205',
@@ -178,13 +179,26 @@ if ($bridgeText -match '(?im)(chipInfo\.(platformId|implementationId)|pGpuArch)\
 if ($bridgeText -match '(?im)\b(gsp|gmmu|pma|gpu\s*va)\b\s*[:=]') {
     Fail-Gate 'Phase 4 bridge contains a LiteOS-side GPU-owned implementation'
 }
+$disableIndex = $bridgeText.IndexOf(
+    'rm_disable_adapter(context->stack, context->state);',
+    [System.StringComparison]::Ordinal)
+$irqStopIndex = $bridgeText.IndexOf(
+    'nv_rm_vendor_stop_irq(context);',
+    [System.StringComparison]::Ordinal)
+$shutdownIndex = $bridgeText.IndexOf(
+    'rm_shutdown_adapter(context->stack, context->state);',
+    [System.StringComparison]::Ordinal)
+if ($disableIndex -lt 0 -or $irqStopIndex -lt 0 -or $shutdownIndex -lt 0 -or
+    $disableIndex -ge $irqStopIndex -or $irqStopIndex -ge $shutdownIndex) {
+    Fail-Gate 'Phase 4 RM teardown is not disable -> IRQ stop -> shutdown'
+}
 
 $workQueueText = Get-Content -LiteralPath $workQueueSource -Raw
 foreach ($requiredWorkQueueText in @(
         'os_queue_work_item(', 'os_flush_work_queue(',
         'os_is_queue_flush_ongoing(', 'rm_execute_work_item(',
         'nv_port_work_queue(', 'nv_port_work_drain(',
-        'deferred worker')) {
+        'deferred_run(64U)', 'deferred worker')) {
     if ($workQueueText -notmatch [regex]::Escape($requiredWorkQueueText)) {
         Fail-Gate "workqueue adapter evidence is absent: $requiredWorkQueueText"
     }

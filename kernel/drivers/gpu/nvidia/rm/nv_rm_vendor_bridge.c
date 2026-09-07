@@ -37,7 +37,7 @@ typedef struct nv_rm_vendor_context {
     bool irq_started;
     bool rm_initialized;
     bool private_initialized;
-    bool adapter_attempted;
+    bool adapter_initialized;
 } nv_rm_vendor_context_t;
 
 static void nv_rm_vendor_irq_bottom_half(void *argument);
@@ -205,9 +205,17 @@ static void nv_rm_vendor_cleanup(nv_rm_vendor_context_t *context)
     if (context == NULL)
         return;
 
+    /* Match the immutable 595.84 Linux teardown order: disable the running
+     * adapter while its RM interrupt path is still available, then tear down
+     * the IRQ, and only then release the adapter state.  A failed
+     * rm_init_adapter() is not a successful adapter and must not be passed to
+     * rm_shutdown_adapter(). */
+    if (context->adapter_initialized)
+        rm_disable_adapter(context->stack, context->state);
+
     nv_rm_vendor_stop_irq(context);
 
-    if (context->adapter_attempted)
+    if (context->adapter_initialized)
         rm_shutdown_adapter(context->stack, context->state);
 
     if (context->private_initialized)
@@ -436,11 +444,11 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
      * supplies no GSP protocol, VRAM PMA, GPU VA, or GMMU implementation;
      * any such work remains inside the immutable RM object graph.
      */
-    context->adapter_attempted = true;
     if (!rm_init_adapter(context->stack, context->state)) {
         nv_rm_vendor_cleanup(context);
         return K_EIO;
     }
+    context->adapter_initialized = true;
 
     if (atomic_load_explicit(&context->irq_bottom_schedule_failed,
                              memory_order_acquire)) {

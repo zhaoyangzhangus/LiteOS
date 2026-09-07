@@ -99,6 +99,33 @@ static void nv_liteos_work_execute(void *argument)
     atomic_store_explicit(&entry->completed, true, memory_order_release);
 }
 
+static kstatus_t nv_liteos_work_drain_entry(
+    nv_liteos_work_entry_t *entry)
+{
+    if (entry == NULL)
+        return K_EINVAL;
+
+    for (;;) {
+        unsigned state = atomic_load_explicit(&entry->work.state,
+                                              memory_order_acquire);
+        if (state == NV_PORT_WORK_IDLE || state == NV_PORT_WORK_CANCELLED)
+            return K_OK;
+
+        /* Phase 4 probes RM before LiteOS starts the persistent deferred
+         * worker.  The existing deferred runner is explicitly early-boot
+         * safe, so use it to execute the real queued callback.  If no item
+         * can be made runnable while the worker is absent, report the
+         * condition instead of spinning forever or claiming a flush. */
+        if (!deferred_worker_started()) {
+            if (deferred_run(64U) == 0U)
+                return K_EAGAIN;
+            continue;
+        }
+
+        return nv_port_work_drain(&entry->work, UINT64_MAX);
+    }
+}
+
 NV_STATUS NV_API_CALL os_queue_work_item(struct os_work_queue *queue,
                                           void *data)
 {
@@ -185,7 +212,7 @@ NV_STATUS NV_API_CALL os_flush_work_queue(struct os_work_queue *queue,
     nv_port_spin_unlock(&g_nv_liteos_work_lock);
 
     for (index = 0U; index < pending_count; ++index) {
-        if (nv_port_work_drain(&pending[index]->work, UINT64_MAX) != K_OK) {
+        if (nv_liteos_work_drain_entry(pending[index]) != K_OK) {
             result = NV_ERR_OPERATING_SYSTEM;
             break;
         }
