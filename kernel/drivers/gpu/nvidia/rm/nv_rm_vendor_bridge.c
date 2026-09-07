@@ -9,8 +9,14 @@
 
 #include <gpu/gpu.h>
 #include <gpu/gpu_arch.h>
+#include <core/hal.h>
+#include <core/hal_mgr.h>
+#include <core/system.h>
+#include <gpu_mgr/gpu_mgr.h>
 #include <nv-priv.h>
 #include <nv_arch.h>
+#include <nv_ref.h>
+#include <nvoc/object.h>
 
 #include "../../port/include/nv_port.h"
 
@@ -36,8 +42,10 @@ typedef struct nv_rm_vendor_context {
     uint32_t irq_flags;
     bool irq_started;
     bool rm_initialized;
+    bool event_locks_initialized;
     bool private_initialized;
     bool adapter_initialized;
+    OBJGPU *phase4_gpu;
 } nv_rm_vendor_context_t;
 
 static void nv_rm_vendor_irq_bottom_half(void *argument);
@@ -218,8 +226,19 @@ static void nv_rm_vendor_cleanup(nv_rm_vendor_context_t *context)
     if (context->adapter_initialized)
         rm_shutdown_adapter(context->stack, context->state);
 
+    /* Phase 4 keeps only the real vendor OBJGPU discovery object alive.  It
+     * must be deleted before the private RM and global RM state are released;
+     * GSP bootstrap and the full adapter path begin in Phase 5. */
+    if (context->phase4_gpu != NULL) {
+        objDelete(context->phase4_gpu);
+        context->phase4_gpu = NULL;
+    }
+
     if (context->private_initialized)
         rm_free_private_state(context->stack, context->state);
+
+    if (context->event_locks_initialized)
+        rm_destroy_event_locks(context->stack, context->state);
 
     if (context->rm_initialized)
         rm_shutdown_rm(context->stack);
@@ -333,11 +352,164 @@ static kstatus_t nv_rm_vendor_fill_pci(const pci_device_t *device,
     return K_OK;
 }
 
+static void nv_rm_vendor_log_boot_registers(const nv_state_t *state)
+{
+    nv_port_mmio_mapping_t mapping = {0};
+
+    if (state == NULL || state->regs == NULL)
+        return;
+
+    if (nv_port_mmio_map(paddr_make(state->regs->cpu_address), 0x1000U,
+                         NV_PORT_CACHE_UC, &mapping) != K_OK) {
+        liteos_serial_write_serial_only(
+            "LITEOS_NVIDIA_BOOT_REGS_READ_FAILED\r\n");
+        return;
+    }
+
+    liteos_serial_printf_serial_only(
+        "LITEOS_NVIDIA_BOOT_REGS boot0=%x boot1=%x boot42=%x\r\n",
+        (unsigned)nv_port_mmio_read32(mapping.base, 0x000U),
+        (unsigned)nv_port_mmio_read32(mapping.base, 0x004U),
+        (unsigned)nv_port_mmio_read32(mapping.base, 0xa00U));
+    (void)nv_port_mmio_unmap(&mapping);
+}
+
+static void nv_rm_vendor_log_hal_state(const nv_state_t *state)
+{
+    const nv_priv_t *private_state;
+    OBJSYS *sys;
+    OBJHALMGR *hal_mgr;
+    OBJGPUMGR *gpu_mgr;
+    GpuArch *gpu_arch = NULL;
+    NvU64 encoded_dbdf = 0ULL;
+    NvU32 probed_gpu_matches = 0U;
+    NvU32 probed_dbdf_matches = 0U;
+    NvU32 registered_gpu_id = 0U;
+    NvU64 registered_dbdf = 0ULL;
+    NvU32 matched_impl = 0U;
+    NV_STATUS match_status = (NV_STATUS)0xffffffffU;
+
+    if (state == NULL)
+        return;
+
+    private_state = (const nv_priv_t *)NV_GET_NV_PRIV(state);
+    sys = SYS_GET_INSTANCE();
+    hal_mgr = sys != NULL ? SYS_GET_HALMGR(sys) : NULL;
+    gpu_mgr = sys != NULL ? SYS_GET_GPUMGR(sys) : NULL;
+    if (private_state != NULL && hal_mgr != NULL) {
+        match_status = halmgrGetHalForGpu(
+            hal_mgr, private_state->pmc_boot_0,
+            private_state->pmc_boot_42, &matched_impl);
+    }
+    encoded_dbdf = gpuEncodeDomainBusDevice(
+        state->pci_info.domain, state->pci_info.bus, state->pci_info.slot);
+    if (private_state != NULL && gpu_mgr != NULL) {
+        gpu_arch = gpumgrGetGpuArch(private_state->pmc_boot_42, 0U,
+                                    TEGRA_CHIP_TYPE_DEFAULT);
+        for (NvU32 i = 0U; i < NV_ARRAY_ELEMENTS(gpu_mgr->probedGpus); ++i) {
+            if (gpu_mgr->probedGpus[i].gpuId == state->gpu_id) {
+                ++probed_gpu_matches;
+                registered_gpu_id = gpu_mgr->probedGpus[i].gpuId;
+                registered_dbdf = gpu_mgr->probedGpus[i].gpuDomainBusDevice;
+            }
+            if (gpu_mgr->probedGpus[i].gpuDomainBusDevice == encoded_dbdf)
+                ++probed_dbdf_matches;
+        }
+    }
+
+    liteos_serial_printf_serial_only(
+        "LITEOS_NVIDIA_HAL_STATE sys=%llx mgr=%llx gb205=%llx match=%x impl=%x dbdf=%llx gpu=%x probed=%u/%u reg=%x/%llx arch=%llx chip=%x/%x\r\n",
+        (unsigned long long)(uintptr_t)sys,
+        (unsigned long long)(uintptr_t)hal_mgr,
+        hal_mgr != NULL
+            ? (unsigned long long)(uintptr_t)hal_mgr->pHalList[HAL_IMPL_GB205]
+            : 0ULL,
+        (unsigned)match_status, (unsigned)matched_impl,
+        (unsigned long long)encoded_dbdf, private_state != NULL
+            ? (unsigned)state->gpu_id : 0U,
+        (unsigned)probed_gpu_matches, (unsigned)probed_dbdf_matches,
+        (unsigned)registered_gpu_id, (unsigned long long)registered_dbdf,
+        (unsigned long long)(uintptr_t)gpu_arch,
+        gpu_arch != NULL ? (unsigned)gpu_arch->chipArch : 0U,
+        gpu_arch != NULL ? (unsigned)gpu_arch->chipImpl : 0U);
+}
+
+/* Phase 4 stops at the real vendor OBJGPU/NVOC/HAL discovery boundary.  The
+ * object is not inserted into gpumgr's handle table and is deleted by the
+ * normal reverse teardown path.  Phase 5 owns the adapter/GSP transition. */
+static kstatus_t nv_rm_vendor_create_phase4_gpu(
+    nv_rm_vendor_context_t *context)
+{
+    const nv_priv_t *private_state;
+    OBJSYS *sys;
+    GpuArch *gpu_arch;
+    OBJGPU *probe_gpu = NULL;
+    NV_STATUS create_status;
+    NV_STATUS bind_status = (NV_STATUS)0xffffffffU;
+
+    if (context == NULL || context->state == NULL)
+        return K_EINVAL;
+
+    private_state = (const nv_priv_t *)NV_GET_NV_PRIV(context->state);
+    sys = SYS_GET_INSTANCE();
+    if (private_state == NULL || sys == NULL)
+        return K_EIO;
+
+    gpu_arch = gpumgrGetGpuArch(private_state->pmc_boot_42, 0U,
+                                TEGRA_CHIP_TYPE_DEFAULT);
+    if (gpu_arch == NULL)
+        return K_EIO;
+
+    /* 595.84's generated host NVOC graph maps the physical-PF discovery
+     * variant to PF_KERNEL_ONLY.  This selects the vendor GB205 HAL only; it
+     * does not load firmware, start GSP, or issue an RPC. */
+    create_status = objCreate(&probe_gpu, sys, OBJGPU,
+                              gpu_arch->chipArch,
+                              gpu_arch->chipImpl,
+                              gpu_arch->hidrev,
+                              gpu_arch->tegraType,
+                              RM_RUNTIME_VARIANT_PF_KERNEL_ONLY,
+                              0U,
+                              0U,
+                              context->state->gpu_id,
+                              NULL,
+                              gpu_arch);
+    if (create_status == NV_OK && probe_gpu != NULL)
+        bind_status = gpuBindHalLegacy(probe_gpu,
+                                       private_state->pmc_boot_0,
+                                       private_state->pmc_boot_42,
+                                       0U);
+
+    liteos_serial_printf_serial_only(
+        "LITEOS_NVIDIA_PHASE4_GPU_OBJECT create=%x bind=%x obj=%llx hal=%llx impl=%x arch=%x chip=%x\r\n",
+        (unsigned)create_status,
+        (unsigned)bind_status,
+        (unsigned long long)(uintptr_t)probe_gpu,
+        probe_gpu != NULL ? (unsigned long long)(uintptr_t)probe_gpu->pHal : 0ULL,
+        probe_gpu != NULL ? (unsigned)probe_gpu->halImpl : 0U,
+        (unsigned)gpu_arch->chipArch, (unsigned)gpu_arch->chipImpl);
+
+    if (create_status != NV_OK || bind_status != NV_OK || probe_gpu == NULL) {
+        if (probe_gpu != NULL)
+            objDelete(probe_gpu);
+        return K_EIO;
+    }
+
+    context->phase4_gpu = probe_gpu;
+    liteos_serial_write_serial_only(
+        "LITEOS_NVIDIA_PHASE4_GPU_OBJECT_READY\r\n");
+    return K_OK;
+}
+
 static void nv_rm_vendor_set_result(nv_rm_vendor_context_t *context,
                                     nv_rm_vendor_result_t *result)
 {
     nv_priv_t *private_state = (nv_priv_t *)NV_GET_NV_PRIV(context->state);
-    OBJGPU *gpu = private_state != NULL ? private_state->pGpu : NULL;
+    /* Phase 4 deliberately reports the real discovery object constructed by
+     * nv_rm_vendor_create_phase4_gpu().  private_state->pGpu belongs to the
+     * later adapter path and may be the vendor's pre-attach placeholder; it
+     * is not the object whose PF_KERNEL_ONLY NVOC/HAL binding we just proved. */
+    OBJGPU *gpu = context != NULL ? context->phase4_gpu : NULL;
     GpuArch *gpu_arch = gpu != NULL ? gpu->pGpuArch : NULL;
 
     if (result == NULL)
@@ -353,14 +525,33 @@ static void nv_rm_vendor_set_result(nv_rm_vendor_context_t *context,
     if (gpu == NULL || gpu_arch == NULL)
         return;
 
-    result->chip_arch = gpu->chipInfo.platformId;
-    result->chip_impl = gpu->chipInfo.implementationId;
+    /* chipInfo is populated by gpuPostConstruct, which is intentionally a
+     * later Phase 5 boundary.  The architecture facts used here come from
+     * the vendor GpuArch selected by the immutable HAL manager. */
+    result->chip_arch = gpu_arch->chipArch;
+    result->chip_impl = gpu_arch->chipImpl;
     result->hal_impl = gpu->halImpl;
-    result->blackwell = result->chip_arch == GPU_ARCHITECTURE_BLACKWELL_GB2XX;
+    /* GpuArch stores the PMC_BOOT_42 architecture code (0x1b for GB200),
+     * while GPU_ARCHITECTURE_BLACKWELL_GB2XX is the separate published
+     * architecture encoding (0x1b0).  Use the value actually returned by the
+     * immutable vendor HAL lookup at this boundary. */
+    result->blackwell = result->chip_arch == NV_PMC_BOOT_42_ARCHITECTURE_GB200;
     result->gb205 = result->chip_impl == GPU_IMPLEMENTATION_GB205;
-    result->hal_valid = result->rm_device != NULL && gpu->pHal != NULL &&
-                        (private_state->flags & NV_INIT_FLAG_HAL) != 0U &&
-                        (private_state->flags & NV_INIT_FLAG_HAL_COMPONENTS) != 0U;
+    /* The private-state HAL flags are set by the later adapter path.  Phase 4
+     * stops after this real OBJGPU NVOC/HAL binding, so the vendor HAL object
+     * and its resolved GB205 implementation are the valid evidence here. */
+    result->hal_valid = gpu->pHal != NULL && gpu->halImpl == HAL_IMPL_GB205;
+    liteos_serial_printf_serial_only(
+        "LITEOS_NVIDIA_PHASE4_RESULT gpu=%llx arch=%llx hal=%llx pga=%llx impl=%x flags=%x valid=%u blackwell=%u gb205=%u\r\n",
+        (unsigned long long)(uintptr_t)gpu,
+        (unsigned long long)(uintptr_t)gpu_arch,
+        (unsigned long long)(uintptr_t)gpu->pHal,
+        (unsigned long long)(uintptr_t)gpu->pGpuArch,
+        (unsigned)gpu->halImpl,
+        private_state != NULL ? (unsigned)private_state->flags : 0U,
+        result->hal_valid ? 1U : 0U,
+        result->blackwell ? 1U : 0U,
+        result->gb205 ? 1U : 0U);
 }
 
 kstatus_t nv_rm_vendor_start(const pci_device_t *device,
@@ -417,10 +608,23 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
     }
     context->rm_initialized = true;
 
+    /* The Linux frontend initializes these per-device RM locks before
+     * rm_is_supported_device().  LiteOS cannot call nv_lock_init_locks(),
+     * because that wrapper owns Linux-only nv_linux_state_t storage; the
+     * vendor RM event-lock entry points are the portable part of the same
+     * lifecycle and operate directly on nv_state_t. */
+    if (!rm_init_event_locks(context->stack, context->state)) {
+        liteos_serial_write_serial_only(
+            "LITEOS_NVIDIA_EVENT_LOCKS_FAILED\r\n");
+        nv_rm_vendor_cleanup(context);
+        return K_EIO;
+    }
+    context->event_locks_initialized = true;
+
     vendor_status = rm_is_supported_device(context->stack, context->state);
     if (vendor_status != NV_OK) {
         liteos_serial_printf_serial_only(
-            "LITEOS_NVIDIA_RM_UNSUPPORTED status=%08x\r\n",
+            "LITEOS_NVIDIA_RM_UNSUPPORTED status=%x\r\n",
             (unsigned)vendor_status);
         nv_rm_vendor_cleanup(context);
         return K_EIO;
@@ -432,26 +636,12 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
     }
     context->private_initialized = true;
 
-    if (nv_rm_vendor_start_irq(device, context) != K_OK) {
+    nv_rm_vendor_log_boot_registers(context->state);
+    nv_rm_vendor_log_hal_state(context->state);
+
+    if (nv_rm_vendor_create_phase4_gpu(context) != K_OK) {
         liteos_serial_write_serial_only(
-            "LITEOS_NVIDIA_IRQ_UNAVAILABLE\r\n");
-        nv_rm_vendor_cleanup(context);
-        return K_EIO;
-    }
-
-    /*
-     * The call is intentionally the vendor adapter entry point.  LiteOS
-     * supplies no GSP protocol, VRAM PMA, GPU VA, or GMMU implementation;
-     * any such work remains inside the immutable RM object graph.
-     */
-    if (!rm_init_adapter(context->stack, context->state)) {
-        nv_rm_vendor_cleanup(context);
-        return K_EIO;
-    }
-    context->adapter_initialized = true;
-
-    if (atomic_load_explicit(&context->irq_bottom_schedule_failed,
-                             memory_order_acquire)) {
+            "LITEOS_NVIDIA_PHASE4_GPU_OBJECT_FAIL\r\n");
         nv_rm_vendor_cleanup(context);
         return K_EIO;
     }
@@ -463,6 +653,8 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
         return K_EIO;
     }
 
+    liteos_serial_write_serial_only(
+        "LITEOS_NVIDIA_PHASE4_HAL_READY\r\n");
     *context_out = context;
     return K_OK;
 }

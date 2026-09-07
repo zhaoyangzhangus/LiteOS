@@ -102,6 +102,20 @@ static bool bar_is_memory64(uint32_t low) {
     return (low & 1U) == 0 && ((low >> 1) & 3U) == 2U;
 }
 
+static uint64_t pci_bar_length_from_masks(uint32_t mask_low,
+                                          uint32_t mask_high,
+                                          bool memory, bool is_64) {
+    uint32_t low_mask = memory ? (mask_low & ~0xFU) : (mask_low & ~3U);
+    if (is_64) {
+        uint64_t mask = (uint64_t)low_mask | ((uint64_t)mask_high << 32);
+        return mask != 0U ? (~mask + 1ULL) : 0U;
+    }
+    /* A 32-bit BAR is sized in a 32-bit address space.  Promote only after
+     * the complement and add have wrapped at 32 bits; promoting first turns
+     * a normal 64 MiB BAR into 0xffffffff04000000. */
+    return low_mask != 0U ? (uint64_t)(~low_mask + 1U) : 0U;
+}
+
 static bool read_bar(const x86_acpi_ecam_t *segment, pci_device_t *device,
                      uint32_t index) {
     uint16_t offset = (uint16_t)(0x10U + index * 4U);
@@ -159,12 +173,11 @@ static bool read_bar(const x86_acpi_ecam_t *segment, pci_device_t *device,
     if (is_64) bar->flags |= PCI_RESOURCE_64BIT;
     if (memory && (low & (1U << 3)) != 0) bar->flags |= PCI_RESOURCE_PREFETCH;
     uint64_t address = memory ? (uint64_t)(low & ~0xFU) : (uint64_t)(low & ~3U);
-    uint64_t mask = memory ? (uint64_t)(mask_low & ~0xFU) : (uint64_t)(mask_low & ~3U);
     if (is_64) {
         address |= (uint64_t)original_high << 32;
-        mask |= (uint64_t)mask_high << 32;
     }
-    uint64_t length = mask != 0 ? (~mask + 1ULL) : 0;
+    uint64_t length = pci_bar_length_from_masks(mask_low, mask_high,
+                                                memory, is_64);
     /* Some firmware leaves an unassigned 64-bit BAR at the top of the
      * physical address space. Treat that BAR as absent instead of allowing
      * its wrapped range to abort enumeration of unrelated devices. */
@@ -738,6 +751,15 @@ const pci_host_t *pci_current_host(void) {
 }
 
 bool pci_ecam_self_test(void) {
+    if (pci_bar_length_from_masks(0xFC000000U, 0U, true, false) !=
+            0x04000000ULL ||
+        pci_bar_length_from_masks(0xFFFFFF00U, 0U, false, false) !=
+            0x00000100ULL ||
+        pci_bar_length_from_masks(0xFFFFFFF0U, 0xFFFFFFFFU, true, true) !=
+            0x0000000000000010ULL) {
+        g_pci_last_error = 0x100U;
+        return false;
+    }
     if (pci_ecam_init(&g_pci_host) != K_OK || !g_pci_host.initialized ||
         g_pci_host.ecam_count == 0) {
         if (g_pci_last_error == 0U) g_pci_last_error = 0x200U;

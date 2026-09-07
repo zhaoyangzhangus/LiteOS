@@ -84,7 +84,12 @@ if ($RealTest) {
     # stamps do not encode every CFLAGS value.  Force a clean target rebuild so
     # a reused Build directory cannot mix ordinary and real-test objects.
     $makeArguments = @('-B') + $makeArguments
-    $makeArguments += @('DEBUG=2', 'LITEOS_DEBUG_SERIAL=1', 'LITEOS_REALTEST=1')
+    $makeArguments += @(
+        'DEBUG=2',
+        'LITEOS_DEBUG_SERIAL=1',
+        'LITEOS_REALTEST=1',
+        'KERNEL_EXTRA_CFLAGS=-DLITEOS_NVIDIA_REALTEST_NO_DESKTOP=1'
+    )
     $makeArguments += 'esp'
 }
 else {
@@ -114,11 +119,15 @@ if ($makeExitCode -ne 0) {
 # loses the section-relative addends used by local .bss/.rdata references.
 # Build the Phase 4 LiteOS object graph directly as ELF instead; the native
 # build above remains the source of the UEFI loader and ESP payload.
+$elfKernelExtraCFlags = '-mcmodel=kernel'
+if ($RealTest) {
+    $elfKernelExtraCFlags += ' -DLITEOS_NVIDIA_REALTEST_NO_DESKTOP=1'
+}
 $elfMakeArguments = @(
     '-B', ('BUILD={0}' -f $elfBuildName),
     'TOOLPREFIX=x86_64-elf-',
     'LD=x86_64-elf-gcc',
-    'KERNEL_EXTRA_CFLAGS=-mcmodel=kernel',
+    ('KERNEL_EXTRA_CFLAGS={0}' -f $elfKernelExtraCFlags),
     ('KERNEL_LDFLAGS=-nostdlib -Wl,-T,{0}' -f $linkerScript.Replace('\', '/'))
 )
 if ($RealTest) {

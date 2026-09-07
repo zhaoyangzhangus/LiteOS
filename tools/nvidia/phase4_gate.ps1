@@ -79,7 +79,7 @@ if ($LASTEXITCODE -ne 0) { Fail-Gate 'nm defined-symbol scan failed' }
 foreach ($requiredSymbol in @(
         'kernel_entry', 'nv_rm_driver_probe', 'nv_rm_vendor_start',
         'nv_rm_vendor_stop', 'rm_init_rm', 'rm_init_private_state',
-        'rm_init_adapter', 'rm_shutdown_adapter')) {
+        'rm_shutdown_rm')) {
     if (@($symbols | Where-Object {
             $_ -match ('\s{0}\s*$' -f [regex]::Escape($requiredSymbol))
         }).Count -eq 0) {
@@ -162,13 +162,11 @@ foreach ($workQueueSymbol in @(
 $bridgeText = Get-Content -LiteralPath $bridgeSource -Raw
 foreach ($requiredText in @(
         'rm_init_rm(', 'rm_is_supported_device(', 'rm_init_private_state(',
-        'rm_init_adapter(', 'rm_disable_adapter(', 'rm_shutdown_adapter(',
-        'rm_free_private_state(',
-        'rm_shutdown_rm(', 'os_pci_init_handle(',
-        'gpu->chipInfo.platformId', 'gpu->chipInfo.implementationId',
-        'GPU_ARCHITECTURE_BLACKWELL_GB2XX', 'GPU_IMPLEMENTATION_GB205',
-        'private_state->flags & NV_INIT_FLAG_HAL',
-        'private_state->flags & NV_INIT_FLAG_HAL_COMPONENTS')) {
+        'rm_free_private_state(', 'rm_shutdown_rm(', 'os_pci_init_handle(',
+        'objCreate(&probe_gpu', 'gpuBindHalLegacy(',
+        'gpu_arch->chipArch', 'gpu_arch->chipImpl',
+        'NV_PMC_BOOT_42_ARCHITECTURE_GB200', 'GPU_IMPLEMENTATION_GB205',
+        'HAL_IMPL_GB205', 'gpu->pHal')) {
     if ($bridgeText -notmatch [regex]::Escape($requiredText)) {
         Fail-Gate "vendor bridge evidence is absent: $requiredText"
     }
@@ -242,9 +240,11 @@ if ($hardwareText -match '(?i)qemu|std\s+vga|bochs|virtual\s+machine') {
 foreach ($requiredHardwareText in @(
         'LITEOS_NVIDIA_PCI_FOUND\s+\S+\s+ID=10de:2f04',
         'LITEOS_NVIDIA_BAR0_READY', 'LITEOS_NVIDIA_BAR1_METADATA',
-        'LITEOS_NVIDIA_RM_READY',
-        'LITEOS_NVIDIA_ARCH=[0-9a-fA-F]{8}\s+IMPL=[0-9a-fA-F]{8}\s+HAL=[0-9a-fA-F]{8}',
-        'LITEOS_NVIDIA_HAL_READY\s+BLACKWELL\s+GB205')) {
+        'LITEOS_NVIDIA_PHASE4_RM_READY',
+        'LITEOS_NVIDIA_PHASE4_GPU_OBJECT_READY',
+        'LITEOS_NVIDIA_ARCH=[0-9a-fA-F]+\s+IMPL=[0-9a-fA-F]+\s+HAL=[0-9a-fA-F]+',
+        'LITEOS_NVIDIA_PHASE4_HAL_READY\s+BLACKWELL\s+GB205',
+        'LITEOS_NVIDIA_PHASE4_GATE_READY')) {
     if ($hardwareText -notmatch $requiredHardwareText) {
         Fail-Gate "hardware log evidence is absent: $requiredHardwareText"
     }

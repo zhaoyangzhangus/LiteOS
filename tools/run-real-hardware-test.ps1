@@ -5,6 +5,7 @@ param(
     [string]$DriveLetter = 'F',
     [string]$Build = 'build-realtest',
     [switch]$NvidiaPhase4,
+    [switch]$ReuseNvidiaPhase4Build,
     [switch]$DiagnosticBot,
     [switch]$Rtl8126FirmwareDownload,
     [switch]$ForceReboot,
@@ -101,6 +102,24 @@ function Backup-Target([string]$relativePath, [string]$volumeRoot) {
     Copy-Item -LiteralPath $source -Destination $destination -Recurse -Force
 }
 
+function Copy-FileIfChanged([string]$sourceFile, [string]$targetFile) {
+    $sourceHash = (Get-FileHash -LiteralPath $sourceFile -Algorithm SHA256).Hash
+    if (Test-Path -LiteralPath $targetFile -PathType Leaf) {
+        $targetHash = (Get-FileHash -LiteralPath $targetFile -Algorithm SHA256).Hash
+        if ($sourceHash -eq $targetHash) {
+            $script:deploymentSkippedFiles++
+            $script:deploymentSkippedPaths.Add($targetFile)
+            return
+        }
+    }
+
+    $parent = Split-Path -Parent $targetFile
+    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    Copy-Item -LiteralPath $sourceFile -Destination $targetFile -Force
+    $script:deploymentCopiedFiles++
+    $script:deploymentCopiedPaths.Add($targetFile)
+}
+
 function Copy-DirectoryContents([string]$sourceDirectory, [string]$targetDirectory) {
     New-Item -ItemType Directory -Force -Path $targetDirectory | Out-Null
     foreach ($child in (Get-ChildItem -LiteralPath $sourceDirectory -Force)) {
@@ -109,7 +128,7 @@ function Copy-DirectoryContents([string]$sourceDirectory, [string]$targetDirecto
             Copy-DirectoryContents $child.FullName $destination
         }
         else {
-            Copy-Item -LiteralPath $child.FullName -Destination $destination -Force
+            Copy-FileIfChanged $child.FullName $destination
         }
     }
 }
@@ -178,11 +197,24 @@ if ($NvidiaPhase4) {
     # This switch is intentionally opt-in.  The ordinary real-test path keeps
     # building the production LiteOS image; the NVIDIA path must use the
     # strong Phase 4 vendor-RM link produced by phase4_build.ps1.
-    $buildScript = Join-Path $projectRoot 'tools\nvidia\phase4_build.ps1'
-    $buildArguments = @('-Build', $Build, '-RealTest')
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
-    if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 4 build failed ($LASTEXITCODE)." }
     $espPath = Join-Path $projectRoot 'build\nvidia\phase4\esp'
+    if ($ReuseNvidiaPhase4Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\LITEOS\kernel.elf')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 4 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 4 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase4_build.ps1'
+        $buildArguments = @('-Build', $Build, '-RealTest')
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript @buildArguments
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 4 build failed ($LASTEXITCODE)." }
+    }
 }
 else {
     $buildScript = Join-Path $projectRoot 'tools\build-windows.ps1'
@@ -226,15 +258,29 @@ foreach ($relative in @(
 
 Remove-Item -LiteralPath (Join-Path $volumeRoot 'EFI\LITEOS\realtest.log'),
     (Join-Path $volumeRoot 'realtest.log') -Force -ErrorAction SilentlyContinue
+$script:deploymentCopiedFiles = 0
+$script:deploymentSkippedFiles = 0
+$script:deploymentCopiedPaths = New-Object 'System.Collections.Generic.List[string]'
+$script:deploymentSkippedPaths = New-Object 'System.Collections.Generic.List[string]'
 foreach ($entry in (Get-ChildItem -LiteralPath $espPath -Force)) {
     $destination = Join-Path $volumeRoot $entry.Name
     if ($entry.PSIsContainer) {
         Copy-DirectoryContents $entry.FullName $destination
     }
     else {
-        Copy-Item -LiteralPath $entry.FullName -Destination $destination -Force
+        Copy-FileIfChanged $entry.FullName $destination
     }
 }
+
+$deploymentSummary = @(
+    "copied_files=$($script:deploymentCopiedFiles)"
+    "skipped_unchanged_files=$($script:deploymentSkippedFiles)"
+    "copied_paths=$($script:deploymentCopiedPaths.Count)"
+    "skipped_paths=$($script:deploymentSkippedPaths.Count)"
+)
+Save-Text (Join-Path $runDirectory 'deployment-summary.txt') ($deploymentSummary -join "`r`n")
+Write-Host ("Incremental deployment: copied {0} file(s), skipped {1} unchanged file(s)." -f `
+    $script:deploymentCopiedFiles, $script:deploymentSkippedFiles)
 
 $sourceBoot = Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'
 $targetBoot = Join-Path $volumeRoot 'EFI\BOOT\BOOTX64.EFI'

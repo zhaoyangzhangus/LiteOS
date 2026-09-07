@@ -436,13 +436,18 @@ void liteos_realtest_record_exception(uint64_t vector, uint64_t error_code,
 }
 
 void liteos_realtest_finish_success(void) {
-    /* Keep capture open: the desktop is the real hardware test boundary, so
-     * input and compositor diagnostics must remain durable after PASS. */
+    /* The real-hardware deployment is a boot-and-return probe.  Persist the
+     * terminal result before resetting so the host collector can prove both
+     * the hardware outcome and the return to Windows without entering the
+     * desktop. */
     liteos_realtest_mark("LITEOS_REALTEST_PASS");
     liteos_realtest_capture("LITEOS_REALTEST_PASS\r\n");
-    liteos_realtest_capture("LITEOS_REALTEST_DESKTOP_RUNNING\r\n");
     (void)liteos_realtest_flush();
     liteos_serial_write_serial_only("LITEOS_REALTEST_PASS\r\n");
+    liteos_realtest_capture("LITEOS_REALTEST_REBOOTING\r\n");
+    (void)liteos_realtest_flush();
+    liteos_serial_write_serial_only("LITEOS_REALTEST_REBOOTING\r\n");
+    x86_system_reboot();
 }
 
 void liteos_realtest_finish_failure(void) {

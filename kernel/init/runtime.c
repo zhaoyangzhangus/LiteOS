@@ -51,6 +51,12 @@
 #include <kernel/vfs.h>
 #include <kernel/journal.h>
 #include <kernel/litefs.h>
+
+#include "../drivers/gpu/nvidia/rm/include/nv_rm_driver.h"
+
+#ifndef LITEOS_NVIDIA_REALTEST_NO_DESKTOP
+#define LITEOS_NVIDIA_REALTEST_NO_DESKTOP 0
+#endif
 #include <kernel/e1000.h>
 #include <kernel/net_core.h>
 #include <kernel/net_manager.h>
@@ -184,6 +190,18 @@ static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
         halt_forever();
     }
     liteos_serial_write("LITEOS_SMP_USER_DISPATCH_OK\r\n");
+#if LITEOS_NVIDIA_REALTEST_NO_DESKTOP
+    if (liteos_realtest_enabled()) {
+        const nv_gpu_device_t *nvidia_gpu = nv_rm_driver_current();
+        if (nvidia_gpu == 0 || nvidia_gpu->state != NV_GPU_HAL_READY) {
+            liteos_serial_write_serial_only("LITEOS_NVIDIA_PHASE4_FAIL\r\n");
+            liteos_realtest_mark("LITEOS_NVIDIA_PHASE4_FAIL");
+            liteos_realtest_finish_failure();
+        }
+        liteos_serial_write_serial_only("LITEOS_NVIDIA_PHASE4_GATE_READY\r\n");
+        liteos_realtest_finish_success();
+    }
+#endif
     if (!window_server_kernel_ready()) {
         liteos_serial_write("LITEOS_WINDOW_SERVER_KERNEL_FAIL\r\n");
         halt_forever();

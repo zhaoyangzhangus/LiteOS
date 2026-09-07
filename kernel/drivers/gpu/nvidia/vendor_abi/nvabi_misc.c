@@ -2,7 +2,9 @@
 
 NvU64 os_page_size = NVABI_PAGE_SIZE;
 NvU64 os_max_page_size = NVABI_PAGE_SIZE;
-NvU64 os_page_mask = NVABI_PAGE_MASK;
+/* NVIDIA's os_page_mask follows Linux PAGE_MASK semantics: it keeps the
+ * page-aligned base, while ~os_page_mask is the in-page offset mask. */
+NvU64 os_page_mask = ~NVABI_PAGE_MASK;
 NvU8 os_page_shift = 12U;
 NvBool os_cc_enabled = NV_FALSE;
 NvBool os_cc_sev_snp_enabled = NV_FALSE;
