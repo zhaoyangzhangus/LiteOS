@@ -51,6 +51,14 @@ NV_STATUS NV_API_CALL nv_alloc_pages(
     if (page_count == 0U || page_size != NVABI_PAGE_SIZE ||
         pte_array == NULL || priv_data == NULL || unencrypted ||
         node_id >= 0) {
+        liteos_serial_printf_serial_only(
+            "LITEOS_NVIDIA_NV_ALLOC_INVALID pages=%u page_size=%llx contig=%u cache=%u zero=%u unencrypted=%u node=%d pte=%llx priv=%llx\r\n",
+            (unsigned)page_count, (unsigned long long)page_size,
+            contiguous != NV_FALSE ? 1U : 0U,
+            (unsigned)cache_type, zeroed != NV_FALSE ? 1U : 0U,
+            unencrypted != NV_FALSE ? 1U : 0U, (int)node_id,
+            (unsigned long long)(uintptr_t)pte_array,
+            (unsigned long long)(uintptr_t)priv_data);
         return nvabi_invalid_status("nv_alloc_pages", "nv-memory");
     }
     if ((uint64_t)page_count > UINT64_MAX / page_size) {

@@ -17,6 +17,7 @@
 #include <core/hal_mgr.h>
 #include <core/system.h>
 #include <gpu_mgr/gpu_mgr.h>
+#include <mem_mgr/io_vaspace.h>
 #include <nv-priv.h>
 #include <nv_arch.h>
 #include <nv_ref.h>
@@ -335,6 +336,11 @@ static kstatus_t nv_rm_vendor_fill_pci(const pci_device_t *device,
 
     state->regs = &state->bars[0];
     state->fb = &state->bars[1];
+    /* LiteOS has no GPU IOVA-remap domain at this boundary.  Zero is a
+     * valid vendor vaspace id, not the sentinel for a direct-physical PCIe
+     * path; leave GMMU/VA ownership with NVIDIA by passing the exact vendor
+     * "no domain" value. */
+    state->iovaspace_id = NV_IOVA_DOMAIN_NONE;
     state->cpu_numa_node_id = (NvS32)-1;
 #if LITEOS_NVIDIA_PHASE5
     state->request_firmware = NV_TRUE;
