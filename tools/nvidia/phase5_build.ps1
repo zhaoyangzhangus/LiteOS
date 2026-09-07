@@ -283,6 +283,8 @@ Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_nv_unsupported.S') `
     (Join-Path $phase5AbiRoot '0006.o') $abiAsmFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_memory.c') `
     (Join-Path $phase5AbiRoot '0003.o') $abiCFlags
+Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_pci.c') `
+    (Join-Path $phase5AbiRoot '0011.o') $abiCFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_firmware.c') `
     (Join-Path $phase5AbiRoot 'nvabi_firmware.o') $abiCFlags
 Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_vendor_bridge.c') `
@@ -297,6 +299,7 @@ $replacementObjects = @{
     'nvidia-port-memory.o' = (Join-Path $phase5ObjectRoot 'nvidia-port-memory.o').Replace('\', '/')
     'nvidia-port-vm.o' = (Join-Path $phase5ObjectRoot 'nvidia-port-vm.o').Replace('\', '/')
     'vmalloc.o' = (Join-Path $phase5ObjectRoot 'vmalloc.o').Replace('\', '/')
+    '0011.o' = (Join-Path $phase5AbiRoot '0011.o').Replace('\', '/')
 }
 $phase4Rows = @(Get-Content -LiteralPath $phase4LinkList |
     Where-Object { $_ -and $_[0] -ne '#' })

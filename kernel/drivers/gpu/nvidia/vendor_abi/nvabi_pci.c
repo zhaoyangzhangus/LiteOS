@@ -35,10 +35,10 @@ void *NV_API_CALL os_pci_init_handle(NvU32 domain, NvU8 bus, NvU8 slot,
                                      NvU8 function, NvU16 *vendor,
                                      NvU16 *device_id) {
     const pci_device_t *device = nvabi_find_bdf(domain, bus, slot, function);
-    if (device == NULL) {
-        nvabi_log_unsupported("os_pci_init_handle", "os-pci-detect");
-        return NULL;
-    }
+    /* RM probes arbitrary BDFs while enumerating the PCI fabric.  A missing
+     * device is the normal negative result of this lookup, not an unsupported
+     * LiteOS operation; keep the probe silent and let vendor code continue. */
+    if (device == NULL) return NULL;
     nvabi_pci_handle_t *handle = (nvabi_pci_handle_t *)kzalloc(
         sizeof(*handle), 0U);
     if (handle == NULL) return NULL;

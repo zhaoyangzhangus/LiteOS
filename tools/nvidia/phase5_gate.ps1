@@ -21,11 +21,13 @@ $bridgeSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_vendor_b
 $driverSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_driver.c'
 $firmwareSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_firmware.c'
 $memorySource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_memory.c'
+$pciSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_pci.c'
 $unsupportedSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_nv_unsupported.S'
 $portVmSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\port\nv_port_vm.c'
 $vmallocSource = Join-Path $repoRoot 'kernel\mm\vmalloc.c'
 $phase5UnsupportedObject = Join-Path $phase5Root 'objects\vendor_abi\0006.o'
 $phase5MemoryObject = Join-Path $phase5Root 'objects\vendor_abi\0003.o'
+$phase5PciObject = Join-Path $phase5Root 'objects\vendor_abi\0011.o'
 $phase5PortMemoryObject = Join-Path $phase5Root 'objects\nvidia-port-memory.o'
 $phase5PortVmObject = Join-Path $phase5Root 'objects\nvidia-port-vm.o'
 $phase5VmallocObject = Join-Path $phase5Root 'objects\vmalloc.o'
@@ -57,11 +59,13 @@ Require-File $bridgeSource 'Phase 5 vendor bridge source'
 Require-File $driverSource 'Phase 5 driver source'
 Require-File $firmwareSource 'Phase 5 firmware adapter source'
 Require-File $memorySource 'Phase 5 memory ABI source'
+Require-File $pciSource 'Phase 5 PCI ABI source'
 Require-File $unsupportedSource 'vendor ABI source'
 Require-File $portVmSource 'Phase 5 kernel mapping port source'
 Require-File $vmallocSource 'Phase 5 vmalloc source'
 Require-File $phase5UnsupportedObject 'Phase 5 ABI object without firmware fallback'
 Require-File $phase5MemoryObject 'Phase 5 incremental memory ABI object'
+Require-File $phase5PciObject 'Phase 5 incremental PCI ABI object'
 Require-File $phase5PortMemoryObject 'Phase 5 incremental port memory object'
 Require-File $phase5PortVmObject 'Phase 5 incremental kernel mapping port object'
 Require-File $phase5VmallocObject 'Phase 5 incremental vmalloc object'
@@ -153,8 +157,9 @@ if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -
     @($linkRows | Where-Object { $_ -like '*phase5/objects/nv_rm_vendor_bridge.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/nvabi_firmware.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/sha256.o' }).Count -ne 1 -or
-    @($linkRows | Where-Object { $_ -like '*phase4/objects/vendor_abi/*.o' }).Count -ne 9 -or
+    @($linkRows | Where-Object { $_ -like '*phase4/objects/vendor_abi/*.o' }).Count -ne 8 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0003.o' }).Count -ne 1 -or
+    @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0011.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0006.o' }).Count -ne 1) {
     Fail-Gate 'Phase 5 link list does not contain the incremental RM/firmware closure'
 }
@@ -177,6 +182,7 @@ if ($bridgeText -notmatch '(?s)if\s*\(!rm_init_adapter\([^)]*\)\)') {
 
 $firmwareText = Get-Content -LiteralPath $firmwareSource -Raw
 $memoryText = Get-Content -LiteralPath $memorySource -Raw
+$pciText = Get-Content -LiteralPath $pciSource -Raw
 $portVmText = Get-Content -LiteralPath $portVmSource -Raw
 $vmallocText = Get-Content -LiteralPath $vmallocSource -Raw
 foreach ($requiredFirmwareText in @(
@@ -201,6 +207,11 @@ foreach ($requiredMappingText in @(
     Require-Text $vmallocText $requiredMappingText 'LiteOS vmalloc page mapping'
 }
 Require-Text $portVmText 'vmalloc_map_pages(' 'kernel mapping port adapter'
+foreach ($requiredPciText in @(
+        'nvabi_find_bdf(', 'nv_port_pci_read32(',
+        'nv_port_pci_write32(', 'if (device == NULL) return NULL;')) {
+    Require-Text $pciText $requiredPciText 'real PCI BDF adapter'
+}
 if ($unsupportedSource) {
     $phase5UnsupportedSymbols = @(& $nm.Source '-g' '--defined-only' '--' $phase5UnsupportedObject 2>&1 |
         ForEach-Object { $_.ToString() })
