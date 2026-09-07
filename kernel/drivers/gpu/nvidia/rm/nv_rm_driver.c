@@ -4,6 +4,10 @@
 
 #include "nv_rm_vendor_bridge.h"
 
+#ifndef LITEOS_NVIDIA_PHASE5
+#define LITEOS_NVIDIA_PHASE5 0
+#endif
+
 #define NVIDIA_VENDOR_ID 0x10deU
 #define NVIDIA_GB205_DEVICE_ID 0x2f04U
 
@@ -132,7 +136,8 @@ kstatus_t nv_rm_driver_probe(void)
     nv_rm_vendor_result_t result = {0};
     kstatus_t status;
 
-    if (g_nv_gpu.state == NV_GPU_HAL_READY)
+    if (g_nv_gpu.state == NV_GPU_HAL_READY ||
+        g_nv_gpu.state == NV_GPU_GSP_READY)
         return K_OK;
 
     if (g_nv_gpu.state == NV_GPU_FAILED)
@@ -240,6 +245,10 @@ kstatus_t nv_rm_driver_probe(void)
     g_nv_gpu.state = NV_GPU_HAL_READY;
     liteos_serial_write_serial_only(
         "LITEOS_NVIDIA_PHASE4_HAL_READY BLACKWELL GB205\r\n");
+#if LITEOS_NVIDIA_PHASE5
+    g_nv_gpu.state = NV_GPU_GSP_READY;
+    liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_READY\r\n");
+#endif
     return K_OK;
 }
 

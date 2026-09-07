@@ -11,6 +11,10 @@
 
 #include "../drivers/gpu/nvidia/rm/include/nv_rm_driver.h"
 
+#ifndef LITEOS_NVIDIA_PHASE5
+#define LITEOS_NVIDIA_PHASE5 0
+#endif
+
 static BOOLEAN devices_fail_at(const liteos_init_devices_hooks_t *hooks,
                                const CHAR8 *message, const char *file,
                                uint32_t line) {
@@ -53,10 +57,15 @@ BOOLEAN liteos_init_devices(LITEOS_BOOT_INFO *info,
     }
     hooks->write("LITEOS_PCI_ECAM_OK\r\n");
 
-    /* NVIDIA RM is optional for non-NVIDIA boots.  A matching device is
-     * never reported as ready unless the real vendor bridge completes. */
+    /* Phase 5 needs the mounted root filesystem for the matching GSP image;
+     * the runtime continuation performs the same real probe after filesystem
+     * initialization.  Earlier phases retain their original early probe. */
+#if !LITEOS_NVIDIA_PHASE5
     if (nv_rm_driver_probe() != K_OK)
         hooks->write("LITEOS_NVIDIA_PROBE_FAIL\r\n");
+#else
+    hooks->write("LITEOS_NVIDIA_PROBE_DEFERRED\r\n");
+#endif
 
     liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_11);
     if (!input_core_init() || !input_core_self_test()) {

@@ -6,6 +6,8 @@ param(
     [string]$Build = 'build-realtest',
     [switch]$NvidiaPhase4,
     [switch]$ReuseNvidiaPhase4Build,
+    [switch]$NvidiaPhase5,
+    [switch]$ReuseNvidiaPhase5Build,
     [switch]$DiagnosticBot,
     [switch]$Rtl8126FirmwareDownload,
     [switch]$ForceReboot,
@@ -63,6 +65,15 @@ public static class LiteOsFirmwareEnvironment {
 if ($letter.Length -ne 1) { throw "DriveLetter must be one letter: $DriveLetter" }
 if ($DiskNumber -lt 0 -or $PartitionNumber -lt 1) {
     throw 'DiskNumber and PartitionNumber are invalid.'
+}
+if ($NvidiaPhase4 -and $NvidiaPhase5) {
+    throw 'NvidiaPhase4 and NvidiaPhase5 are mutually exclusive.'
+}
+if ($ReuseNvidiaPhase4Build -and -not $NvidiaPhase4) {
+    throw 'ReuseNvidiaPhase4Build requires NvidiaPhase4.'
+}
+if ($ReuseNvidiaPhase5Build -and -not $NvidiaPhase5) {
+    throw 'ReuseNvidiaPhase5Build requires NvidiaPhase5.'
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -216,6 +227,29 @@ if ($NvidiaPhase4) {
         if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 4 build failed ($LASTEXITCODE)." }
     }
 }
+elseif ($NvidiaPhase5) {
+    # Phase 5 reuses the completed Phase 4 vendor object graph and only
+    # rebuilds the changed GSP/firmware boundary.  The build script also
+    # stages the matching 595.84 firmware into this ESP.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase5\esp'
+    if ($ReuseNvidiaPhase5Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\LITEOS\kernel.elf'),
+            (Join-Path $espPath 'EFI\LITEOS\firmware\gsp_ga10x.bin')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 5 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 5 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase5_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 5 build failed ($LASTEXITCODE)." }
+    }
+}
 else {
     $buildScript = Join-Path $projectRoot 'tools\build-windows.ps1'
     $buildArguments = @('-Build', $Build, '-Debug', '2', '-RealTest')
@@ -242,6 +276,10 @@ foreach ($required in @(
     if (-not (Test-Path -LiteralPath (Join-Path $espPath $required))) {
         throw "Build is missing ESP file: $required"
     }
+}
+if ($NvidiaPhase5 -and
+    -not (Test-Path -LiteralPath (Join-Path $espPath 'EFI\LITEOS\firmware\gsp_ga10x.bin') -PathType Leaf)) {
+    throw 'Phase 5 ESP is missing EFI\LITEOS\firmware\gsp_ga10x.bin'
 }
 
 foreach ($relative in @(

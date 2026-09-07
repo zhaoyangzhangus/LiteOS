@@ -2,6 +2,10 @@
 
 #include <nv.h>
 
+#ifndef LITEOS_NVIDIA_PHASE5
+#define LITEOS_NVIDIA_PHASE5 0
+#endif
+
 #include <arch/x86_64/cpu.h>
 #include <kernel/console.h>
 #include <kernel/deferred.h>
@@ -332,7 +336,11 @@ static kstatus_t nv_rm_vendor_fill_pci(const pci_device_t *device,
     state->regs = &state->bars[0];
     state->fb = &state->bars[1];
     state->cpu_numa_node_id = (NvS32)-1;
+#if LITEOS_NVIDIA_PHASE5
+    state->request_firmware = NV_TRUE;
+#else
     state->request_firmware = NV_FALSE;
+#endif
     state->request_fw_client_rm = NV_FALSE;
     state->allow_fallback_to_monolithic_rm = NV_FALSE;
     state->enable_firmware_logs = NV_FALSE;
@@ -655,6 +663,24 @@ kstatus_t nv_rm_vendor_start(const pci_device_t *device,
 
     liteos_serial_write_serial_only(
         "LITEOS_NVIDIA_PHASE4_HAL_READY\r\n");
+#if LITEOS_NVIDIA_PHASE5
+    if (nv_rm_vendor_start_irq(device, context) != K_OK) {
+        liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_IRQ_FAIL\r\n");
+        nv_rm_vendor_cleanup(context);
+        *result = (nv_rm_vendor_result_t){0};
+        return K_EIO;
+    }
+    liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_BOOT_START\r\n");
+    if (!rm_init_adapter(context->stack, context->state)) {
+        liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_BOOT_FAIL\r\n");
+        nv_rm_vendor_cleanup(context);
+        *result = (nv_rm_vendor_result_t){0};
+        return K_EIO;
+    }
+    context->adapter_initialized = true;
+    liteos_serial_write_serial_only(
+        "LITEOS_NVIDIA_GSP_BOOT_FINISH status=ready\r\n");
+#endif
     *context_out = context;
     return K_OK;
 }

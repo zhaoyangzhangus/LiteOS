@@ -57,6 +57,9 @@
 #ifndef LITEOS_NVIDIA_REALTEST_NO_DESKTOP
 #define LITEOS_NVIDIA_REALTEST_NO_DESKTOP 0
 #endif
+#ifndef LITEOS_NVIDIA_PHASE5
+#define LITEOS_NVIDIA_PHASE5 0
+#endif
 #include <kernel/e1000.h>
 #include <kernel/net_core.h>
 #include <kernel/net_manager.h>
@@ -190,7 +193,20 @@ static void __attribute__((noreturn)) kernel_runtime_main(void *context) {
         halt_forever();
     }
     liteos_serial_write("LITEOS_SMP_USER_DISPATCH_OK\r\n");
-#if LITEOS_NVIDIA_REALTEST_NO_DESKTOP
+#if LITEOS_NVIDIA_PHASE5
+    if (nv_rm_driver_probe() != K_OK ||
+        nv_rm_driver_current() == 0 ||
+        nv_rm_driver_current()->state != NV_GPU_GSP_READY) {
+        liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_FAIL\r\n");
+        liteos_realtest_mark("LITEOS_NVIDIA_GSP_FAIL");
+        liteos_realtest_finish_failure();
+    }
+    liteos_serial_write_serial_only("LITEOS_NVIDIA_GSP_READY\r\n");
+    if (liteos_realtest_enabled()) {
+        liteos_serial_write_serial_only("LITEOS_NVIDIA_PHASE5_GATE_READY\r\n");
+        liteos_realtest_finish_success();
+    }
+#elif LITEOS_NVIDIA_REALTEST_NO_DESKTOP
     if (liteos_realtest_enabled()) {
         const nv_gpu_device_t *nvidia_gpu = nv_rm_driver_current();
         if (nvidia_gpu == 0 || nvidia_gpu->state != NV_GPU_HAL_READY) {

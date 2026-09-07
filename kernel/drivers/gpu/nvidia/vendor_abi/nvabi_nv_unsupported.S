@@ -706,19 +706,6 @@ nv_get_file_private:
     ret
     .size nv_get_file_private, .-nv_get_file_private
 
-    .globl nv_get_firmware
-    .type nv_get_firmware, @function
-nv_get_firmware:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_get_firmware(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    xorl %eax, %eax
-    popq %rbp
-    ret
-    .size nv_get_firmware, .-nv_get_firmware
-
     .globl nv_get_max_freq
     .type nv_get_max_freq, @function
 nv_get_max_freq:
@@ -1082,19 +1069,6 @@ nv_put_file_private:
     popq %rbp
     ret
     .size nv_put_file_private, .-nv_put_file_private
-
-    .globl nv_put_firmware
-    .type nv_put_firmware, @function
-nv_put_firmware:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_put_firmware(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    # void return
-    popq %rbp
-    ret
-    .size nv_put_firmware, .-nv_put_firmware
 
     .globl nv_register_peer_io_mem
     .type nv_register_peer_io_mem, @function
