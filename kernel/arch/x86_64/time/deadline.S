@@ -4,7 +4,9 @@
     .globl liteos_lapic_spurious_entry
     .globl liteos_smp_ipi_entry
     .globl liteos_tlb_ipi_entry
+#ifndef __ELF__
     .def liteos_lapic_timer_entry; .scl 2; .type 32; .endef
+#endif
     .extern liteos_lapic_timer_interrupt
     .extern x86_smp_ipi_interrupt
     .extern x86_tlb_ipi_interrupt

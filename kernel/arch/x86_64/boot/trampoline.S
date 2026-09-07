@@ -1,4 +1,8 @@
+#ifdef __ELF__
+    .section .rdata
+#else
     .section .rdata,"dr"
+#endif
     .p2align 4
     .globl x86_ap_trampoline_start
     .globl x86_ap_trampoline_parameters

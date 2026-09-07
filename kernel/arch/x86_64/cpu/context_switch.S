@@ -4,10 +4,12 @@
     .globl x86_switch_context_root
     .globl x86_kernel_thread_start
     .globl x86_rebase_stack_and_call
+#ifndef __ELF__
     .def x86_switch_context; .scl 2; .type 32; .endef
     .def x86_switch_context_root; .scl 2; .type 32; .endef
     .def x86_kernel_thread_start; .scl 2; .type 32; .endef
     .def x86_rebase_stack_and_call; .scl 2; .type 32; .endef
+#endif
 
 /*
  * First entry for a pure Ring0 scheduler thread.

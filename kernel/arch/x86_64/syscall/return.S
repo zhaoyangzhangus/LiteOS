@@ -2,7 +2,9 @@
     .p2align 4
     .globl liteos_arch_enter_user
     .globl x86_user_thread_start
+#ifndef __ELF__
     .def liteos_arch_enter_user; .scl 2; .type 32; .endef
+#endif
     .extern x86_return_to_user
     .extern sched_finish_switch
     .extern x86_cpu_note_user_entry

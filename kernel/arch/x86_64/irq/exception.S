@@ -119,7 +119,11 @@ liteos_arch_interrupt_stub:
     jmp 3b
 
 /* C 初始化 IDT 时通过此只读表取得每个异常入口。 */
+#ifdef __ELF__
+    .section .rdata
+#else
     .section .rdata,"dr"
+#endif
     .p2align 3
     .globl liteos_exception_stub_table
 liteos_exception_stub_table:
@@ -431,7 +435,11 @@ liteos_irq_common:
     addq $16, %rsp
     iretq
 
+#ifdef __ELF__
+    .section .rdata
+#else
     .section .rdata,"dr"
+#endif
     .p2align 3
     .globl liteos_irq_stub_table
 liteos_irq_stub_table:

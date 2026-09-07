@@ -97,7 +97,11 @@ x86_put_user_u32_raw:
     ret
 
 /* 显式边界符号避免依赖 PE/COFF 链接器自动生成 __start/__stop。 */
+#ifdef __ELF__
+    .section .rdata
+#else
     .section .rdata,"dr"
+#endif
     .p2align 3
     .globl liteos_uaccess_table_start
 liteos_uaccess_table_start:

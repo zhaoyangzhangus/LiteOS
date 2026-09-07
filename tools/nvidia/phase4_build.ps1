@@ -18,6 +18,8 @@ function Assert-RelativeBuild([string]$Name) {
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Assert-RelativeBuild $Build
+$elfBuildName = $Build + '-elf'
+Assert-RelativeBuild $elfBuildName
 $vendorRoot = Join-Path $repoRoot 'third_party\nvidia\595.84'
 $vendorSourceRoot = Join-Path $vendorRoot 'open-gpu-kernel-modules'
 $abiSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi'
@@ -107,20 +109,49 @@ if ($makeExitCode -ne 0) {
     throw "$buildKind build failed"
 }
 
+# A native Windows build emits PE/COFF kernel objects.  They are suitable for
+# the normal PE kernel link, but converting each relocatable object to ELF
+# loses the section-relative addends used by local .bss/.rdata references.
+# Build the Phase 4 LiteOS object graph directly as ELF instead; the native
+# build above remains the source of the UEFI loader and ESP payload.
+$elfMakeArguments = @(
+    '-B', ('BUILD={0}' -f $elfBuildName),
+    'TOOLPREFIX=x86_64-elf-',
+    'LD=x86_64-elf-gcc',
+    'KERNEL_EXTRA_CFLAGS=-mcmodel=kernel',
+    ('KERNEL_LDFLAGS=-nostdlib -Wl,-T,{0}' -f $linkerScript.Replace('\', '/'))
+)
+if ($RealTest) {
+    $elfMakeArguments += @('DEBUG=2', 'LITEOS_DEBUG_SERIAL=1', 'LITEOS_REALTEST=1')
+}
+$elfMakeArguments += 'kernel'
+$previousMakeErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $elfMakeOutput = @(& $Make @elfMakeArguments 2>&1 |
+        ForEach-Object { $_.ToString() })
+    $elfMakeExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $previousMakeErrorActionPreference
+}
+foreach ($line in $elfMakeOutput) { Write-Output $line }
+if ($elfMakeExitCode -ne 0) {
+    throw 'Phase 4 ELF LiteOS kernel build failed'
+}
+
 $gccCommand = Get-Command x86_64-elf-gcc -ErrorAction Stop
 $linkerCommand = Get-Command x86_64-elf-ld -ErrorAction Stop
-$peObjcopyCommand = Get-Command x86_64-w64-mingw32-objcopy -ErrorAction Stop
 $gcc = $gccCommand.Source
 $linker = $linkerCommand.Source
-$peObjcopy = $peObjcopyCommand.Source
 
 New-Item -ItemType Directory -Path $liteosObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $abiObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-$liteosBuildRoot = Join-Path $repoRoot $Build
+$liteosBuildRoot = Join-Path $repoRoot $elfBuildName
 $liteosInputRoot = Join-Path $liteosBuildRoot 'kernel'
-$liteosEspRoot = Join-Path $liteosBuildRoot 'esp'
+$liteosEspRoot = Join-Path (Join-Path $repoRoot $Build) 'esp'
 $liteosBuildDescription = if ($RealTest) { 'real-test' } else { 'production' }
 Require-File (Join-Path $liteosInputRoot 'entry.o') "$liteosBuildDescription kernel objects"
 $liteosFiles = @(Get-ChildItem -LiteralPath $liteosInputRoot -File -Filter '*.o' |
@@ -128,17 +159,10 @@ $liteosFiles = @(Get-ChildItem -LiteralPath $liteosInputRoot -File -Filter '*.o'
 if ($liteosFiles.Count -eq 0) { throw 'production kernel object directory is empty' }
 
 $liteosObjects = New-Object 'System.Collections.Generic.List[string]'
-for ($index = 0; $index -lt $liteosFiles.Count; $index++) {
-    $source = $liteosFiles[$index].FullName
-    $target = Join-Path $liteosObjectRoot ('{0:D4}.elf.o' -f ($index + 1))
-    $diagnostics = @(& $peObjcopy '-O' 'elf64-x86-64' '--' $source $target 2>&1 |
-        ForEach-Object { $_.ToString() })
-    $exitCode = $LASTEXITCODE
-    foreach ($line in $diagnostics) { Write-Output $line }
-    if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $target -PathType Leaf)) {
-        throw "LiteOS object conversion failed: $source"
-    }
-    [void]$liteosObjects.Add($target.Replace('\', '/'))
+foreach ($file in $liteosFiles) {
+    # These objects are produced by x86_64-elf-gcc and already carry ELF
+    # relocations.  Do not pass them through the PE objcopy backend.
+    [void]$liteosObjects.Add($file.FullName.Replace('\', '/'))
 }
 
 # The vendor source include graph intentionally selects src/nvidia's Unix
@@ -365,5 +389,6 @@ Write-Output ('PHASE4_ESP={0}' -f $phase4Esp)
 Write-Output ('PHASE4_LITEOS_OBJECTS={0}' -f $liteosObjects.Count)
 Write-Output ('PHASE4_LINK_OBJECTS={0}' -f $linkObjects.Count)
 Write-Output ('PHASE4_LITEOS_BUILD={0}' -f $Build)
+Write-Output ('PHASE4_LITEOS_ELF_BUILD={0}' -f $elfBuildName)
 Write-Output ('PHASE4_REALTEST={0}' -f ($(if ($RealTest) { '1' } else { '0' })))
 Write-Output 'PHASE4_BUILD=PASS'

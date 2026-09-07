@@ -1,7 +1,9 @@
     .text
     .p2align 4
     .globl ___chkstk_ms
+#ifndef __ELF__
     .def ___chkstk_ms; .scl 2; .type 32; .endef
+#endif
 
 /* GCC 在大栈帧前调用此入口；这里只探测页边界，不改变最终 RSP。 */
 ___chkstk_ms:

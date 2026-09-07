@@ -1,4 +1,8 @@
+#ifdef __ELF__
+    .section .rdata
+#else
     .section .rdata,"dr"
+#endif
     .p2align 4
     .globl liteos_user_runtime_blob_start
     .globl liteos_user_runtime_blob_end
