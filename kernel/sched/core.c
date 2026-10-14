@@ -20,6 +20,286 @@ static arch_switch_context_t *g_context_test_from;
 static arch_switch_context_t *g_context_test_to;
 static volatile uint32_t g_context_test_ran;
 static volatile uint32_t g_context_test_rounds;
+typedef struct sched_wake_trace {
+    uint64_t tid, epoch, notified, ready, number, argument0;
+    uint64_t current_tid, current_vruntime, vruntime, floor, queued, active;
+    uint64_t published, source_cpu, target_cpu;
+    uint64_t interrupt, interrupt_tid, interrupt_active, interrupt_preempt;
+    uint64_t interrupt_preempt_caller;
+    uint64_t requested, request_send;
+} sched_wake_trace_t;
+typedef struct sched_wake_delay {
+    uint64_t tid, number, argument0, total_ns, notify_to_ready_ns, ready_to_run_ns;
+    uint64_t current_tid, current_vruntime, vruntime, floor, queued, active;
+    uint64_t notify_to_publish_ns, publish_to_ready_ns, source_cpu, target_cpu;
+    uint64_t publish_to_interrupt_ns, interrupt_to_ready_ns;
+    uint64_t interrupt_tid, interrupt_active, interrupt_preempt;
+    uint64_t interrupt_preempt_caller;
+    uint64_t publish_to_request_ns, request_to_interrupt_ns, request_send;
+} sched_wake_delay_t;
+static volatile uint64_t g_sched_wake_trace_tid;
+/* Opt-in diagnostic threshold, not a scheduling policy knob. Default keeps
+ * the historical 10ms gate; bounded finer sampling localizes sub-frame waits. */
+static volatile uint64_t g_sched_wake_trace_threshold_ns = 10000000ULL;
+static sched_wake_trace_t g_sched_wake_trace;
+static volatile sched_wake_delay_t g_sched_wake_delays[16];
+static atomic_flag g_sched_wake_trace_guard = ATOMIC_FLAG_INIT;
+static volatile uint64_t g_sched_preempt_callers[MAX_CPUS];
+/* Worst sampled READY interval: duration, owner tid/pid, syscall, preemption,
+ * outer guard caller, TLB guard, class, block epoch, CPU, selected tid,
+ * active syscall number, argument0 and user RIP. */
+static volatile uint64_t g_sched_wake_stall[14];
+/* Same owner fields as READY stall, followed by interrupted RIP/RFLAGS and
+ * origin TSC. Unlike READY stall this measures a published inbox wait. */
+static volatile uint64_t g_sched_inbox_stall[17];
+/* Worst actual noncoalesced reschedule send during the bounded trial:
+ * duration ns, source CPU, target CPU, start/end TSC, accepted, attempts.
+ * Global maximum, not necessarily the same event as a wake-delay record. */
+static volatile uint64_t g_sched_ipi_send[7];
+
+static uint64_t scheduler_trace_threshold_ns(void) {
+    uint64_t value = g_sched_wake_trace_threshold_ns;
+    if (value == 0U) return 10000000ULL;
+    if (value < 100000ULL) return 100000ULL;
+    return value > 1000000000ULL ? 1000000000ULL : value;
+}
+
+void sched_trace_inbox_stall(uint64_t now_tsc, uint64_t rip, uint64_t rflags) {
+    if (g_sched_wake_trace_tid == 0U) return;
+    uint32_t cpu_id = x86_current_cpu_index();
+    if (cpu_id >= g_cpu_count ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    sched_wake_trace_t *trace = &g_sched_wake_trace;
+    if (trace->tid == g_sched_wake_trace_tid && trace->published &&
+        !trace->ready && trace->target_cpu == cpu_id &&
+        trace->source_cpu != cpu_id && now_tsc >= trace->published) {
+        uint64_t elapsed = x86_tsc_to_ns(now_tsc-trace->published);
+        thread_t *current = g_cpus[cpu_id].queue.current;
+        if (elapsed >= scheduler_trace_threshold_ns() && elapsed > g_sched_inbox_stall[0] &&
+            (current == 0 || current->tid != trace->tid)) {
+            bool active = x86_syscall_active_fast();
+            bool preempt = sched_preempt_disabled();
+            arch_trap_frame_t *frame = active && current != 0 &&
+                current->process != 0 && current->kernel_stack_top >= sizeof(*frame) ?
+                (arch_trap_frame_t *)(uintptr_t)
+                    (current->kernel_stack_top-sizeof(*frame)) : 0;
+            uint64_t values[17] = {
+                elapsed, current != 0 ? current->tid : 0U,
+                current != 0 && current->process != 0 ? current->process->pid : 0U,
+                active, preempt, preempt ? g_sched_preempt_callers[cpu_id] : 0U,
+                x86_tlb_shootdown_active(), current != 0 ? current->sched_class : 0U,
+                trace->epoch, cpu_id, trace->tid,
+                frame != 0 ? frame->rax : 0U, frame != 0 ? frame->rdi : 0U,
+                frame != 0 ? frame->rip : 0U, rip, rflags, trace->published};
+            for (size_t index = 0U; index < 17U; ++index)
+                g_sched_inbox_stall[index] = values[index];
+        }
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+void scheduler_trace_reschedule_send(uint32_t cpu_id, uint64_t started,
+                                      bool accepted, uint32_t attempts) {
+    if (g_sched_wake_trace_tid == 0U || cpu_id >= g_cpu_count) return;
+    uint64_t finished = x86_read_tsc();
+    if (finished < started ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    uint64_t elapsed = x86_tsc_to_ns(finished-started);
+    if (elapsed > g_sched_ipi_send[0]) {
+        uint64_t values[7] = {elapsed, x86_current_cpu_index(), cpu_id,
+                              started, finished, accepted, attempts};
+        for (size_t index = 0U; index < 7U; ++index)
+            g_sched_ipi_send[index] = values[index];
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+void sched_trace_wake_stall(uint64_t now_tsc) {
+    if (g_sched_wake_trace_tid == 0U) return;
+    uint32_t cpu_id = x86_current_cpu_index();
+    if (cpu_id >= g_cpu_count ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    if (g_sched_wake_trace.tid == g_sched_wake_trace_tid &&
+        g_sched_wake_trace.ready &&
+        g_sched_wake_trace.target_cpu == cpu_id &&
+        now_tsc >= g_sched_wake_trace.ready) {
+        uint64_t elapsed = x86_tsc_to_ns(now_tsc-g_sched_wake_trace.ready);
+        thread_t *current = g_cpus[cpu_id].queue.current;
+        if (elapsed >= scheduler_trace_threshold_ns() && elapsed > g_sched_wake_stall[0] &&
+            (current == 0 || current->tid != g_sched_wake_trace_tid)) {
+            bool preempt = sched_preempt_disabled();
+            g_sched_wake_stall[0] = elapsed;
+            g_sched_wake_stall[1] = current != 0 ? current->tid : 0U;
+            g_sched_wake_stall[2] = current != 0 && current->process != 0 ?
+                                   current->process->pid : 0U;
+            g_sched_wake_stall[3] = x86_syscall_active_fast();
+            g_sched_wake_stall[4] = preempt;
+            g_sched_wake_stall[5] = preempt ? g_sched_preempt_callers[cpu_id] : 0U;
+            g_sched_wake_stall[6] = x86_tlb_shootdown_active();
+            g_sched_wake_stall[7] = current != 0 ? current->sched_class : 0U;
+            g_sched_wake_stall[8] = g_sched_wake_trace.epoch;
+            g_sched_wake_stall[9] = cpu_id;
+            g_sched_wake_stall[10] = g_sched_wake_trace_tid;
+            arch_trap_frame_t *frame = g_sched_wake_stall[3] && current != 0 &&
+                current->process != 0 && current->kernel_stack_top >= sizeof(*frame) ?
+                (arch_trap_frame_t *)(uintptr_t)
+                    (current->kernel_stack_top-sizeof(*frame)) : 0;
+            g_sched_wake_stall[11] = frame != 0 ? frame->rax : 0U;
+            g_sched_wake_stall[12] = frame != 0 ? frame->rdi : 0U;
+            g_sched_wake_stall[13] = frame != 0 ? frame->rip : 0U;
+        }
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+static void scheduler_trace_notify(thread_t *thread) {
+    if (g_sched_wake_trace_tid == 0U || thread->tid != g_sched_wake_trace_tid ||
+        atomic_load_explicit(&thread->state, memory_order_acquire) != THREAD_BLOCKED ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    uint64_t epoch = atomic_load_explicit(&thread->block_epoch, memory_order_relaxed);
+    if (g_sched_wake_trace.tid != thread->tid || g_sched_wake_trace.epoch != epoch) {
+        arch_trap_frame_t *frame = (arch_trap_frame_t *)
+            (uintptr_t)(thread->kernel_stack_top - sizeof(*frame));
+        g_sched_wake_trace = (sched_wake_trace_t){
+            .tid=thread->tid, .epoch=epoch, .notified=x86_read_tsc(),
+            .number=frame->rax, .argument0=frame->rdi,
+            .source_cpu=x86_current_cpu_index(), .target_cpu=thread->owner_cpu};
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+static void scheduler_trace_publish(thread_t *thread) {
+    if (g_sched_wake_trace_tid == 0U || thread->tid != g_sched_wake_trace_tid ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    if (g_sched_wake_trace.tid == thread->tid &&
+        g_sched_wake_trace.epoch == atomic_load_explicit(&thread->block_epoch,
+                                                        memory_order_relaxed) &&
+        !g_sched_wake_trace.published) {
+        g_sched_wake_trace.published=x86_read_tsc();
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+void scheduler_trace_reschedule_request(uint32_t cpu_id, bool send) {
+    if (g_sched_wake_trace_tid == 0U || cpu_id >= g_cpu_count ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    if (g_sched_wake_trace.tid == g_sched_wake_trace_tid &&
+        g_sched_wake_trace.published && !g_sched_wake_trace.ready &&
+        !g_sched_wake_trace.requested &&
+        g_sched_wake_trace.source_cpu == x86_current_cpu_index() &&
+        g_sched_wake_trace.source_cpu != cpu_id &&
+        g_sched_wake_trace.target_cpu == cpu_id) {
+        g_sched_wake_trace.requested = x86_read_tsc();
+        /* 1 = coalesced into existing pending request; 2 = send attempted.
+         * This does not claim hardware delivery or a successful send. */
+        g_sched_wake_trace.request_send = send ? 2U : 1U;
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+void scheduler_trace_reschedule_interrupt(uint32_t cpu_id) {
+    /* Disabled unless a bounded browser probe selects one thread. Observe
+     * the first target IPI only; coalesced/unrelated later IPIs must not
+     * replace evidence of an earlier syscall/critical-section deferral. */
+    if (g_sched_wake_trace_tid == 0U || cpu_id >= g_cpu_count ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    if (g_sched_wake_trace.tid == g_sched_wake_trace_tid &&
+        g_sched_wake_trace.notified && !g_sched_wake_trace.ready &&
+        g_sched_wake_trace.source_cpu != g_sched_wake_trace.target_cpu &&
+        g_sched_wake_trace.target_cpu == cpu_id &&
+        !g_sched_wake_trace.interrupt) {
+        thread_t *current = g_cpus[cpu_id].queue.current;
+        g_sched_wake_trace.interrupt = x86_read_tsc();
+        g_sched_wake_trace.interrupt_tid = current ? current->tid : 0U;
+        g_sched_wake_trace.interrupt_active = x86_syscall_active_fast();
+        g_sched_wake_trace.interrupt_preempt = sched_preempt_disabled();
+        g_sched_wake_trace.interrupt_preempt_caller =
+            g_sched_wake_trace.interrupt_preempt ? g_sched_preempt_callers[cpu_id] : 0U;
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+static void scheduler_trace_ready(scheduler_cpu_t *cpu, thread_t *thread) {
+    if (g_sched_wake_trace_tid == 0U || thread->tid != g_sched_wake_trace_tid ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    if (g_sched_wake_trace.tid == thread->tid && g_sched_wake_trace.notified &&
+        g_sched_wake_trace.epoch == atomic_load_explicit(&thread->block_epoch,
+                                                        memory_order_relaxed)) {
+        thread_t *current=cpu->queue.current;
+        g_sched_wake_trace.ready=x86_read_tsc();
+        g_sched_wake_trace.current_tid=current ? current->tid : 0U;
+        g_sched_wake_trace.current_vruntime=current ? current->sched.vruntime : 0U;
+        g_sched_wake_trace.vruntime=thread->sched.vruntime;
+        g_sched_wake_trace.floor=cpu->queue.min_vruntime;
+        g_sched_wake_trace.queued=cpu->queue.nr_running;
+        g_sched_wake_trace.active=x86_syscall_active_fast();
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+
+static void scheduler_trace_run(thread_t *thread) {
+    if (g_sched_wake_trace_tid == 0U || thread->tid != g_sched_wake_trace_tid ||
+        atomic_flag_test_and_set_explicit(&g_sched_wake_trace_guard,
+                                          memory_order_acquire)) return;
+    sched_wake_trace_t trace=g_sched_wake_trace;
+    if (trace.tid == thread->tid && trace.ready &&
+        trace.epoch == atomic_load_explicit(&thread->block_epoch, memory_order_relaxed)) {
+        uint64_t now=x86_read_tsc();
+        uint64_t total=x86_tsc_to_ns(now-trace.notified);
+        if (total >= scheduler_trace_threshold_ns()) {
+            for (size_t index=0;index<16;++index) {
+                if (g_sched_wake_delays[index].tid &&
+                    (g_sched_wake_delays[index].number != trace.number ||
+                     g_sched_wake_delays[index].argument0 != trace.argument0)) continue;
+                if (total > g_sched_wake_delays[index].total_ns)
+                    g_sched_wake_delays[index]=(sched_wake_delay_t){
+                        trace.tid, trace.number, trace.argument0, total,
+                        x86_tsc_to_ns(trace.ready-trace.notified),
+                        x86_tsc_to_ns(now-trace.ready), trace.current_tid,
+                        trace.current_vruntime, trace.vruntime, trace.floor,
+                        trace.queued, trace.active,
+                        trace.published >= trace.notified ?
+                            x86_tsc_to_ns(trace.published-trace.notified) : 0U,
+                        trace.published && trace.ready >= trace.published ?
+                            x86_tsc_to_ns(trace.ready-trace.published) : 0U,
+                        trace.source_cpu, trace.target_cpu,
+                        trace.interrupt && trace.published &&
+                                trace.interrupt >= trace.published ?
+                            x86_tsc_to_ns(trace.interrupt-trace.published) : 0U,
+                        trace.interrupt && trace.ready >= trace.interrupt ?
+                            x86_tsc_to_ns(trace.ready-trace.interrupt) : 0U,
+                        trace.interrupt_tid, trace.interrupt_active,
+                        trace.interrupt_preempt, trace.interrupt_preempt_caller,
+                        trace.requested >= trace.published && trace.published ?
+                            x86_tsc_to_ns(trace.requested-trace.published) : 0U,
+                        trace.interrupt >= trace.requested && trace.requested ?
+                            x86_tsc_to_ns(trace.interrupt-trace.requested) : 0U,
+                        trace.request_send};
+                break;
+            }
+        }
+        g_sched_wake_trace=(sched_wake_trace_t){0};
+    }
+    atomic_flag_clear_explicit(&g_sched_wake_trace_guard, memory_order_release);
+}
+static bool scheduler_command_drain_local(uint32_t cpu_id,
+                                         scheduler_cpu_t *cpu,
+                                         bool publish_snapshot);
+static bool scheduler_command_ack_step(uint32_t cpu_id,
+                                       scheduler_cpu_t *cpu,
+                                       thread_t *thread,
+                                       uint32_t source_limit,
+                                       uint32_t ack_mask,
+                                       uint32_t ack_value,
+                                       bool drain_releases);
 
 void sched_mark_initial_placement(thread_t *thread) {
     if (thread != 0) {
@@ -186,6 +466,7 @@ void sched_cpu_init(uint32_t cpu_id) {
     atomic_init(&cpu->reap_lock.state, 0U);
     atomic_init(&cpu->queue_snapshot, 0U);
     atomic_init(&cpu->command_pending, false);
+    atomic_init(&cpu->remote_wake_head, 0);
     atomic_init(&cpu->need_resched, false);
     atomic_init(&cpu->command_release_pending, false);
     atomic_init(&cpu->reap_deferred_queued, false);
@@ -387,11 +668,9 @@ kstatus_t sched_start_thread(thread_t *thread) {
     }
 
     uint32_t previous_owner = thread->owner_cpu;
-    uint32_t target_cpu =
-        (thread->sched.flags & SCHED_ENTITY_INITIAL_PLACEMENT) != 0U ?
-        scheduler_choose_cpu(thread, current_cpu) :
-        scheduler_cpu_available(thread->owner_cpu) ?
-        thread->owner_cpu : current_cpu;
+    /* First placement honors both affinity and the global runnable-load
+     * snapshot; later starts retain their established owner CPU. */
+    uint32_t target_cpu = scheduler_choose_start_cpu(thread, current_cpu);
     if (!scheduler_cpu_available(target_cpu)) {
         atomic_store_explicit(&thread->start_pending, false,
                               memory_order_release);
@@ -452,13 +731,31 @@ bool sched_publish_blocked(thread_t *thread) {
 }
 
 bool sched_publish_running(thread_t *thread) {
-    if (!scheduler_current_thread_owner(thread, 0) ||
-        atomic_load_explicit(&thread->state, memory_order_acquire) !=
-            THREAD_BLOCKED) {
+    uint32_t cpu_id;
+    if (thread == 0 || !scheduler_current_cpu(&cpu_id) ||
+        !scheduler_cpu_available(thread->owner_cpu) ||
+        thread->owner_cpu != cpu_id) {
         return false;
     }
-    atomic_store_explicit(&thread->state, THREAD_RUNNING, memory_order_release);
-    return true;
+
+    uint64_t irq_flags = scheduler_irq_save();
+    scheduler_cpu_t *cpu = &g_cpus[cpu_id];
+    unsigned state = atomic_load_explicit(&thread->state,
+                                          memory_order_relaxed);
+    bool published = false;
+    /* A return from schedule() is proof this thread is executing now.  Heal
+     * stale BLOCKED/READY metadata before it can return to user mode. */
+    if (cpu->queue.current == thread) {
+        if (state == THREAD_RUNNING) {
+            published = true;
+        } else if (state == THREAD_BLOCKED || state == THREAD_READY) {
+            atomic_store_explicit(&thread->state, THREAD_RUNNING,
+                                  memory_order_release);
+            published = true;
+        }
+    }
+    scheduler_irq_restore(irq_flags);
+    return published;
 }
 
 bool sched_publish_dead(thread_t *thread) {
@@ -480,12 +777,21 @@ bool sched_publish_dead(thread_t *thread) {
         scheduler_irq_restore(irq_flags);
         if (!queued) return false;
         (void)x86_smp_request_reschedule(owner_cpu);
-        while (atomic_load_explicit(&thread->command_ack,
-                                    memory_order_acquire) !=
-               SCHED_CMD_STATE_ACK) {
+        unsigned acknowledgement;
+        for (;;) {
+            /* The owner may be waiting for an acknowledgement from us too.
+             * Drain our inbox while waiting, rather than relying on syscall
+             * exit to service the IPI and creating a cross-CPU wait cycle. */
+            bool acknowledged = scheduler_command_ack_step(
+                current_cpu, &g_cpus[current_cpu], thread, g_cpu_count,
+                SCHED_CMD_STATE_ACK, SCHED_CMD_STATE_ACK, true);
+            acknowledgement = atomic_load_explicit(&thread->command_ack,
+                                                    memory_order_acquire);
+            if (acknowledged) break;
             __asm__ volatile ("pause");
         }
-        return atomic_load_explicit(&thread->state,
+        return (acknowledgement & SCHED_CMD_STATE_CHANGED) != 0U &&
+               atomic_load_explicit(&thread->state,
                                     memory_order_acquire) == THREAD_DEAD;
     }
 
@@ -528,6 +834,7 @@ static bool scheduler_complete_wake_local(
     if (cpu->queue.current != thread) {
         enqueue_local_raw(cpu, thread);
     }
+    scheduler_trace_ready(cpu, thread);
 
     return true;
 }
@@ -557,6 +864,26 @@ static bool scheduler_capture_block_epoch(
     }
 }
 
+static inline bool scheduler_command_publish_snapshot(
+    atomic_uint *tail_index,
+    sched_cmd_t *slots,
+    uint32_t slot_mask,
+    uint32_t head,
+    uint32_t tail,
+    thread_t *thread,
+    uint32_t op,
+    uint32_t generation) {
+    if ((uint32_t)(tail - head) > slot_mask) return false;
+    sched_cmd_t *slot = &slots[tail & slot_mask];
+    slot->object = (uintptr_t)thread;
+    slot->op = op;
+    slot->generation = generation;
+    /* Source-owned tail publishes the complete message. The acquired head
+     * snapshot may be stale, but can only conservatively report a full ring. */
+    atomic_store_explicit(tail_index, tail + 1U, memory_order_release);
+    return true;
+}
+
 static bool scheduler_command_ring_try_push(
     sched_cmd_ring_t *ring,
     thread_t *thread,
@@ -569,20 +896,8 @@ static bool scheduler_command_ring_try_push(
     uint32_t head =
         atomic_load_explicit(&ring->head, memory_order_acquire);
 
-    if ((uint32_t)(tail - head) >= SCHED_CMD_SLOTS) {
-        return false;
-    }
-
-    sched_cmd_t *slot = &ring->slots[tail & SCHED_CMD_MASK];
-    slot->object = (uintptr_t)thread;
-    slot->op = op;
-    slot->generation = generation;
-
-    /*
-     * Release publishes the complete message. Only source_cpu writes tail.
-     */
-    atomic_store_explicit(&ring->tail, tail + 1U, memory_order_release);
-    return true;
+    return scheduler_command_publish_snapshot(&ring->tail, ring->slots,
+        SCHED_CMD_MASK, head, tail, thread, op, generation);
 }
 
 static bool scheduler_command_overflow_try_push(
@@ -596,14 +911,8 @@ static bool scheduler_command_overflow_try_push(
         atomic_load_explicit(&ring->tail, memory_order_relaxed);
     uint32_t head =
         atomic_load_explicit(&ring->head, memory_order_acquire);
-    if ((uint32_t)(tail - head) >= SCHED_CMD_OVERFLOW_SLOTS) return false;
-
-    sched_cmd_t *slot = &ring->slots[tail & SCHED_CMD_OVERFLOW_MASK];
-    slot->object = (uintptr_t)thread;
-    slot->op = op;
-    slot->generation = generation;
-    atomic_store_explicit(&ring->tail, tail + 1U, memory_order_release);
-    return true;
+    return scheduler_command_publish_snapshot(&ring->tail, ring->slots,
+        SCHED_CMD_OVERFLOW_MASK, head, tail, thread, op, generation);
 }
 
 static bool scheduler_command_channel_try_push(
@@ -624,8 +933,9 @@ static bool scheduler_command_channel_try_push(
                                  memory_order_relaxed);
         if (head != tail) {
             if (overflowed != 0) *overflowed = true;
-            return scheduler_command_overflow_try_push(
-                &channel->overflow, thread, op, generation);
+            return scheduler_command_publish_snapshot(
+                &channel->overflow.tail, channel->overflow.slots,
+                SCHED_CMD_OVERFLOW_MASK, head, tail, thread, op, generation);
         }
         channel->overflow_active = false;
     }
@@ -701,14 +1011,6 @@ static bool scheduler_remote_command_try_push_unowned(
         source_cpu, target_cpu, thread, op, generation, false);
 }
 
-static bool scheduler_affinity_allows(
-    const thread_t *thread,
-    uint32_t cpu_id) {
-    return thread != 0 && cpu_id < MAX_CPUS &&
-           (thread->affinity.bits[cpu_id >> 6] &
-            (1ULL << (cpu_id & 63U))) != 0;
-}
-
 static bool scheduler_transfer_local(
     uint32_t source_cpu,
     scheduler_cpu_t *source,
@@ -774,36 +1076,78 @@ static void scheduler_migrate_local(
     }
 }
 
+static inline void scheduler_thread_mailbox_lock(thread_t *thread) {
+    while (atomic_exchange_explicit(&thread->remote_wake_lock, 1U,
+                                    memory_order_acquire)) {
+        while (atomic_load_explicit(&thread->remote_wake_lock,
+                                    memory_order_relaxed)) {
+            __asm__ volatile ("pause");
+        }
+    }
+}
+
+static inline void scheduler_thread_mailbox_unlock(thread_t *thread) {
+    atomic_store_explicit(&thread->remote_wake_lock, 0U, memory_order_release);
+}
+
+static inline void scheduler_command_release_enqueue_locked(
+    scheduler_cpu_t *cpu,
+    thread_t *thread) {
+    /* Caller holds the thread mailbox lock and serializes the CPU FIFO with
+     * local IRQs disabled. Publish only the empty-to-nonempty transition. */
+    if (thread->command_release_count != 0U) {
+        ++thread->command_release_count;
+        return;
+    }
+    bool was_empty = cpu->command_release_head == 0;
+    thread->command_release_next = 0;
+    if (cpu->command_release_tail != 0) {
+        cpu->command_release_tail->command_release_next = thread;
+    } else {
+        cpu->command_release_head = thread;
+    }
+    cpu->command_release_tail = thread;
+    thread->command_release_count = 1U;
+    if (was_empty) {
+        atomic_store_explicit(&cpu->command_release_pending, true,
+                              memory_order_release);
+    }
+}
+
 static void scheduler_command_release_enqueue_local(
     scheduler_cpu_t *cpu,
     thread_t *thread) {
-    if (thread->command_release_count == 0U) {
-        thread->command_release_next = 0;
-        if (cpu->command_release_tail != 0) {
-            cpu->command_release_tail->command_release_next = thread;
-        } else {
-            cpu->command_release_head = thread;
-        }
-        cpu->command_release_tail = thread;
-    }
-    ++thread->command_release_count;
-    atomic_store_explicit(&cpu->command_release_pending, true,
-                          memory_order_release);
+    scheduler_thread_mailbox_lock(thread);
+    scheduler_command_release_enqueue_locked(cpu, thread);
+    scheduler_thread_mailbox_unlock(thread);
 }
 
 static void scheduler_command_release_drain(uint32_t cpu_id) {
     if (cpu_id >= g_cpu_count) return;
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    if (SCHED_UNLIKELY(!atomic_exchange_explicit(
-            &cpu->command_release_pending, false, memory_order_acquire))) {
+    if (SCHED_UNLIKELY(!atomic_load_explicit(
+            &cpu->command_release_pending, memory_order_acquire))) {
         return;
     }
 
     for (;;) {
         uint64_t queue_flags = scheduler_irq_save();
+        uint32_t local_cpu;
+        /* Popping is IRQ-serialized and strictly local; destruction is not.
+         * The last command ref can free a VM and perform TLB shootdowns.
+         * Leave both the FIFO and its pending bit intact until an unlocked,
+         * interruptible continuation on its owner CPU can do that work.
+         * Recheck ownership on every pop: object_put may block or migrate. */
+        if ((queue_flags & (1ULL << 9)) == 0U || sched_preempt_disabled() ||
+            x86_tlb_shootdown_active() ||
+            !scheduler_current_cpu(&local_cpu) || local_cpu != cpu_id) {
+            scheduler_irq_restore(queue_flags);
+            return;
+        }
         thread_t *thread = cpu->command_release_head;
         uint32_t count = 0U;
         if (thread != 0) {
+            scheduler_thread_mailbox_lock(thread);
             cpu->command_release_head = thread->command_release_next;
             if (cpu->command_release_head == 0) {
                 cpu->command_release_tail = 0;
@@ -811,6 +1155,11 @@ static void scheduler_command_release_drain(uint32_t cpu_id) {
             thread->command_release_next = 0;
             count = thread->command_release_count;
             thread->command_release_count = 0U;
+            scheduler_thread_mailbox_unlock(thread);
+        }
+        if (cpu->command_release_head == 0) {
+            atomic_store_explicit(&cpu->command_release_pending, false,
+                                  memory_order_release);
         }
         scheduler_irq_restore(queue_flags);
 
@@ -876,13 +1225,17 @@ static void scheduler_command_consume_local(
             if (message.op == SCHED_CMD_EXIT) {
                 unsigned state = atomic_load_explicit(&thread->state,
                                                       memory_order_relaxed);
+                bool state_changed = false;
                 if (state == THREAD_NEW || state == THREAD_READY) {
                     atomic_store_explicit(&thread->state, THREAD_DEAD,
                                           memory_order_release);
+                    state_changed = true;
                 }
                 if ((message.generation & SCHED_CMD_STATE_ACK) != 0U) {
                     atomic_store_explicit(&thread->command_ack,
-                                          SCHED_CMD_STATE_ACK,
+                                          SCHED_CMD_STATE_ACK |
+                                              (state_changed ?
+                                               SCHED_CMD_STATE_CHANGED : 0U),
                                           memory_order_release);
                 }
             }
@@ -907,18 +1260,23 @@ static void scheduler_command_consume_local(
     }
 }
 
-static void scheduler_command_drain_primary_local(
+static inline void scheduler_command_drain_ring_local(
     uint32_t cpu_id,
     scheduler_cpu_t *cpu,
-    sched_cmd_ring_t *ring) {
+    atomic_uint *head_index,
+    atomic_uint *tail_index,
+    const sched_cmd_t *slots,
+    uint32_t slot_mask) {
     uint32_t head =
-        atomic_load_explicit(&ring->head, memory_order_relaxed);
+        atomic_load_explicit(head_index, memory_order_relaxed);
     uint32_t tail =
-        atomic_load_explicit(&ring->tail, memory_order_acquire);
+        atomic_load_explicit(tail_index, memory_order_acquire);
     uint32_t consumed = head;
 
+    /* Consume the captured batch only. Release slots after all callbacks,
+     * retaining the producer/consumer ownership and wraparound protocol. */
     while (consumed != tail) {
-        sched_cmd_t message = ring->slots[consumed & SCHED_CMD_MASK];
+        sched_cmd_t message = slots[consumed & slot_mask];
         ++consumed;
         bool holds_reference =
             message.op != SCHED_CMD_REMOVE ||
@@ -927,38 +1285,80 @@ static void scheduler_command_drain_primary_local(
             cpu_id, cpu, message, holds_reference);
     }
     if (consumed != head) {
-        atomic_store_explicit(&ring->head, consumed, memory_order_release);
+        atomic_store_explicit(head_index, consumed, memory_order_release);
     }
+}
+
+static void scheduler_command_drain_primary_local(
+    uint32_t cpu_id,
+    scheduler_cpu_t *cpu,
+    sched_cmd_ring_t *ring) {
+    scheduler_command_drain_ring_local(cpu_id, cpu, &ring->head, &ring->tail,
+                                       ring->slots, SCHED_CMD_MASK);
 }
 
 static void scheduler_command_drain_overflow_local(
     uint32_t cpu_id,
     scheduler_cpu_t *cpu,
     sched_cmd_overflow_ring_t *ring) {
-    uint32_t head =
-        atomic_load_explicit(&ring->head, memory_order_relaxed);
-    uint32_t tail =
-        atomic_load_explicit(&ring->tail, memory_order_acquire);
-    uint32_t consumed = head;
+    scheduler_command_drain_ring_local(cpu_id, cpu, &ring->head, &ring->tail,
+                                       ring->slots, SCHED_CMD_OVERFLOW_MASK);
+}
 
-    while (consumed != tail) {
-        sched_cmd_t message =
-            ring->slots[consumed & SCHED_CMD_OVERFLOW_MASK];
-        ++consumed;
-        bool holds_reference =
-            message.op != SCHED_CMD_REMOVE ||
-            (message.generation & SCHED_CMD_REMOVE_NO_REF) == 0U;
-        scheduler_command_consume_local(
-            cpu_id, cpu, message, holds_reference);
+static bool scheduler_remote_wake_publish(scheduler_cpu_t *cpu,
+                                           thread_t *thread, uint32_t epoch) {
+    if (!object_try_get(thread)) return false;
+    scheduler_thread_mailbox_lock(thread);
+    if (atomic_load_explicit(&thread->block_epoch, memory_order_acquire) != epoch ||
+        atomic_load_explicit(&thread->state, memory_order_acquire) != THREAD_BLOCKED) {
+        scheduler_thread_mailbox_unlock(thread);
+        object_put(thread);
+        return false;
     }
-    if (consumed != head) {
-        atomic_store_explicit(&ring->head, consumed, memory_order_release);
+    thread->remote_wake_epoch = epoch;
+    if (atomic_load_explicit(&thread->remote_wake_queued, memory_order_relaxed)) {
+        scheduler_thread_mailbox_unlock(thread);
+        object_put(thread);
+        return true;
+    }
+    atomic_store_explicit(&thread->remote_wake_queued, true, memory_order_relaxed);
+    thread_t *head = atomic_load_explicit(&cpu->remote_wake_head,
+                                          memory_order_acquire);
+    do {
+        thread->remote_wake_next = head;
+    } while (!atomic_compare_exchange_weak_explicit(
+        &cpu->remote_wake_head, &head, thread,
+        memory_order_release, memory_order_acquire));
+    scheduler_thread_mailbox_unlock(thread);
+    atomic_store_explicit(&cpu->command_pending, true, memory_order_release);
+    return true;
+}
+
+static void scheduler_remote_wake_drain(uint32_t cpu_id, scheduler_cpu_t *cpu) {
+    thread_t *thread = atomic_exchange_explicit(&cpu->remote_wake_head, 0,
+                                                memory_order_acquire);
+    while (thread != 0) {
+        scheduler_thread_mailbox_lock(thread);
+        /* Snapshot and complete before releasing the node for reuse. */
+        thread_t *next = thread->remote_wake_next;
+        uint32_t epoch = thread->remote_wake_epoch;
+        if (thread->owner_cpu == cpu_id) {
+            (void)scheduler_complete_wake_local(cpu, thread, epoch, true);
+        }
+        atomic_store_explicit(&thread->remote_wake_queued, false,
+                              memory_order_relaxed);
+        /* Transfer the mailbox reference before releasing its existing lock;
+         * no second lock acquisition or object destruction is needed here. */
+        scheduler_command_release_enqueue_locked(cpu, thread);
+        scheduler_thread_mailbox_unlock(thread);
+        thread = next;
     }
 }
 
-static bool scheduler_command_drain_local(
+static bool scheduler_command_drain_local_limit(
     uint32_t cpu_id,
     scheduler_cpu_t *cpu,
+    uint32_t source_limit,
     bool publish_snapshot) {
     if (cpu == 0 || cpu->command_inbox == 0 ||
         SCHED_UNLIKELY(!atomic_exchange_explicit(
@@ -966,8 +1366,8 @@ static bool scheduler_command_drain_local(
         return false;
     }
 
-    uint32_t source_limit =
-        g_cpu_count < MAX_CPUS ? g_cpu_count : MAX_CPUS;
+    scheduler_remote_wake_drain(cpu_id, cpu);
+    if (source_limit > MAX_CPUS) source_limit = MAX_CPUS;
     for (uint32_t source = 0U; source < source_limit; ++source) {
         if (source == cpu_id) continue;
         sched_cmd_channel_t *channel = &cpu->command_inbox[source];
@@ -1018,6 +1418,12 @@ static bool scheduler_local_wake_requires_preempt(
     unsigned current_state =
         atomic_load_explicit(&current->state, memory_order_relaxed);
     if (current == thread || current_state != THREAD_RUNNING) return true;
+    /* A local FAIR wake has no reschedule IPI. Request a choice at the
+     * next safe boundary, just as a timer does for competing FAIR tasks.
+     * schedule() accounts the current syscall tail before choosing; do
+     * not compare an uncharged current vruntime here or preempt RT. */
+    if (thread->sched_class == SCHED_CLASS_FAIR)
+        return current->sched_class == SCHED_CLASS_FAIR;
     if (thread->sched_class != SCHED_CLASS_RT) return false;
     if (current->sched_class != SCHED_CLASS_RT) return true;
     return thread->rt_priority < current->rt_priority ||
@@ -1038,13 +1444,14 @@ void sched_handle_reschedule_request(void) {
     if (!should_preempt && cpu->queue_snapshot_dirty) {
         scheduler_publish_queue_snapshot(cpu);
     }
-    scheduler_command_release_drain(cpu_id);
     scheduler_irq_restore(irq_flags);
     if (should_preempt) scheduler_schedule_internal(true);
+    else sched_finish_switch();
 }
 
 void sched_wake(thread_t *thread) {
     if (thread == 0 || g_cpu_count == 0) return;
+    scheduler_trace_notify(thread);
 
     uint32_t caller_cpu = x86_current_cpu_index();
     uint32_t cpu_id = scheduler_cpu_available(thread->owner_cpu) ?
@@ -1069,15 +1476,18 @@ void sched_wake(thread_t *thread) {
         }
 
         uint64_t irq_flags = scheduler_irq_save();
-        bool queued = scheduler_remote_command_try_push(
-            caller_cpu, cpu_id, thread, SCHED_CMD_WAKE, block_epoch);
+        bool queued = scheduler_remote_wake_publish(cpu, thread, block_epoch);
         scheduler_irq_restore(irq_flags);
 
-        if (queued) (void)x86_smp_request_reschedule(cpu_id);
+        if (queued) {
+            scheduler_trace_publish(thread);
+            (void)x86_smp_request_reschedule(cpu_id);
+        }
         return;
     }
 
     uint64_t queue_flags = scheduler_irq_save();
+    scheduler_trace_publish(thread);
     bool woke = scheduler_complete_wake_local(
         cpu, thread, 0U, false);
     if (woke && cpu->queue_snapshot_dirty) {
@@ -1141,6 +1551,10 @@ static void scheduler_schedule_internal(bool commands_already_drained) {
     }
     thread_t *current = cpu->queue.current;
     bool current_transferred = false;
+    /* Charge the tail since the last timer tick before enqueueing or
+     * migrating current. Short blocking/yielding bursts must not run free. */
+    (void)scheduler_account_current(&cpu->queue,
+                                    x86_tsc_to_ns(x86_read_tsc()));
     unsigned current_state = THREAD_DEAD;
     if (current != 0 && current != cpu->queue.idle) {
         current_state = atomic_load_explicit(&current->state,
@@ -1152,9 +1566,8 @@ static void scheduler_schedule_internal(bool commands_already_drained) {
             if (cpu->queue_snapshot_dirty) {
                 scheduler_publish_queue_snapshot(cpu);
             }
-            scheduler_command_release_drain(cpu_id);
             scheduler_irq_restore(irq_flags);
-            if (cpu->reap_head != 0) sched_finish_switch();
+            sched_finish_switch();
             return;
         }
         if (current_state == THREAD_RUNNING &&
@@ -1183,6 +1596,7 @@ static void scheduler_schedule_internal(bool commands_already_drained) {
     }
     thread_t *next = pick_next_local(cpu);
     if (next != 0) {
+        scheduler_trace_run(next);
         dequeue_local_raw(cpu, next);
         atomic_store_explicit(&next->state, THREAD_RUNNING, memory_order_relaxed);
         next->owner_cpu = (uint16_t)cpu_id;
@@ -1211,11 +1625,9 @@ static void scheduler_schedule_internal(bool commands_already_drained) {
 
         scheduler_reap_enqueue_local(cpu, current);
     }
-    scheduler_command_release_drain(cpu_id);
-
     if (same_current) {
         scheduler_irq_restore(irq_flags);
-        if (cpu->reap_head != 0) sched_finish_switch();
+        sched_finish_switch();
         return;
     }
 
@@ -1280,9 +1692,9 @@ bool sched_try_run_ready(void) {
     if (!runnable && cpu->queue_snapshot_dirty) {
         scheduler_publish_queue_snapshot(cpu);
     }
-    scheduler_command_release_drain(cpu_id);
     scheduler_irq_restore(irq_flags);
     if (runnable) scheduler_schedule_internal(true);
+    else sched_finish_switch();
     return runnable;
 }
 
@@ -1292,12 +1704,22 @@ void schedule(void) {
 
 void sched_preempt_disable(void) {
     /* GS is CPU-private: one local RMW is enough, no locked atomic needed. */
+    if (g_sched_wake_trace_tid != 0U && !x86_preempt_disabled_fast()) {
+        uint32_t cpu_id = x86_current_cpu_index();
+        if (cpu_id < MAX_CPUS)
+            g_sched_preempt_callers[cpu_id] =
+                (uint64_t)(uintptr_t)__builtin_return_address(0);
+    }
     x86_preempt_disable_fast();
 }
 
 void sched_preempt_enable(void) {
     if (!x86_preempt_disabled_fast()) return;
     x86_preempt_enable_fast();
+    if (g_sched_wake_trace_tid != 0U && !x86_preempt_disabled_fast()) {
+        uint32_t cpu_id = x86_current_cpu_index();
+        if (cpu_id < MAX_CPUS) g_sched_preempt_callers[cpu_id] = 0U;
+    }
 }
 
 bool sched_preempt_disabled(void) {
@@ -1475,7 +1897,8 @@ void sched_finish_switch(void) {
         return;
     }
 
-    if ((flags & (1ULL << 9)) == 0) {
+    if ((flags & (1ULL << 9)) == 0 || sched_preempt_disabled() ||
+        x86_tlb_shootdown_active()) {
         /*
          * Typical case:
          *
@@ -1496,6 +1919,7 @@ void sched_finish_switch(void) {
      * Normal process/kernel scheduling boundary: teardown can execute
      * synchronously.
      */
+    scheduler_command_release_drain(cpu_id);
     scheduler_reap_drain_cpu(cpu_id);
 }
 
@@ -1524,6 +1948,23 @@ bool sched_state_transition_self_test(void) {
         return false;
     }
 
+    uint32_t current_cpu = x86_current_cpu_index();
+    if (!scheduler_cpu_available(current_cpu)) return false;
+    scheduler_cpu_t *current = &g_cpus[current_cpu];
+    thread_t *saved_current = current->queue.current;
+    uint64_t irq_flags = scheduler_irq_save();
+    current->queue.current = &thread;
+    bool resumed_blocked = sched_publish_running(&thread) &&
+        atomic_load_explicit(&thread.state, memory_order_acquire) ==
+            THREAD_RUNNING;
+    atomic_store_explicit(&thread.state, THREAD_READY, memory_order_relaxed);
+    bool resumed_ready = sched_publish_running(&thread) &&
+        atomic_load_explicit(&thread.state, memory_order_acquire) ==
+            THREAD_RUNNING;
+    current->queue.current = saved_current;
+    scheduler_irq_restore(irq_flags);
+    if (!resumed_blocked || !resumed_ready) return false;
+
     initialize_thread(&ready, 2U, SCHED_CLASS_FAIR, 0U);
     ready.owner_cpu = thread.owner_cpu;
     if (!sched_publish_dead(&ready) ||
@@ -1531,16 +1972,198 @@ bool sched_state_transition_self_test(void) {
         sched_publish_dead(&ready)) {
         return false;
     }
+
+    /* Remote EXIT acknowledgement distinguishes publication from an already
+     * terminal thread so only the winning terminator commits the exit status. */
+    thread_t remote_exit = {0};
+    scheduler_cpu_t remote_cpu = {0};
+    atomic_init(&remote_exit.state, THREAD_READY);
+    atomic_init(&remote_exit.command_ack, 0U);
+    remote_exit.owner_cpu = (uint16_t)x86_current_cpu_index();
+    remote_cpu.queue.current = &remote_exit;
+    sched_cmd_t exit_message = {
+        .object = (uintptr_t)&remote_exit,
+        .op = SCHED_CMD_EXIT,
+        .generation = SCHED_CMD_STATE_ACK,
+    };
+    scheduler_command_consume_local(remote_exit.owner_cpu, &remote_cpu,
+                                    exit_message, false);
+    if (atomic_load_explicit(&remote_exit.state, memory_order_acquire) !=
+            THREAD_DEAD ||
+        atomic_load_explicit(&remote_exit.command_ack, memory_order_acquire) !=
+            (SCHED_CMD_STATE_ACK | SCHED_CMD_STATE_CHANGED)) {
+        return false;
+    }
+    atomic_store_explicit(&remote_exit.command_ack, 0U,
+                          memory_order_relaxed);
+    scheduler_command_consume_local(remote_exit.owner_cpu, &remote_cpu,
+                                    exit_message, false);
+    if (atomic_load_explicit(&remote_exit.command_ack, memory_order_acquire) !=
+        SCHED_CMD_STATE_ACK) {
+        return false;
+    }
     return true;
 }
 
+static bool scheduler_command_drain_local(
+    uint32_t cpu_id,
+    scheduler_cpu_t *cpu,
+    bool publish_snapshot) {
+    return scheduler_command_drain_local_limit(
+        cpu_id, cpu, g_cpu_count, publish_snapshot);
+}
+
+/*
+ * Progress a remote acknowledgement wait by servicing this CPU's inbox.
+ * Reschedule IPIs can defer command draining until syscall exit, but the
+ * caller may itself be stuck in that syscall waiting for the remote owner.
+ * Keeping this path identical to the normal local drain also preserves the
+ * per-CPU SPSC consumer ownership and IRQ serialization.
+ */
+static bool scheduler_command_ack_step(uint32_t cpu_id,
+                                       scheduler_cpu_t *cpu,
+                                       thread_t *thread,
+                                       uint32_t source_limit,
+                                       uint32_t ack_mask,
+                                       uint32_t ack_value,
+                                       bool drain_releases) {
+    if (cpu == 0 || thread == 0 || cpu_id >= MAX_CPUS) return false;
+
+    uint64_t irq_flags = scheduler_irq_save();
+    (void)scheduler_command_drain_local_limit(
+        cpu_id, cpu, source_limit, false);
+    if (cpu->queue_snapshot_dirty) scheduler_publish_queue_snapshot(cpu);
+    scheduler_irq_restore(irq_flags);
+    if (drain_releases) scheduler_command_release_drain(cpu_id);
+
+    return (atomic_load_explicit(&thread->command_ack,
+                                 memory_order_acquire) & ack_mask) == ack_value;
+}
+
+bool sched_remote_remove_ack_self_test(void) {
+    scheduler_cpu_t cpu0 = {0};
+    scheduler_cpu_t cpu1 = {0};
+    sched_cmd_channel_t cpu0_channels[2] = {0};
+    sched_cmd_channel_t cpu1_channels[2] = {0};
+    thread_t thread0 = {0};
+    thread_t thread1 = {0};
+    const uint32_t generation =
+        SCHED_CMD_REMOVE_NO_REF | SCHED_CMD_REMOVE_ACK;
+
+    for (uint32_t source = 0U; source < 2U; ++source) {
+        atomic_init(&cpu0_channels[source].primary.head, 0U);
+        atomic_init(&cpu0_channels[source].primary.tail, 0U);
+        atomic_init(&cpu0_channels[source].overflow.head, 0U);
+        atomic_init(&cpu0_channels[source].overflow.tail, 0U);
+        atomic_init(&cpu1_channels[source].primary.head, 0U);
+        atomic_init(&cpu1_channels[source].primary.tail, 0U);
+        atomic_init(&cpu1_channels[source].overflow.head, 0U);
+        atomic_init(&cpu1_channels[source].overflow.tail, 0U);
+    }
+    atomic_init(&cpu0.command_pending, false);
+    atomic_init(&cpu1.command_pending, false);
+    atomic_init(&thread0.command_ack, 0U);
+    atomic_init(&thread1.command_ack, 0U);
+    thread0.owner_cpu = 0U;
+    thread1.owner_cpu = 1U;
+    cpu0.command_inbox = cpu0_channels;
+    cpu1.command_inbox = cpu1_channels;
+    cpu0.queue.current = &thread0;
+    cpu1.queue.current = &thread1;
+
+    /* Each CPU waits for the other's REMOVE acknowledgement. Exercise both
+     * ring capacities and index wrap through the actual local drain. */
+    atomic_store_explicit(&cpu0_channels[1].primary.head, UINT32_MAX,
+                          memory_order_relaxed);
+    atomic_store_explicit(&cpu0_channels[1].primary.tail, UINT32_MAX,
+                          memory_order_relaxed);
+    atomic_store_explicit(&cpu1_channels[0].overflow.head, UINT32_MAX,
+                          memory_order_relaxed);
+    atomic_store_explicit(&cpu1_channels[0].overflow.tail, UINT32_MAX,
+                          memory_order_relaxed);
+    if (!scheduler_command_ring_try_push(
+            &cpu0_channels[1].primary, &thread0, SCHED_CMD_REMOVE,
+            generation) ||
+        !scheduler_command_overflow_try_push(
+            &cpu1_channels[0].overflow, &thread1, SCHED_CMD_REMOVE,
+            generation)) {
+        return false;
+    }
+    atomic_store_explicit(&cpu0.command_pending, true, memory_order_release);
+    atomic_store_explicit(&cpu1.command_pending, true, memory_order_release);
+
+    bool cpu0_still_waiting = !scheduler_command_ack_step(
+        0U, &cpu0, &thread1, 2U, UINT32_MAX, generation, false);
+    bool cpu1_unblocked = scheduler_command_ack_step(
+        1U, &cpu1, &thread0, 2U, UINT32_MAX, generation, false);
+    bool cpu0_unblocked = scheduler_command_ack_step(
+        0U, &cpu0, &thread1, 2U, UINT32_MAX, generation, false);
+    return cpu0_still_waiting && cpu1_unblocked && cpu0_unblocked &&
+           atomic_load_explicit(&cpu0_channels[1].primary.head,
+                                memory_order_acquire) == 0U &&
+           atomic_load_explicit(&cpu1_channels[0].overflow.head,
+                                memory_order_acquire) == 0U &&
+           atomic_load_explicit(&thread0.command_ack, memory_order_acquire) ==
+               generation &&
+           atomic_load_explicit(&thread1.command_ack, memory_order_acquire) ==
+               generation;
+}
+
 static bool scheduler_remote_wake_benchmark(void);
+
+static bool scheduler_command_channel_self_test(thread_t *thread) {
+    sched_cmd_channel_t channel = {0};
+    uint32_t primary_start = UINT32_MAX - 3U;
+    uint32_t overflow_start = UINT32_MAX - 31U;
+    atomic_init(&channel.primary.head, primary_start);
+    atomic_init(&channel.primary.tail, primary_start);
+    atomic_init(&channel.overflow.head, overflow_start);
+    atomic_init(&channel.overflow.tail, overflow_start);
+    for (uint32_t index = 0U;
+         index < SCHED_CMD_SLOTS + SCHED_CMD_OVERFLOW_SLOTS; ++index) {
+        bool overflowed = false;
+        if (!scheduler_command_channel_try_push(&channel, thread,
+                SCHED_CMD_WAKE, index, &overflowed) ||
+            overflowed != (index >= SCHED_CMD_SLOTS)) return false;
+    }
+    for (uint32_t index = 0U; index < SCHED_CMD_SLOTS; ++index) {
+        sched_cmd_t entry = channel.primary.slots[
+            (primary_start + index) & SCHED_CMD_MASK];
+        if (entry.object != (uintptr_t)thread || entry.op != SCHED_CMD_WAKE ||
+            entry.generation != index) return false;
+    }
+    for (uint32_t index = 0U; index < SCHED_CMD_OVERFLOW_SLOTS; ++index) {
+        sched_cmd_t entry = channel.overflow.slots[
+            (overflow_start + index) & SCHED_CMD_OVERFLOW_MASK];
+        if (entry.object != (uintptr_t)thread || entry.op != SCHED_CMD_WAKE ||
+            entry.generation != SCHED_CMD_SLOTS + index) return false;
+    }
+    bool overflowed = false;
+    if (scheduler_command_channel_try_push(&channel, thread, SCHED_CMD_WAKE,
+            99U, &overflowed) || !overflowed) return false;
+    /* Primary capacity cannot bypass older messages still in overflow. */
+    atomic_store_explicit(&channel.primary.head, primary_start + SCHED_CMD_SLOTS,
+                          memory_order_release);
+    if (scheduler_command_channel_try_push(&channel, thread, SCHED_CMD_WAKE,
+            99U, &overflowed)) return false;
+    atomic_store_explicit(&channel.overflow.head, overflow_start + 1U,
+                          memory_order_release);
+    if (!scheduler_command_channel_try_push(&channel, thread, SCHED_CMD_WAKE,
+            100U, &overflowed) || !overflowed) return false;
+    atomic_store_explicit(&channel.overflow.head,
+                          overflow_start + SCHED_CMD_OVERFLOW_SLOTS + 1U,
+                          memory_order_release);
+    return scheduler_command_channel_try_push(&channel, thread, SCHED_CMD_WAKE,
+               101U, &overflowed) && !overflowed && !channel.overflow_active;
+}
 
 bool sched_remote_wake_self_test(void) {
     sched_cmd_ring_t ring;
     sched_cmd_t message;
     thread_t first = {0};
     thread_t second = {0};
+
+    if (!scheduler_command_channel_self_test(&first)) return false;
 
     scheduler_zero(&ring, sizeof(ring));
     atomic_init(&ring.head, 0U);
@@ -1605,7 +2228,7 @@ static void sched_context_test_entry(void) {
 
 #define SCHED_REMOTE_BENCH_SAMPLES 32U
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 static atomic_bool g_remote_benchmark_stop;
 static atomic_bool g_remote_benchmark_waiting;
 static atomic_uint g_remote_benchmark_runs;
@@ -1685,7 +2308,7 @@ static void scheduler_remote_benchmark_emit_stats(
 #endif
 
 static bool scheduler_remote_wake_benchmark(void) {
-#if !LITEOS_REALTEST
+#if !OS_REALTEST
     return true;
 #else
     static thread_t thread;
@@ -1880,10 +2503,10 @@ bool sched_context_switch_self_test(void) {
 
 kstatus_t sched_set_affinity(thread_t *thread, const cpumask_t *mask) {
     if (thread == 0 || mask == 0 || g_cpu_count == 0) return K_EINVAL;
+    cpumask_t requested = *mask;
     bool any = false;
     for (uint32_t word = 0; word < MAX_CPUS / 64U; ++word) {
-        thread->affinity.bits[word] = mask->bits[word];
-        if (mask->bits[word] != 0) any = true;
+        if (requested.bits[word] != 0) any = true;
     }
     if (!any) return K_EINVAL;
 
@@ -1891,10 +2514,19 @@ kstatus_t sched_set_affinity(thread_t *thread, const cpumask_t *mask) {
     if (!scheduler_current_cpu(&current_cpu)) return K_EINVAL;
     uint32_t owner_cpu = scheduler_cpu_available(thread->owner_cpu) ?
                          thread->owner_cpu : current_cpu;
-    if (scheduler_affinity_allows(thread, owner_cpu)) return K_OK;
+    if (scheduler_affinity_mask_allows(&requested, owner_cpu)) {
+        thread->affinity = requested;
+        return K_OK;
+    }
 
-    uint32_t target_cpu = scheduler_choose_cpu(thread, current_cpu);
-    if (!scheduler_cpu_available(target_cpu)) return K_EINVAL;
+    uint32_t target_cpu;
+    if (!scheduler_select_cpu_mask(&requested, current_cpu, &target_cpu) ||
+        !scheduler_cpu_available(target_cpu) ||
+        !scheduler_affinity_mask_allows(&requested, target_cpu)) return K_EINVAL;
+    /* A failed preflight must not replace the live affinity. Ordinary chooser
+     * callers retain their current-CPU fallback; affinity updates require an
+     * explicitly selected, available member of the requested mask. */
+    thread->affinity = requested;
 
     unsigned state = atomic_load_explicit(&thread->state, memory_order_acquire);
     if (state == THREAD_NEW || state == THREAD_DEAD) {
@@ -1984,8 +2616,9 @@ void sched_remove(thread_t *thread) {
         if (!queued) return;
         (void)x86_smp_request_reschedule(cpu_id);
         if (unowned) {
-            while (atomic_load_explicit(&thread->command_ack,
-                                        memory_order_acquire) != generation) {
+            while (!scheduler_command_ack_step(
+                current_cpu, &g_cpus[current_cpu], thread, g_cpu_count,
+                UINT32_MAX, generation, true)) {
                 __asm__ volatile ("pause");
             }
         }

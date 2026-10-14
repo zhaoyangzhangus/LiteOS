@@ -12,12 +12,20 @@
 
 typedef struct futex_entry {
     list_head_t node;
-    /* The physical word is the identity shared by process aliases. */
+    /* Shared keys use a physical word; private keys use an address-space VA. */
     uint64_t key;
+    vm_space_t *space;
+    bool private_key;
     process_t *process;
     uint32_t refs;
     wait_queue_t waitq;
 } futex_entry_t;
+
+typedef struct futex_key {
+    uint64_t value;
+    vm_space_t *space;
+    bool private_key;
+} futex_key_t;
 
 typedef struct {
     spinlock_t lock;
@@ -56,6 +64,7 @@ static futex_entry_t *entry_from_node(list_head_t *node) {
 }
 
 static void futex_init(void) {
+    if (atomic_load_explicit(&g_futex_init_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0;
     if (atomic_compare_exchange_strong_explicit(&g_futex_init_state, &expected, 1U,
                                                  memory_order_acq_rel,
@@ -72,32 +81,72 @@ static void futex_init(void) {
     }
 }
 
-static uint32_t futex_hash(uint64_t key) {
-    uint64_t value = key >> 2;
-    value ^= key >> 21;
+static uint32_t futex_hash(const futex_key_t *key) {
+    uint64_t value = key->value >> 2;
+    value ^= key->value >> 21;
     value ^= value >> 32;
+    if (key->private_key) {
+        uint64_t space = (uint64_t)(uintptr_t)key->space;
+        value ^= space >> 4;
+        value ^= space >> 21;
+        value ^= space >> 32;
+    }
     return (uint32_t)value & (FUTEX_BUCKET_COUNT - 1U);
 }
 
-static futex_entry_t *find_locked(futex_bucket_t *bucket, uint64_t key) {
+static futex_entry_t *find_locked(futex_bucket_t *bucket,
+                                  const futex_key_t *key) {
     for (list_head_t *node = bucket->entries.next; node != &bucket->entries;
          node = node->next) {
         futex_entry_t *entry = entry_from_node(node);
-        if (entry->key == key) return entry;
+        if (entry->key == key->value &&
+            entry->private_key == key->private_key &&
+            (!key->private_key || entry->space == key->space)) {
+            return entry;
+        }
     }
     return 0;
 }
 
 static kstatus_t futex_resolve_key(process_t *process, vaddr_t address,
-                                   uint64_t *out_key) {
+                                   bool private_key, futex_key_t *out_key) {
+    kstatus_t status;
+
     if (process == 0 || process->vm == 0 || out_key == 0 ||
         address < FUTEX_USER_BASE || address >= FUTEX_USER_END) {
         return K_EACCES;
     }
 
+    if (private_key) {
+        /* Linux private futex identity is (address space, virtual address).
+         * Walking all four page-table levels here used to take the global
+         * page-table spinlock for every pthread lock/unlock, even though the
+         * physical page is irrelevant to this key.  Validate and fault in
+         * the word through uaccess instead: mapped pages take the hardware
+         * translation fast path, while absent pages still get normal VM
+         * demand-fault handling. */
+        uint32_t value;
+        status = get_user_u32(&value, (const uint32_t __user *)address);
+        if (status != K_OK) {
+            status = vm_handle_fault(process->vm, &(vm_fault_info_t){
+                .address = address,
+                .access = VM_PROT_READ,
+                .cpu_error = 0,
+            });
+            if (status != K_OK) return status;
+            status = get_user_u32(&value,
+                                  (const uint32_t __user *)address);
+            if (status != K_OK) return status;
+        }
+
+        out_key->value = address;
+        out_key->space = process->vm;
+        out_key->private_key = true;
+        return K_OK;
+    }
+
     paddr_t physical;
-    kstatus_t status = x86_translate_page(process->vm->root_table, address,
-                                           &physical, 0);
+    status = x86_translate_page(process->vm->root_table, address, &physical, 0);
     if (status != K_OK) {
         status = vm_handle_fault(process->vm, &(vm_fault_info_t){
             .address = address,
@@ -112,21 +161,23 @@ static kstatus_t futex_resolve_key(process_t *process, vaddr_t address,
 
     /* Include the byte offset so different words in one shared page do not
      * wake each other.  Callers already enforce 4-byte user alignment. */
-    *out_key = physical.value;
+    out_key->value = physical.value;
+    out_key->space = 0;
+    out_key->private_key = false;
     return K_OK;
 }
 
 static kstatus_t futex_get(process_t *process, vaddr_t address, bool create,
-                           futex_entry_t **out) {
-    uint64_t key;
-    kstatus_t status = futex_resolve_key(process, address, &key);
+                           bool private_key, futex_entry_t **out) {
+    futex_key_t key;
+    kstatus_t status = futex_resolve_key(process, address, private_key, &key);
     if (status != K_OK) return status;
-    uint32_t index = futex_hash(key);
+    uint32_t index = futex_hash(&key);
     futex_bucket_t *bucket = &g_futex_buckets[index];
     futex_entry_t *candidate = 0;
     for (;;) {
         futex_bucket_lock(&bucket->lock);
-        futex_entry_t *entry = find_locked(bucket, key);
+        futex_entry_t *entry = find_locked(bucket, &key);
         if (entry != 0) {
             ++entry->refs;
             futex_bucket_unlock(&bucket->lock);
@@ -140,9 +191,12 @@ static kstatus_t futex_get(process_t *process, vaddr_t address, bool create,
             return K_ENOENT;
         }
         if (candidate != 0) {
-            candidate->key = key;
+            candidate->key = key.value;
+            candidate->space = key.space;
+            candidate->private_key = key.private_key;
             candidate->process = process;
             candidate->refs = 1U;
+            if (key.private_key) vm_space_get(key.space);
             object_get(process);
             wait_queue_init(&candidate->waitq);
             list_add_tail(&bucket->entries, &candidate->node);
@@ -158,7 +212,12 @@ static kstatus_t futex_get(process_t *process, vaddr_t address, bool create,
 }
 
 static void futex_put(futex_entry_t *entry) {
-    uint32_t index = futex_hash(entry->key);
+    futex_key_t key = {
+        .value = entry->key,
+        .space = entry->space,
+        .private_key = entry->private_key,
+    };
+    uint32_t index = futex_hash(&key);
     futex_bucket_t *bucket = &g_futex_buckets[index];
     bool destroy = false;
     futex_bucket_lock(&bucket->lock);
@@ -168,6 +227,7 @@ static void futex_put(futex_entry_t *entry) {
     }
     futex_bucket_unlock(&bucket->lock);
     if (destroy) {
+        if (entry->private_key) vm_space_put(entry->space);
         object_put(entry->process);
         kfree(entry);
     }
@@ -183,12 +243,14 @@ static bool futex_predicate(void *raw_context) {
     return context->fault != K_OK || context->mismatch;
 }
 
-kstatus_t futex_wait(process_t *process, uint32_t __user *address,
-                     uint32_t expected, uint64_t timeout_ns) {
+kstatus_t futex_wait_keyed(process_t *process, uint32_t __user *address,
+                           uint32_t expected, uint64_t timeout_ns,
+                           bool private_key) {
     if (process == 0 || address == 0 || ((uintptr_t)address & 3U) != 0) return K_EINVAL;
     futex_init();
     futex_entry_t *entry = 0;
-    kstatus_t status = futex_get(process, (vaddr_t)(uintptr_t)address, true, &entry);
+    kstatus_t status = futex_get(process, (vaddr_t)(uintptr_t)address, true,
+                                 private_key, &entry);
     if (status != K_OK) return status;
     futex_predicate_t predicate = {
         .address = address,
@@ -204,18 +266,35 @@ kstatus_t futex_wait(process_t *process, uint32_t __user *address,
     return status;
 }
 
-kstatus_t futex_wake(process_t *process, uint32_t __user *address,
-                     uint32_t maximum, uint32_t *woken) {
+kstatus_t futex_wait(process_t *process, uint32_t __user *address,
+                     uint32_t expected, uint64_t timeout_ns) {
+    return futex_wait_keyed(process, address, expected, timeout_ns, true);
+}
+
+kstatus_t futex_wake_keyed(process_t *process, uint32_t __user *address,
+                           uint32_t maximum, uint32_t *woken,
+                           bool private_key) {
     if (process == 0 || address == 0 || woken == 0 ||
         ((uintptr_t)address & 3U) != 0) return K_EINVAL;
     futex_init();
     *woken = 0;
     if (maximum == 0) return K_OK;
     futex_entry_t *entry = 0;
-    /* 唤醒方也必须创建桶项，避免等待方首次建项时产生 lost wakeup。 */
-    kstatus_t status = futex_get(process, (vaddr_t)(uintptr_t)address, true, &entry);
+    /* A wake with no registered waiter is a no-op.  The waiter publishes its
+     * entry before checking the user word under the wait-queue lock, so a
+     * concurrent store+wake cannot be lost: either wake sees the entry or
+     * the waiter's subsequent predicate observes the changed word.  Creating
+     * an entry here allocates and frees on every uncontended mutex unlock. */
+    kstatus_t status = futex_get(process, (vaddr_t)(uintptr_t)address, false,
+                                 private_key, &entry);
+    if (status == K_ENOENT) return K_OK;
     if (status != K_OK) return status;
     while (*woken < maximum && wake_one(&entry->waitq) != 0) ++*woken;
     futex_put(entry);
     return K_OK;
+}
+
+kstatus_t futex_wake(process_t *process, uint32_t __user *address,
+                     uint32_t maximum, uint32_t *woken) {
+    return futex_wake_keyed(process, address, maximum, woken, true);
 }

@@ -1,14 +1,14 @@
-#ifndef LITEOS_CONSOLE_FONT_A8_H
-#define LITEOS_CONSOLE_FONT_A8_H
+#ifndef OS_CONSOLE_FONT_A8_H
+#define OS_CONSOLE_FONT_A8_H
 
 #include <stdint.h>
 
-#define LITEOS_CONSOLE_FONT_WIDTH 12U
-#define LITEOS_CONSOLE_FONT_HEIGHT 24U
-#define LITEOS_CONSOLE_FONT_FIRST 0x20U
-#define LITEOS_CONSOLE_FONT_LAST 0x7EU
+#define OS_CONSOLE_FONT_WIDTH 12U
+#define OS_CONSOLE_FONT_HEIGHT 24U
+#define OS_CONSOLE_FONT_FIRST 0x20U
+#define OS_CONSOLE_FONT_LAST 0x7EU
 
-static const uint8_t g_liteos_console_font_a8[95][288] = {
+static const uint8_t g_console_font_a8[95][288] = {
     {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -2482,12 +2482,12 @@ static const uint8_t g_liteos_console_font_a8[95][288] = {
 };
 
 static inline const uint8_t *
-liteos_console_font_glyph(uint8_t character) {
+kernel_console_font_glyph(uint8_t character) {
     uint32_t code = character;
-    if (code < LITEOS_CONSOLE_FONT_FIRST ||
-        code > LITEOS_CONSOLE_FONT_LAST) code = '?';
-    return g_liteos_console_font_a8[code -
-        LITEOS_CONSOLE_FONT_FIRST];
+    if (code < OS_CONSOLE_FONT_FIRST ||
+        code > OS_CONSOLE_FONT_LAST) code = '?';
+    return g_console_font_a8[code -
+        OS_CONSOLE_FONT_FIRST];
 }
 
 #endif

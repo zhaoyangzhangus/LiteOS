@@ -3,6 +3,7 @@
 #include <arch/x86_64/cpu.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/console.h>
+#include <kernel/clock.h>
 #include <kernel/completion_port.h>
 #include <kernel/debug_stage.h>
 #include <kernel/futex.h>
@@ -12,10 +13,19 @@
 #include <kernel/timer.h>
 #include <kernel/wait.h>
 #include <uapi/ipc.h>
+#include <uapi/syscall.h>
 #include <uapi/time.h>
 #include <uapi/wait.h>
 
 #include "internal.h"
+
+#ifndef OS_DEBUG_SERIAL
+#define OS_DEBUG_SERIAL 0
+#endif
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_debug_wait_many_logs;
+#endif
 
 int64_t syscall_port_create(uint64_t kind, uint64_t capacity,
                                uint64_t output_pointer, uint64_t unused3,
@@ -84,8 +94,172 @@ int64_t syscall_completion_wait(uint64_t handle, uint64_t timeout_ns,
     return status;
 }
 
-/* CLOCK_GET(0, output_timespec)：返回单调 TSC 时钟，不受墙上时间校准影响。 */
+/* QEMU exposes the host's UTC wall clock through the PC RTC.  Seed the
+ * realtime offset once; monotonic time must remain independent of it. */
 static atomic_int_fast64_t g_realtime_offset_ns;
+static atomic_uint g_realtime_init_state;
+
+typedef struct clock_rtc_snapshot {
+    uint8_t second;
+    uint8_t minute;
+    uint8_t hour;
+    uint8_t day;
+    uint8_t month;
+    uint8_t year;
+    uint8_t century;
+} clock_rtc_snapshot_t;
+
+static uint8_t clock_cmos_read(uint8_t reg) {
+    uint8_t value;
+    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)(0x80U | reg)),
+                      "Nd"((uint16_t)0x70U));
+    __asm__ volatile ("inb %1, %0" : "=a"(value) : "Nd"((uint16_t)0x71U));
+    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0x0DU),
+                      "Nd"((uint16_t)0x70U));
+    return value;
+}
+
+static uint8_t clock_bcd_to_binary(uint8_t value) {
+    return (uint8_t)((value & 0x0fU) + 10U * (value >> 4U));
+}
+
+static void clock_rtc_read_snapshot(clock_rtc_snapshot_t *value) {
+    value->second = clock_cmos_read(0x00U);
+    value->minute = clock_cmos_read(0x02U);
+    value->hour = clock_cmos_read(0x04U);
+    value->day = clock_cmos_read(0x07U);
+    value->month = clock_cmos_read(0x08U);
+    value->year = clock_cmos_read(0x09U);
+    value->century = clock_cmos_read(0x32U);
+}
+
+static bool clock_rtc_snapshots_equal(const clock_rtc_snapshot_t *left,
+                                      const clock_rtc_snapshot_t *right) {
+    return left->second == right->second && left->minute == right->minute &&
+           left->hour == right->hour && left->day == right->day &&
+           left->month == right->month && left->year == right->year &&
+           left->century == right->century;
+}
+
+static bool clock_rtc_epoch_seconds(int64_t *result) {
+    clock_rtc_snapshot_t first;
+    clock_rtc_snapshot_t second;
+    uint8_t mode = clock_cmos_read(0x0bU);
+    uint32_t year;
+    uint32_t month;
+    uint32_t day;
+    uint32_t hour;
+    uint32_t minute;
+    uint32_t century;
+    int64_t adjusted_year;
+    int64_t era;
+    uint32_t year_of_era;
+    uint32_t day_of_year;
+    uint32_t day_of_era;
+    int64_t days;
+    bool stable = false;
+
+    if (result == 0) return false;
+    for (uint32_t attempt = 0U; attempt < 4U; ++attempt) {
+        uint32_t poll = 0U;
+        while ((clock_cmos_read(0x0aU) & 0x80U) != 0U && poll++ < 100000U) {
+            __asm__ volatile ("pause");
+        }
+        if (poll >= 100000U) continue;
+        clock_rtc_read_snapshot(&first);
+        if ((clock_cmos_read(0x0aU) & 0x80U) != 0U) continue;
+        clock_rtc_read_snapshot(&second);
+        if (clock_rtc_snapshots_equal(&first, &second)) {
+            stable = true;
+            break;
+        }
+    }
+    if (!stable) return false;
+
+    second = first;
+    hour = (uint32_t)(second.hour & 0x7fU);
+    if ((mode & 0x04U) == 0U) {
+        second.second = clock_bcd_to_binary(second.second);
+        second.minute = clock_bcd_to_binary(second.minute);
+        hour = clock_bcd_to_binary((uint8_t)hour);
+        second.day = clock_bcd_to_binary(second.day);
+        second.month = clock_bcd_to_binary(second.month);
+        second.year = clock_bcd_to_binary(second.year);
+        second.century = clock_bcd_to_binary(second.century);
+    }
+    if ((mode & 0x02U) == 0U) {
+        if (hour == 0U || hour > 12U) return false;
+        hour = hour % 12U + ((second.hour & 0x80U) != 0U ? 12U : 0U);
+    }
+    month = second.month;
+    day = second.day;
+    minute = second.minute;
+    century = second.century;
+    if (century >= 19U && century <= 99U) {
+        year = century * 100U + second.year;
+    } else {
+        year = second.year >= 70U ? 1900U + second.year :
+                                     2000U + second.year;
+    }
+    if (year < 1970U || year > 9999U || month < 1U || month > 12U ||
+        day < 1U || day > 31U || hour > 23U || minute > 59U ||
+        second.second > 59U) return false;
+    static const uint8_t month_days[12] = {
+        31U, 28U, 31U, 30U, 31U, 30U,
+        31U, 31U, 30U, 31U, 30U, 31U,
+    };
+    bool leap_year = (year % 4U == 0U) &&
+                     (year % 100U != 0U || year % 400U == 0U);
+    if (day > month_days[month - 1U] +
+                  (month == 2U && leap_year ? 1U : 0U)) return false;
+
+    adjusted_year = (int64_t)year - (month <= 2U ? 1 : 0);
+    era = adjusted_year / 400;
+    year_of_era = (uint32_t)(adjusted_year - era * 400);
+    day_of_year = (153U * (month > 2U ? month - 3U : month + 9U) + 2U) / 5U +
+                  day - 1U;
+    day_of_era = year_of_era * 365U + year_of_era / 4U -
+                 year_of_era / 100U + day_of_year;
+    days = era * 146097 + (int64_t)day_of_era - 719468;
+    *result = days * 86400LL + (int64_t)hour * 3600LL +
+              (int64_t)minute * 60LL + second.second;
+    return true;
+}
+
+static void clock_realtime_initialize(void) {
+    unsigned expected = 0U;
+    if (atomic_compare_exchange_strong_explicit(
+            &g_realtime_init_state, &expected, 1U,
+            memory_order_acq_rel, memory_order_acquire)) {
+        int64_t seconds;
+        bool valid = clock_rtc_epoch_seconds(&seconds) &&
+                     seconds <= INT64_MAX / 1000000000LL;
+        if (valid) {
+            uint64_t monotonic_ns = x86_tsc_to_ns(x86_read_tsc());
+            if (monotonic_ns <= (uint64_t)INT64_MAX) {
+                int64_t epoch_ns = seconds * 1000000000LL;
+                atomic_store_explicit(&g_realtime_offset_ns,
+                                      epoch_ns - (int64_t)monotonic_ns,
+                                      memory_order_release);
+            } else {
+                valid = false;
+            }
+        }
+#if OS_DEBUG_SERIAL
+        kernel_serial_printf_serial_only(
+            "OS_CLOCK_RTC_SEED valid=%u epoch_seconds=%llu\r\n",
+            valid ? 1U : 0U,
+            (unsigned long long)(valid ? seconds : 0LL));
+#endif
+        atomic_store_explicit(&g_realtime_init_state, 2U,
+                              memory_order_release);
+        return;
+    }
+    while (atomic_load_explicit(&g_realtime_init_state,
+                                memory_order_acquire) != 2U) {
+        __asm__ volatile ("pause");
+    }
+}
 
 static bool clock_timespec_to_ns(const os_timespec_t *value,
                                  int64_t *result) {
@@ -118,7 +292,7 @@ static bool clock_timespec_to_ns(const os_timespec_t *value,
     return true;
 }
 
-static kstatus_t clock_read_value(uint32_t clock_id, os_timespec_t *value) {
+kstatus_t kernel_clock_read(uint32_t clock_id, os_timespec_t *value) {
     uint64_t monotonic_ns = x86_tsc_to_ns(x86_read_tsc());
     int64_t signed_ns;
     int64_t offset;
@@ -129,6 +303,7 @@ static kstatus_t clock_read_value(uint32_t clock_id, os_timespec_t *value) {
     if (monotonic_ns > (uint64_t)INT64_MAX) return K_EOVERFLOW;
     signed_ns = (int64_t)monotonic_ns;
     if (clock_id == OS_CLOCK_REALTIME) {
+        clock_realtime_initialize();
         offset = atomic_load_explicit(&g_realtime_offset_ns,
                                       memory_order_acquire);
         if ((offset > 0 && signed_ns > INT64_MAX - offset) ||
@@ -155,7 +330,7 @@ int64_t syscall_clock_get(uint64_t clock_id, uint64_t output_pointer,
     (void)unused4;
     (void)unused5;
     os_timespec_t value;
-    kstatus_t status = clock_read_value((uint32_t)clock_id, &value);
+    kstatus_t status = kernel_clock_read((uint32_t)clock_id, &value);
     if (status != K_OK) return status;
     return copy_to_user((void __user *)(uintptr_t)output_pointer,
                         &value, sizeof(value));
@@ -183,6 +358,7 @@ int64_t syscall_clock_set(uint64_t arguments_pointer, uint64_t unused1,
         !clock_timespec_to_ns(&arguments.value, &target_ns)) {
         return K_EINVAL;
     }
+    clock_realtime_initialize();
     monotonic_ns = x86_tsc_to_ns(x86_read_tsc());
     if (monotonic_ns > (uint64_t)INT64_MAX) return K_EOVERFLOW;
     monotonic_signed = (int64_t)monotonic_ns;
@@ -285,21 +461,21 @@ int64_t syscall_wait_one(uint64_t handle, uint64_t timeout_ns,
     (void)unused5;
     process_t *process = current_process();
     if (process == 0) return K_EPERM;
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_WAIT_ONE_ENTER,
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_WAIT_ONE_ENTER,
                              (uint32_t)handle);
     void *object = 0;
     kstatus_t status = handle_lookup(&process->handles, (handle_t)handle,
                                      OBJECT_RIGHT_WAIT, &object);
     if (status != K_OK) {
-#if LITEOS_DEBUG_SERIAL
-        liteos_serial_write("LITEOS_DIAG_WAIT_ONE_LOOKUP_FAIL STATUS=");
-        liteos_serial_write_u32((uint32_t)status);
-        liteos_serial_write(" HANDLE_LOW=");
-        liteos_serial_write_u32((uint32_t)handle);
-        liteos_serial_write(" HANDLE_HIGH=");
-        liteos_serial_write_u32((uint32_t)(handle >> 32));
-        liteos_serial_write("\r\n");
+#if OS_DEBUG_SERIAL
+        kernel_serial_write("OS_DIAG_WAIT_ONE_LOOKUP_FAIL STATUS=");
+        kernel_serial_write_u32((uint32_t)status);
+        kernel_serial_write(" HANDLE_LOW=");
+        kernel_serial_write_u32((uint32_t)handle);
+        kernel_serial_write(" HANDLE_HIGH=");
+        kernel_serial_write_u32((uint32_t)(handle >> 32));
+        kernel_serial_write("\r\n");
 #endif
         return status;
     }
@@ -315,8 +491,8 @@ int64_t syscall_wait_one(uint64_t handle, uint64_t timeout_ns,
         status = copy_to_user((void __user *)(uintptr_t)output_pointer,
                               &result, sizeof(result));
     }
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_WAIT_ONE_RETURN,
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_WAIT_ONE_RETURN,
                              (uint32_t)status);
     object_put(object);
     return status;
@@ -373,6 +549,17 @@ int64_t syscall_wait_many(uint64_t arguments_pointer, uint64_t unused1,
     for (uint32_t i = 0; i < referenced; ++i) object_put(objects[i]);
     kfree(objects);
     kfree(handles);
+#if OS_DEBUG_SERIAL
+    if (g_debug_wait_many_logs < 256U) {
+        kernel_serial_printf_serial_only(
+            "OS_WAIT_MANY count=%u timeout_ms=%u status=%d index=%u\r\n",
+            arguments.count,
+            arguments.timeout_ns == OS_WAIT_INFINITE ? UINT32_MAX :
+                (uint32_t)(arguments.timeout_ns / 1000000U),
+            status, arguments.result_index);
+        ++g_debug_wait_many_logs;
+    }
+#endif
     return status;
 }
 
@@ -380,11 +567,13 @@ int64_t syscall_futex_wait(uint64_t address, uint64_t expected, uint64_t timeout
                               uint64_t flags, uint64_t unused4, uint64_t unused5) {
     (void)unused4;
     (void)unused5;
-    if (flags != 0 || expected > UINT32_MAX) return K_EINVAL;
+    if ((flags & ~((uint64_t)OS_FUTEX_FLAG_SHARED)) != 0U ||
+        expected > UINT32_MAX) return K_EINVAL;
     process_t *process = current_process();
     if (process == 0) return K_EPERM;
-    return futex_wait(process, (uint32_t __user *)(uintptr_t)address,
-                      (uint32_t)expected, timeout_ns);
+    return futex_wait_keyed(process, (uint32_t __user *)(uintptr_t)address,
+                            (uint32_t)expected, timeout_ns,
+                            (flags & OS_FUTEX_FLAG_SHARED) == 0U);
 }
 
 int64_t syscall_futex_wake(uint64_t address, uint64_t maximum, uint64_t flags,
@@ -392,11 +581,13 @@ int64_t syscall_futex_wake(uint64_t address, uint64_t maximum, uint64_t flags,
     (void)unused3;
     (void)unused4;
     (void)unused5;
-    if (flags != 0 || maximum > UINT32_MAX) return K_EINVAL;
+    if ((flags & ~((uint64_t)OS_FUTEX_FLAG_SHARED)) != 0U ||
+        maximum > UINT32_MAX) return K_EINVAL;
     process_t *process = current_process();
     if (process == 0) return K_EPERM;
     uint32_t woken = 0;
-    kstatus_t status = futex_wake(process, (uint32_t __user *)(uintptr_t)address,
-                                  (uint32_t)maximum, &woken);
+    kstatus_t status = futex_wake_keyed(
+        process, (uint32_t __user *)(uintptr_t)address, (uint32_t)maximum,
+        &woken, (flags & OS_FUTEX_FLAG_SHARED) == 0U);
     return status == K_OK ? (int64_t)woken : status;
 }

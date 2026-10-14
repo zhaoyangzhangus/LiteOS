@@ -7,6 +7,7 @@
 #include <kernel/mm.h>
 #include <kernel/irq.h>
 #include <kernel/sched.h>
+#include <kernel/string.h>
 #include <arch/x86_64/syscall_internal.h>
 
 #define IA32_EFER                 0xC0000080U
@@ -24,10 +25,10 @@
 #define CR4_SMEP                  (1ULL << 20)
 #define CR4_SMAP                  (1ULL << 21)
 
-#define LITEOS_GDT_CODE_SELECTOR  0x08U
-#define LITEOS_IDT_ENTRIES        256U
-#define LITEOS_IST_STACK_SIZE     (32U * 1024U)
-#define LITEOS_RING0_STACK_RESERVE (64U * 1024U)
+#define OS_GDT_CODE_SELECTOR  0x08U
+#define OS_IDT_ENTRIES        256U
+#define OS_IST_STACK_SIZE     (32U * 1024U)
+#define OS_RING0_STACK_RESERVE (64U * 1024U)
 
 typedef struct __attribute__((packed)) {
     uint16_t limit;
@@ -64,10 +65,10 @@ typedef void (*irq_entry_t)(void);
 typedef struct x86_cpu_arch {
     uint64_t gdt[7] __attribute__((aligned(8)));
     x86_tss_t tss __attribute__((aligned(16)));
-    idt_entry_t idt[LITEOS_IDT_ENTRIES] __attribute__((aligned(16)));
-    uint8_t double_fault_stack[LITEOS_IST_STACK_SIZE] __attribute__((aligned(16)));
-    uint8_t nmi_stack[LITEOS_IST_STACK_SIZE] __attribute__((aligned(16)));
-    uint8_t machine_check_stack[LITEOS_IST_STACK_SIZE] __attribute__((aligned(16)));
+    idt_entry_t idt[OS_IDT_ENTRIES] __attribute__((aligned(16)));
+    uint8_t double_fault_stack[OS_IST_STACK_SIZE] __attribute__((aligned(16)));
+    uint8_t nmi_stack[OS_IST_STACK_SIZE] __attribute__((aligned(16)));
+    uint8_t machine_check_stack[OS_IST_STACK_SIZE] __attribute__((aligned(16)));
     x86_cpu_local_t embedded_local __attribute__((aligned(CACHELINE_SIZE)));
     x86_cpu_local_t *local;
     uint32_t cpu_index;
@@ -80,13 +81,13 @@ static x86_cpu_arch_t *g_cpu_arch[MAX_CPUS];
 
 x86_cpu_features_t x86_boot_cpu_features;
 
-extern exception_entry_t liteos_exception_stub_table[32];
-extern irq_entry_t liteos_irq_stub_table[IRQ_VECTOR_LAST - IRQ_VECTOR_FIRST + 1U];
-extern void liteos_arch_interrupt_stub(void);
-extern void liteos_lapic_timer_entry(void);
-extern void liteos_lapic_spurious_entry(void);
-extern void liteos_smp_ipi_entry(void);
-extern void liteos_tlb_ipi_entry(void);
+extern exception_entry_t arch_exception_stub_table[32];
+extern irq_entry_t arch_irq_stub_table[IRQ_VECTOR_LAST - IRQ_VECTOR_FIRST + 1U];
+extern void arch_arch_interrupt_stub(void);
+extern void arch_lapic_timer_entry(void);
+extern void arch_lapic_spurious_entry(void);
+extern void arch_smp_ipi_entry(void);
+extern void arch_tlb_ipi_entry(void);
 
 static void memory_zero(void *memory, size_t size) {
     uint8_t *bytes = (uint8_t *)memory;
@@ -165,6 +166,38 @@ uint32_t x86_cpu_preempt_disable_count(uint32_t cpu_index) {
 }
 
 
+static uint8_t cpu_pit_read(uint16_t port) {
+    uint8_t value;
+    __asm__ volatile ("inb %w1, %0" : "=a"(value) : "d"(port));
+    return value;
+}
+
+static void cpu_pit_write(uint16_t port, uint8_t value) {
+    __asm__ volatile ("outb %0, %w1" : : "a"(value), "d"(port));
+}
+
+/* BSP-only, before timers/threads start. Channel 2 does not alter PIT IRQ0.
+ * Bound polling so a platform without a legacy PIT cannot hang boot. */
+static uint64_t cpu_tsc_pit_sample(void) {
+    const uint32_t latch = 29829U;
+    uint8_t saved = cpu_pit_read(0x61U);
+    cpu_pit_write(0x61U, (uint8_t)((saved & ~3U) | 1U));
+    cpu_pit_write(0x43U, 0xB0U);
+    cpu_pit_write(0x42U, (uint8_t)latch);
+    cpu_pit_write(0x42U, (uint8_t)(latch >> 8));
+    uint64_t start = x86_read_tsc();
+    uint32_t polls = 0U;
+    while (polls < 1000000U && (cpu_pit_read(0x61U) & 0x20U) == 0U) {
+        ++polls;
+    }
+    uint64_t end = x86_read_tsc();
+    cpu_pit_write(0x61U, saved);
+    if (polls == 0U || polls == 1000000U || end <= start ||
+        end - start > UINT64_MAX / 1193182ULL) return 0U;
+    uint64_t hz = ((end - start) * 1193182ULL) / latch;
+    return hz >= 10000000ULL && hz <= 10000000000ULL ? hz : 0U;
+}
+
 void x86_cpu_detect_features(void) {
     uint32_t eax;
     uint32_t ebx;
@@ -207,8 +240,13 @@ void x86_cpu_detect_features(void) {
         if (base_mhz != 0) x86_boot_cpu_features.tsc_hz = (uint64_t)base_mhz * 1000000ULL;
     }
     if (x86_boot_cpu_features.tsc_hz == 0) {
-        /* 极早期平台缺少频率叶时使用保守后备值，后续由时钟源校准覆盖。 */
-        x86_boot_cpu_features.tsc_hz = 1000000000ULL;
+        uint64_t best = UINT64_MAX;
+        for (uint32_t sample = 0U; sample < 3U; ++sample) {
+            uint64_t hz = cpu_tsc_pit_sample();
+            if (hz != 0U && hz < best) best = hz;
+        }
+        x86_boot_cpu_features.tsc_hz = best != UINT64_MAX ?
+                                         best : 1000000000ULL;
     }
     if (maximum_extended >= 0x80000001U) {
         cpuid(0x80000001U, 0U, &eax, &ebx, &ecx, &edx);
@@ -317,7 +355,7 @@ bool x86_cpu_hardening_self_test(void) {
 
 static void x86_fp_default_state(void *area) {
     uint8_t *bytes = (uint8_t *)area;
-    for (uint32_t index = 0U; index < X86_FX_STATE_SIZE; ++index) bytes[index] = 0U;
+    memset(bytes, 0, X86_FX_STATE_SIZE);
     *(uint16_t *)(bytes + 0U) = 0x037FU;
     *(uint32_t *)(bytes + 24U) = 0x00001F80U;
     *(uint32_t *)(bytes + 28U) = 0x0000FFFFU;
@@ -325,7 +363,7 @@ static void x86_fp_default_state(void *area) {
 
 bool x86_fp_state_create(arch_thread_state_t *state) {
     if (state == 0 || state->xsave_area != 0) return false;
-    void *area = kzalloc(X86_FX_STATE_SIZE, 0);
+    void *area = kmalloc(X86_FX_STATE_SIZE, 0);
     if (area == 0 || ((uintptr_t)area & 15U) != 0U) {
         kfree(area);
         return false;
@@ -359,10 +397,7 @@ void x86_fp_state_clone_current(arch_thread_state_t *source,
         destination->xsave_size != X86_FX_STATE_SIZE) return;
     sched_preempt_disable();
     __asm__ volatile ("fxsave64 (%0)" : : "r"(source->xsave_area) : "memory");
-    for (uint32_t index = 0U; index < X86_FX_STATE_SIZE; ++index) {
-        ((uint8_t *)destination->xsave_area)[index] =
-            ((const uint8_t *)source->xsave_area)[index];
-    }
+    memmove(destination->xsave_area, source->xsave_area, X86_FX_STATE_SIZE);
     sched_preempt_enable();
 }
 
@@ -416,7 +451,7 @@ static void load_gdt(const descriptor_table_register_t *table) {
 static void set_idt_entry(idt_entry_t *entry, uintptr_t handler, uint8_t ist,
                           uint8_t type_attributes) {
     entry->offset_low = (uint16_t)(handler & 0xFFFFU);
-    entry->selector = LITEOS_GDT_CODE_SELECTOR;
+    entry->selector = OS_GDT_CODE_SELECTOR;
     entry->ist = ist & 7U;
     entry->type_attributes = type_attributes;
     entry->offset_middle = (uint16_t)((handler >> 16) & 0xFFFFU);
@@ -426,8 +461,8 @@ static void set_idt_entry(idt_entry_t *entry, uintptr_t handler, uint8_t ist,
 
 static void build_idt(x86_cpu_arch_t *arch) {
     if (arch == 0) return;
-    uintptr_t default_handler = (uintptr_t)&liteos_arch_interrupt_stub;
-    for (uint32_t i = 0; i < LITEOS_IDT_ENTRIES; ++i) {
+    uintptr_t default_handler = (uintptr_t)&arch_arch_interrupt_stub;
+    for (uint32_t i = 0; i < OS_IDT_ENTRIES; ++i) {
         set_idt_entry(&arch->idt[i], default_handler, 0U, 0x8EU);
     }
     for (uint32_t i = 0; i < 32U; ++i) {
@@ -435,20 +470,20 @@ static void build_idt(x86_cpu_arch_t *arch) {
         if (i == 8U) ist = X86_IST_DOUBLE_FAULT;
         else if (i == 2U) ist = X86_IST_NMI;
         else if (i == 18U) ist = X86_IST_MACHINE_CHECK;
-        set_idt_entry(&arch->idt[i], (uintptr_t)liteos_exception_stub_table[i], ist,
+        set_idt_entry(&arch->idt[i], (uintptr_t)arch_exception_stub_table[i], ist,
                       i == 3U ? 0xEEU : 0x8EU);
     }
     for (uint32_t i = IRQ_VECTOR_FIRST; i <= IRQ_VECTOR_LAST; ++i) {
         set_idt_entry(&arch->idt[i],
-                      (uintptr_t)liteos_irq_stub_table[i - IRQ_VECTOR_FIRST],
+                      (uintptr_t)arch_irq_stub_table[i - IRQ_VECTOR_FIRST],
                       0U, 0x8EU);
     }
-    set_idt_entry(&arch->idt[32], (uintptr_t)&liteos_lapic_timer_entry, 0U, 0x8EU);
-    set_idt_entry(&arch->idt[X86_SMP_IPI_VECTOR], (uintptr_t)&liteos_smp_ipi_entry,
+    set_idt_entry(&arch->idt[32], (uintptr_t)&arch_lapic_timer_entry, 0U, 0x8EU);
+    set_idt_entry(&arch->idt[X86_SMP_IPI_VECTOR], (uintptr_t)&arch_smp_ipi_entry,
                   0U, 0x8EU);
-    set_idt_entry(&arch->idt[X86_TLB_IPI_VECTOR], (uintptr_t)&liteos_tlb_ipi_entry,
+    set_idt_entry(&arch->idt[X86_TLB_IPI_VECTOR], (uintptr_t)&arch_tlb_ipi_entry,
                   0U, 0x8EU);
-    set_idt_entry(&arch->idt[255], (uintptr_t)&liteos_lapic_spurious_entry, 0U, 0x8EU);
+    set_idt_entry(&arch->idt[255], (uintptr_t)&arch_lapic_spurious_entry, 0U, 0x8EU);
 }
 
 static void prepare_arch_context(x86_cpu_arch_t *arch, x86_cpu_local_t *local,
@@ -528,7 +563,7 @@ void x86_idt_init(void) {
     __asm__ volatile ("lidt (%0)" : : "r"(&idt_register) : "memory");
 }
 
-BOOLEAN liteos_arch_cpu_init(void) {
+BOOLEAN arch_cpu_init(void) {
     uint32_t eax;
     uint32_t ebx;
     uint32_t ecx;
@@ -538,7 +573,7 @@ BOOLEAN liteos_arch_cpu_init(void) {
     (void)eax;
     (void)ecx;
     (void)edx;
-    prepare_arch_context(&g_bsp_arch, &liteos_syscall_cpu_local, 0U, ebx >> 24, 0);
+    prepare_arch_context(&g_bsp_arch, &syscall_cpu_local, 0U, ebx >> 24, 0);
     g_cpu_arch[0] = &g_bsp_arch;
     if (!load_arch_context(&g_bsp_arch)) return 0;
     g_bsp_arch.local->Flags |= X86_CPU_LOCAL_ONLINE;
@@ -582,8 +617,8 @@ bool x86_cpu_init_secondary(uint32_t cpu_index, uint32_t apic_id) {
     return x86_current_cpu_index() == cpu_index && x86_current_apic_id() == apic_id;
 }
 
-BOOLEAN liteos_arch_set_kernel_stack(uint64_t stack_base, uint64_t stack_size) {
-    if (stack_base == 0 || stack_size < LITEOS_RING0_STACK_RESERVE * 2ULL ||
+BOOLEAN arch_set_kernel_stack(uint64_t stack_base, uint64_t stack_size) {
+    if (stack_base == 0 || stack_size < OS_RING0_STACK_RESERVE * 2ULL ||
         stack_base > UINT64_MAX - stack_size) {
         return 0;
     }
@@ -592,7 +627,7 @@ BOOLEAN liteos_arch_set_kernel_stack(uint64_t stack_base, uint64_t stack_size) {
      * Ring3 硬件中断使用下半区，避免覆盖稍后要恢复的返回地址。
      * 正式 thread_t 上线后，调度切换会把 RSP0 更新为该线程的专用内核栈。
      */
-    uint64_t ring0_stack_top = stack_base + LITEOS_RING0_STACK_RESERVE;
+    uint64_t ring0_stack_top = stack_base + OS_RING0_STACK_RESERVE;
     if ((ring0_stack_top & 0xFULL) != 0) return 0;
     x86_cpu_arch_t *arch = current_arch();
     if (arch == 0) return 0;

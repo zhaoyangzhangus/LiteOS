@@ -31,12 +31,22 @@ uint64_t compositor_publication_damage_pixels(void) {
  * the single atomic transaction by passing allow_yield=false. */
 void compositor_publication_rect(const Rect *rect,
                                     bool allow_yield) {
+    Rect clipped;
     uint32_t width;
     uint64_t pixels_since_yield = 0U;
 
-    if (rect == 0 || rect->x0 >= rect->x1 || rect->y0 >= rect->y1) {
+    if (rect == 0 || g_window_server.framebuffer == 0 ||
+        g_window_server.composite_framebuffer == 0 ||
+        g_window_server.display_stride < g_window_server.display_width) {
         return;
     }
+    /* Final publication owns clipping even when an upstream damage producer
+     * retained coordinates from an older geometry. Clip before converting
+     * signed positions to scanline indices or subtracting widths. */
+    if (!rect_clip_to_extent(rect->x0, rect->y0, rect->x1, rect->y1,
+            g_window_server.display_width, g_window_server.display_height,
+            &clipped)) return;
+    rect = &clipped;
 
     width =
         rect->x1 -
@@ -61,10 +71,17 @@ void compositor_publication_rect(const Rect *rect,
                 (uint64_t)row * g_window_server.display_stride +
                 rect->x0);
 
-        compositor_copy_wc_scanline(
-            destination,
-            source,
-            width);
+        if (!window_present_cursor_publish_span(
+                destination,
+                source,
+                rect->x0,
+                row,
+                width)) {
+            compositor_copy_wc_scanline(
+                destination,
+                source,
+                width);
+        }
 
         if (!allow_yield) {
             continue;
@@ -84,8 +101,12 @@ void compositor_publication_rect(const Rect *rect,
          * rectangle no longer calls schedule() every 16 rows while a full
          * 2560-pixel row gets a proportionally shorter quantum.
          *
-         * WC stores remain ordered by the final frame fence.
+         * Flush this CPU's WC stores before a scheduling point: the worker
+         * can resume on a different CPU. Each scanline already preserves the
+         * visible cursor, including on QEMU's fixed page. The immutable scene
+         * and single compositor owner remain held across the scheduling point.
          */
+        __asm__ volatile ("sfence" : : : "memory");
         sched_preempt_enable();
         schedule();
         sched_preempt_disable();
@@ -110,28 +131,9 @@ static void compositor_publication_drag_exposure_rect(
 
     Rect rect;
 
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
-
-    if (right >
-        (int64_t)g_window_server.display_width) {
-        right = g_window_server.display_width;
-    }
-
-    if (bottom >
-        (int64_t)g_window_server.display_height) {
-        bottom = g_window_server.display_height;
-    }
-
-    if (left >= right ||
-        top >= bottom) {
-        return;
-    }
-
-    rect.x0 = (uint32_t)left;
-    rect.y0 = (uint32_t)top;
-    rect.x1 = (uint32_t)right;
-    rect.y1 = (uint32_t)bottom;
+    if (!rect_clip_to_extent(left, top, right, bottom,
+            g_window_server.display_width, g_window_server.display_height,
+            &rect)) return;
 
     compositor_publication_rect(
         &rect,

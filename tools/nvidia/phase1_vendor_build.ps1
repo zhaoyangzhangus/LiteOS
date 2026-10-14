@@ -108,7 +108,7 @@ if ($mutableVendorFiles.Count -ne 0) {
 
 # The upstream source lists are the authority for the OS-agnostic RM and
 # modeset portions. kernel-open/ is intentionally not selected here: it is the
-# Linux kbuild/ABI frontend reference, not a LiteOS implementation.
+# Linux kbuild/ABI frontend reference, not a System implementation.
 $sourceLists = @(
     [PSCustomObject]@{ Component = 'rm'; ListPath = (Join-Path $vendorSourceRoot 'src\nvidia\srcs.mk') },
     [PSCustomObject]@{ Component = 'modeset'; ListPath = (Join-Path $vendorSourceRoot 'src\nvidia-modeset\srcs.mk') }
@@ -161,7 +161,7 @@ foreach ($sourceList in $sourceLists) {
 }
 
 $sourceReportLines = New-Object 'System.Collections.Generic.List[string]'
-$sourceReportLines.Add('# LiteOS Phase 1 deterministic vendor source selection')
+$sourceReportLines.Add('# System Phase 1 deterministic vendor source selection')
 $sourceReportLines.Add('# Authority: upstream src/nvidia/srcs.mk and src/nvidia-modeset/srcs.mk')
 $sourceReportLines.Add('# kernel-open/ is excluded from this OS-agnostic inventory')
 $sourceReportLines.Add(('# component{0}language{0}source{0}origin' -f $tab))
@@ -295,7 +295,7 @@ $modesetCompiler = (Get-Command g++ -ErrorAction Stop).Source
 $compilerVersion = (& $rmCompiler --version 2>&1 | Select-Object -First 1).ToString()
 
 $compileLogLines = New-Object 'System.Collections.Generic.List[string]'
-$compileLogLines.Add('# LiteOS Phase 1 vendor compile log')
+$compileLogLines.Add('# System Phase 1 vendor compile log')
 $compileLogLines.Add('# profile=host-unix-probe')
 $compileLogLines.Add('# vendor semantic patches=0')
 $compileLogLines.Add(('# compiler={0}' -f $compilerVersion))
@@ -388,7 +388,7 @@ foreach ($record in $compiledRecords) {
 
 # Rewrite the object report after nm so its per-object nm status is final.
 $objectReportLines = New-Object 'System.Collections.Generic.List[string]'
-$objectReportLines.Add('# LiteOS Phase 1 vendor object inventory')
+$objectReportLines.Add('# System Phase 1 vendor object inventory')
 $objectReportLines.Add(('# source_list_sha256={0}' -f $sourceListHash))
 $objectReportLines.Add(('# status{0}component{0}language{0}id{0}source{0}object{0}exit_code{0}nm_status' -f $tab))
 foreach ($record in $records) {
@@ -399,7 +399,7 @@ Write-AsciiLines $objectReport $objectReportLines
 $unresolvedNames = @($undefinedBySymbol.Keys | Where-Object { -not $definitions.Contains($_) } | Sort-Object)
 $resolvedUndefinedCount = $undefinedBySymbol.Count - $unresolvedNames.Count
 $unresolvedReportLines = New-Object 'System.Collections.Generic.List[string]'
-$unresolvedReportLines.Add('# LiteOS Phase 1 unresolved external symbol inventory')
+$unresolvedReportLines.Add('# System Phase 1 unresolved external symbol inventory')
 $unresolvedReportLines.Add(('# source_list_sha256={0}' -f $sourceListHash))
 $unresolvedReportLines.Add(('# selected_sources={0};compiled_objects={1};compile_failures={2};resolved_partial_symbols={3};unresolved_symbols={4}' -f $records.Count, $compiledRecords.Count, @($records | Where-Object Status -eq 'compile_failed').Count, $resolvedUndefinedCount, $unresolvedNames.Count))
 $unresolvedReportLines.Add('# classification=deterministic symbol-name heuristic; no implementation is supplied')

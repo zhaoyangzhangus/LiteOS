@@ -83,7 +83,6 @@ typedef struct e1000_state {
     bool tcp_loopback_peer_enabled;
     bool tcp_loopback_synack_seen;
     bool tcp_loopback_data_ack_seen;
-    spinlock_t poll_lock;
     bool link_up;
     bool initialized;
     e1000_recovery_context_t recovery;
@@ -119,6 +118,13 @@ typedef struct e1000_state {
     volatile uint32_t rtl_tx_count;
     uint32_t rtl_diagnostic_reports;
     uint64_t rtl_diagnostic_tsc;
+    uint8_t rtl_cmd_after_start;
+    uint8_t rtl_cmd_before_irq;
+    uint8_t rtl_cmd_after_irq;
+    uint8_t rtl_cmd_last_before_enable;
+    uint8_t rtl_cmd_last_after_enable;
+    uint32_t rtl_enable_attempts;
+    uint32_t rtl_enable_failures;
 } e1000_state_t;
 
 static inline uint32_t e1000_read(const e1000_state_t *state, uint32_t offset) {
@@ -211,3 +217,4 @@ bool e1000_tcp_loopback_peer_ack(e1000_state_t *state,
 bool e1000_tcp_loopback_peer_ack6(e1000_state_t *state,
                                   const e1000_rx_packet_t *packet,
                                   const socket_tcp_reply_t *reply);
+bool e1000_unmatched_tcp_reset_self_test(void);

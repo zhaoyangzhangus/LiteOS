@@ -2,8 +2,11 @@
 #include <arch/x86_64/cpu.h>
 #include <arch/x86_64/smp.h>
 #include <kernel/console.h>
+#include <kernel/display.h>
 #include <kernel/perf.h>
+#include <kernel/qemu_stdvga.h>
 #include <kernel/sched.h>
+#include <kernel/string.h>
 #include <kernel/telemetry.h>
 
 #include <ascii_font.h>
@@ -21,7 +24,7 @@ atomic_uint_fast64_t g_window_dirty_generation
 atomic_uint_fast64_t g_window_dirty_notified_generation
     __attribute__((aligned(64)));
 
-/* LiteOS desktop shell: wallpaper, icons and launcher. */
+/* System desktop shell: wallpaper, icons and launcher. */
 /*
  * Snapshot-local tile floor cache.
  *
@@ -64,6 +67,13 @@ bool window_server_init(void) {
         compositor_present_init();
         desktop_shell_init();
         atomic_init(&g_window_server.worker_generation, 0U);
+        wait_queue_init(&g_window_server.desktop_launch_waitq);
+        atomic_init(&g_window_server.desktop_launch_queue_count, 0U);
+        atomic_init(&g_window_server.desktop_chrome_launch_pid, 0U);
+        atomic_init(&g_window_server.desktop_chrome_relaunch_pending, false);
+        g_window_server.desktop_chrome_closing_pid = 0U;
+        g_window_server.desktop_launch_queue_head = 0U;
+        g_window_server.desktop_launch_queue_tail = 0U;
         atomic_init(&g_window_dirty_hint, false);
         atomic_init(&g_window_dirty_generation, 0U);
         atomic_init(&g_window_dirty_notified_generation, 0U);
@@ -81,6 +91,7 @@ bool window_server_init(void) {
         window_input_reset_drag_locked();
         window_clear_title_capture_locked();
         atomic_init(&g_window_server.worker_started, false);
+        atomic_init(&g_window_server.desktop_launch_worker_started, false);
         atomic_init(&g_window_server.desktop_asset_worker_started, false);
         atomic_init(&g_window_worker_running_reported, false);
         g_window_server.kernel_ready = false;
@@ -191,8 +202,8 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
     (void)argument;
     if (!atomic_exchange_explicit(&g_window_worker_running_reported, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_WINDOW_WORKER_RUNNING CPU=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_WINDOW_WORKER_RUNNING CPU=%u\r\n",
             x86_current_cpu_index());
     }
     for (;;) {
@@ -204,7 +215,8 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
                           UINT64_MAX) != K_OK) continue;
 
         /*
-         * Normal pointer-only motion keeps the direct cursor HID-rate path.
+         * Normal pointer-only motion keeps the direct cursor HID-rate path
+         * except on QEMU StdVGA, where it must use the hidden-page flip.
          *
          * Active drag uses ONE input pump with a larger budget. Keeping the
          * whole queued pure-motion run inside one window_motion_batch_t means
@@ -217,6 +229,9 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
          */
         for (;;) {
             bool defer_cursor_for_drag = false;
+            bool qemu_cursor_flip =
+                qemu_stdvga_page_flip_active() &&
+                !display_core_has_native_scanout(0U);
 
             if (input_core_pending() != 0U) {
                 /*
@@ -232,7 +247,7 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
                     g_window_server.dirty;
                 window_unlock();
 
-                if (!defer_cursor_for_drag) {
+                if (!defer_cursor_for_drag && !qemu_cursor_flip) {
                     compositor_present_cursor_direct(false);
                 }
             }
@@ -255,7 +270,11 @@ static void __attribute__((noreturn)) window_server_worker_main(void *argument) 
 bool window_server_start_worker(void) {
     if (!window_server_init()) return false;
     if (atomic_load_explicit(&g_window_server.worker_started,
-                             memory_order_acquire)) return true;
+                             memory_order_acquire)) {
+        (void)desktop_shell_start_launch_worker(
+            g_window_server.worker.owner_cpu);
+        return true;
+    }
 
     thread_t *current = sched_current_thread();
     uint32_t cpu_id = x86_current_cpu_index();
@@ -279,8 +298,7 @@ bool window_server_start_worker(void) {
     }
 
     thread_t *worker = &g_window_server.worker;
-    uint8_t *worker_bytes = (uint8_t *)worker;
-    for (size_t i = 0U; i < sizeof(*worker); ++i) worker_bytes[i] = 0U;
+    memset(worker, 0, sizeof(*worker));
 
     refcount_init(&worker->object.refs, 1U);
     worker->object.type = KOBJECT_TYPE_THREAD;
@@ -344,6 +362,10 @@ bool window_server_start_worker(void) {
                               memory_order_release);
         return false;
     }
+    /* Application image loading is deliberately independent from the input
+     * and compositor owner.  The input pump only enqueues a launch request;
+     * VFS reads and ELF mapping happen on this worker. */
+    (void)desktop_shell_start_launch_worker(worker_cpu);
     /* Best effort: one compositor remains the scene owner; only the final
      * disjoint scanline publication is delegated to these helpers. */
     (void)compositor_present_start_copy_workers(worker_cpu);

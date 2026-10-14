@@ -106,226 +106,135 @@ void window_event_schedule_wake_locked(
  *
  * Only the extremely rare overflow path scans the registry.
  */
+static void window_event_publish_wake(window_server_window_t *window) {
+    if (window == 0) return;
+    (void)wake_one(&window->event_waitq);
+    object_notify_signaled(window);
+    object_put(window);
+}
+
 bool window_flush_event_wakes(void) {
-    window_server_window_t *
-        ready[WINDOW_SERVER_MAX_WINDOWS];
-
-    window_server_window_t *
-        overflow_ready[WINDOW_SERVER_MAX_WINDOWS];
-
-    uint32_t ready_count = 0U;
+    window_server_window_t *ready[WINDOW_SERVER_MAX_WINDOWS];
+    window_server_window_t *overflow_ready[WINDOW_SERVER_MAX_WINDOWS];
     uint32_t overflow_count = 0U;
-    bool overflow;
 
     window_lock();
+    uint32_t ready_count = g_window_server.event_ready_count;
+    if (ready_count > WINDOW_SERVER_MAX_WINDOWS)
+        ready_count = WINDOW_SERVER_MAX_WINDOWS;
+    bool overflow = g_window_server.event_ready_overflow;
 
-    ready_count =
-        g_window_server.event_ready_count;
-
-    if (ready_count >
-        WINDOW_SERVER_MAX_WINDOWS) {
-        ready_count =
-            WINDOW_SERVER_MAX_WINDOWS;
-    }
-
-    for (uint32_t index = 0U;
-         index < ready_count;
-         ++index) {
-
-        window_server_window_t *window =
-            g_window_server.event_ready_windows[index];
-
+    for (uint32_t index = 0U; index < ready_count; ++index) {
+        window_server_window_t *window = g_window_server.event_ready_windows[index];
         ready[index] = window;
-
         g_window_server.event_ready_windows[index] = 0;
-
-        if (window != 0) {
-            window->event_wake_pending = false;
-        }
+        // Normal batches detach and clear membership in one pass. Overflow
+        // batches retain membership until registry deduplication is complete.
+        if (!overflow && window != 0) window->event_wake_pending = false;
     }
-
     g_window_server.event_ready_count = 0U;
-
-    overflow =
-        g_window_server.event_ready_overflow;
-
-    g_window_server.event_ready_overflow =
-        false;
+    g_window_server.event_ready_overflow = false;
 
     if (overflow) {
         for (uint32_t index = 0U;
              index < g_window_server.count &&
-             overflow_count < WINDOW_SERVER_MAX_WINDOWS;
-             ++index) {
-
-            window_server_window_t *window =
-                g_window_server.windows[index];
-
-            if (window == 0 ||
-                window->event_count == 0U) {
-                continue;
-            }
-
+             overflow_count < WINDOW_SERVER_MAX_WINDOWS; ++index) {
+            window_server_window_t *window = g_window_server.windows[index];
+            if (window == 0 || window->event_wake_pending ||
+                window->event_count == 0U) continue;
             object_get(window);
-
-            overflow_ready[
-                overflow_count++] =
-                window;
+            overflow_ready[overflow_count++] = window;
+        }
+        // Clear membership before unlocking so a concurrent enqueue can
+        // schedule another wake during post-lock publication.
+        for (uint32_t index = 0U; index < ready_count; ++index) {
+            if (ready[index] != 0) ready[index]->event_wake_pending = false;
         }
     }
-
     window_unlock();
 
-    for (uint32_t index = 0U;
-         index < ready_count;
-         ++index) {
-
-        if (ready[index] == 0) {
-            continue;
-        }
-
-        (void)wake_one(
-            &ready[index]->event_waitq);
-
-        object_put(
-            ready[index]);
-    }
-
-    for (uint32_t index = 0U;
-         index < overflow_count;
-         ++index) {
-
-        (void)wake_one(
-            &overflow_ready[index]->event_waitq);
-
-        object_put(
-            overflow_ready[index]);
-    }
-
-    return
-        ready_count != 0U ||
-        overflow_count != 0U;
+    for (uint32_t index = 0U; index < ready_count; ++index)
+        window_event_publish_wake(ready[index]);
+    for (uint32_t index = 0U; index < overflow_count; ++index)
+        window_event_publish_wake(overflow_ready[index]);
+    return ready_count != 0U || overflow_count != 0U;
 }
 
 
-void window_enqueue_event_locked(window_server_window_t *window,
-                                 const input_event_t *event) {
-    if (window == 0 || event == 0) return;
+/* All producers share slot eviction, clearing and post-payload publication. */
+static os_window_event_t *window_event_reserve_locked(window_server_window_t *window) {
     if (window->event_count >= WINDOW_EVENT_CAPACITY) {
         window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
         --window->event_count;
     }
-    window->events[window->event_write].identifier = window->identifier;
-    window->events[window->event_write].type = OS_WINDOW_EVENT_INPUT;
-    window->events[window->event_write].input.timestamp = event->timestamp;
-    window->events[window->event_write].input.device_id = event->device_id;
-    window->events[window->event_write].input.type = event->type;
-    window->events[window->event_write].input.flags = event->flags;
-    window->events[window->event_write].input.code = event->code;
-    window->events[window->event_write].input.value = event->value;
+    os_window_event_t *queued = &window->events[window->event_write];
+    *queued = (os_window_event_t){0};
+    queued->identifier = window->identifier;
+    return queued;
+}
 
-    window_event_set_pointer_locked(
-        window,
-        &window->events[
-            window->event_write]);
-
+static void window_event_commit_locked(window_server_window_t *window) {
     window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
     ++window->event_count;
     window_event_schedule_wake_locked(window);
 }
 
-
-/*
- * Queue one cooperative window-close request.
- *
- * No handle is closed and no process is terminated here. Ring3 remains the
- * owner of normal shutdown policy.
- */
-void window_enqueue_close_request_locked(
-    window_server_window_t *window) {
-
-    os_window_event_t *queued;
-
-    if (window == 0) {
-        return;
-    }
-
-    /*
-     * A close request is level-like from the application's point of view.
-     * Avoid filling the fixed event queue with repeated close clicks while
-     * the first request is still pending.
-     */
-    for (uint32_t offset = 0U;
-         offset < window->event_count;
-         ++offset) {
-
-        uint32_t slot =
-            (window->event_read + offset) %
-            WINDOW_EVENT_CAPACITY;
-
-        queued =
-            &window->events[slot];
-
-        if (queued->identifier ==
-                window->identifier &&
-            queued->type ==
-                OS_WINDOW_EVENT_CLOSE_REQUEST) {
-
-            return;
-        }
-    }
-
-    if (window->event_count >=
-        WINDOW_EVENT_CAPACITY) {
-
-        window->event_read =
-            (window->event_read + 1U) %
-            WINDOW_EVENT_CAPACITY;
-
-        --window->event_count;
-    }
-
-    queued =
-        &window->events[
-            window->event_write];
-
-    /*
-     * Clear the complete slot so the unused union payload never exposes
-     * stale bytes from a previous INPUT/RESIZE event.
-     */
-    *queued =
-        (os_window_event_t){0};
-
-    queued->identifier =
-        window->identifier;
-
-    queued->type =
-        OS_WINDOW_EVENT_CLOSE_REQUEST;
-
-    window->event_write =
-        (window->event_write + 1U) %
-        WINDOW_EVENT_CAPACITY;
-
-    ++window->event_count;
-    window_event_schedule_wake_locked(window);
+void window_enqueue_client_input_locked(window_server_window_t *window,
+                                       const os_input_event_t *event) {
+    if (window == 0 || event == 0) return;
+    os_window_event_t *queued = window_event_reserve_locked(window);
+    queued->type = OS_WINDOW_EVENT_INPUT;
+    queued->input = *event;
+    window_event_set_pointer_locked(window, queued);
+    window_event_commit_locked(window);
 }
 
+void window_enqueue_event_locked(window_server_window_t *window,
+                                 const input_event_t *event) {
+    if (window == 0 || event == 0) return;
+    os_window_event_t *queued = window_event_reserve_locked(window);
+    queued->type = OS_WINDOW_EVENT_INPUT;
+    queued->input.timestamp = event->timestamp;
+    queued->input.device_id = event->device_id;
+    queued->input.type = event->type;
+    queued->input.flags = event->flags;
+    queued->input.code = event->code;
+    queued->input.value = event->value;
+    window_event_set_pointer_locked(window, queued);
+    window_event_commit_locked(window);
+}
+
+/* Close requests are cooperative and deduplicated until consumed or evicted.
+ * Ring3, not this queue, owns normal process shutdown policy. */
+void window_enqueue_close_request_locked(window_server_window_t *window) {
+    if (window == 0) return;
+    for (uint32_t offset = 0U; offset < window->event_count; ++offset) {
+        uint32_t slot = (window->event_read + offset) % WINDOW_EVENT_CAPACITY;
+        const os_window_event_t *queued = &window->events[slot];
+        if (queued->identifier == window->identifier &&
+            queued->type == OS_WINDOW_EVENT_CLOSE_REQUEST) return;
+    }
+    os_window_event_t *queued = window_event_reserve_locked(window);
+    queued->type = OS_WINDOW_EVENT_CLOSE_REQUEST;
+    window_event_commit_locked(window);
+}
+
+void window_enqueue_minimized_event_locked(window_server_window_t *window) {
+    if (window == 0) return;
+    os_window_event_t *queued = window_event_reserve_locked(window);
+    queued->type = OS_WINDOW_EVENT_MINIMIZED;
+    queued->minimized.minimized = window->minimized ? 1U : 0U;
+    window_event_commit_locked(window);
+}
 
 void window_enqueue_resize_event_locked(window_server_window_t *window) {
-    os_window_event_t *queued;
-    uint32_t slot;
-
     if (window == 0) return;
-
-    /*
-     * During a live resize only the newest size matters.  If the previous
-     * queued event is already RESIZE, overwrite it instead of filling the
-     * per-window queue with every mouse delta.
-     */
+    /* Consecutive resize events collapse to the newest geometry without
+     * crossing an intervening input, close or minimized event. */
     if (window->event_count != 0U) {
-        slot = (window->event_write + WINDOW_EVENT_CAPACITY - 1U) %
-               WINDOW_EVENT_CAPACITY;
-        queued = &window->events[slot];
+        uint32_t slot = (window->event_write + WINDOW_EVENT_CAPACITY - 1U) %
+                        WINDOW_EVENT_CAPACITY;
+        os_window_event_t *queued = &window->events[slot];
         if (queued->identifier == window->identifier &&
             queued->type == OS_WINDOW_EVENT_RESIZE) {
             queued->resize.width = window->width;
@@ -335,20 +244,35 @@ void window_enqueue_resize_event_locked(window_server_window_t *window) {
             return;
         }
     }
-
-    if (window->event_count >= WINDOW_EVENT_CAPACITY) {
-        window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
-        --window->event_count;
-    }
-
-    queued = &window->events[window->event_write];
-    queued->identifier = window->identifier;
+    os_window_event_t *queued = window_event_reserve_locked(window);
     queued->type = OS_WINDOW_EVENT_RESIZE;
     queued->resize.width = window->width;
     queued->resize.height = window->height;
     queued->resize.buffer_size = window->buffer_size;
-    queued->resize.reserved = 0U;
-    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
-    ++window->event_count;
-    window_event_schedule_wake_locked(window);
+    window_event_commit_locked(window);
+}
+
+void window_enqueue_moved_event_locked(window_server_window_t *window) {
+    if (window == 0) return;
+    os_window_event_t *queued = 0;
+    /* Never coalesce across input: its client coordinates belong to the
+     * geometry at that point in the stream. */
+    if (window->event_count != 0U) {
+        uint32_t slot = (window->event_write + WINDOW_EVENT_CAPACITY - 1U) %
+                        WINDOW_EVENT_CAPACITY;
+        if (window->events[slot].identifier == window->identifier &&
+            window->events[slot].type == OS_WINDOW_EVENT_MOVED) {
+            queued = &window->events[slot];
+        }
+    }
+    bool append = queued == 0;
+    if (append) queued = window_event_reserve_locked(window);
+    queued->type = OS_WINDOW_EVENT_MOVED;
+    queued->moved.x = window_pointer_clamp_i32(
+        (int64_t)window->x + window_client_offset_x(window->flags));
+    queued->moved.y = window_pointer_clamp_i32(
+        (int64_t)window->y + window_client_offset_y(window->flags));
+    queued->moved.reserved = 0U;
+    queued->moved.reserved2 = 0U;
+    if (append) window_event_commit_locked(window);
 }

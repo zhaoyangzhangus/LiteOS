@@ -23,6 +23,7 @@
 #define KMEM_STRESS_SLOT_COUNT 48U
 #define KMEM_STRESS_OPERATIONS 2048U
 #define KMEM_STRESS_MAX_SIZE    4096U
+#define KMEM_CACHE_CHAIN_TEST_ALLOCATIONS 128U
 
 typedef struct allocation_header {
     uint64_t magic;
@@ -43,13 +44,15 @@ typedef struct slab_page {
     uint16_t free_count;
     uint16_t class_index;
     uint16_t reserved;
+    struct slab_page **prev_link;
 } slab_page_t;
 
 typedef struct {
     spinlock_t lock;
+    /* Contains only slabs with at least one globally available slot. */
     slab_page_t *slabs;
     uint16_t slot_size;
-    uint16_t reserved;
+    uint16_t slot_count; /* immutable after allocator initialization */
 } kmem_cache_t;
 
 /* 每个 CPU 的小对象缓存；缓存对象已从全局 slab 链表摘除。 */
@@ -86,12 +89,23 @@ _Static_assert(sizeof(allocation_header_t) == 32U, "kmalloc header layout");
 _Static_assert(sizeof(slab_page_t) <= KMEM_SLAB_HEADER_SIZE, "slab page header layout");
 
 static void bytes_fill(void *memory, uint8_t value, size_t size) {
-    uint8_t *bytes = (uint8_t *)memory;
-    while (size-- != 0) *bytes++ = value;
+    /* Keep poison/redzone semantics, but do not fill large allocations one
+     * byte at a time while the allocator has disabled preemption. */
+    __builtin_memset(memory, value, size);
 }
 
 static bool bytes_equal(const void *memory, uint8_t value, size_t size) {
     const uint8_t *bytes = (const uint8_t *)memory;
+    uint64_t repeated = UINT64_C(0x0101010101010101) * value;
+    while (size >= sizeof(repeated)) {
+        uint64_t word;
+        /* An explicit builtin copy avoids alignment/aliasing assumptions;
+         * the freestanding x86 build emits an integer load, not SIMD. */
+        __builtin_memcpy(&word, bytes, sizeof(word));
+        if (word != repeated) return false;
+        bytes += sizeof(word);
+        size -= sizeof(word);
+    }
     while (size-- != 0) {
         if (*bytes++ != value) return false;
     }
@@ -103,6 +117,7 @@ static void cache_lock(kmem_cache_t *cache) {
      * enough for a timer tick.  Keep the owner on its CPU until the cache
      * state is published; otherwise another CPU can spin forever if the owner
      * is never selected again. */
+    sched_preempt_disable();
     uint32_t cpu_index = x86_current_cpu_index();
     uint32_t class_index = cache >= g_caches &&
                            cache < g_caches + KMEM_CLASS_COUNT ?
@@ -113,11 +128,7 @@ static void cache_lock(kmem_cache_t *cache) {
         __atomic_store_n(&g_cache_waiting[cpu_index], 1U,
                          __ATOMIC_RELEASE);
     }
-    sched_preempt_disable();
-    while (atomic_exchange_explicit(&cache->lock.state, 1U,
-                                     memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&cache->lock);
     if (class_index < KMEM_CLASS_COUNT) {
         __atomic_store_n(&g_cache_owner[class_index], cpu_index,
                          __ATOMIC_RELEASE);
@@ -132,11 +143,13 @@ static void cache_unlock(kmem_cache_t *cache) {
     uint32_t class_index = cache >= g_caches &&
                            cache < g_caches + KMEM_CLASS_COUNT ?
                            (uint32_t)(cache - g_caches) : UINT32_MAX;
-    atomic_store_explicit(&cache->lock.state, 0U, memory_order_release);
+    /* Clear diagnostics before releasing ownership: a successor may publish
+     * its CPU immediately after unlock, and must not be erased by us. */
     if (class_index < KMEM_CLASS_COUNT) {
         __atomic_store_n(&g_cache_owner[class_index], UINT32_MAX,
                          __ATOMIC_RELEASE);
     }
+    spinlock_unlock(&cache->lock);
     sched_preempt_enable();
 }
 
@@ -171,6 +184,7 @@ static void record_error(void) {
 }
 
 static void initialize_allocator(void) {
+    if (atomic_load_explicit(&g_init_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     sched_preempt_disable();
     if (atomic_compare_exchange_strong_explicit(&g_init_state, &expected, 1U,
@@ -182,7 +196,8 @@ static void initialize_allocator(void) {
             __atomic_store_n(&g_cache_owner[i], UINT32_MAX, __ATOMIC_RELAXED);
             g_caches[i].slabs = 0;
             g_caches[i].slot_size = g_slot_sizes[i];
-            g_caches[i].reserved = 0;
+            g_caches[i].slot_count = (uint16_t)((PAGE_SIZE -
+                KMEM_SLAB_HEADER_SIZE) / g_slot_sizes[i]);
         }
         for (uint32_t cpu = 0; cpu < MAX_CPUS; ++cpu) {
             for (uint16_t i = 0; i < KMEM_CLASS_COUNT; ++i) {
@@ -203,6 +218,20 @@ static void initialize_allocator(void) {
     }
 }
 
+static uint16_t class_index_for_size(size_t size) {
+    if (size <= (size_t)g_slot_sizes[0] - KMEM_PAYLOAD_OFFSET - KMEM_TRAILER_SIZE)
+        return 0U;
+    if (size > (size_t)g_slot_sizes[KMEM_CLASS_COUNT - 1U] -
+                   KMEM_PAYLOAD_OFFSET - KMEM_TRAILER_SIZE)
+        return KMEM_CLASS_COUNT;
+    /* Slots alternate 3/4 and full powers of two: 96,128,...,1536,2048.
+     * Bounds above make both addition and clz's nonzero operand safe. */
+    uint32_t slot = (uint32_t)size + KMEM_PAYLOAD_OFFSET + KMEM_TRAILER_SIZE;
+    unsigned exponent = 32U - (unsigned)__builtin_clz(slot - 1U);
+    uint32_t three_quarters = 3U << (exponent - 2U);
+    return (uint16_t)(2U * (exponent - 7U) + (slot > three_quarters));
+}
+
 static size_t class_capacity(uint16_t class_index) {
     return (size_t)g_slot_sizes[class_index] - KMEM_PAYLOAD_OFFSET - KMEM_TRAILER_SIZE;
 }
@@ -215,16 +244,13 @@ static allocation_header_t *payload_header(void *payload) {
     return (allocation_header_t *)((uint8_t *)payload - KMEM_PAYLOAD_OFFSET);
 }
 
-static kmem_magazine_t *current_magazine(uint16_t class_index) {
-    uint32_t cpu;
+static kmem_magazine_t *current_magazine(uint16_t class_index, uint32_t cpu) {
     if (class_index >= KMEM_CLASS_COUNT) return 0;
-    cpu = x86_current_cpu_index();
     if (cpu >= MAX_CPUS) return 0;
     return &g_magazines[cpu].classes[class_index];
 }
 
-static void record_fastpath_hit(void) {
-    uint32_t cpu = x86_current_cpu_index();
+static void record_fastpath_hit(uint32_t cpu) {
     if (cpu < MAX_CPUS) {
         atomic_fetch_add_explicit(&g_cpu_stats[cpu].fastpath_hits, 1U,
                                   memory_order_relaxed);
@@ -244,18 +270,17 @@ static uint64_t allocation_cookie(const allocation_header_t *header, const void 
 }
 
 static void write_trailer(void *payload, uint32_t requested, uint64_t cookie) {
-    uint8_t *destination = (uint8_t *)payload + requested;
-    for (uint32_t i = 0; i < KMEM_TRAILER_SIZE; ++i) {
-        destination[i] = (uint8_t)(cookie >> (i * 8U));
-    }
+    _Static_assert(KMEM_TRAILER_SIZE == sizeof(cookie), "allocation trailer width");
+    _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "allocation trailer encoding");
+    /* The trailer follows an arbitrary byte-sized request, so use a builtin
+     * copy rather than an aligned uint64_t pointer dereference. */
+    __builtin_memcpy((uint8_t *)payload + requested, &cookie, sizeof(cookie));
 }
 
 static bool trailer_valid(const void *payload, uint32_t requested, uint64_t cookie) {
-    const uint8_t *source = (const uint8_t *)payload + requested;
-    for (uint32_t i = 0; i < KMEM_TRAILER_SIZE; ++i) {
-        if (source[i] != (uint8_t)(cookie >> (i * 8U))) return false;
-    }
-    return true;
+    uint64_t stored;
+    __builtin_memcpy(&stored, (const uint8_t *)payload + requested, sizeof(stored));
+    return stored == cookie;
 }
 
 static bool header_redzones_valid(const allocation_header_t *header, const void *payload) {
@@ -266,7 +291,9 @@ static bool header_redzones_valid(const allocation_header_t *header, const void 
 }
 
 static slab_page_t *create_slab(uint16_t class_index) {
-    page_t *page = page_alloc(0, PAGE_ALLOC_ZERO);
+    /* Headers, guards and payload poison are initialized below. Avoid a
+     * redundant full-page clear while the cache lock is held. */
+    page_t *page = page_alloc(0, 0);
     if (page == 0) return 0;
     page->owner = PAGE_OWNER_SLAB;
     uint8_t *base = (uint8_t *)phys_to_direct(page_to_phys(page));
@@ -277,12 +304,12 @@ static slab_page_t *create_slab(uint16_t class_index) {
     slab_page_t *slab = (slab_page_t *)base;
     slab->magic = KMEM_SLAB_MAGIC;
     slab->next = 0;
+    slab->prev_link = 0;
     slab->page = page;
     slab->free_list = 0;
     slab->class_index = class_index;
     slab->reserved = 0;
-    slab->slot_count = (uint16_t)((PAGE_SIZE - KMEM_SLAB_HEADER_SIZE) /
-                                  g_slot_sizes[class_index]);
+    slab->slot_count = g_caches[class_index].slot_count;
     slab->free_count = slab->slot_count;
 
     size_t capacity = class_capacity(class_index);
@@ -299,11 +326,96 @@ static slab_page_t *create_slab(uint16_t class_index) {
         bytes_fill((uint8_t *)header + sizeof(*header), KMEM_REDZONE_BYTE,
                    KMEM_FRONT_SIZE);
         void *payload = header_payload(header);
-        bytes_fill(payload, KMEM_POISON_FREE, capacity);
+        /* The free-list link owns the first word; activation checks only
+         * the poison after it. Do not fill bytes immediately overwritten. */
+        bytes_fill((uint8_t *)payload + sizeof(void *), KMEM_POISON_FREE,
+                   capacity - sizeof(void *));
         *(void **)payload = slab->free_list;
         slab->free_list = payload;
     }
     return slab;
+}
+
+/* cache->lock must be held for all partial-slab list operations. */
+static slab_page_t *cache_partial_head(kmem_cache_t *cache) {
+    while (cache->slabs != 0 && cache->slabs->free_list == 0) {
+        slab_page_t *empty = cache->slabs;
+        cache->slabs = empty->next;
+        if (cache->slabs != 0) cache->slabs->prev_link = &cache->slabs;
+        empty->next = 0;
+        empty->prev_link = 0;
+        record_error();
+    }
+    return cache->slabs;
+}
+
+static void cache_partial_insert(kmem_cache_t *cache, slab_page_t *slab) {
+    if (slab == 0 || slab->free_list == 0) {
+        record_error();
+        return;
+    }
+    slab->next = cache->slabs;
+    slab->prev_link = &cache->slabs;
+    if (slab->next != 0) slab->next->prev_link = &slab->next;
+    cache->slabs = slab;
+}
+
+static void cache_partial_remove_head(kmem_cache_t *cache,
+                                      slab_page_t *slab) {
+    if (slab == 0 || cache->slabs != slab || slab->free_list != 0) {
+        record_error();
+        return;
+    }
+    cache->slabs = slab->next;
+    if (cache->slabs != 0) cache->slabs->prev_link = &cache->slabs;
+    slab->next = 0;
+    slab->prev_link = 0;
+}
+
+/* All slots being globally free implies none remain in a CPU magazine or
+ * belong to a live allocation.  Drop the partial-list link before freeing. */
+static void cache_release_empty(kmem_cache_t *cache, slab_page_t *slab) {
+    if (slab == 0 || slab->free_count != slab->slot_count) return;
+    (void)cache;
+    slab_page_t **link = slab->prev_link;
+    if (link == 0 || *link != slab) {
+        record_error();
+        return;
+    }
+    *link = slab->next;
+    if (slab->next != 0) slab->next->prev_link = link;
+    slab->next = 0;
+    slab->prev_link = 0;
+    page_t *page = slab->page;
+    slab->magic = 0U;
+    page_free(page);
+}
+
+/* Return a validated free payload while cache->lock is held. Neither caller
+ * may touch the slab after this operation: its last slot can release it. */
+static void cache_put_payload_locked(kmem_cache_t *cache, slab_page_t *slab,
+                                     void *payload) {
+    bool was_empty = slab->free_list == 0;
+    *(void **)payload = slab->free_list;
+    slab->free_list = payload;
+    ++slab->free_count;
+    if (was_empty) cache_partial_insert(cache, slab);
+    cache_release_empty(cache, slab);
+}
+
+/* Caller holds cache->lock; both allocation routes share slot ownership. */
+static void *cache_take_payload_locked(kmem_cache_t *cache, uint16_t class_index) {
+    slab_page_t *slab = cache_partial_head(cache);
+    if (slab == 0) {
+        slab = create_slab(class_index);
+        if (slab == 0) return 0;
+        cache_partial_insert(cache, slab);
+    }
+    void *payload = slab->free_list;
+    slab->free_list = *(void **)payload;
+    --slab->free_count;
+    if (slab->free_list == 0) cache_partial_remove_head(cache, slab);
+    return payload;
 }
 
 static bool magazine_refill(uint16_t class_index, kmem_magazine_t *magazine) {
@@ -314,17 +426,8 @@ static bool magazine_refill(uint16_t class_index, kmem_magazine_t *magazine) {
     cache = &g_caches[class_index];
     cache_lock(cache);
     while (moved < KMEM_MAGAZINE_CAPACITY) {
-        slab_page_t *slab = cache->slabs;
-        while (slab != 0 && slab->free_list == 0) slab = slab->next;
-        if (slab == 0) {
-            slab = create_slab(class_index);
-            if (slab == 0) break;
-            slab->next = cache->slabs;
-            cache->slabs = slab;
-        }
-        void *payload = slab->free_list;
-        slab->free_list = *(void **)payload;
-        --slab->free_count;
+        void *payload = cache_take_payload_locked(cache, class_index);
+        if (payload == 0) break;
         *(void **)payload = magazine->head;
         magazine->head = payload;
         ++magazine->count;
@@ -360,15 +463,13 @@ static void magazine_flush(uint16_t class_index, kmem_magazine_t *magazine) {
             record_error();
             continue;
         }
-        *(void **)payload = slab->free_list;
-        slab->free_list = payload;
-        ++slab->free_count;
+        cache_put_payload_locked(cache, slab, payload);
     }
     cache_unlock(cache);
 }
 
 static void *activate_payload(uint16_t class_index, void *payload,
-                              size_t requested, uint32_t flags) {
+                              size_t requested, uint32_t flags, bool zero) {
     allocation_header_t *header;
     size_t capacity;
 
@@ -383,40 +484,37 @@ static void *activate_payload(uint16_t class_index, void *payload,
     header->requested = (uint32_t)requested;
     header->state = KMEM_STATE_ALLOCATED;
     header->flags = (uint8_t)flags;
-    bytes_fill(payload, KMEM_POISON_ALLOC, capacity);
+    if (zero) {
+        bytes_fill(payload, 0, requested);
+        bytes_fill((uint8_t *)payload + requested, KMEM_POISON_ALLOC,
+                   capacity - requested);
+    } else {
+        bytes_fill(payload, KMEM_POISON_ALLOC, capacity);
+    }
     bytes_fill((uint8_t *)header + sizeof(*header), KMEM_REDZONE_BYTE, KMEM_FRONT_SIZE);
     header->cookie = allocation_cookie(header, payload);
     write_trailer(payload, header->requested, header->cookie);
     return payload;
 }
 
-static void *allocate_from_cache(uint16_t class_index, size_t requested, uint32_t flags) {
+static void *allocate_from_cache(uint16_t class_index, size_t requested,
+                                 uint32_t flags, bool zero) {
     kmem_cache_t *cache = &g_caches[class_index];
     cache_lock(cache);
-    slab_page_t *slab = cache->slabs;
-    while (slab != 0 && slab->free_list == 0) slab = slab->next;
-    if (slab == 0) {
-        slab = create_slab(class_index);
-        if (slab == 0) {
-            cache_unlock(cache);
-            return 0;
-        }
-        slab->next = cache->slabs;
-        cache->slabs = slab;
-    }
-    void *payload = slab->free_list;
-    slab->free_list = *(void **)payload;
-    --slab->free_count;
+    void *payload = cache_take_payload_locked(cache, class_index);
     cache_unlock(cache);
-    return activate_payload(class_index, payload, requested, flags);
+    if (payload == 0) return 0;
+    return activate_payload(class_index, payload, requested, flags, zero);
 }
 
-static void *allocate_large(size_t requested, uint32_t flags) {
+static void *allocate_large(size_t requested, uint32_t flags, bool zero) {
     if (requested > UINT32_MAX || requested > UINT64_MAX -
         (KMEM_PAYLOAD_OFFSET + KMEM_TRAILER_SIZE)) return 0;
     uint64_t needed = requested + KMEM_PAYLOAD_OFFSET + KMEM_TRAILER_SIZE;
-    uint8_t order = 0;
-    while (order <= BUDDY_MAX_ORDER && ((1ULL << order) * PAGE_SIZE) < needed) ++order;
+    /* ceil(log2(needed)) gives the smallest covering power of two. The
+     * one-page case also avoids clz(0); bounded requests keep order in range. */
+    uint8_t order = needed <= PAGE_SIZE ? 0U :
+        (uint8_t)(64U - (unsigned)__builtin_clzll(needed - 1U) - PAGE_SHIFT);
     if (order > BUDDY_MAX_ORDER) return 0;
     page_t *page = page_alloc(order, 0);
     if (page == 0) return 0;
@@ -434,64 +532,64 @@ static void *allocate_large(size_t requested, uint32_t flags) {
     header->flags = (uint8_t)flags;
     bytes_fill((uint8_t *)header + sizeof(*header), KMEM_REDZONE_BYTE, KMEM_FRONT_SIZE);
     void *payload = header_payload(header);
-    bytes_fill(payload, KMEM_POISON_ALLOC, requested);
+    bytes_fill(payload, zero ? 0 : KMEM_POISON_ALLOC, requested);
     header->cookie = allocation_cookie(header, payload);
     write_trailer(payload, header->requested, header->cookie);
     return payload;
 }
 
-void *kmalloc(size_t size, uint32_t flags) {
+/* Select initialization before activation: kzalloc must not poison and then
+ * overwrite the same requested bytes. Keep slack poison and all guards. */
+static void *kmalloc_internal(size_t size, uint32_t flags, bool zero) {
     void *result = 0;
     if (size == 0) return 0;
+    /* Take one CPU snapshot after pinning; use it for the magazine,
+     * hit statistics and diagnostics throughout this allocation. */
+    sched_preempt_disable();
     uint32_t cpu_index = x86_current_cpu_index();
     if (cpu_index < MAX_CPUS) {
         __atomic_store_n(&g_kmem_progress[cpu_index], 1U,
                          __ATOMIC_RELEASE);
     }
-    /* A magazine belongs to the CPU that owns it.  Keep the whole fast path
-     * on that CPU; otherwise a preemption/migration between current_magazine()
-     * and the list update can corrupt a magazine or strand an allocation. */
-    sched_preempt_disable();
     initialize_allocator();
     if (cpu_index < MAX_CPUS) {
         __atomic_store_n(&g_kmem_progress[cpu_index], 2U,
                          __ATOMIC_RELEASE);
     }
-    for (uint16_t i = 0; i < KMEM_CLASS_COUNT; ++i) {
-        if (size <= class_capacity(i)) {
-            kmem_magazine_t *magazine = current_magazine(i);
-            if (magazine != 0) {
-                if (cpu_index < MAX_CPUS) {
-                    __atomic_store_n(&g_kmem_progress[cpu_index], 20U + i,
-                                     __ATOMIC_RELEASE);
-                }
-                if (magazine->head == 0) (void)magazine_refill(i, magazine);
-                if (cpu_index < MAX_CPUS) {
-                    __atomic_store_n(&g_kmem_progress[cpu_index], 30U + i,
-                                     __ATOMIC_RELEASE);
-                }
-                if (magazine->head != 0) {
-                    void *payload = magazine->head;
-                    magazine->head = *(void **)payload;
-                    --magazine->count;
-                    record_fastpath_hit();
-                    result = activate_payload(i, payload, size, flags);
-                    goto done;
-                }
-            }
+    uint16_t i = class_index_for_size(size);
+    if (i < KMEM_CLASS_COUNT) {
+        kmem_magazine_t *magazine = current_magazine(i, cpu_index);
+        if (magazine != 0) {
             if (cpu_index < MAX_CPUS) {
-                __atomic_store_n(&g_kmem_progress[cpu_index], 40U + i,
+                __atomic_store_n(&g_kmem_progress[cpu_index], 20U + i,
                                  __ATOMIC_RELEASE);
             }
-            result = allocate_from_cache(i, size, flags);
-            goto done;
+            if (magazine->head == 0) (void)magazine_refill(i, magazine);
+            if (cpu_index < MAX_CPUS) {
+                __atomic_store_n(&g_kmem_progress[cpu_index], 30U + i,
+                                 __ATOMIC_RELEASE);
+            }
+            if (magazine->head != 0) {
+                void *payload = magazine->head;
+                magazine->head = *(void **)payload;
+                --magazine->count;
+                record_fastpath_hit(cpu_index);
+                result = activate_payload(i, payload, size, flags, zero);
+                goto done;
+            }
         }
+        if (cpu_index < MAX_CPUS) {
+            __atomic_store_n(&g_kmem_progress[cpu_index], 40U + i,
+                             __ATOMIC_RELEASE);
+        }
+        result = allocate_from_cache(i, size, flags, zero);
+        goto done;
     }
     if (cpu_index < MAX_CPUS) {
         __atomic_store_n(&g_kmem_progress[cpu_index], 60U,
                          __ATOMIC_RELEASE);
     }
-    result = allocate_large(size, flags);
+    result = allocate_large(size, flags, zero);
 done:
     if (cpu_index < MAX_CPUS) {
         __atomic_store_n(&g_kmem_progress[cpu_index], 90U,
@@ -501,10 +599,36 @@ done:
     return result;
 }
 
+void *kmalloc(size_t size, uint32_t flags) {
+    return kmalloc_internal(size, flags, false);
+}
+
+void *kmalloc_try_cached(size_t size, uint32_t flags) {
+    if (size == 0U || atomic_load_explicit(&g_init_state,
+                                          memory_order_acquire) != 2U)
+        return 0;
+    uint16_t index = class_index_for_size(size);
+    if (index >= KMEM_CLASS_COUNT) return 0;
+    kmem_cache_t *cache = &g_caches[index];
+    /* A hard interrupt can have interrupted this very lock's owner. Do not
+     * spin or call cache_lock(): a failed try is an allocation failure. */
+    if (!spinlock_try_lock(&cache->lock)) return 0;
+    slab_page_t *slab = cache_partial_head(cache);
+    void *payload = 0;
+    if (slab != 0) {
+        payload = slab->free_list;
+        slab->free_list = *(void **)payload;
+        --slab->free_count;
+        if (slab->free_list == 0) cache_partial_remove_head(cache, slab);
+    }
+    spinlock_unlock(&cache->lock);
+    /* The detached slot keeps its slab alive. Activation does not access a
+     * magazine or allocate, so it is safe outside the cache critical section. */
+    return activate_payload(index, payload, size, flags, false);
+}
+
 void *kzalloc(size_t size, uint32_t flags) {
-    void *memory = kmalloc(size, flags);
-    if (memory != 0) bytes_fill(memory, 0, size);
-    return memory;
+    return kmalloc_internal(size, flags, true);
 }
 
 static void kfree_internal(void *pointer) {
@@ -543,12 +667,16 @@ static void kfree_internal(void *pointer) {
     }
     if (!header_redzones_valid(header, pointer)) record_error();
     size_t capacity = class_capacity(header->class_index);
-    bytes_fill(pointer, KMEM_POISON_FREE, capacity);
+    /* Both return routes overwrite the first word with their free-list link;
+     * activation validates only the remaining poison bytes. */
+    bytes_fill((uint8_t *)pointer + sizeof(void *), KMEM_POISON_FREE,
+               capacity - sizeof(void *));
     header->requested = 0;
     header->state = KMEM_STATE_FREE;
     header->cookie = 0;
 
-    kmem_magazine_t *magazine = current_magazine(header->class_index);
+    kmem_magazine_t *magazine = current_magazine(header->class_index,
+                                               x86_current_cpu_index());
     if (magazine != 0) {
         *(void **)pointer = magazine->head;
         magazine->head = pointer;
@@ -558,9 +686,7 @@ static void kfree_internal(void *pointer) {
     }
 
     cache_lock(cache);
-    *(void **)pointer = slab->free_list;
-    slab->free_list = pointer;
-    ++slab->free_count;
+    cache_put_payload_locked(cache, slab, pointer);
     cache_unlock(cache);
 }
 
@@ -593,6 +719,46 @@ uint64_t kmem_fastpath_refills(void) {
     return total;
 }
 
+static bool cache_partial_list_valid_locked(kmem_cache_t *cache,
+                                            uint16_t class_index) {
+    uint32_t visited = 0U;
+    for (slab_page_t *slab = cache->slabs; slab != 0; slab = slab->next) {
+        if (slab->magic != KMEM_SLAB_MAGIC ||
+            slab->class_index != class_index || slab->free_list == 0 ||
+            slab->free_count == 0U || slab->free_count > slab->slot_count ||
+            ++visited > 1048576U) return false;
+    }
+    return true;
+}
+
+static bool kmem_cache_partial_list_self_test(void) {
+    void *allocations[KMEM_CACHE_CHAIN_TEST_ALLOCATIONS] = {0};
+    uint32_t allocated = 0U;
+    bool success = true;
+
+    for (; allocated < KMEM_CACHE_CHAIN_TEST_ALLOCATIONS; ++allocated) {
+        allocations[allocated] = kmalloc(32U, 0U);
+        if (allocations[allocated] == 0) {
+            success = false;
+            break;
+        }
+    }
+
+    kmem_cache_t *cache = &g_caches[0];
+    cache_lock(cache);
+    if (success && !cache_partial_list_valid_locked(cache, 0U)) {
+        success = false;
+    }
+    cache_unlock(cache);
+
+    while (allocated != 0U) kfree(allocations[--allocated]);
+
+    cache_lock(cache);
+    if (!cache_partial_list_valid_locked(cache, 0U)) success = false;
+    cache_unlock(cache);
+    return success;
+}
+
 bool kmem_self_test(void) {
     uint64_t before = kmem_error_count();
     uint8_t *small = (uint8_t *)kmalloc(63U, 0);
@@ -618,6 +784,8 @@ bool kmem_self_test(void) {
     poison = (uint8_t *)kmalloc(32U, 0);
     if (poison == 0) return false;
     kfree(poison);
+
+    if (!kmem_cache_partial_list_self_test()) return false;
 
     uint8_t *redzone = (uint8_t *)kmalloc(17U, 0);
     if (redzone == 0) return false;
@@ -668,8 +836,8 @@ bool kmem_stress_self_test(void) {
     uint64_t errors_before = kmem_error_count();
     bool success = true;
 
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_MEMORY,
-                       LITEOS_DEBUG_STEP_STRESS, 0U);
+    kernel_debug_stage(OS_DEBUG_PHASE_MEMORY,
+                       OS_DEBUG_STEP_STRESS, 0U);
     for (uint32_t operation = 0U;
          operation < KMEM_STRESS_OPERATIONS && success;
          ++operation) {
@@ -702,12 +870,12 @@ bool kmem_stress_self_test(void) {
     if (kmem_error_count() != errors_before) success = false;
 
     if (!success) {
-        liteos_debug_stage_fail(LITEOS_DEBUG_PHASE_MEMORY,
-                                LITEOS_DEBUG_STEP_STRESS, K_EIO);
+        kernel_debug_stage_fail(OS_DEBUG_PHASE_MEMORY,
+                                OS_DEBUG_STEP_STRESS, K_EIO);
         return false;
     }
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_MEMORY,
-                       LITEOS_DEBUG_STEP_STRESS,
+    kernel_debug_stage(OS_DEBUG_PHASE_MEMORY,
+                       OS_DEBUG_STEP_STRESS,
                        KMEM_STRESS_OPERATIONS);
     return true;
 }

@@ -418,7 +418,7 @@ static uint32_t boot_apic_id(void) {
     return ebx >> 24;
 }
 
-bool x86_acpi_discover(const LITEOS_BOOT_INFO *boot_info) {
+bool x86_acpi_discover(const OS_BOOT_INFO *boot_info) {
     if (g_discovered || boot_info == 0 || boot_info->AcpiRsdp == 0) return false;
     bytes_zero(&g_platform, sizeof(g_platform));
     const acpi_rsdp_t *rsdp =
@@ -517,6 +517,26 @@ bool x86_acpi_reset(void) {
     }
     __asm__ volatile ("mfence" : : : "memory");
     return true;
+}
+
+kstatus_t x86_acpi_poweroff(void) {
+    /* parse_dsdt_sleep reads _S5_: its two legacy-named fields are the
+     * PM1a/PM1b S5 types, not the S3/S4 sleep states. */
+    if (!x86_acpi_sleep_supported() || g_platform.pm1_control_length < 2U ||
+        g_platform.pm1a_control_block == 0U ||
+        g_platform.sleep_type_s3 > 7U || g_platform.sleep_type_s4 > 7U)
+        return K_ENOSYS;
+    uint16_t ports[2] = {g_platform.pm1a_control_block, g_platform.pm1b_control_block};
+    uint8_t types[2] = {g_platform.sleep_type_s3, g_platform.sleep_type_s4};
+    for (unsigned i = 0U; i < 2U; ++i) {
+        if (ports[i] == 0U) continue;
+        uint16_t control;
+        __asm__ volatile ("inw %1, %0" : "=a"(control) : "Nd"(ports[i]));
+        control = (uint16_t)((control & ~((7U << 10) | (1U << 13))) |
+                            ((uint16_t)types[i] << 10) | (1U << 13));
+        __asm__ volatile ("outw %0, %1" : : "a"(control), "Nd"(ports[i]));
+    }
+    return K_OK;
 }
 
 kstatus_t x86_acpi_enter_sleep(uint8_t sleep_state) {

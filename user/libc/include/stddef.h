@@ -8,7 +8,11 @@ typedef __WCHAR_TYPE__ wchar_t;
 typedef __WINT_TYPE__ wint_t;
 
 #ifndef NULL
+#ifdef __cplusplus
+#define NULL nullptr
+#else
 #define NULL ((void *)0)
+#endif
 #endif
 
 #define offsetof(type, member) __builtin_offsetof(type, member)

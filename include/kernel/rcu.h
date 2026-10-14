@@ -1,6 +1,6 @@
 #pragma once
-#ifndef LITEOS_KERNEL_RCU_H
-#define LITEOS_KERNEL_RCU_H
+#ifndef OS_KERNEL_RCU_H
+#define OS_KERNEL_RCU_H
 
 #include "base.h"
 #include "spinlock.h"

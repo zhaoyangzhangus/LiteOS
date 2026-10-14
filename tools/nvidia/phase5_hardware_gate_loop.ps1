@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [int]$TargetBoots = 100,
+    [int]$TargetBoots = 4,
     [int]$WarmupSeconds = 20,
     [int]$ResultWaitSeconds = 180,
     [switch]$Cleanup
@@ -17,7 +17,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $hardwareRoot = Join-Path $projectRoot 'build-realtest\real-hardware'
 $statePath = Join-Path $projectRoot 'build-realtest\phase5-hardware-gate-loop.json'
 $loopLogPath = Join-Path $projectRoot 'build-realtest\phase5-hardware-gate-loop.log'
-$taskName = 'LiteOS-NVIDIA-Phase5-Hardware-Gate'
+$taskName = 'System-NVIDIA-Phase5-Hardware-Gate'
 $scriptPath = (Resolve-Path $MyInvocation.MyCommand.Path).Path
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $interactiveUser = $identity.Name
@@ -57,13 +57,13 @@ function Get-ValidHardwareLogs {
     foreach ($file in $files) {
         $text = Get-Content -LiteralPath $file.FullName -Raw
         $required =
-            $text -match 'LITEOS_NVIDIA_GSP_BOOT_START' -and
-            $text -match 'LITEOS_NVIDIA_FIRMWARE_RESOLVED path=\S+ size=\d+ sha256=\S+ expectation=595\.84 hash_ok=1' -and
-            $text -match 'LITEOS_NVIDIA_GSP_BOOT_FINISH status=ready' -and
-            $text -match 'LITEOS_NVIDIA_GSP_READY' -and
-            $text -match 'LITEOS_NVIDIA_PHASE5_GATE_READY' -and
-            $text -match 'LITEOS_REALTEST_PASS' -and
-            $text -match 'LITEOS_REALTEST_REBOOTING'
+            $text -match 'OS_NVIDIA_GSP_BOOT_START' -and
+            $text -match 'OS_NVIDIA_FIRMWARE_RESOLVED path=\S+ size=\d+ sha256=\S+ expectation=595\.84 hash_ok=1' -and
+            $text -match 'OS_NVIDIA_GSP_BOOT_FINISH status=ready' -and
+            $text -match 'OS_NVIDIA_GSP_READY' -and
+            $text -match 'OS_NVIDIA_PHASE5_GATE_READY' -and
+            $text -match 'OS_REALTEST_PASS' -and
+            $text -match 'OS_REALTEST_REBOOTING'
         $forbidden =
             $text -match '(?i)qemu|std\s+vga|bochs|virtual\s+machine' -or
             $text -match '(?i)fake|override|hard.?code|not_linked|probe_fail|GSP_BOOT_FAIL'

@@ -1,5 +1,6 @@
 #include <kernel/power.h>
 #include <kernel/spinlock.h>
+#include <kernel/sched.h>
 #include <kernel/device.h>
 #include <arch/x86_64/acpi.h>
 
@@ -11,22 +12,23 @@ static struct {
 } g_power;
 
 static void power_lock(void) {
-    while (atomic_exchange_explicit(&g_power.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    /* Pin only the registry/state update, never the device callbacks. */
+    sched_preempt_disable();
+    spinlock_lock(&g_power.lock);
 }
 
 static void power_unlock(void) {
-    atomic_store_explicit(&g_power.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_power.lock);
+    sched_preempt_enable();
 }
 
 bool power_manager_init(void) {
+    if (atomic_load_explicit(&g_power.init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_power.init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_power.lock.state, 0U);
+        spinlock_init(&g_power.lock);
         atomic_init(&g_power.system_state, POWER_SYSTEM_RUNNING);
         for (uint32_t i = 0; i < POWER_MAX_DEVICES; ++i) {
             g_power.devices[i].registered = false;
@@ -42,17 +44,18 @@ bool power_manager_init(void) {
 }
 
 static bool power_known_locked(const power_device_t *device) {
-    if (device == 0) return false;
-    for (uint32_t i = 0; i < POWER_MAX_DEVICES; ++i) {
-        if (&g_power.devices[i] == device) return device->registered;
-    }
-    return false;
+    uintptr_t address = (uintptr_t)device;
+    uintptr_t base = (uintptr_t)&g_power.devices[0];
+    if (address < base || address - base >= sizeof(g_power.devices)) return false;
+    uintptr_t offset = address - base;
+    if (offset % sizeof(g_power.devices[0]) != 0U) return false;
+    return g_power.devices[offset / sizeof(g_power.devices[0])].registered;
 }
 
 static uint32_t power_snapshot_locked(power_device_t **devices) {
     uint32_t count = 0U;
     for (uint32_t i = 0; i < POWER_MAX_DEVICES; ++i) {
-        if (g_power.devices[i].registered && count < POWER_MAX_DEVICES) {
+        if (g_power.devices[i].registered) {
             devices[count++] = &g_power.devices[i];
         }
     }
@@ -146,6 +149,7 @@ kstatus_t power_unregister_device_object(struct device *device) {
 
 kstatus_t power_system_suspend(void) {
     power_device_t *devices[POWER_MAX_DEVICES];
+    power_device_state_t previous_states[POWER_MAX_DEVICES];
     uint32_t count;
     if (!power_manager_init()) return K_EIO;
 
@@ -159,6 +163,8 @@ kstatus_t power_system_suspend(void) {
     atomic_store_explicit(&g_power.system_state, POWER_SYSTEM_SUSPENDING,
                           memory_order_release);
     for (uint32_t i = 0; i < count; ++i) {
+        previous_states[i] = (power_device_state_t)atomic_load_explicit(
+            &devices[i]->state, memory_order_acquire);
         atomic_store_explicit(&devices[i]->state, POWER_DEVICE_SUSPENDING,
                               memory_order_release);
     }
@@ -189,6 +195,11 @@ kstatus_t power_system_suspend(void) {
                 if (resume_status != K_OK) rollback_failed = true;
             }
             power_lock();
+            /* No suspend callback ran for the remaining devices. */
+            for (uint32_t j = i + 1U; j < count; ++j) {
+                atomic_store_explicit(&devices[j]->state, previous_states[j],
+                                      memory_order_release);
+            }
             atomic_store_explicit(&g_power.system_state,
                                   rollback_failed ? POWER_SYSTEM_FAILED :
                                                     POWER_SYSTEM_RUNNING,
@@ -233,6 +244,12 @@ kstatus_t power_system_resume(void) {
                                                POWER_DEVICE_FAILED,
                               memory_order_release);
         if (status != K_OK) {
+            /* Reverse-order resume stopped here: untouched devices remain
+             * suspended, not in a transition that can no longer complete. */
+            for (uint32_t j = 0U; j + 1U < i; ++j) {
+                atomic_store_explicit(&devices[j]->state, POWER_DEVICE_SUSPENDED,
+                                      memory_order_release);
+            }
             atomic_store_explicit(&g_power.system_state, POWER_SYSTEM_FAILED,
                                   memory_order_release);
             power_unlock();

@@ -1,29 +1,75 @@
 #include "internal.h"
 
+kstatus_t vm_pin_user_page(vm_space_t *space, vaddr_t address, bool writable,
+                           page_t **out) {
+    if (out == 0) return K_EINVAL;
+    *out = 0;
+    if (space == 0 || address < VM_USER_BASE || address >= VM_USER_END ||
+        (address & (PAGE_SIZE - 1ULL)) != 0U) return K_EINVAL;
+    vm_fault_info_t fault = {
+        .address = address,
+        .access = writable ? VM_PROT_WRITE : VM_PROT_READ,
+    };
+    /* Translation and backing-store reference acquisition must share the VMA
+     * guard with unmap/mprotect/discard. Never pin an unowned physical page. */
+    /* An absent COW page first materializes read-only, then a write fault
+     * makes its private writable copy. Revalidate after both transitions. */
+    const unsigned attempts = 3U;
+    for (unsigned attempt = 0U; attempt < attempts; ++attempt) {
+        kstatus_t status;
+        bool needs_fault = false;
+        map_lock(space);
+        vm_area_t *area = find_area(space, address);
+        if (area == 0 || area->object == 0 ||
+            (area->prot & fault.access) != fault.access) {
+            status = K_EACCES;
+        } else if (area->object->type != VM_OBJECT_ANON &&
+                   area->object->type != VM_OBJECT_SHARED) {
+            status = K_ENOSYS;
+        } else {
+            paddr_t physical;
+            uint64_t flags = 0U;
+            status = x86_translate_page(space->root_table, address, &physical,
+                                        &flags);
+            needs_fault = status == K_ENOENT;
+            if (status == K_OK && writable &&
+                !x86_page_entry_writable(flags)) {
+                status = K_EACCES;
+                needs_fault = true;
+            }
+            if (status == K_OK) {
+                page_t *page = phys_to_page(physical);
+                uint64_t index =
+                    (area->object_offset + address - area->start) >> PAGE_SHIFT;
+                if (page == 0 || !anon_page_pin(area->object, index, page))
+                    status = K_EIO;
+                else
+                    *out = page;
+            }
+        }
+        map_unlock(space);
+        if (!needs_fault || attempt + 1U == attempts) return status;
+        /* Resident writable pages need no fault/invlpg transaction. For a
+         * missing/COW page, resolve outside the guard, then revalidate the
+         * entire VMA/PTE/backing relation. A racing unmap never gets pinned. */
+        status = vm_handle_fault(space, &fault);
+        if (status != K_OK) return status;
+    }
+    return K_EIO;
+}
+
+void vm_unpin_user_page(page_t *page) {
+    /* The last outstanding pin can outlive the VMA/object reference. */
+    anon_page_unpin(page);
+}
+
 /* REFACTOR_P6_SHARED_OBJECT_OWNER: shared-object creation and direct access. */
 
 kstatus_t vm_object_create_shared(size_t size, vm_object_t **out) {
     if (out == 0 || size == 0 || (size & (PAGE_SIZE - 1ULL)) != 0) {
         return K_EINVAL;
     }
-    vm_object_t *object = (vm_object_t *)kzalloc(sizeof(vm_object_t), 0);
-    anon_store_t *store = (anon_store_t *)kzalloc(sizeof(anon_store_t), 0);
-    if (object == 0 || store == 0) {
-        kfree(store);
-        kfree(object);
-        return K_ENOMEM;
-    }
-    atomic_init(&store->lock.state, 0U);
-    store->pages = 0;
-    store->lookup_hint = 0;
-    refcount_init(&object->refs, 1U);
-    vm_object_stats_init(object);
-    object->type = VM_OBJECT_SHARED;
-    object->flags = VM_OBJECT_INTERNAL;
-    object->size = size;
-    object->u.shared.shared_root = store;
-    *out = object;
-    return K_OK;
+    return vm_object_create_anon_store(size, VM_OBJECT_SHARED, out);
 }
 
 kstatus_t vm_object_shared_page_direct(vm_object_t *object, uint64_t offset,

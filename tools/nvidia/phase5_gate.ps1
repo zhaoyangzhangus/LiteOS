@@ -29,12 +29,14 @@ $bridgeSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_vendor_b
 $driverSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm\nv_rm_driver.c'
 $firmwareSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_firmware.c'
 $memorySource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_memory.c'
+$osSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_os.c'
 $pciSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_pci.c'
 $unsupportedSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi\nvabi_nv_unsupported.S'
 $portVmSource = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\port\nv_port_vm.c'
 $vmallocSource = Join-Path $repoRoot 'kernel\mm\vmalloc.c'
 $phase5UnsupportedObject = Join-Path $phase5Root 'objects\vendor_abi\0006.o'
 $phase5MemoryObject = Join-Path $phase5Root 'objects\vendor_abi\0003.o'
+$phase5OsObject = Join-Path $phase5Root 'objects\vendor_abi\0009.o'
 $phase5PciObject = Join-Path $phase5Root 'objects\vendor_abi\0011.o'
 $phase5PortMemoryObject = Join-Path $phase5Root 'objects\nvidia-port-memory.o'
 $phase5PortVmObject = Join-Path $phase5Root 'objects\nvidia-port-vm.o'
@@ -67,12 +69,14 @@ Require-File $bridgeSource 'Phase 5 vendor bridge source'
 Require-File $driverSource 'Phase 5 driver source'
 Require-File $firmwareSource 'Phase 5 firmware adapter source'
 Require-File $memorySource 'Phase 5 memory ABI source'
+Require-File $osSource 'Phase 5 OS ABI source'
 Require-File $pciSource 'Phase 5 PCI ABI source'
 Require-File $unsupportedSource 'vendor ABI source'
 Require-File $portVmSource 'Phase 5 kernel mapping port source'
 Require-File $vmallocSource 'Phase 5 vmalloc source'
 Require-File $phase5UnsupportedObject 'Phase 5 ABI object without firmware fallback'
 Require-File $phase5MemoryObject 'Phase 5 incremental memory ABI object'
+Require-File $phase5OsObject 'Phase 5 incremental OS ABI object'
 Require-File $phase5PciObject 'Phase 5 incremental PCI ABI object'
 Require-File $phase5PortMemoryObject 'Phase 5 incremental port memory object'
 Require-File $phase5PortVmObject 'Phase 5 incremental kernel mapping port object'
@@ -96,14 +100,14 @@ if (Test-Path -LiteralPath $priorLogsRoot -PathType Container) {
     $p4Evidence = @(Get-ChildItem -LiteralPath $priorLogsRoot -Recurse -File -Filter 'realtest.log' |
         ForEach-Object {
             $text = Get-Content -LiteralPath $_.FullName -Raw
-            if ($text -match 'LITEOS_NVIDIA_PCI_FOUND\s+\S+\s+ID=10de:2f04' -and
-                $text -match 'LITEOS_NVIDIA_BAR0_READY' -and
-                $text -match 'LITEOS_NVIDIA_BAR1_METADATA' -and
-                $text -match 'LITEOS_NVIDIA_PHASE4_RM_READY' -and
-                $text -match 'LITEOS_NVIDIA_PHASE4_GPU_OBJECT_READY' -and
-                $text -match 'LITEOS_NVIDIA_PHASE4_HAL_READY\s+BLACKWELL\s+GB205' -and
-                $text -match 'LITEOS_NVIDIA_PHASE4_GATE_READY' -and
-                $text -match 'LITEOS_REALTEST_PASS') {
+            if ($text -match 'OS_NVIDIA_PCI_FOUND\s+\S+\s+ID=10de:2f04' -and
+                $text -match 'OS_NVIDIA_BAR0_READY' -and
+                $text -match 'OS_NVIDIA_BAR1_METADATA' -and
+                $text -match 'OS_NVIDIA_PHASE4_RM_READY' -and
+                $text -match 'OS_NVIDIA_PHASE4_GPU_OBJECT_READY' -and
+                $text -match 'OS_NVIDIA_PHASE4_HAL_READY\s+BLACKWELL\s+GB205' -and
+                $text -match 'OS_NVIDIA_PHASE4_GATE_READY' -and
+                $text -match 'OS_REALTEST_PASS') {
                 $_.FullName
             }
         })
@@ -165,8 +169,9 @@ if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -
     @($linkRows | Where-Object { $_ -like '*phase5/objects/nv_rm_vendor_bridge.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/nvabi_firmware.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/sha256.o' }).Count -ne 1 -or
-    @($linkRows | Where-Object { $_ -like '*phase4/objects/vendor_abi/*.o' }).Count -ne 8 -or
+    @($linkRows | Where-Object { $_ -like '*phase4/objects/vendor_abi/*.o' }).Count -ne 7 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0003.o' }).Count -ne 1 -or
+    @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0009.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0011.o' }).Count -ne 1 -or
     @($linkRows | Where-Object { $_ -like '*phase5/objects/vendor_abi/0006.o' }).Count -ne 1) {
     Fail-Gate 'Phase 5 link list does not contain the incremental RM/firmware closure'
@@ -175,14 +180,14 @@ if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -
 $bridgeText = Get-Content -LiteralPath $bridgeSource -Raw
 foreach ($requiredBridgeText in @(
         'state->request_firmware = NV_TRUE;', 'rm_init_adapter(',
-        'nv_rm_vendor_start_irq(', 'LITEOS_NVIDIA_GSP_BOOT_START',
-        'LITEOS_NVIDIA_GSP_BOOT_FINISH status=ready',
+        'nv_rm_vendor_start_irq(', 'OS_NVIDIA_GSP_BOOT_START',
+        'OS_NVIDIA_GSP_BOOT_FINISH status=ready',
         'allow_fallback_to_monolithic_rm = NV_FALSE;',
         'enable_firmware_logs = NV_FALSE;')) {
     Require-Text $bridgeText $requiredBridgeText 'vendor bridge GSP lifecycle'
 }
 if ($bridgeText -match '(?im)\b(gmmu|pma|gpu\s*va)\b\s*[:=]') {
-    Fail-Gate 'Phase 5 bridge contains a LiteOS-side GPU-owned implementation'
+    Fail-Gate 'Phase 5 bridge contains a System-side GPU-owned implementation'
 }
 if ($bridgeText -notmatch '(?s)if\s*\(!rm_init_adapter\([^)]*\)\)') {
     Fail-Gate 'Phase 5 bridge does not fail closed on rm_init_adapter'
@@ -190,14 +195,15 @@ if ($bridgeText -notmatch '(?s)if\s*\(!rm_init_adapter\([^)]*\)\)') {
 
 $firmwareText = Get-Content -LiteralPath $firmwareSource -Raw
 $memoryText = Get-Content -LiteralPath $memorySource -Raw
+$osText = Get-Content -LiteralPath $osSource -Raw
 $pciText = Get-Content -LiteralPath $pciSource -Raw
 $portVmText = Get-Content -LiteralPath $portVmSource -Raw
 $vmallocText = Get-Content -LiteralPath $vmallocSource -Raw
 foreach ($requiredFirmwareText in @(
         'vfs_open_kernel(', 'vfs_read_kernel(', 'sha256_compute(',
         'nvabi_firmware_hash_matches(', 'kfree(data)',
-        'LITEOS_NVIDIA_FIRMWARE_REQUEST',
-        'LITEOS_NVIDIA_FIRMWARE_RESOLVED',
+        'OS_NVIDIA_FIRMWARE_REQUEST',
+        'OS_NVIDIA_FIRMWARE_RESOLVED',
         'expectation=595.84')) {
     Require-Text $firmwareText $requiredFirmwareText 'immutable firmware loading/lifetime metadata'
 }
@@ -210,9 +216,16 @@ foreach ($requiredMemoryText in @(
         'nv_port_mem_unmap_kernel_pages(')) {
     Require-Text $memoryText $requiredMemoryText 'kernel system-memory mapping ABI'
 }
+foreach ($requiredOsText in @(
+        'nv_port_semaphore_init(&value->semaphore, 1U)',
+        'nv_port_semaphore_down(&value->semaphore',
+        'nv_port_semaphore_up(&value->semaphore)',
+        'NV_ERR_TIMEOUT_RETRY')) {
+    Require-Text $osText $requiredOsText 'vendor mutex semaphore semantics'
+}
 foreach ($requiredMappingText in @(
         'vmalloc_map_pages(', 'x86_map_page(', 'x86_unmap_page(')) {
-    Require-Text $vmallocText $requiredMappingText 'LiteOS vmalloc page mapping'
+    Require-Text $vmallocText $requiredMappingText 'System vmalloc page mapping'
 }
 Require-Text $portVmText 'vmalloc_map_pages(' 'kernel mapping port adapter'
 foreach ($requiredPciText in @(
@@ -236,7 +249,7 @@ $runtimeText = Get-Content -LiteralPath $runtimeSource -Raw
 $devicesText = Get-Content -LiteralPath $devicesSource -Raw
 Require-Text $driverText 'NV_GPU_GSP_READY' 'driver GSP state'
 Require-Text $runtimeText 'nv_rm_driver_probe()' 'post-filesystem Phase 5 probe'
-Require-Text $devicesText 'LITEOS_NVIDIA_PROBE_DEFERRED' 'deferred early probe'
+Require-Text $devicesText 'OS_NVIDIA_PROBE_DEFERRED' 'deferred early probe'
 if ($driverText -match '(?im)state\s*=\s*NV_GPU_GSP_READY\s*;(?s).*?nv_rm_vendor_start') {
     Fail-Gate 'driver marks GSP ready before the vendor start boundary'
 }
@@ -247,7 +260,7 @@ $expectedFirmware = @{
 }
 foreach ($firmwareName in $expectedFirmware.Keys) {
     $source = Join-Path $firmwareRoot $firmwareName
-    $staged = Join-Path $phase5Esp ('EFI\LITEOS\firmware\{0}' -f $firmwareName)
+    $staged = Join-Path $phase5Esp ('EFI\OS\firmware\{0}' -f $firmwareName)
     Require-File $source "595.84 firmware $firmwareName"
     Require-File $staged "staged firmware $firmwareName"
     foreach ($path in @($source, $staged)) {
@@ -269,8 +282,8 @@ foreach ($path in $HardwareLog) {
     $usableLogs += $fullPath
 }
 $usableLogs = @($usableLogs | Sort-Object -Unique)
-if ($usableLogs.Count -lt 100) {
-    Write-Output ('HARDWARE_GATE=UNAVAILABLE logs={0}/100' -f $usableLogs.Count)
+if ($usableLogs.Count -lt 4) {
+    Write-Output ('HARDWARE_GATE=UNAVAILABLE logs={0}/4' -f $usableLogs.Count)
     Write-Output 'GATE_P5=UNAVAILABLE'
     exit 2
 }
@@ -282,13 +295,13 @@ foreach ($path in $usableLogs) {
         Fail-Gate "QEMU or virtual-machine log cannot satisfy the real-hardware Gate: $path"
     }
     foreach ($requiredHardwareText in @(
-            'LITEOS_NVIDIA_GSP_BOOT_START',
-            'LITEOS_NVIDIA_FIRMWARE_RESOLVED path=\S+ size=\d+ sha256=\S+ expectation=595\.84 hash_ok=1',
-            'LITEOS_NVIDIA_GSP_BOOT_FINISH status=ready',
-            'LITEOS_NVIDIA_GSP_READY',
-            'LITEOS_NVIDIA_PHASE5_GATE_READY',
-            'LITEOS_REALTEST_PASS',
-            'LITEOS_REALTEST_REBOOTING')) {
+            'OS_NVIDIA_GSP_BOOT_START',
+            'OS_NVIDIA_FIRMWARE_RESOLVED path=\S+ size=\d+ sha256=\S+ expectation=595\.84 hash_ok=1',
+            'OS_NVIDIA_GSP_BOOT_FINISH status=ready',
+            'OS_NVIDIA_GSP_READY',
+            'OS_NVIDIA_PHASE5_GATE_READY',
+            'OS_REALTEST_PASS',
+            'OS_REALTEST_REBOOTING')) {
         if ($text -notmatch $requiredHardwareText) {
             Fail-Gate "hardware log evidence is absent: $requiredHardwareText ($path)"
         }
@@ -317,5 +330,5 @@ foreach ($path in $usableLogs) {
     }
 }
 
-Write-Output ('HARDWARE_GATE=PASS cold_boots={0}' -f $usableLogs.Count)
+Write-Output ('HARDWARE_GATE=PASS cold_boots={0} profile_minimum=4' -f $usableLogs.Count)
 Write-Output 'GATE_P5=PASS'

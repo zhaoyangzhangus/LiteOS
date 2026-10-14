@@ -4,9 +4,11 @@
 #include <arch/x86_64/uaccess.h>
 
 #ifdef NV_PORT_HOST_TEST
-#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #endif
 
 static bool nv_port_vm_cache_valid(uint32_t cache_type) {
@@ -22,20 +24,24 @@ static enum x86_cache_mode nv_port_vm_cache_mode(uint32_t cache_type) {
 }
 
 static void nv_port_vm_unpin_page(page_t *page) {
-    if (page == 0) return;
-    atomic_fetch_sub_explicit(&page->refs, 1U, memory_order_release);
-    uint64_t previous = __atomic_fetch_sub(&page->private_data, 1ULL,
-                                           __ATOMIC_ACQ_REL);
-    if (previous <= 1ULL) page->flags &= ~PAGE_PINNED;
+    vm_unpin_user_page(page);
 }
 #else
 static void *nv_port_vm_host_aligned_alloc(size_t size) {
     size_t rounded = (size + PAGE_SIZE - 1U) & ~(PAGE_SIZE - 1U);
+#ifdef _WIN32
     return _aligned_malloc(rounded, PAGE_SIZE);
+#else
+    return aligned_alloc(PAGE_SIZE, rounded);
+#endif
 }
 
 static void nv_port_vm_host_free(void *storage) {
+#ifdef _WIN32
     _aligned_free(storage);
+#else
+    free(storage);
+#endif
 }
 #endif
 
@@ -221,34 +227,21 @@ kstatus_t nv_port_vm_pin_user_pages(vm_space_t *space, vaddr_t address,
     if (count64 == 0U || count64 > page_capacity || count64 > UINT32_MAX) {
         return K_ENOSPC;
     }
-    kstatus_t status = vm_populate_range(space, (vaddr_t)start,
-                                         (size_t)rounded);
-    if (status != K_OK) return status;
+    *page_count = 0U;
+    kstatus_t status;
     uint32_t count = (uint32_t)count64;
     for (uint32_t index = 0U; index < count; ++index) {
-        paddr_t physical;
-        status = x86_translate_page(
-            space->root_table, (vaddr_t)(start + (uint64_t)index * PAGE_SIZE),
-            &physical, 0);
-        page_t *page = status == K_OK ? phys_to_page(physical) : 0;
-        if (status != K_OK || page == 0 || (page->flags & PAGE_FREE) != 0U) {
+        page_t *page = 0;
+        status = vm_pin_user_page(space,
+            (vaddr_t)(start + (uint64_t)index * PAGE_SIZE), true, &page);
+        if (status != K_OK) {
             for (uint32_t release = 0U; release < index; ++release) {
                 nv_port_vm_unpin_page(pages[release]);
+                pages[release] = 0;
             }
-            return status == K_OK ? K_EIO : status;
-        }
-        for (uint32_t previous = 0U; previous < index; ++previous) {
-            if (pages[previous] == page) {
-                for (uint32_t release = 0U; release < index; ++release) {
-                    nv_port_vm_unpin_page(pages[release]);
-                }
-                return K_EINVAL;
-            }
+            return status;
         }
         pages[index] = page;
-        atomic_fetch_add_explicit(&page->refs, 1U, memory_order_acq_rel);
-        __atomic_add_fetch(&page->private_data, 1ULL, __ATOMIC_ACQ_REL);
-        page->flags |= PAGE_PINNED;
     }
     *page_count = count;
     return K_OK;

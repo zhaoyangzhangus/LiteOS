@@ -73,22 +73,28 @@ static int64_t netd_syscall_two(uint64_t number, uint64_t arg0,
     return (int64_t)rax;
 }
 
+static void netd_persist_debug(const char *text, size_t length);
+
 static void netd_debug(const char *text) {
     size_t length = 0U;
     if (text == 0) return;
-    while (text[length] != '\0' && length < 240U) ++length;
+    while (length < 240U && text[length] != '\0') ++length;
+    if (length == 0U) return;
     (void)netd_syscall_two(OS_SYS_DEBUG_WRITE, (uint64_t)(uintptr_t)text,
                            length);
+    netd_persist_debug(text, length);
 }
 
 static void netd_debug_attempt(netd_context_t *context, const char *text) {
-    if (context == 0 || context->debug_attempts >= 6U) return;
+    if (context == 0 || text == 0 || text[0] == '\0' ||
+        context->debug_attempts >= 6U) return;
     ++context->debug_attempts;
     netd_debug(text);
 }
 
 static void netd_debug_packet(netd_context_t *context, const char *text) {
-    if (context == 0 || context->debug_packets >= 6U) return;
+    if (context == 0 || text == 0 || text[0] == '\0' ||
+        context->debug_packets >= 6U) return;
     ++context->debug_packets;
     netd_debug(text);
 }
@@ -115,6 +121,34 @@ static int64_t netd_syscall_four(uint64_t number, uint64_t arg0,
     __asm__ volatile ("syscall" : "+a"(rax), "+D"(rdi), "+S"(rsi),
                       "+d"(rdx), "+r"(r10) : : "rcx", "r11", "memory");
     return (int64_t)rax;
+}
+
+static void netd_persist_debug(const char *text, size_t length) {
+    static os_handle_t file = OS_INVALID_HANDLE;
+    static uint64_t total;
+    static bool attempted;
+    if (text == 0 || length == 0U || length > 240U ||
+        total > 16384U || length > 16384U - total) return;
+    if (!attempted) {
+        attempted = true;
+        if (netd_syscall_four(OS_SYS_FILE_OPEN,
+                (uint64_t)(uintptr_t)"/netd.log",
+                OS_FILE_OPEN_WRITE | OS_FILE_OPEN_CREATE | OS_FILE_OPEN_TRUNCATE,
+                0644U, (uint64_t)(uintptr_t)&file) < 0)
+            file = OS_INVALID_HANDLE;
+    }
+    if (file == OS_INVALID_HANDLE) return;
+    size_t offset = 0U;
+    while (offset < length) {
+        uint64_t written = 0U;
+        if (netd_syscall_four(OS_SYS_FILE_WRITE, file,
+                (uint64_t)(uintptr_t)(text + offset), length - offset,
+                (uint64_t)(uintptr_t)&written) < 0 ||
+            written == 0U || written > length - offset) break;
+        offset += (size_t)written;
+        total += written;
+    }
+    (void)netd_syscall_one(OS_SYS_FILE_FSYNC, file);
 }
 
 static int64_t netd_syscall_six(uint64_t number, uint64_t arg0,
@@ -262,7 +296,7 @@ static bool arm_timer(netd_context_t *context, uint64_t delay_ns) {
     if (netd_syscall_three(OS_SYS_TIMER_CREATE, delay_ns, 0U,
                            (uint64_t)(uintptr_t)&timer) < 0 ||
         timer == OS_INVALID_HANDLE) {
-        netd_debug("LITEOS_NETD_TIMER_FAIL\r\n");
+        netd_debug("OS_NETD_TIMER_FAIL\r\n");
         return false;
     }
     context->timer = timer;
@@ -549,12 +583,12 @@ static bool start_dhcp(netd_context_t *context) {
     if (context == 0) return false;
     if (context->socket == OS_INVALID_HANDLE &&
         socket_create_bound(&context->socket) < 0) {
-        netd_debug("LITEOS_NETD_SOCKET_FAIL\r\n");
+        netd_debug("OS_NETD_SOCKET_FAIL\r\n");
         context->state = NETD_STATE_WAIT_OFFER;
         return arm_timer(context, NETD_DHCP_RETRY_NS);
     }
     if (context->debug_attempts == 0U)
-        netd_debug("LITEOS_NETD_SOCKET_OK\r\n");
+        netd_debug("OS_NETD_SOCKET_OK\r\n");
 
     drain_socket(context->socket);
     ++context->transaction;
@@ -564,8 +598,8 @@ static bool start_dhcp(netd_context_t *context) {
     context->state = NETD_STATE_WAIT_OFFER;
     sent = send_discover(context);
     netd_debug_attempt(context, sent ?
-        "LITEOS_NETD_DISCOVER_SEND_OK\r\n" :
-        "LITEOS_NETD_DISCOVER_SEND_FAIL\r\n");
+        "OS_NETD_DISCOVER_SEND_OK\r\n" :
+        "OS_NETD_DISCOVER_SEND_FAIL\r\n");
     return arm_timer(context, NETD_DHCP_RETRY_NS);
 }
 
@@ -588,7 +622,9 @@ static bool enter_link_down(netd_context_t *context) {
         context->status.ipv4_prefix_length = 0U;
     }
     context->state = NETD_STATE_LINK_DOWN;
-    return true;
+    /* Cold PHY negotiation can finish after the initial status snapshot.
+     * Keep a bounded fallback even if a link notification is lost. */
+    return arm_timer(context, NETD_DHCP_RETRY_NS);
 }
 
 static bool refresh_and_transition(netd_context_t *context) {
@@ -600,7 +636,7 @@ static bool refresh_and_transition(netd_context_t *context) {
         context->debug_link_up =
             (context->status.flags & OS_NET_STATUS_LINK_UP) != 0U;
         netd_debug(context->debug_link_up ?
-            "LITEOS_NETD_LINK_UP\r\n" : "LITEOS_NETD_LINK_DOWN\r\n");
+            "OS_NETD_LINK_UP\r\n" : "OS_NETD_LINK_DOWN\r\n");
     }
     if ((context->status.flags & OS_NET_STATUS_LINK_UP) == 0U)
         return enter_link_down(context);
@@ -620,16 +656,16 @@ static bool process_socket(netd_context_t *context) {
         int64_t received = socket_receive_nonblock(context->socket,
                                                    packet, sizeof(packet));
         if (received <= 0) return true;
-        netd_debug_packet(context, "LITEOS_NETD_PACKET_RX\r\n");
+        netd_debug_packet(context, "OS_NETD_PACKET_RX\r\n");
 
         if (!parse_dhcp_packet(packet, (size_t)received,
                                context->transaction, &offer)) {
-            netd_debug_packet(context, "LITEOS_NETD_PACKET_INVALID\r\n");
+            netd_debug_packet(context, "OS_NETD_PACKET_INVALID\r\n");
             continue;
         }
 
         if (offer.message_type == 6U) {
-            netd_debug("LITEOS_NETD_DHCP_NAK\r\n");
+            netd_debug("OS_NETD_DHCP_NAK\r\n");
             return start_dhcp(context);
         }
 
@@ -645,13 +681,13 @@ static bool process_socket(netd_context_t *context) {
             context->server_id = offer.server_id;
             context->offered_dns_server =
                 offer.has_dns_server ? offer.dns_server : 0U;
-            netd_debug("LITEOS_NETD_DHCP_OFFER\r\n");
+            netd_debug("OS_NETD_DHCP_OFFER\r\n");
             if (send_request(context)) {
-                netd_debug("LITEOS_NETD_REQUEST_SEND_OK\r\n");
+                netd_debug("OS_NETD_REQUEST_SEND_OK\r\n");
                 context->state = NETD_STATE_WAIT_ACK;
                 if (!arm_timer(context, NETD_DHCP_RETRY_NS)) return false;
             } else {
-                netd_debug("LITEOS_NETD_REQUEST_SEND_FAIL\r\n");
+                netd_debug("OS_NETD_REQUEST_SEND_FAIL\r\n");
             }
             continue;
         }
@@ -664,7 +700,7 @@ static bool process_socket(netd_context_t *context) {
             if (!prefix_from_mask(offer.subnet_mask, &prefix)) continue;
 
             if (netd_set_ipv4(offer.address, prefix, offer.gateway) == 0) {
-                netd_debug("LITEOS_NETD_DHCP_ACK\r\n");
+                netd_debug("OS_NETD_DHCP_ACK\r\n");
                 context->status.ipv4_address = offer.address;
                 context->status.ipv4_gateway = offer.gateway;
                 context->status.ipv4_prefix_length = prefix;
@@ -672,7 +708,7 @@ static bool process_socket(netd_context_t *context) {
                     offer.dns_server : context->offered_dns_server);
                 return enter_bound(context);
             }
-            netd_debug("LITEOS_NETD_IPV4_SET_FAIL\r\n");
+            netd_debug("OS_NETD_IPV4_SET_FAIL\r\n");
             return start_dhcp(context);
         }
     }
@@ -705,20 +741,20 @@ __attribute__((noreturn)) void netd_entry(void) {
         .transaction = 0x4C544F53U,
     };
 
-    netd_debug("LITEOS_NETD_START\r\n");
+    netd_debug("OS_NETD_START\r\n");
     if (!create_link_port(&context)) {
-        netd_debug("LITEOS_NETD_LINK_PORT_FAIL\r\n");
+        netd_debug("OS_NETD_LINK_PORT_FAIL\r\n");
         netd_exit(1U);
     }
     if (!refresh_and_transition(&context)) {
-        netd_debug("LITEOS_NETD_INITIAL_STATUS_FAIL\r\n");
+        netd_debug("OS_NETD_INITIAL_STATUS_FAIL\r\n");
         netd_exit(1U);
     }
 
     for (;;) {
         enum netd_wait_event event = NETD_WAIT_NONE;
         if (wait_events(&context, &event) < 0) {
-            netd_debug("LITEOS_NETD_WAIT_FAIL\r\n");
+            netd_debug("OS_NETD_WAIT_FAIL\r\n");
             netd_exit(1U);
         }
 

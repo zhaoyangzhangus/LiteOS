@@ -3,8 +3,8 @@
 
 /* REFACTOR_P7A_INPUT_OWNER: title capture cleanup and event pump boundary. */
 
-#ifndef LITEOS_REALTEST
-#define LITEOS_REALTEST 0
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
 #endif
 
 void window_clear_title_capture_locked(void) {
@@ -58,6 +58,25 @@ static window_server_window_t *window_at_locked(uint32_t x, uint32_t y) {
     return window_scene_hit_test_locked(x, y);
 }
 
+uint32_t window_input_cursor_shape_locked(void) {
+    uint32_t edges = g_window_server.resize_edges;
+    if (g_window_server.dragging_identifier == 0U) {
+        edges = window_input_resize_edges_locked(
+            window_at_locked(g_window_server.pointer_x, g_window_server.pointer_y),
+            g_window_server.pointer_x, g_window_server.pointer_y);
+    }
+    bool horizontal = (edges & (WINDOW_RESIZE_LEFT | WINDOW_RESIZE_RIGHT)) != 0U;
+    bool vertical = (edges & (WINDOW_RESIZE_TOP | WINDOW_RESIZE_BOTTOM)) != 0U;
+    if (horizontal && vertical) {
+        bool left = (edges & WINDOW_RESIZE_LEFT) != 0U;
+        bool top = (edges & WINDOW_RESIZE_TOP) != 0U;
+        return left == top ? WINDOW_CURSOR_SIZE_NWSE : WINDOW_CURSOR_SIZE_NESW;
+    }
+    if (horizontal) return WINDOW_CURSOR_SIZE_WE;
+    if (vertical) return WINDOW_CURSOR_SIZE_NS;
+    return WINDOW_CURSOR_ARROW;
+}
+
 static window_server_window_t *keyboard_window_locked(void) {
     return window_scene_keyboard_locked();
 }
@@ -69,6 +88,7 @@ static uint32_t desktop_number_shortcut_app(uint32_t key_code) {
         DESKTOP_APP_NOTES,
         DESKTOP_APP_NETWORK,
         DESKTOP_APP_TASKMGR,
+        DESKTOP_APP_CHROME,
     };
     if (key_code < 0x1EU || key_code >= 0x1EU +
             sizeof(apps) / sizeof(apps[0])) {
@@ -77,7 +97,7 @@ static uint32_t desktop_number_shortcut_app(uint32_t key_code) {
     return apps[key_code - 0x1EU];
 }
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 /* Keep only the zoom-key proof needed by the automated input regression. */
 static void input_route_diag_key(const input_event_t *event,
                                  const window_server_window_t *target,
@@ -85,8 +105,8 @@ static void input_route_diag_key(const input_event_t *event,
     if (event == 0 || target == 0 || !delivered ||
         event->type != INPUT_EVENT_KEY || event->value != INPUT_VALUE_PRESS ||
         event->code != 0x2EU) return;
-    liteos_serial_printf_serial_only(
-        "LITEOS_DIAG_INPUT_ROUTE code=%u value=%u focus=%u target=%u delivered=%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_DIAG_INPUT_ROUTE code=%u value=%u focus=%u target=%u delivered=%u\r\n",
         event->code, (uint32_t)event->value,
         g_window_server.focused_identifier, target->identifier, 1U);
 }
@@ -115,9 +135,14 @@ uint32_t window_title_button_at_locked(
         WINDOW_TITLE_BUTTON_MINIMIZE,
     };
 
-    if (window == 0 || window_client_decorations(window->flags)) {
+    if (window == 0 || (window_client_decorations(window->flags) &&
+                       !window_standard_caption(window->flags))) {
         return WINDOW_TITLE_BUTTON_NONE;
     }
+    /* The outer resize strip wins over caption controls, including the
+     * upper-right corner beside Close. Cursor and click must agree. */
+    if (window_input_resize_edges_locked(window, pointer_x, pointer_y) != 0U)
+        return WINDOW_TITLE_BUTTON_NONE;
 
     for (uint32_t index = 0U;
          index < sizeof(buttons) / sizeof(buttons[0]);
@@ -126,7 +151,7 @@ uint32_t window_title_button_at_locked(
         int32_t x;
         int32_t y;
 
-        if (!window_title_button_rect(window->x,
+        if (!window_caption_button_rect(window->flags, window->x,
                                       window->y,
                                       window->width,
                                       buttons[index],
@@ -137,8 +162,10 @@ uint32_t window_title_button_at_locked(
 
         if ((int64_t)pointer_x >= x &&
             (int64_t)pointer_y >= y &&
-            (int64_t)pointer_x < (int64_t)x + WINDOW_TITLE_BUTTON_SIZE &&
-            (int64_t)pointer_y < (int64_t)y + WINDOW_TITLE_BUTTON_SIZE) {
+            (int64_t)pointer_x < (int64_t)x +
+                (window_standard_caption(window->flags) ? 32U : WINDOW_TITLE_BUTTON_SIZE) &&
+            (int64_t)pointer_y < (int64_t)y +
+                (window_standard_caption(window->flags) ? os_window_caption_height(window->flags) : WINDOW_TITLE_BUTTON_SIZE)) {
             return buttons[index];
         }
     }
@@ -156,7 +183,7 @@ uint32_t window_title_button_at_locked(
 /*
  * Hide a window without destroying its object, surface or client geometry.
  */
-static bool window_minimize_locked(
+bool window_minimize_locked(
     window_server_window_t *window) {
 
     window_server_window_t *new_focused = 0;
@@ -174,6 +201,8 @@ static bool window_minimize_locked(
         window);
 
     window->minimized = true;
+    window->client_pointer_capture = false;
+    window->client_button_capture = false;
     window->dirty = true;
 
     /*
@@ -207,6 +236,7 @@ static bool window_minimize_locked(
             if (candidate == 0 ||
                 candidate == window ||
                 candidate->minimized ||
+                candidate->client_show_inactive ||
                 (candidate->flags &
                  OS_WINDOW_VISIBLE) == 0U) {
                 continue;
@@ -224,6 +254,7 @@ static bool window_minimize_locked(
             new_focused);
     }
 
+    window_enqueue_minimized_event_locked(window);
     return true;
 }
 
@@ -239,8 +270,7 @@ static bool window_toggle_maximize_locked(
 
     uint32_t available_height;
 
-    if (window == 0 ||
-        window_client_decorations(window->flags) ||
+    if (window == 0 || window->fullscreen ||
         (window->flags &
          OS_WINDOW_RESIZABLE) == 0U ||
         g_window_server.display_width <=
@@ -282,7 +312,7 @@ static bool window_toggle_maximize_locked(
 
         new_width =
             g_window_server.display_width -
-            WINDOW_FRAME_EXTRA;
+            window_frame_extra(window->flags);
 
         available_height =
             g_window_server.display_height -
@@ -290,8 +320,8 @@ static bool window_toggle_maximize_locked(
 
         new_height =
             available_height -
-            WINDOW_TITLEBAR_HEIGHT -
-            WINDOW_FRAME_EXTRA;
+            window_titlebar_height(window->flags) -
+            window_frame_extra(window->flags);
 
         window->maximized =
             true;
@@ -361,6 +391,90 @@ static bool window_toggle_maximize_locked(
 
     return true;
 }
+kstatus_t window_server_set_maximized_owned(process_t *owner,
+    window_server_window_t *window, uint32_t maximized) {
+    if (!owner || !window || maximized > 1U || !window_server_kernel_ready()) return K_EINVAL;
+    window_lock();
+    if (window->owner != owner || !window->identifier ||
+        window_scene_find_locked(window->identifier) != window) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if (window->fullscreen) { window_unlock(); return K_EINVAL; }
+    if (window->maximized == (maximized != 0U)) {
+        window_unlock();
+        return K_OK;
+    }
+    bool changed = window_toggle_maximize_locked(window);
+    window_unlock();
+    if (changed) window_server_notify_worker();
+    return changed ? K_OK : K_EINVAL;
+}
+
+/* Normal and captured routing use the same bounded screen coordinates. Keep
+ * wheel/unknown axes unchanged, but do not discard their client events. */
+static bool window_route_relative_pointer_locked(const input_event_t *event) {
+    uint32_t old_x = g_window_server.pointer_x;
+    uint32_t old_y = g_window_server.pointer_y;
+    uint32_t extent;
+    int64_t next;
+    if (event->code == INPUT_REL_X) {
+        extent = g_window_server.display_width;
+        next = (int64_t)old_x + event->value;
+    } else if (event->code == INPUT_REL_Y) {
+        extent = g_window_server.display_height;
+        next = (int64_t)old_y + event->value;
+    } else {
+        return false;
+    }
+    if (extent == 0U || next < 0) next = 0;
+    else if (next >= extent) next = (int64_t)extent - 1;
+    uint32_t x = event->code == INPUT_REL_X ? (uint32_t)next : old_x;
+    uint32_t y = event->code == INPUT_REL_Y ? (uint32_t)next : old_y;
+    if (x == old_x && y == old_y) return false;
+    window_input_set_pointer_locked(x, y);
+    return true;
+}
+
+/* Exclusive client capture precedes desktop/title hit testing. In particular,
+ * a menu must receive clicks on the desktop, not only over its parent. */
+static bool route_client_capture_locked(const input_event_t *event) {
+    if (event->type != INPUT_EVENT_RELATIVE &&
+        event->type != INPUT_EVENT_BUTTON) return false;
+    window_server_window_t *captured = 0;
+    for (uint32_t i = 0; i < g_window_server.count; ++i) {
+        window_server_window_t *candidate = g_window_server.windows[i];
+        if (candidate != 0 && (candidate->client_pointer_capture ||
+                              candidate->client_button_capture) &&
+            !candidate->client_hidden && !candidate->minimized &&
+            ((candidate->flags & OS_WINDOW_VISIBLE) != 0U ||
+             (candidate->client_pointer_capture &&
+              candidate->present_sequence == 0U))) {
+            captured = candidate;
+            break;
+        }
+    }
+    if (captured == 0) return false;
+    if (event->type == INPUT_EVENT_RELATIVE) {
+        uint32_t old_x = g_window_server.pointer_x;
+        uint32_t old_y = g_window_server.pointer_y;
+        if (window_route_relative_pointer_locked(event)) {
+            window_mark_moved_cursor_locked(old_x, old_y,
+                g_window_server.pointer_x, g_window_server.pointer_y);
+            window_coalesce_damage_locked();
+        }
+    }
+    if (event->type == INPUT_EVENT_BUTTON && event->code == INPUT_BUTTON_LEFT &&
+        event->value == INPUT_VALUE_PRESS &&
+        (captured->flags & OS_WINDOW_EXPLICIT_MOVE_RESIZE) != 0U)
+        captured->client_button_capture = true;
+    if (event->type == INPUT_EVENT_BUTTON && event->code == INPUT_BUTTON_LEFT &&
+        event->value == INPUT_VALUE_RELEASE)
+        captured->client_button_capture = false;
+    window_enqueue_event_locked(captured, event);
+    return true;
+}
+
 void route_input_locked(const input_event_t *event) {
     window_server_window_t *target = 0;
     bool deliver_input = true;
@@ -368,6 +482,7 @@ void route_input_locked(const input_event_t *event) {
         WINDOW_TITLE_BUTTON_NONE;
 
     if (event == 0) return;
+    if (route_client_capture_locked(event)) return;
 
 
     if (event->type == INPUT_EVENT_KEY) {
@@ -419,26 +534,22 @@ void route_input_locked(const input_event_t *event) {
     if (event->type == INPUT_EVENT_RELATIVE) {
         uint32_t old_pointer_x = g_window_server.pointer_x;
         uint32_t old_pointer_y = g_window_server.pointer_y;
-        int64_t next;
+        (void)window_route_relative_pointer_locked(event);
 
-        if (event->code == INPUT_REL_X) {
-            next = (int64_t)g_window_server.pointer_x + event->value;
-            if (next < 0) next = 0;
-            if (next >= g_window_server.display_width) {
-                next = g_window_server.display_width == 0U ? 0 :
-                       (int64_t)g_window_server.display_width - 1;
-            }
-            window_input_set_pointer_locked((uint32_t)next,
-                                            g_window_server.pointer_y);
-        } else if (event->code == INPUT_REL_Y) {
-            next = (int64_t)g_window_server.pointer_y + event->value;
-            if (next < 0) next = 0;
-            if (next >= g_window_server.display_height) {
-                next = g_window_server.display_height == 0U ? 0 :
-                       (int64_t)g_window_server.display_height - 1;
-            }
-            window_input_set_pointer_locked(g_window_server.pointer_x,
-                                            (uint32_t)next);
+        /* Only repaint caption rows when the hovered control changes. */
+        window_server_window_t *old_hover = window_at_locked(old_pointer_x, old_pointer_y);
+        window_server_window_t *new_hover = window_at_locked(g_window_server.pointer_x,
+                                                            g_window_server.pointer_y);
+        uint32_t old_button = window_title_button_at_locked(old_hover, old_pointer_x, old_pointer_y);
+        uint32_t new_button = window_title_button_at_locked(new_hover, g_window_server.pointer_x,
+                                                            g_window_server.pointer_y);
+        if (old_hover != new_hover || old_button != new_button) {
+            if (old_hover && window_standard_caption(old_hover->flags) && old_button)
+                window_mark_rect_locked(old_hover->x + (int32_t)old_hover->width - 96,
+                                        old_hover->y, 96U, os_window_caption_height(old_hover->flags));
+            if (new_hover && window_standard_caption(new_hover->flags) && new_button)
+                window_mark_rect_locked(new_hover->x + (int32_t)new_hover->width - 96,
+                                        new_hover->y, 96U, os_window_caption_height(new_hover->flags));
         }
 
         {
@@ -468,9 +579,9 @@ void route_input_locked(const input_event_t *event) {
                 window_scene_find_locked(
                     g_window_server.title_pressed_identifier);
             if (window_title_capture_moved_locked()) {
-                if (pressed != 0 &&
+                if (g_window_server.title_pressed_client && pressed != 0 &&
                     (pressed->flags & OS_WINDOW_VISIBLE) != 0U &&
-                    !pressed->maximized) {
+                    !pressed->maximized && !pressed->fullscreen) {
                     window_input_begin_drag_locked(
                         pressed->identifier,
                         (int32_t)g_window_server.title_pressed_pointer_x -
@@ -500,49 +611,13 @@ void route_input_locked(const input_event_t *event) {
                 /* Decoration capture: mouse deltas belong to Ring0, not client. */
                 deliver_input = false;
             } else {
-                int32_t old_x = dragged->x;
-                int32_t old_y = dragged->y;
                 int32_t new_x =
                     (int32_t)g_window_server.pointer_x -
                     g_window_server.drag_offset_x;
                 int32_t new_y =
                     (int32_t)g_window_server.pointer_y -
                     g_window_server.drag_offset_y;
-                uint32_t outer_width =
-                    window_outer_width(dragged->width, dragged->flags);
-                uint32_t outer_height =
-                    window_outer_height(dragged->height, dragged->flags);
-
-                bool reuse_retained =
-                    g_window_server.drag_blit_valid &&
-                    window_drag_reuse_safe_locked(
-                        dragged,
-                        old_x, old_y,
-                        new_x, new_y,
-                        outer_width, outer_height);
-
-                window_input_record_drag_frame_locked(
-                    reuse_retained,
-                    old_x, old_y,
-                    new_x, new_y,
-                    outer_width, outer_height);
-
-                dragged->x = new_x;
-                dragged->y = new_y;
-
-                window_mark_moved_rect_locked(
-                    old_x, old_y, new_x, new_y,
-                    outer_width, outer_height,
-                    !reuse_retained);
-
-                if (reuse_retained) {
-                    window_mark_drag_corner_repair_locked(
-                        new_x, new_y,
-                        outer_width, outer_height,
-                        dragged->flags);
-                }
-
-                dragged->dirty = true;
+                window_drag_move_locked(dragged, new_x, new_y);
                 target = dragged;
                 deliver_input = false;
             }
@@ -605,6 +680,7 @@ void route_input_locked(const input_event_t *event) {
                     g_window_server.pointer_y;
                 g_window_server.title_pressed_client = false;
                 g_window_server.title_pressed_event = *event;
+                window_mark_window_locked(target);
 
             } else if (
                 event->value ==
@@ -648,6 +724,7 @@ void route_input_locked(const input_event_t *event) {
                 }
 
                 window_clear_title_capture_locked();
+                if (target) window_mark_window_locked(target);
             }
         }
 
@@ -687,18 +764,23 @@ void route_input_locked(const input_event_t *event) {
                 window_input_begin_drag_locked(
                     target->identifier, 0, 0, resize_edges);
                 deliver_input = false;
+            } else if (((target->flags & OS_WINDOW_EXPLICIT_MOVE_RESIZE) != 0U &&
+                        window_client_decorations(target->flags)) ||
+                       (window_standard_caption(target->flags) &&
+                       (int64_t)g_window_server.pointer_y - target->y >= os_window_caption_height(target->flags))) {
+                /* Implicit content-button grab ends on release, even outside
+                 * the window. Explicit Chrome menu capture is independent. */
+                target->client_button_capture = true;
             } else if (
                 window_client_decorations(target->flags) &&
                 (int64_t)g_window_server.pointer_y - target->y >= 0 &&
                 (int64_t)g_window_server.pointer_y - target->y <
-                    WINDOW_CLIENT_DRAG_REGION_HEIGHT &&
-                !window_client_drag_region(
-                    target->flags, target->x, target->y, target->width,
-                    g_window_server.pointer_x,
-                    g_window_server.pointer_y)) {
-                /* Client controls use the same press-vs-drag threshold as
-                 * compositor controls.  The press is replayed on release
-                 * only if the pointer never became a drag. */
+                    (window_standard_caption(target->flags) ? os_window_caption_height(target->flags) : WINDOW_CLIENT_DRAG_REGION_HEIGHT)) {
+                /* The kernel cannot infer client hit targets from header x
+                 * coordinates: Chromium places tabs and close buttons in
+                 * the old guessed drag strips. Stage every header press;
+                 * replay a stationary click, and let the existing movement
+                 * threshold above decide when it becomes a window drag. */
                 g_window_server.title_pressed_identifier =
                     target->identifier;
                 g_window_server.title_pressed_button =
@@ -711,7 +793,7 @@ void route_input_locked(const input_event_t *event) {
                 g_window_server.title_pressed_event = *event;
                 deliver_input = false;
             } else if (
-                !target->maximized &&
+                !target->maximized && !target->fullscreen &&
                 (window_client_drag_region(
                      target->flags, target->x, target->y, target->width,
                      g_window_server.pointer_x,

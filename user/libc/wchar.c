@@ -1,7 +1,7 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <limits.h>
-#include <liteos/utf8.h>
+#include <libc/utf8.h>
 #include <wchar.h>
 #include <wctype.h>
 
@@ -523,6 +523,164 @@ wint_t btowc(int value) {
 
 int wctob(wint_t value) {
     return value <= 0x7fU ? (int)value : EOF;
+}
+
+static long double wide_strtod_common(const wchar_t *text, wchar_t **end,
+                                      int kind) {
+    const wchar_t *cursor;
+    size_t length;
+    size_t bytes;
+    size_t consumed;
+    char *converted;
+    char *narrow_end;
+    mbstate_t state = {0};
+    char encoded[4];
+    long double result;
+
+    if (end != 0) *end = (wchar_t *)text;
+    if (text == 0) {
+        errno = EINVAL;
+        return 0.0L;
+    }
+    length = wcslen(text);
+    if (length > (SIZE_MAX - 1U) / MB_LEN_MAX) {
+        errno = EOVERFLOW;
+        return 0.0L;
+    }
+    converted = (char *)malloc(length * MB_LEN_MAX + 1U);
+    if (converted == 0) return 0.0L;
+    cursor = text;
+    bytes = wcsrtombs(converted, &cursor, length * MB_LEN_MAX + 1U, &state);
+    if (bytes == (size_t)-1) {
+        free(converted);
+        return 0.0L;
+    }
+    narrow_end = converted;
+    if (kind == 0) result = strtod(converted, &narrow_end);
+    else if (kind == 1) result = (long double)strtof(converted, &narrow_end);
+    else result = strtold(converted, &narrow_end);
+    consumed = (size_t)(narrow_end - converted);
+    if (end != 0) {
+        cursor = text;
+        bytes = 0U;
+        while (*cursor != L'\0' && bytes < consumed) {
+            size_t encoded_length = wcrtomb(encoded, *cursor, &state);
+            if (encoded_length == (size_t)-1) break;
+            bytes += encoded_length;
+            ++cursor;
+        }
+        *end = (wchar_t *)cursor;
+    }
+    free(converted);
+    return result;
+}
+
+double wcstod(const wchar_t *text, wchar_t **end) {
+    return (double)wide_strtod_common(text, end, 0);
+}
+
+float wcstof(const wchar_t *text, wchar_t **end) {
+    return (float)wide_strtod_common(text, end, 1);
+}
+
+long double wcstold(const wchar_t *text, wchar_t **end) {
+    return wide_strtod_common(text, end, 2);
+}
+
+static char *wide_format_to_multibyte(const wchar_t *format) {
+    const wchar_t *cursor;
+    size_t length;
+    size_t capacity;
+    size_t converted;
+    char *result;
+    mbstate_t state = {0};
+
+    if (format == 0) {
+        errno = EINVAL;
+        return 0;
+    }
+    length = wcslen(format);
+    if (length > (SIZE_MAX - 1U) / MB_LEN_MAX) {
+        errno = EOVERFLOW;
+        return 0;
+    }
+    capacity = length * MB_LEN_MAX + 1U;
+    result = (char *)malloc(capacity);
+    if (result == 0) return 0;
+    cursor = format;
+    converted = wcsrtombs(result, &cursor, capacity, &state);
+    if (converted == (size_t)-1) {
+        free(result);
+        return 0;
+    }
+    return result;
+}
+
+int vswprintf(wchar_t *buffer, size_t capacity, const wchar_t *format,
+              va_list arguments) {
+    char *narrow_format;
+    char *narrow_output;
+    int narrow_length;
+    size_t wide_length;
+    va_list sizing_arguments;
+    va_list output_arguments;
+
+    if (buffer == 0 && capacity != 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    narrow_format = wide_format_to_multibyte(format);
+    if (narrow_format == 0) return -1;
+
+    va_copy(sizing_arguments, arguments);
+    narrow_length = vsnprintf(0, 0U, narrow_format, sizing_arguments);
+    va_end(sizing_arguments);
+    if (narrow_length < 0) {
+        free(narrow_format);
+        return -1;
+    }
+    narrow_output = (char *)malloc((size_t)narrow_length + 1U);
+    if (narrow_output == 0) {
+        free(narrow_format);
+        return -1;
+    }
+    va_copy(output_arguments, arguments);
+    if (vsnprintf(narrow_output, (size_t)narrow_length + 1U, narrow_format,
+                  output_arguments) < 0) {
+        va_end(output_arguments);
+        free(narrow_output);
+        free(narrow_format);
+        return -1;
+    }
+    va_end(output_arguments);
+    wide_length = mbstowcs(0, narrow_output, 0U);
+    if (wide_length == (size_t)-1) {
+        free(narrow_output);
+        free(narrow_format);
+        return -1;
+    }
+    if (buffer != 0 && capacity != 0U) {
+        const char *cursor = narrow_output;
+        mbstate_t state = {0};
+        if (mbsrtowcs(buffer, &cursor, capacity, &state) == (size_t)-1) {
+            free(narrow_output);
+            free(narrow_format);
+            return -1;
+        }
+        if (wide_length >= capacity) buffer[capacity - 1U] = L'\0';
+    }
+    free(narrow_output);
+    free(narrow_format);
+    return wide_length > (size_t)INT_MAX ? INT_MAX : (int)wide_length;
+}
+
+int swprintf(wchar_t *buffer, size_t capacity, const wchar_t *format, ...) {
+    int result;
+    va_list arguments;
+    va_start(arguments, format);
+    result = vswprintf(buffer, capacity, format, arguments);
+    va_end(arguments);
+    return result;
 }
 
 static unsigned int wide_digit(wchar_t value) {

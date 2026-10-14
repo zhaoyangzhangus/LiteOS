@@ -11,15 +11,15 @@
 #include <kernel/window_server.h>
 #include <arch/x86_64/syscall_internal.h>
 
-BOOLEAN liteos_userspace_start_window_worker(
-    const liteos_init_userspace_hooks_t *hooks) {
+BOOLEAN userspace_start_window_worker(
+    const kernel_init_userspace_hooks_t *hooks) {
     if (!window_server_start_worker()) {
-        hooks->write("LITEOS_WINDOW_WORKER_FAIL\r\n");
+        hooks->write("OS_WINDOW_WORKER_FAIL\r\n");
         return 0;
     }
-    hooks->write("LITEOS_WINDOW_WORKER_OK\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_DESKTOP,
-                       LITEOS_DEBUG_STEP_START, 1U);
+    hooks->write("OS_WINDOW_WORKER_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_DESKTOP,
+                       OS_DEBUG_STEP_START, 1U);
     return 1;
 }
 
@@ -32,11 +32,11 @@ static uint32_t runtime_debug_cpu(void) {
     return cpu < MAX_CPUS ? cpu : x86_current_cpu_index();
 }
 
-static BOOLEAN userspace_fail_at(const liteos_init_userspace_hooks_t *hooks,
+static BOOLEAN userspace_fail_at(const kernel_init_userspace_hooks_t *hooks,
                                  const CHAR8 *message, const char *file,
                                  uint32_t line) {
-    liteos_debug_stage_fail_at(LITEOS_DEBUG_PHASE_USER,
-                               LITEOS_DEBUG_STEP_FAIL, K_EIO, file, line);
+    kernel_debug_stage_fail_at(OS_DEBUG_PHASE_USER,
+                               OS_DEBUG_STEP_FAIL, K_EIO, file, line);
     hooks->write(message);
     hooks->halt();
     return 0;
@@ -45,19 +45,19 @@ static BOOLEAN userspace_fail_at(const liteos_init_userspace_hooks_t *hooks,
 #define userspace_fail(hooks, message) \
     userspace_fail_at((hooks), (message), __FILE__, __LINE__)
 
-BOOLEAN liteos_init_userspace(const liteos_init_userspace_hooks_t *hooks) {
+BOOLEAN kernel_init_userspace(const kernel_init_userspace_hooks_t *hooks) {
     if (hooks == 0 || hooks->write == 0 || hooks->write_u32 == 0 ||
         hooks->halt == 0) return 0;
 
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_5,
-                       LITEOS_DEBUG_STEP_ENTER, 0U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_5,
-                       LITEOS_DEBUG_STEP_PROGRESS, 1U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_5,
+                       OS_DEBUG_STEP_ENTER, 0U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_5,
+                       OS_DEBUG_STEP_PROGRESS, 1U);
     if (!user_init_bootstrap_self_test()) {
-        liteos_debug_stage_fail(LITEOS_DEBUG_PHASE_USER,
-                                LITEOS_DEBUG_STEP_FAIL,
+        kernel_debug_stage_fail(OS_DEBUG_PHASE_USER,
+                                OS_DEBUG_STEP_FAIL,
                                 (int64_t)user_init_failure_result());
-        hooks->write("LITEOS_USER_INIT_FAIL_STAGE=");
+        hooks->write("OS_USER_INIT_FAIL_STAGE=");
         hooks->write_u32(user_init_failure_stage());
         hooks->write(" RESULT_LOW=");
         hooks->write_u32((UINT32)user_init_failure_result());
@@ -65,71 +65,71 @@ BOOLEAN liteos_init_userspace(const liteos_init_userspace_hooks_t *hooks) {
         hooks->halt();
         return 0;
     }
-    hooks->write("LITEOS_USER_INIT_OK SERVICES=6\r\n");
-    hooks->write("LITEOS_TIMER_PREEMPT_OK\r\n");
+    hooks->write("OS_USER_INIT_OK SERVICES=6\r\n");
+    hooks->write("OS_TIMER_PREEMPT_OK\r\n");
     if (!ipc_self_test()) {
-        return userspace_fail(hooks, "LITEOS_IPC_TEST_FAIL\r\n");
+        return userspace_fail(hooks, "OS_IPC_TEST_FAIL\r\n");
     }
-    hooks->write("LITEOS_IPC_OK\r\n");
+    hooks->write("OS_IPC_OK\r\n");
     if (!window_server_init()) {
-        return userspace_fail(hooks, "LITEOS_WINDOW_SERVER_INIT_FAIL\r\n");
+        return userspace_fail(hooks, "OS_WINDOW_SERVER_INIT_FAIL\r\n");
     }
 
     if (!user_init_start()) {
-        return userspace_fail(hooks, "LITEOS_USER_INIT_START_FAIL\r\n");
+        return userspace_fail(hooks, "OS_USER_INIT_START_FAIL\r\n");
     }
-    hooks->write("LITEOS_USER_INIT_STARTED SERVICES=6\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_5,
-                       LITEOS_DEBUG_STEP_PROGRESS, 2U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER,
-                       LITEOS_DEBUG_STEP_START, 6U);
+    hooks->write("OS_USER_INIT_STARTED SERVICES=6\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_5,
+                       OS_DEBUG_STEP_PROGRESS, 2U);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER,
+                       OS_DEBUG_STEP_START, 6U);
 
     if (!deferred_start_worker()) {
-        return userspace_fail(hooks, "LITEOS_DEFERRED_WORKER_FAIL\r\n");
+        return userspace_fail(hooks, "OS_DEFERRED_WORKER_FAIL\r\n");
     }
-    hooks->write("LITEOS_DEFERRED_WORKER_OK\r\n");
+    hooks->write("OS_DEFERRED_WORKER_OK\r\n");
 
     if (x86_smp_discovered_count() <= 1U) {
-        hooks->write("LITEOS_WINDOW_WORKER_DEFERRED\r\n");
-        liteos_debug_stage(LITEOS_DEBUG_PHASE_DESKTOP,
-                           LITEOS_DEBUG_STEP_ENTER, 1U);
-    } else if (!liteos_userspace_start_window_worker(hooks)) {
+        hooks->write("OS_WINDOW_WORKER_DEFERRED\r\n");
+        kernel_debug_stage(OS_DEBUG_PHASE_DESKTOP,
+                           OS_DEBUG_STEP_ENTER, 1U);
+    } else if (!userspace_start_window_worker(hooks)) {
         hooks->halt();
         return 0;
     }
-    liteos_debug_stage_pending(LITEOS_DEBUG_PHASE_SPEC_19);
-    liteos_debug_stage_pending(LITEOS_DEBUG_PHASE_SPEC_20);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_3,
-                       LITEOS_DEBUG_STEP_PROGRESS, 10U);
+    kernel_debug_stage_pending(OS_DEBUG_PHASE_SPEC_19);
+    kernel_debug_stage_pending(OS_DEBUG_PHASE_SPEC_20);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_3,
+                       OS_DEBUG_STEP_PROGRESS, 10U);
     return 1;
 }
 
 static void userspace_halt(
-    const liteos_init_userspace_hooks_t *hooks) {
+    const kernel_init_userspace_hooks_t *hooks) {
     hooks->halt();
     for (;;) __asm__ volatile ("cli; hlt");
 }
 
-void liteos_userspace_run_runtime_self_test(
-    const liteos_init_userspace_hooks_t *hooks) {
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                       LITEOS_DEBUG_STEP_ENTER, 0U);
+void userspace_run_runtime_self_test(
+    const kernel_init_userspace_hooks_t *hooks) {
+    kernel_debug_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                       OS_DEBUG_STEP_ENTER, 0U);
     if (!user_elf_runtime_self_test()) {
         uint32_t failure_stage = user_elf_runtime_failure_stage();
-        liteos_debug_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                           LITEOS_DEBUG_STEP_EXIT, failure_stage);
+        kernel_debug_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                           OS_DEBUG_STEP_EXIT, failure_stage);
         if (failure_stage != 19U) {
-            liteos_debug_stage_fail(
-                LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                LITEOS_DEBUG_STEP_FAIL,
+            kernel_debug_stage_fail(
+                OS_DEBUG_PHASE_USER_RUNTIME,
+                OS_DEBUG_STEP_FAIL,
                 (int64_t)user_elf_runtime_failure_result());
         }
-        hooks->write("LITEOS_USER_RUNTIME_FAIL_STAGE=");
+        hooks->write("OS_USER_RUNTIME_FAIL_STAGE=");
         hooks->write_u32(failure_stage);
         hooks->write(" RESULT_LOW=");
         hooks->write_u32((UINT32)user_elf_runtime_failure_result());
         hooks->write(" THREAD_CREATE_STAGE=");
-        hooks->write_u32(liteos_syscall_thread_create_stage());
+        hooks->write_u32(syscall_thread_create_stage());
         hooks->write(" FUTEX_WORD=");
         hooks->write_u32(user_elf_runtime_futex_word());
         hooks->write(" COW_PROGRESS=");
@@ -299,14 +299,14 @@ void liteos_userspace_run_runtime_self_test(
          * markers (for example TCP stage 0x50) are real runtime failures.
          */
         if (failure_stage == 19U) {
-            hooks->write("LITEOS_USER_RUNTIME_EXEC_WARN\r\n");
+            hooks->write("OS_USER_RUNTIME_EXEC_WARN\r\n");
             return;
         }
         userspace_halt(hooks);
     }
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                       LITEOS_DEBUG_STEP_READY, 1U);
-    hooks->write("LITEOS_USER_RUNTIME_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                       OS_DEBUG_STEP_READY, 1U);
+    hooks->write("OS_USER_RUNTIME_OK\r\n");
     /*
      * PROCESS_EXEC replaces the test address space before this function
      * regains control.  In that expected path the old page containing the
@@ -320,11 +320,11 @@ void liteos_userspace_run_runtime_self_test(
         !user_elf_runtime_vm_concurrent_passed() ||
         !user_elf_runtime_uaccess_passed() ||
         !user_elf_runtime_wait_race_passed())) {
-        liteos_debug_stage_fail(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                                LITEOS_DEBUG_STEP_FAIL, K_EIO);
-        hooks->write("LITEOS_USER_RUNTIME_SUBTEST_FAIL\r\n");
+        kernel_debug_stage_fail(OS_DEBUG_PHASE_USER_RUNTIME,
+                                OS_DEBUG_STEP_FAIL, K_EIO);
+        hooks->write("OS_USER_RUNTIME_SUBTEST_FAIL\r\n");
         userspace_halt(hooks);
     }
-    hooks->write("LITEOS_USER_RUNTIME_SUBTESTS_OK\r\n");
-    hooks->write("LITEOS_USERMODE_OK\r\n");
+    hooks->write("OS_USER_RUNTIME_SUBTESTS_OK\r\n");
+    hooks->write("OS_USERMODE_OK\r\n");
 }

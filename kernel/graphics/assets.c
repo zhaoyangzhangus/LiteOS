@@ -4,6 +4,7 @@
 #include <kernel/console.h>
 #include <kernel/kmem.h>
 #include <kernel/sched.h>
+#include <kernel/string.h>
 #include <kernel/vfs.h>
 #include "internal.h"
 
@@ -18,7 +19,6 @@ static uint8_t g_desktop_asset_worker_stack
     __attribute__((aligned(16)));
 
 atomic_bool g_desktop_assets_available;
-atomic_bool g_desktop_assets_pending;
 desktop_asset_image_t g_desktop_wallpaper_asset;
 desktop_asset_image_t g_desktop_icons_asset;
 desktop_asset_image_t g_desktop_file_manager_asset;
@@ -26,7 +26,6 @@ desktop_asset_image_t g_desktop_file_manager_asset;
 void desktop_shell_init(void) {
     wait_queue_init(&g_desktop_asset_waitq);
     atomic_init(&g_desktop_assets_available, false);
-    atomic_init(&g_desktop_assets_pending, false);
     g_desktop_wallpaper_asset = (desktop_asset_image_t){0};
     g_desktop_icons_asset = (desktop_asset_image_t){0};
     g_desktop_file_manager_asset = (desktop_asset_image_t){0};
@@ -99,17 +98,22 @@ static void __attribute__((noreturn)) desktop_asset_worker_main(void *argument) 
 
     loaded = desktop_load_assets();
     if (loaded) {
-        liteos_serial_write_serial_only("LITEOS_DESKTOP_ASSETS_OK\r\n");
+        kernel_serial_write_serial_only("OS_DESKTOP_ASSETS_OK\r\n");
         atomic_store_explicit(&g_desktop_assets_available, true,
                               memory_order_release);
-        atomic_store_explicit(&g_desktop_assets_pending, true,
-                              memory_order_release);
+        if (!desktop_shell_build_cache()) {
+            kernel_serial_write_serial_only(
+                "OS_DESKTOP_CACHE_FAIL\r\n");
+        } else {
+            kernel_serial_write_serial_only(
+                "OS_DESKTOP_CACHE_OK\r\n");
+        }
         window_lock();
         window_mark_dirty_locked();
         window_unlock();
         window_server_notify_worker();
     } else {
-        liteos_serial_write_serial_only("LITEOS_DESKTOP_ASSETS_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_DESKTOP_ASSETS_FAIL\r\n");
     }
 
     /* Keep the scheduler-visible thread blocked after its one-shot job. */
@@ -124,7 +128,6 @@ bool desktop_shell_start_asset_worker(uint32_t compositor_cpu) {
     uint32_t current_cpu = x86_current_cpu_index();
     uint32_t asset_cpu = UINT32_MAX;
     thread_t *worker;
-    uint8_t *worker_bytes;
 
     if (atomic_load_explicit(&g_window_server.desktop_asset_worker_started,
                              memory_order_acquire)) {
@@ -150,10 +153,7 @@ bool desktop_shell_start_asset_worker(uint32_t compositor_cpu) {
     }
 
     worker = &g_window_server.desktop_asset_worker;
-    worker_bytes = (uint8_t *)worker;
-    for (size_t byte = 0U; byte < sizeof(*worker); ++byte) {
-        worker_bytes[byte] = 0U;
-    }
+    memset(worker, 0, sizeof(*worker));
 
     refcount_init(&worker->object.refs, 1U);
     worker->object.type = KOBJECT_TYPE_THREAD;

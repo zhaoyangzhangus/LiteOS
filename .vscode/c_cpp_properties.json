@@ -1,7 +1,7 @@
 {
     "configurations": [
         {
-            "name": "LiteOS (Windows native)",
+            "name": "System (Linux/QEMU)",
             "compilerPath": "gcc",
             "intelliSenseMode": "linux-gcc-x64",
             "cStandard": "c11",
@@ -9,11 +9,10 @@
             "includePath": [
                 "${workspaceFolder}/include",
                 "${workspaceFolder}/user/services/audiod",
-                "${workspaceFolder}/user/libc/include",
-                "${workspaceFolder}/build/generated"
+                "${workspaceFolder}/user/libc/include"
             ],
             "defines": [
-                "LITEOS_KERNEL_BUILD"
+                "OS_KERNEL_BUILD"
             ],
             "compilerArgs": [
                 "-ffreestanding",

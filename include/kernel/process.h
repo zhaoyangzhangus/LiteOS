@@ -4,6 +4,7 @@
 #include <kernel/handle.h>
 #include <kernel/wait.h>
 #include <uapi/process.h>
+#include <kernel/linux_abi.h>
 #pragma once
 #include "base.h"
 #include "object.h"
@@ -48,8 +49,13 @@ typedef struct process {
 
     spinlock_t thread_lock;
     list_head_t threads;
+    /* Borrowed monitor hint; read/write and detach invalidation use thread_lock. */
+    list_head_t *monitor_thread_cursor;
     list_head_t job_node;
     uint32_t thread_count;
+    uint64_t retired_cpu_ns; /* Thread-lock protected completed CPU time. */
+    /* Linux presents the initial thread's TID as the process PID. */
+    uint64_t linux_thread_group_leader_tid;
 
     /* Global monitor membership and stable user-visible metadata. */
     list_head_t global_node;
@@ -60,6 +66,17 @@ typedef struct process {
     int64_t exit_code;
     uint32_t exit_signal;
     uint64_t create_time_ns;
+
+    /* Linux PT_INTERP images use a separate syscall-number personality. */
+    uint32_t personality;
+    /* The native System dynamic loader runs before Linux ABI activation. */
+    bool linux_loader_pending;
+    char linux_root[256];
+    char linux_cwd[256];
+    char linux_exe[256];
+    vaddr_t linux_brk_base;
+    vaddr_t linux_brk;
+    linux_fd_table_t linux_fds;
 
     spinlock_t signal_lock;
     os_signal_action_t signal_actions[OS_SIGNAL_COUNT + 1U];
@@ -77,6 +94,9 @@ uint64_t process_parent_pid(const process_t *process);
 kstatus_t process_enumerate(uint32_t index, os_process_snapshot_t *snapshot);
 kstatus_t process_enumerate_thread(uint32_t index,
                                    os_thread_snapshot_t *snapshot);
+kstatus_t process_task_query(uint64_t pid, uint64_t tid, os_task_info_t *info);
+kstatus_t process_terminate_pid(process_t *caller, uint64_t pid, uint64_t create_time_ns);
+kstatus_t process_terminate_tid(process_t *caller, uint64_t pid, uint64_t tid, uint64_t create_time_ns);
 uint64_t process_allocate_task_id(void);
 void process_set_name(process_t *process, const char *path);
 kstatus_t process_exec(process_t *process, const char __user *path,
@@ -117,6 +137,7 @@ __noreturn void thread_exit(int64_t status);
 
 #define THREAD_FLAG_EXECUTION_REF  (1U << 0)
 #define THREAD_FLAG_EXECUTION_REAPING (1U << 1)
+#define THREAD_FLAG_TERMINATE_REQUEST (1U << 2)
 #define PROCESS_FLAG_EVER_HAD_THREAD (1U << 0)
 #define PROCESS_FLAG_RESOURCES_RELEASED (1U << 1)
 #define PROCESS_FLAG_INIT_CPU_PINNED (1U << 2)

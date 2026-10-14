@@ -146,8 +146,8 @@ extern "C" void __tsan_release(void *addr);
   #define _LARGEFILE64_SOURCE 1
 
   // These OSes use 64-bit offsets by default.
-  #if defined(BL_PLATFORM_LITEOS)
-    // LiteOS already uses a 64-bit off_t and does not expose separate *64 APIs.
+  #if defined(BL_PLATFORM_FREESTANDING)
+    // The freestanding target uses a 64-bit off_t and does not expose separate *64 APIs.
     #define BL_FILE64_API(NAME) NAME
   #elif defined(__APPLE__    ) || \
       defined(__HAIKU__    ) || \

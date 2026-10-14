@@ -1,6 +1,7 @@
 #include <arch/x86_64/cpu.h>
 #include <kernel/deferred.h>
 #include <kernel/spinlock.h>
+#include <kernel/sched.h>
 #include <kernel/watchdog.h>
 
 static struct {
@@ -10,27 +11,30 @@ static struct {
 } g_watchdog;
 
 static void watchdog_lock(void) {
-    while (atomic_exchange_explicit(&g_watchdog.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    /* Keep the owner runnable on this CPU until protected state is released. */
+    sched_preempt_disable();
+    spinlock_lock(&g_watchdog.lock);
 }
 
 static bool watchdog_try_lock(void) {
-    return atomic_exchange_explicit(&g_watchdog.lock.state, 1U,
-                                    memory_order_acquire) == 0U;
+    sched_preempt_disable();
+    if (spinlock_try_lock(&g_watchdog.lock)) return true;
+    sched_preempt_enable();
+    return false;
 }
 
 static void watchdog_unlock(void) {
-    atomic_store_explicit(&g_watchdog.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_watchdog.lock);
+    sched_preempt_enable();
 }
 
 bool watchdog_manager_init(void) {
+    if (atomic_load_explicit(&g_watchdog.init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_watchdog.init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_watchdog.lock.state, 0U);
+        spinlock_init(&g_watchdog.lock);
         for (uint32_t i = 0; i < WATCHDOG_MAX_CLIENTS; ++i) {
             g_watchdog.clients[i].registered = false;
             g_watchdog.clients[i].queued = false;
@@ -47,11 +51,12 @@ bool watchdog_manager_init(void) {
 }
 
 static bool watchdog_known_locked(const watchdog_client_t *client) {
-    if (client == 0) return false;
-    for (uint32_t i = 0; i < WATCHDOG_MAX_CLIENTS; ++i) {
-        if (&g_watchdog.clients[i] == client) return client->registered;
-    }
-    return false;
+    uintptr_t address = (uintptr_t)client;
+    uintptr_t base = (uintptr_t)&g_watchdog.clients[0];
+    if (address < base || address - base >= sizeof(g_watchdog.clients)) return false;
+    uintptr_t offset = address - base;
+    if (offset % sizeof(g_watchdog.clients[0]) != 0U) return false;
+    return g_watchdog.clients[offset / sizeof(g_watchdog.clients[0])].registered;
 }
 
 static uint64_t watchdog_deadline(uint64_t now, uint64_t timeout) {

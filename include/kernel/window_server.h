@@ -4,6 +4,28 @@
 #include <uapi/window.h>
 
 struct process;
+struct window_server_window;
+#include <uapi/window_surface.h>
+kstatus_t window_server_surface_begin(struct process *owner,
+    struct window_server_window *window, os_surface_frame_t *frame);
+kstatus_t window_server_surface_end(struct process *owner,
+    struct window_server_window *window, const os_surface_frame_t *frame,
+    bool commit);
+struct vm_space;
+struct window_server_window;
+kstatus_t window_server_title_owned(struct process *owner, uint32_t identifier,
+                                     const char title[32]);
+kstatus_t window_server_set_decorations_owned(struct process *owner,
+    struct window_server_window *window, uint32_t server_frame);
+kstatus_t window_server_begin_interactive_owned(struct process *owner,
+    struct window_server_window *window, uint32_t edges);
+kstatus_t window_server_geometry_owned(struct process *owner,
+    struct window_server_window *window, int32_t *x, int32_t *y,
+    uint32_t *width, uint32_t *height, uint32_t *maximized);
+kstatus_t window_server_set_maximized_owned(struct process *owner,
+    struct window_server_window *window, uint32_t maximized);
+kstatus_t window_server_set_fullscreen_owned(struct process *owner,
+    struct window_server_window *window, uint32_t fullscreen);
 
 #define KOBJECT_TYPE_WINDOW       0x0117U
 #define WINDOW_RIGHT_ALL          0x00000003U
@@ -32,6 +54,8 @@ bool window_server_start_asset_worker(void);
 void window_server_notify_worker(void);
 /* 初始化后窗口服务器由内核持有显示输出和输入路由权。 */
 bool window_server_kernel_ready(void);
+kstatus_t window_server_set_minimized_owned(struct process *owner,
+    window_server_window_t *window, uint32_t minimized);
 kstatus_t window_server_register_manager(struct process *process);
 bool window_server_is_manager(struct process *process);
 kstatus_t window_server_create(struct process *owner, int32_t x, int32_t y,
@@ -40,6 +64,8 @@ kstatus_t window_server_create(struct process *owner, int32_t x, int32_t y,
                                const char *title, window_server_window_t **out);
 kstatus_t window_server_snapshot(uint32_t index, window_server_snapshot_t *out);
 kstatus_t window_server_lookup(uint32_t identifier, window_server_window_t **out);
+kstatus_t window_server_lookup_owner(struct process *owner,
+                                     window_server_window_t **out);
 uint32_t window_server_window_identifier(
     const window_server_window_t *window);
 uint64_t window_server_window_buffer_size(
@@ -50,15 +76,39 @@ void window_server_handle_closed(window_server_window_t *window);
 void window_server_close_process(struct process *owner);
 kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y,
                             uint32_t visible);
+/* Owned visibility: bit 0 shows, bit 1 suppresses automatic activation. */
+#define WINDOW_SERVER_SHOW_INACTIVE 2U
+kstatus_t window_server_set_visibility_owned(struct process *owner,
+    window_server_window_t *window, uint32_t visible);
+kstatus_t window_server_capture_owned(struct process *owner,
+    window_server_window_t *window, uint32_t capture);
 kstatus_t window_server_focus(uint32_t identifier);
 kstatus_t window_server_map(window_server_window_t *window,
                             struct process *process,
                             uint64_t requested_address, uint64_t *mapped_address);
+/* Caller retains space through mapping and any subsequent transaction rollback. */
+kstatus_t window_server_map_space(window_server_window_t *window,
+                                  struct vm_space *space,
+                                  uint64_t requested_address, uint64_t *mapped_address);
 kstatus_t window_server_update(struct process *process, uint32_t identifier,
                                int32_t x, int32_t y, uint32_t width,
                                uint32_t height, uint32_t flags);
 kstatus_t window_server_set_owner_address(window_server_window_t *window,
                                           uint64_t address);
+kstatus_t window_server_present(struct process *owner,
+                                window_server_window_t *window,
+                                uint64_t address, uint64_t length,
+                                uint32_t stride, int32_t damage_x,
+                                int32_t damage_y, uint32_t damage_width,
+                                uint32_t damage_height);
+kstatus_t window_server_move(struct process *owner,
+                             window_server_window_t *window,
+                             int32_t x, int32_t y);
+kstatus_t window_server_resize(struct process *owner,
+                               window_server_window_t *window,
+                               uint32_t width, uint32_t height);
+kstatus_t window_server_close_owned(struct process *owner,
+                                    window_server_window_t *window);
 kstatus_t window_server_dispatch(uint32_t identifier, const os_input_event_t *event);
 kstatus_t window_server_event_read(struct process *process, uint32_t identifier,
                                    os_window_event_t *event, uint64_t timeout_ns);

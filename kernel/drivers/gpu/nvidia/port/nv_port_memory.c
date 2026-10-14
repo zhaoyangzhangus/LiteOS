@@ -1,8 +1,10 @@
 #include "nv_port.h"
 
 #ifdef NV_PORT_HOST_TEST
-#include <malloc.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #endif
 
 static bool nv_port_power_of_two(size_t value) {
@@ -50,6 +52,31 @@ static void nv_port_mem_clear(nv_port_mem_t *memory) {
     *memory = (nv_port_mem_t){0};
 }
 
+/*
+ * System keeps the RAM direct map WB.  NVIDIA's uncached and write-combined
+ * allocations are additionally exposed through a vmalloc mapping with the
+ * requested PAT mode, so the direct-map alias must not retain dirty/stale
+ * lines when a device starts DMA to these pages.  Linux changes the page
+ * mapping type when it makes this transition; the System port cannot rewrite
+ * the global direct map here, so evict its aliases at the ownership boundary.
+ */
+static void nv_port_mem_invalidate_direct_aliases(
+    const nv_port_mem_t *memory) {
+#ifndef NV_PORT_HOST_TEST
+    if (memory == 0 || memory->cache_type == NV_PORT_CACHE_WB ||
+        memory->phys_pages == 0) return;
+
+    for (uint32_t index = 0U; index < memory->page_count; ++index) {
+        void *direct = phys_to_direct(
+            paddr_make(memory->phys_pages[index]));
+        if (direct != 0)
+            nv_port_cache_invalidate(direct, PAGE_SIZE);
+    }
+#else
+    (void)memory;
+#endif
+}
+
 #ifndef NV_PORT_HOST_TEST
 static page_alloc_flags_t nv_port_page_alloc_flags(uint32_t flags) {
     page_alloc_flags_t page_flags = 0U;
@@ -93,7 +120,11 @@ static void *nv_port_host_aligned_alloc(size_t alignment, size_t size) {
     if (size % alignment != 0U) {
         size += alignment - (size % alignment);
     }
+#ifdef _WIN32
     return _aligned_malloc(size, alignment);
+#else
+    return aligned_alloc(alignment, size);
+#endif
 }
 
 static uint64_t nv_port_host_physical_span(uint32_t page_count) {
@@ -304,6 +335,7 @@ static kstatus_t nv_port_mem_alloc_internal(size_t size, size_t alignment,
         kfree(memory.page_objects);
         return K_EIO;
     }
+    nv_port_mem_invalidate_direct_aliases(&memory);
     if (memory.contiguous && cache_type == NV_PORT_CACHE_WB) {
         memory.cpu_va = phys_to_direct(paddr_make(memory.phys_pages[0]));
     }
@@ -382,6 +414,7 @@ kstatus_t nv_port_mem_wrap_pages(page_t **pages, uint32_t page_count,
 #endif
         return K_EINVAL;
     }
+    nv_port_mem_invalidate_direct_aliases(&memory);
     memory.contiguous = nv_port_mem_is_contiguous(&memory);
 #ifndef NV_PORT_HOST_TEST
     if (memory.contiguous && cache_type == NV_PORT_CACHE_WB) {

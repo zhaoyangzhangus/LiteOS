@@ -24,20 +24,92 @@ typedef enum {
 } memory_order;
 
 #define ATOMIC_VAR_INIT(value) (value)
-#define atomic_init(object, value) __atomic_store_n((object), (value), __ATOMIC_RELAXED)
+
+/* The _n builtins reject pointers to C11 _Atomic-qualified objects with
+ * Clang.  Use the generic builtins and preserve the C11 expression semantics
+ * so both integer and pointer atomics work.  These are the same GNU C
+ * extensions used by GCC's freestanding stdatomic.h. */
+#define atomic_init(object, value)                                              \
+    __extension__                                                               \
+    ({                                                                           \
+        __typeof_unqual__(*(object)) __atomic_init_value = (value);              \
+        __atomic_store((__typeof_unqual__(*(object)) *)(object),                 \
+                       &__atomic_init_value, __ATOMIC_RELAXED);                 \
+    })
 #define atomic_is_lock_free(object) __atomic_is_lock_free(sizeof(*(object)), (object))
-#define atomic_store_explicit(object, value, order) __atomic_store_n((object), (value), (order))
-#define atomic_load_explicit(object, order) __atomic_load_n((object), (order))
-#define atomic_exchange_explicit(object, value, order) __atomic_exchange_n((object), (value), (order))
-#define atomic_compare_exchange_strong_explicit(object, expected, desired, success, failure) \
-    __atomic_compare_exchange_n((object), (expected), (desired), 0, (success), (failure))
-#define atomic_compare_exchange_weak_explicit(object, expected, desired, success, failure) \
-    __atomic_compare_exchange_n((object), (expected), (desired), 1, (success), (failure))
-#define atomic_fetch_add_explicit(object, operand, order) __atomic_fetch_add((object), (operand), (order))
-#define atomic_fetch_sub_explicit(object, operand, order) __atomic_fetch_sub((object), (operand), (order))
-#define atomic_fetch_or_explicit(object, operand, order) __atomic_fetch_or((object), (operand), (order))
-#define atomic_fetch_xor_explicit(object, operand, order) __atomic_fetch_xor((object), (operand), (order))
-#define atomic_fetch_and_explicit(object, operand, order) __atomic_fetch_and((object), (operand), (order))
+#define atomic_store_explicit(object, value, order)                              \
+    __extension__                                                               \
+    ({                                                                           \
+        __auto_type __atomic_store_ptr = (object);                              \
+        __typeof_unqual__(*__atomic_store_ptr) __atomic_store_value = (value);   \
+        __atomic_store((__typeof_unqual__(*__atomic_store_ptr) *)                 \
+                           __atomic_store_ptr,                                   \
+                       &__atomic_store_value, (order));                          \
+    })
+#define atomic_load_explicit(object, order)                                      \
+    __extension__                                                               \
+    ({                                                                           \
+        __auto_type __atomic_load_ptr = (object);                               \
+        __typeof_unqual__(*__atomic_load_ptr) __atomic_load_value;               \
+        __atomic_load((__typeof_unqual__(*__atomic_load_ptr) *)                  \
+                          __atomic_load_ptr,                                     \
+                      &__atomic_load_value, (order));                            \
+        __atomic_load_value;                                                     \
+    })
+#define atomic_exchange_explicit(object, value, order)                           \
+    __extension__                                                               \
+    ({                                                                           \
+        __auto_type __atomic_exchange_ptr = (object);                           \
+        __typeof_unqual__(*__atomic_exchange_ptr) __atomic_exchange_value =      \
+            (value);                                                             \
+        __typeof_unqual__(*__atomic_exchange_ptr) __atomic_exchange_old;         \
+        __atomic_exchange((__typeof_unqual__(*__atomic_exchange_ptr) *)          \
+                              __atomic_exchange_ptr,                             \
+                          &__atomic_exchange_value,                              \
+                          &__atomic_exchange_old, (order));                     \
+        __atomic_exchange_old;                                                   \
+    })
+#define atomic_compare_exchange_strong_explicit(object, expected, desired,      \
+                                                success, failure)                \
+    __extension__                                                               \
+    ({                                                                           \
+        __auto_type __atomic_compare_ptr = (object);                            \
+        __typeof_unqual__(*__atomic_compare_ptr) __atomic_compare_desired =      \
+            (desired);                                                           \
+        __atomic_compare_exchange(                                               \
+            (__typeof_unqual__(*__atomic_compare_ptr) *)__atomic_compare_ptr,     \
+                                  (expected),                                     \
+                                  &__atomic_compare_desired, 0, (success),      \
+                                  (failure));                                    \
+    })
+#define atomic_compare_exchange_weak_explicit(object, expected, desired,        \
+                                              success, failure)                  \
+    __extension__                                                               \
+    ({                                                                           \
+        __auto_type __atomic_compare_ptr = (object);                            \
+        __typeof_unqual__(*__atomic_compare_ptr) __atomic_compare_desired =      \
+            (desired);                                                           \
+        __atomic_compare_exchange(                                               \
+            (__typeof_unqual__(*__atomic_compare_ptr) *)__atomic_compare_ptr,     \
+                                  (expected),                                     \
+                                  &__atomic_compare_desired, 1, (success),      \
+                                  (failure));                                    \
+    })
+#define atomic_fetch_add_explicit(object, operand, order)                        \
+    __atomic_fetch_add((__typeof_unqual__(*(object)) *)(object), (operand),     \
+                       (order))
+#define atomic_fetch_sub_explicit(object, operand, order)                        \
+    __atomic_fetch_sub((__typeof_unqual__(*(object)) *)(object), (operand),     \
+                       (order))
+#define atomic_fetch_or_explicit(object, operand, order)                         \
+    __atomic_fetch_or((__typeof_unqual__(*(object)) *)(object), (operand),      \
+                      (order))
+#define atomic_fetch_xor_explicit(object, operand, order)                        \
+    __atomic_fetch_xor((__typeof_unqual__(*(object)) *)(object), (operand),     \
+                       (order))
+#define atomic_fetch_and_explicit(object, operand, order)                        \
+    __atomic_fetch_and((__typeof_unqual__(*(object)) *)(object), (operand),     \
+                       (order))
 
 #define atomic_store(object, value) atomic_store_explicit((object), (value), memory_order_seq_cst)
 #define atomic_load(object) atomic_load_explicit((object), memory_order_seq_cst)
@@ -70,6 +142,28 @@ typedef _Atomic(unsigned long long) atomic_ullong;
 typedef _Atomic(intptr_t) atomic_intptr_t;
 typedef _Atomic(uintptr_t) atomic_uintptr_t;
 typedef _Atomic(size_t) atomic_size_t;
+/* C11's least/fast-width aliases are distinct typedef names even when they
+ * resolve to the same underlying integer type on this target.  A number of
+ * portable C libraries (including pthreadpool) use these aliases instead of
+ * the exact-width forms. */
+typedef _Atomic(int8_t) atomic_int_least8_t;
+typedef _Atomic(uint8_t) atomic_uint_least8_t;
+typedef _Atomic(int16_t) atomic_int_least16_t;
+typedef _Atomic(uint16_t) atomic_uint_least16_t;
+typedef _Atomic(int32_t) atomic_int_least32_t;
+typedef _Atomic(uint32_t) atomic_uint_least32_t;
+typedef _Atomic(int64_t) atomic_int_least64_t;
+typedef _Atomic(uint64_t) atomic_uint_least64_t;
+typedef _Atomic(int8_t) atomic_int_fast8_t;
+typedef _Atomic(uint8_t) atomic_uint_fast8_t;
+typedef _Atomic(int16_t) atomic_int_fast16_t;
+typedef _Atomic(uint16_t) atomic_uint_fast16_t;
+typedef _Atomic(int32_t) atomic_int_fast32_t;
+typedef _Atomic(uint32_t) atomic_uint_fast32_t;
+typedef _Atomic(int64_t) atomic_int_fast64_t;
+typedef _Atomic(uint64_t) atomic_uint_fast64_t;
+typedef _Atomic(intmax_t) atomic_intmax_t;
+typedef _Atomic(uintmax_t) atomic_uintmax_t;
 typedef struct { atomic_bool value; } atomic_flag;
 
 #define ATOMIC_FLAG_INIT { false }

@@ -1,6 +1,6 @@
 #pragma once
-#ifndef LITEOS_KERNEL_PERF_H
-#define LITEOS_KERNEL_PERF_H
+#ifndef OS_KERNEL_PERF_H
+#define OS_KERNEL_PERF_H
 
 #include "base.h"
 

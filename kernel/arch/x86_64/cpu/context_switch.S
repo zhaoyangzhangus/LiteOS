@@ -4,11 +4,13 @@
     .globl x86_switch_context_root
     .globl x86_kernel_thread_start
     .globl x86_rebase_stack_and_call
+    .globl x86_switch_stack_and_call
 #ifndef __ELF__
     .def x86_switch_context; .scl 2; .type 32; .endef
     .def x86_switch_context_root; .scl 2; .type 32; .endef
     .def x86_kernel_thread_start; .scl 2; .type 32; .endef
     .def x86_rebase_stack_and_call; .scl 2; .type 32; .endef
+    .def x86_switch_stack_and_call; .scl 2; .type 32; .endef
 #endif
 
 /*
@@ -61,6 +63,21 @@ x86_rebase_stack_and_call:
     addq %rdi, %rsp
     xorq %rbp, %rbp
     addq $8, %rsp
+    movq %rdx, %rdi
+    call *%rsi
+    cli
+1:
+    hlt
+    jmp 1b
+
+/* SysV: RDI=target stack top, RSI=continuation, RDX=continuation context.
+ * Keep IF masked while installing the new stack and entering the fresh C
+ * call chain. */
+    .p2align 4
+x86_switch_stack_and_call:
+    cli
+    movq %rdi, %rsp
+    andq $-16, %rsp
     movq %rdx, %rdi
     call *%rsi
     cli

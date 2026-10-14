@@ -1,19 +1,19 @@
 #include "internal.h"
+#include <kernel/sched.h>
 
 static void e1000_queue_lock(e1000_software_queue_t *queue) {
-    while (atomic_exchange_explicit(&queue->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    sched_preempt_disable();
+    spinlock_lock(&queue->lock);
 }
 
 static void e1000_queue_unlock(e1000_software_queue_t *queue) {
-    atomic_store_explicit(&queue->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&queue->lock);
+    sched_preempt_enable();
 }
 
 void e1000_queue_init(e1000_software_queue_t *queue) {
     if (queue == 0) return;
-    atomic_init(&queue->lock.state, 0U);
+    spinlock_init(&queue->lock);
     queue->head = 0U;
     queue->tail = 0U;
     queue->count = 0U;

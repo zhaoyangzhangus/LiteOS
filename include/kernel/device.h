@@ -13,7 +13,7 @@ struct power_device;
 
 #define KOBJECT_TYPE_DEVICE 0x010BU
 
-#define LITEOS_DRIVER_API_VERSION 1U
+#define OS_DRIVER_API_VERSION 1U
 
 enum device_state {
     DEVICE_DISCOVERED = 0,
@@ -106,7 +106,8 @@ kstatus_t device_resume_timeout(device_t *dev, uint64_t timeout_ns);
 kstatus_t device_reset(device_t *dev, uint32_t level);
 kstatus_t device_set_power_timeout(device_t *dev, uint64_t timeout_ns);
 bool device_io_begin(device_t *dev, io_request_t *req);
-void device_io_end(device_t *dev, io_request_t *req);
+/* 锁内摘除登记和引用标记；返回 true 时调用者在锁外释放设备引用。 */
+bool device_io_end(device_t *dev, io_request_t *req);
 kstatus_t driver_register(driver_t *drv);
 void driver_unregister(driver_t *drv);
 #include "io.h"

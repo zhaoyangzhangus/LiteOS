@@ -18,8 +18,7 @@ static void write_msr(uint32_t index, uint64_t value) {
                       "d"((uint32_t)(value >> 32)) : "memory");
 }
 
-void x86_paging_arch_init(void) {
-    x86_page_table_arch_init();
+static void x86_program_pat(void) {
     /* PAT indexes 0/1/2/3 remain WB/WC/UC-/UC for all MMU callers. */
     const uint64_t pat = 0x0007010600070106ULL;
     if (read_msr(IA32_PAT) != pat) {
@@ -27,6 +26,16 @@ void x86_paging_arch_init(void) {
         write_msr(IA32_PAT, pat);
         __asm__ volatile ("wbinvd" : : : "memory");
     }
+}
+
+void x86_paging_arch_init(void) {
+    x86_page_table_arch_init();
+    x86_program_pat();
+}
+
+void x86_paging_arch_init_secondary(void) {
+    /* PAT is per logical CPU; APs do not inherit the BSP's MSR value. */
+    x86_program_pat();
 }
 
 uint64_t x86_pte_cache_bits(enum x86_cache_mode mode, bool large_page) {

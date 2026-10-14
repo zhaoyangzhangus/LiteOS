@@ -1,6 +1,7 @@
 #include <kernel/kmem.h>
 #include <kernel/perf.h>
 #include <kernel/telemetry.h>
+#include <kernel/desktop_icon.h>
 #include "internal.h"
 
 /* REFACTOR_P7A_SHELL_OWNER: desktop geometry and interaction policy. */
@@ -12,8 +13,8 @@
 
 #define DESKTOP_ICON_CELL_WIDTH     88U
 #define DESKTOP_ICON_CELL_HEIGHT    68U
-#define DESKTOP_ICON_IMAGE_WIDTH    48U
-#define DESKTOP_ICON_IMAGE_HEIGHT   48U
+#define DESKTOP_ICON_IMAGE_WIDTH    64U
+#define DESKTOP_ICON_IMAGE_HEIGHT   64U
 typedef struct desktop_icon_entry {
     uint32_t app;
 } desktop_icon_entry_t;
@@ -21,6 +22,10 @@ typedef struct desktop_icon_entry {
 typedef struct desktop_render_context {
     Rect bounds;
     uint32_t hovered_app;
+    volatile uint32_t *target;
+    uint32_t target_width;
+    uint32_t target_height;
+    uint32_t target_stride;
 } desktop_render_context_t;
 
 static const desktop_icon_entry_t g_desktop_icons[] = {
@@ -29,6 +34,7 @@ static const desktop_icon_entry_t g_desktop_icons[] = {
     { DESKTOP_APP_NOTES },
     { DESKTOP_APP_NETWORK },
     { DESKTOP_APP_TASKMGR },
+    { DESKTOP_APP_CHROME },
 };
 
 
@@ -141,24 +147,42 @@ static void desktop_blend_asset_pixel_locked(
     int32_t x,
     int32_t y,
     uint32_t pixel) {
+    volatile uint32_t *target;
+    uint32_t target_width;
+    uint32_t target_height;
+    uint32_t target_stride;
     uint64_t offset;
 
-    if (context == 0 ||
+    if (context == 0) {
+        return;
+    }
+
+    target = context->target != 0 ?
+        context->target : g_window_server.composite_framebuffer;
+    target_width = context->target_width != 0U ?
+        context->target_width : g_window_server.display_width;
+    target_height = context->target_height != 0U ?
+        context->target_height : g_window_server.display_height;
+    target_stride = context->target_stride != 0U ?
+        context->target_stride : g_window_server.display_stride;
+
+    if (target == 0 ||
         x < (int32_t)context->bounds.x0 ||
         y < (int32_t)context->bounds.y0 ||
         x >= (int32_t)context->bounds.x1 ||
         y >= (int32_t)context->bounds.y1 ||
         x < 0 || y < 0 ||
-        x >= (int32_t)g_window_server.display_width ||
-        y >= (int32_t)g_window_server.display_height) {
+        x >= (int32_t)target_width ||
+        y >= (int32_t)target_height ||
+        target_stride < target_width) {
         return;
     }
 
-    offset = (uint64_t)(uint32_t)y * g_window_server.display_stride +
+    offset = (uint64_t)(uint32_t)y * target_stride +
              (uint32_t)x;
-    g_window_server.composite_framebuffer[offset] =
+    target[offset] =
         desktop_blend_argb(
-            g_window_server.composite_framebuffer[offset],
+            target[offset],
             pixel);
 }
 
@@ -241,70 +265,101 @@ static void desktop_draw_hover_frame_locked(int32_t x, int32_t y,
     }
 }
 
+/* Intersect once before walking pixels, including during private-cache build. */
+typedef struct desktop_icon_clip {
+    uint32_t x0, y0, x1, y1;
+} desktop_icon_clip_t;
+
+static bool desktop_icon_clip_locked(const desktop_render_context_t *context,
+    int32_t x, int32_t y, uint32_t width, uint32_t height, desktop_icon_clip_t *out) {
+    if (context == 0 || out == 0 || width == 0U || height == 0U) return false;
+    uint32_t target_width = context->target_width ? context->target_width :
+                           g_window_server.display_width;
+    uint32_t target_height = context->target_height ? context->target_height :
+                            g_window_server.display_height;
+    int64_t right = context->bounds.x1 < (int64_t)target_width ? context->bounds.x1 : (int64_t)target_width;
+    int64_t bottom = context->bounds.y1 < (int64_t)target_height ? context->bounds.y1 : (int64_t)target_height;
+    int64_t left = context->bounds.x0, top = context->bounds.y0;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    int64_t end_x = (int64_t)x + width, end_y = (int64_t)y + height;
+    if (left < x) left = x;
+    if (top < y) top = y;
+    if (end_x > right) end_x = right;
+    if (end_y > bottom) end_y = bottom;
+    if (left >= end_x || top >= end_y) return false;
+    *out = (desktop_icon_clip_t){ (uint32_t)(left - x), (uint32_t)(top - y),
+                   (uint32_t)(end_x - x), (uint32_t)(end_y - y) };
+    return true;
+}
+
+static void desktop_draw_cached_icon_locked(const desktop_render_context_t *context,
+    int32_t x, int32_t y, uint32_t width, const desktop_icon_clip_t *clip, const uint32_t *pixels) {
+    for (uint32_t row = clip->y0; row < clip->y1; ++row)
+        for (uint32_t column = clip->x0; column < clip->x1; ++column)
+            desktop_blend_asset_pixel_locked(context, x + (int32_t)column,
+                y + (int32_t)row, pixels[(uint64_t)row * width + column]);
+}
+
 static void desktop_draw_asset_icon_locked(
     const desktop_render_context_t *context,
     int32_t x, int32_t y, uint32_t width, uint32_t height,
     const desktop_asset_image_t *asset,
     uint32_t source_left, uint32_t source_top,
     uint32_t source_width, uint32_t source_height) {
+    desktop_icon_clip_t clip;
     if (asset == 0 || asset->pixels == 0 ||
         source_width == 0U || source_height == 0U ||
         source_left >= asset->width || source_top >= asset->height ||
         source_width > asset->width - source_left ||
         source_height > asset->height - source_top ||
-        width == 0U || height == 0U) {
+        !desktop_icon_clip_locked(context, x, y, width, height, &clip)) {
         return;
     }
 
-    for (uint32_t row = 0U; row < height; ++row) {
-        uint32_t source_y = source_top +
-            (uint32_t)(((uint64_t)row * source_height) / height);
-        const uint8_t *source = asset->pixels +
-            (uint64_t)source_y * asset->stride +
-            (uint64_t)source_left * 4U;
-        for (uint32_t column = 0U; column < width; ++column) {
-            uint32_t source_x =
-                (uint32_t)(((uint64_t)column * source_width) / width);
-            const uint8_t *pixel = source + (uint64_t)source_x * 4U;
+    /* Immutable artwork is filtered once, not on every hover or scene repair.
+     * Six fixed cache slots cover Files and the five atlas crops. */
+    static struct {
+        const uint8_t *source;
+        uint32_t left, top, width, height;
+        uint32_t pixels[DESKTOP_ICON_IMAGE_WIDTH * DESKTOP_ICON_IMAGE_HEIGHT];
+    } cache[6];
+    uint32_t *filtered = 0;
+    if (width == DESKTOP_ICON_IMAGE_WIDTH && height == DESKTOP_ICON_IMAGE_HEIGHT) {
+        for (uint32_t i = 0U; i < 6U; ++i) {
+            if (cache[i].source == asset->pixels && cache[i].left == source_left &&
+                cache[i].top == source_top && cache[i].width == source_width &&
+                cache[i].height == source_height) {
+                filtered = cache[i].pixels;
+                break;
+            }
+            if (cache[i].source != 0) continue;
+            for (uint32_t row = 0U; row < height; ++row)
+                for (uint32_t column = 0U; column < width; ++column)
+                    cache[i].pixels[row * width + column] = desktop_icon_area_pixel(
+                        asset->pixels, asset->stride, source_left, source_top,
+                        source_width, source_height, width, height, column, row);
+            cache[i].source = asset->pixels;
+            cache[i].left = source_left; cache[i].top = source_top;
+            cache[i].width = source_width; cache[i].height = source_height;
+            filtered = cache[i].pixels;
+            break;
+        }
+    }
+    if (filtered != 0) {
+        desktop_draw_cached_icon_locked(context, x, y, width, &clip, filtered);
+        return;
+    }
+    for (uint32_t row = clip.y0; row < clip.y1; ++row) {
+        for (uint32_t column = clip.x0; column < clip.x1; ++column) {
+            uint32_t pixel = desktop_icon_area_pixel(asset->pixels, asset->stride,
+                    source_left, source_top, source_width, source_height,
+                    width, height, column, row);
             desktop_blend_asset_pixel_locked(
                 context,
                 x + (int32_t)column,
                 y + (int32_t)row,
-                ((uint32_t)pixel[3] << 24) |
-                ((uint32_t)pixel[0] << 16) |
-                ((uint32_t)pixel[1] << 8) |
-                pixel[2]);
-        }
-    }
-}
-
-static void desktop_draw_task_icon_locked(
-    const desktop_render_context_t *context, int32_t x, int32_t y) {
-    if (context == 0) return;
-    for (uint32_t row = 5U; row < 43U; ++row) {
-        for (uint32_t column = 5U; column < 43U; ++column) {
-            desktop_blend_asset_pixel_locked(
-                context, x + (int32_t)column, y + (int32_t)row,
-                0xFF25364AU);
-        }
-    }
-    for (uint32_t row = 28U; row < 38U; ++row) {
-        for (uint32_t column = 10U; column < 17U; ++column) {
-            desktop_blend_asset_pixel_locked(
-                context, x + (int32_t)column, y + (int32_t)row,
-                0xFF5B86D6U);
-        }
-        for (uint32_t column = 20U; column < 27U; ++column) {
-            desktop_blend_asset_pixel_locked(
-                context, x + (int32_t)column, y + (int32_t)row,
-                0xFF5B86D6U);
-        }
-    }
-    for (uint32_t row = 20U; row < 38U; ++row) {
-        for (uint32_t column = 30U; column < 37U; ++column) {
-            desktop_blend_asset_pixel_locked(
-                context, x + (int32_t)column, y + (int32_t)row,
-                0xFF55C58AU);
+                pixel);
         }
     }
 }
@@ -312,6 +367,11 @@ static void desktop_draw_task_icon_locked(
 static bool desktop_draw_wallpaper_asset_locked(
     const desktop_render_context_t *context) {
     const desktop_asset_image_t *asset = &g_desktop_wallpaper_asset;
+    volatile uint32_t *target;
+    uint32_t display_width;
+    uint32_t display_height;
+    uint32_t display_stride;
+    uint32_t *destination;
     uint64_t image_width;
     uint64_t image_height;
     uint64_t x_scale;
@@ -326,17 +386,43 @@ static bool desktop_draw_wallpaper_asset_locked(
         return false;
     }
 
+    target = context->target != 0 ?
+        context->target : g_window_server.composite_framebuffer;
+    display_width = context->target_width != 0U ?
+        context->target_width : g_window_server.display_width;
+    display_height = context->target_height != 0U ?
+        context->target_height : g_window_server.display_height;
+    display_stride = context->target_stride != 0U ?
+        context->target_stride : g_window_server.display_stride;
+    if (display_width == 0U || display_height == 0U ||
+        display_stride < display_width ||
+        context->bounds.x0 >= context->bounds.x1 ||
+        context->bounds.y0 >= context->bounds.y1) {
+        return false;
+    }
+
+    /*
+     * This routine is used only while building the private WB desktop cache.
+     * Keep the cache target in an ordinary pointer so the compiler can retain
+     * the destination row and stride in registers.  The old expression went
+     * through window_server.composite_framebuffer (a volatile pointer) for
+     * every pixel, which turned the one-time wallpaper build into a visibly
+     * blocking QEMU operation.
+     */
+    destination = (uint32_t *)(uintptr_t)target;
+    if (destination == 0) return false;
+
     /* Scale to cover the display while preserving the artwork's aspect
      * ratio.  The source is intentionally kept large on the boot volume;
      * smaller displays therefore use a downscaled, centered image. */
-    if ((uint64_t)g_window_server.display_width * asset->height >=
-        (uint64_t)g_window_server.display_height * asset->width) {
-        image_width = g_window_server.display_width;
-        image_height = ((uint64_t)g_window_server.display_width *
+    if ((uint64_t)display_width * asset->height >=
+        (uint64_t)display_height * asset->width) {
+        image_width = display_width;
+        image_height = ((uint64_t)display_width *
                         asset->height + asset->width - 1U) / asset->width;
     } else {
-        image_height = g_window_server.display_height;
-        image_width = ((uint64_t)g_window_server.display_height *
+        image_height = display_height;
+        image_width = ((uint64_t)display_height *
                        asset->width + asset->height - 1U) / asset->height;
     }
     if (image_width == 0U || image_height == 0U ||
@@ -344,9 +430,9 @@ static bool desktop_draw_wallpaper_asset_locked(
         return false;
     }
 
-    image_left = ((int64_t)g_window_server.display_width -
+    image_left = ((int64_t)display_width -
                   (int64_t)image_width) / 2;
-    image_top = ((int64_t)g_window_server.display_height -
+    image_top = ((int64_t)display_height -
                  (int64_t)image_height) / 2;
     x_scale = ((uint64_t)asset->width << 32U) / image_width;
     y_scale = ((uint64_t)asset->height << 32U) / image_height;
@@ -358,19 +444,20 @@ static bool desktop_draw_wallpaper_asset_locked(
         if (source_y >= asset->height) source_y = asset->height - 1U;
         uint64_t source_x_fixed =
             (uint64_t)((int64_t)context->bounds.x0 - image_left) * x_scale;
+        const uint8_t *source_row = asset->pixels +
+            (uint64_t)source_y * asset->stride;
+        uint32_t *destination_row = destination +
+            (uint64_t)(uint32_t)y * display_stride;
         for (int32_t x = (int32_t)context->bounds.x0;
              x < (int32_t)context->bounds.x1; ++x) {
             uint32_t source_x = (uint32_t)(source_x_fixed >> 32U);
             if (source_x >= asset->width) source_x = asset->width - 1U;
-            const uint8_t *pixel = asset->pixels +
-                (uint64_t)source_y * asset->stride +
+            const uint8_t *pixel = source_row +
                 (uint64_t)source_x * 4U;
             uint32_t color = ((uint32_t)pixel[0] << 16) |
                              ((uint32_t)pixel[1] << 8) |
                              pixel[2];
-            g_window_server.composite_framebuffer[
-                (uint64_t)(uint32_t)y * g_window_server.display_stride +
-                (uint32_t)x] = color;
+            destination_row[(uint32_t)x] = color;
             if (x + 1 < (int32_t)context->bounds.x1) {
                 source_x_fixed += x_scale;
             }
@@ -510,11 +597,6 @@ static void desktop_draw_icon_locked(
         return;
     }
 
-    if (icon->app == DESKTOP_APP_TASKMGR) {
-        desktop_draw_task_icon_locked(context, image_x, image_y);
-        return;
-    }
-
     if (g_desktop_icons_asset.pixels == 0) {
         return;
     }
@@ -525,20 +607,19 @@ static void desktop_draw_icon_locked(
     uint32_t source_height = 0U;
 
     if (icon->app == DESKTOP_APP_TERMINAL) {
-        source_left = 858U;
-        source_top = 32U;
-        source_width = 418U;
-        source_height = 414U;
+        source_width = source_height = 256U;
     } else if (icon->app == DESKTOP_APP_NOTES) {
-        source_left = 258U;
-        source_top = 513U;
-        source_width = 420U;
-        source_height = 419U;
+        source_left = 256U;
+        source_width = source_height = 256U;
     } else if (icon->app == DESKTOP_APP_NETWORK) {
-        source_left = 858U;
-        source_top = 512U;
-        source_width = 421U;
-        source_height = 420U;
+        source_left = 512U;
+        source_width = source_height = 256U;
+    } else if (icon->app == DESKTOP_APP_TASKMGR) {
+        source_left = 768U;
+        source_width = source_height = 256U;
+    } else if (icon->app == DESKTOP_APP_CHROME) {
+        source_left = 1024U;
+        source_width = source_height = 256U;
     }
 
     if (source_width == 0U) {
@@ -611,7 +692,7 @@ static uint32_t *g_desktop_cache;
 static uint32_t g_desktop_cache_width;
 static uint32_t g_desktop_cache_height;
 static uint32_t g_desktop_cache_stride;
-static bool g_desktop_cache_ready;
+static atomic_bool g_desktop_cache_ready;
 
 
 /*
@@ -660,15 +741,14 @@ static inline void desktop_copy_wb_pixels(
 
 
 /*
- * Build the static desktop exactly once.
+ * Build the static desktop on the asset worker's CPU.
  *
- * desktop_render_assets_locked() renders the current artwork and icons.
- * Temporarily redirect its destination into the cache and pass an explicit
- * full-screen context with hover disabled.
+ * The compositor must never spend tens of seconds scaling the large PNG.
+ * Render into the private cache through the context target instead of
+ * temporarily changing g_window_server.composite_framebuffer; that keeps the
+ * live compositor and input path independent while the cache is generated.
  */
-static bool desktop_build_cache(void) {
-    volatile uint32_t *saved_framebuffer;
-
+bool desktop_shell_build_cache(void) {
     desktop_render_context_t cache_context = {
         .bounds = {
             .x0 = 0U,
@@ -677,104 +757,95 @@ static bool desktop_build_cache(void) {
             .y1 = 0U,
         },
         .hovered_app = DESKTOP_APP_NONE,
+        .target = 0,
+        .target_width = 0U,
+        .target_height = 0U,
+        .target_stride = 0U,
     };
-
+    uint32_t display_width = g_window_server.display_width;
+    uint32_t display_height = g_window_server.display_height;
+    uint32_t display_stride = g_window_server.display_stride;
     uint64_t bytes;
-    bool rendered;
 
-    if (g_window_server.display_width == 0U ||
-        g_window_server.display_height == 0U ||
-        g_window_server.display_stride <
-            g_window_server.display_width) {
+    if (display_width == 0U ||
+        display_height == 0U ||
+        display_stride < display_width ||
+        !desktop_shell_assets_available()) {
         return false;
     }
 
-    if (atomic_exchange_explicit(&g_desktop_assets_pending, false,
-                                 memory_order_acq_rel)) {
-        g_desktop_cache_ready = false;
-    }
-
-    /*
-     * Rebuild if a future display-mode change modifies geometry.
-     */
-    if (g_desktop_cache != 0 &&
-        (g_desktop_cache_width !=
-             g_window_server.display_width ||
-         g_desktop_cache_height !=
-             g_window_server.display_height ||
-         g_desktop_cache_stride !=
-             g_window_server.display_stride)) {
-
-        kfree(g_desktop_cache);
-
-        g_desktop_cache = 0;
-        g_desktop_cache_ready = false;
-    }
-
-    if (g_desktop_cache_ready &&
-        g_desktop_cache != 0) {
+    if (atomic_load_explicit(&g_desktop_cache_ready,
+                             memory_order_acquire) &&
+        g_desktop_cache != 0 &&
+        g_desktop_cache_width == display_width &&
+        g_desktop_cache_height == display_height &&
+        g_desktop_cache_stride == display_stride) {
         return true;
     }
 
-    bytes =
-        (uint64_t)g_window_server.display_stride *
-        g_window_server.display_height *
-        sizeof(uint32_t);
+    /* The cache is not consumed until the release-store below. */
+    atomic_store_explicit(&g_desktop_cache_ready, false,
+                          memory_order_release);
 
-    if (bytes == 0U ||
-        bytes > (uint64_t)SIZE_MAX) {
+    if (g_desktop_cache != 0 &&
+        (g_desktop_cache_width != display_width ||
+         g_desktop_cache_height != display_height ||
+         g_desktop_cache_stride != display_stride)) {
+        kfree(g_desktop_cache);
+        g_desktop_cache = 0;
+    }
+
+    bytes = (uint64_t)display_stride *
+            display_height * sizeof(uint32_t);
+    if (bytes == 0U || bytes > (uint64_t)SIZE_MAX) {
         return false;
     }
 
     if (g_desktop_cache == 0) {
-        g_desktop_cache =
-            (uint32_t *)kzalloc(
-                (size_t)bytes,
-                0);
-
+        g_desktop_cache = (uint32_t *)kzalloc((size_t)bytes, 0U);
         if (g_desktop_cache == 0) {
             return false;
         }
     }
 
-    saved_framebuffer =
-        g_window_server.composite_framebuffer;
+    g_desktop_cache_width = display_width;
+    g_desktop_cache_height = display_height;
+    g_desktop_cache_stride = display_stride;
+    cache_context.bounds.x1 = display_width;
+    cache_context.bounds.y1 = display_height;
+    cache_context.target = (volatile uint32_t *)g_desktop_cache;
+    cache_context.target_width = display_width;
+    cache_context.target_height = display_height;
+    cache_context.target_stride = display_stride;
 
-    cache_context.bounds.x1 = g_window_server.display_width;
-    cache_context.bounds.y1 = g_window_server.display_height;
-
-    /*
-     * Render an unhovered full-screen desktop into the retained buffer.
-     */
-    window_buffer_set_target_locked(
-        (volatile uint32_t *)g_desktop_cache);
-
-    rendered = desktop_render_assets_locked(&cache_context);
-
-    /*
-     * Restore live frame state.
-     */
-    window_buffer_set_target_locked(saved_framebuffer);
-
-    if (!rendered) {
+    if (!desktop_render_assets_locked(&cache_context)) {
         return false;
     }
 
-    g_desktop_cache_width =
-        g_window_server.display_width;
-
-    g_desktop_cache_height =
-        g_window_server.display_height;
-
-    g_desktop_cache_stride =
-        g_window_server.display_stride;
-
-    /* The fallback is a valid retained frame even while the disk assets are
-     * being loaded by the background asset worker.  Once those assets arrive
-     * the worker invalidates this cache and requests one replacement frame. */
-    g_desktop_cache_ready = true;
-
+    atomic_store_explicit(&g_desktop_cache_ready, true,
+                          memory_order_release);
     return true;
+}
+
+
+/* The compositor only consumes a completely published cache. */
+static bool desktop_build_cache(void) {
+    uint32_t display_width = g_window_server.display_width;
+    uint32_t display_height = g_window_server.display_height;
+    uint32_t display_stride = g_window_server.display_stride;
+
+    if (display_width == 0U || display_height == 0U ||
+        display_stride < display_width ||
+        !desktop_shell_assets_available() ||
+        g_desktop_cache == 0 ||
+        !atomic_load_explicit(&g_desktop_cache_ready,
+                              memory_order_acquire)) {
+        return false;
+    }
+
+    return g_desktop_cache_width == display_width &&
+           g_desktop_cache_height == display_height &&
+           g_desktop_cache_stride == display_stride;
 }
 
 

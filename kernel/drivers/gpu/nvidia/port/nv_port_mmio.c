@@ -1,9 +1,29 @@
 #include "nv_port.h"
 
 #include <arch/x86_64/paging.h>
+#include <kernel/console.h>
 
 #ifdef NV_PORT_HOST_TEST
+#include <stdlib.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
+
+static void *nv_port_mmio_host_aligned_alloc(size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, PAGE_SIZE);
+#else
+    return aligned_alloc(PAGE_SIZE, size);
+#endif
+}
+
+static void nv_port_mmio_host_free(void *storage) {
+#ifdef _WIN32
+    _aligned_free(storage);
+#else
+    free(storage);
+#endif
+}
 #endif
 
 #define NV_PORT_MMIO_SLOT_COUNT 1024U
@@ -101,7 +121,7 @@ kstatus_t nv_port_mmio_map(paddr_t physical, uint64_t length,
         return K_EOVERFLOW;
     }
 #ifdef NV_PORT_HOST_TEST
-    void *storage = _aligned_malloc((size_t)mapped_length, PAGE_SIZE);
+    void *storage = nv_port_mmio_host_aligned_alloc((size_t)mapped_length);
     if (storage == 0) return K_ENOMEM;
     *out = (nv_port_mmio_mapping_t){
         .base = (uint8_t *)storage + offset,
@@ -131,6 +151,13 @@ kstatus_t nv_port_mmio_map(paddr_t physical, uint64_t length,
         if (status != K_OK) break;
     }
     if (status != K_OK) {
+        kernel_serial_printf_serial_only(
+            "OS_NVIDIA_PORT_MMIO_FAIL slot=%d va=%llx "
+            "physical=%llx length=%llx mapped=%llx status=%d\r\n",
+            (int)slot, (unsigned long long)virtual_base,
+            (unsigned long long)physical.value,
+            (unsigned long long)length,
+            (unsigned long long)mapped, (int)status);
         while (mapped != 0U) {
             mapped -= PAGE_SIZE;
             (void)x86_unmap_page(root, virtual_base + mapped, 0);
@@ -171,7 +198,7 @@ kstatus_t nv_port_mmio_map_bar(const pci_device_t *device, uint32_t bar_index,
 kstatus_t nv_port_mmio_unmap(nv_port_mmio_mapping_t *mapping) {
     if (mapping == 0 || !mapping->active) return K_EINVAL;
 #ifdef NV_PORT_HOST_TEST
-    _aligned_free(mapping->host_storage);
+    nv_port_mmio_host_free(mapping->host_storage);
     *mapping = (nv_port_mmio_mapping_t){0};
     return K_OK;
 #else

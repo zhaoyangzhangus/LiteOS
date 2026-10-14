@@ -1,17 +1,17 @@
 #ifdef __ELF__
-    .section .rdata
+    .section .rdata,"a",@progbits
 #else
     .section .rdata,"dr"
 #endif
     .p2align 4
-    .globl liteos_user_runtime_blob_start
-    .globl liteos_user_runtime_blob_end
-    .globl liteos_user_runtime_child
-    .globl liteos_user_runtime_timer_helper
-    .globl liteos_user_runtime_vm_worker
-    .globl liteos_user_runtime_cow_worker
-    .globl liteos_user_runtime_uaccess_worker
-    .globl liteos_user_runtime_wait_race_worker
+    .globl user_runtime_blob_start
+    .globl user_runtime_blob_end
+    .globl user_runtime_child
+    .globl user_runtime_timer_helper
+    .globl user_runtime_vm_worker
+    .globl user_runtime_cow_worker
+    .globl user_runtime_uaccess_worker
+    .globl user_runtime_wait_race_worker
 
 /*
  * 这段代码不会在内核地址直接执行，而是作为无重定位的测试载荷复制进 ELF
@@ -31,6 +31,7 @@
     .set SYS_WAIT_MANY,      0x0202
     .set SYS_FUTEX_WAIT,     0x0203
     .set SYS_FUTEX_WAKE,     0x0204
+    .set FUTEX_FLAG_SHARED,  1
     .set SYS_PORT_CREATE,     0x0400
     .set SYS_PORT_SEND,       0x0401
     .set SYS_FILE_OPEN,      0x0300
@@ -83,6 +84,8 @@
     .set WAIT_RACE_ACK_TIMEOUT_NS, 100000000
     /* Leave margin for the serial debug stream on a multi-vCPU emulator. */
     .set THREAD_WAIT_TIMEOUT_NS, 5000000000
+    .set EXEC_PIN_ACK_ADDRESS, 0x004021F7
+    .set EXEC_PIN_EXEC_ACK_ADDRESS, 0x004021F8
     .set COW_SYNC_ADDRESS,0x0000000067000000
     .set COW_PRIVATE_ADDRESS,0x0000000068000000
     .set COW_PROGRESS_ADDRESS,0x0000000067000004
@@ -108,7 +111,7 @@
     .set GPU_MAP_ARGS_ADDRESS,    0x004022A0
     .set DISPLAY_ARGS_ADDRESS,    0x00402300
 
-liteos_user_runtime_blob_start:
+user_runtime_blob_start:
     xorl %r10d, %r10d
     xorl %r8d, %r8d
     xorl %r9d, %r9d
@@ -474,7 +477,7 @@ liteos_user_runtime_blob_start:
     movw $1, UACCESS_THREAD_ARGS_ADDRESS+4
     movw $0, UACCESS_THREAD_ARGS_ADDRESS+6
     movq $0x00400000, %rax
-    addq $liteos_user_runtime_uaccess_worker-liteos_user_runtime_blob_start, %rax
+    addq $user_runtime_uaccess_worker-user_runtime_blob_start, %rax
     movq %rax, UACCESS_THREAD_ARGS_ADDRESS+8
     movq THREAD_ARGS_ADDRESS+16, %rax
     movq %rax, UACCESS_THREAD_ARGS_ADDRESS+16
@@ -547,7 +550,7 @@ liteos_user_runtime_blob_start:
     movw $1, WAIT_RACE_THREAD_ARGS_ADDRESS+4
     movw $0, WAIT_RACE_THREAD_ARGS_ADDRESS+6
     movq $0x00400000, %rax
-    addq $liteos_user_runtime_wait_race_worker-liteos_user_runtime_blob_start, %rax
+    addq $user_runtime_wait_race_worker-user_runtime_blob_start, %rax
     movq %rax, WAIT_RACE_THREAD_ARGS_ADDRESS+8
     movq THREAD_ARGS_ADDRESS+16, %rax
     movq %rax, WAIT_RACE_THREAD_ARGS_ADDRESS+16
@@ -631,7 +634,7 @@ liteos_user_runtime_blob_start:
     movw $1, COW_THREAD_ARGS_ADDRESS+4
     movw $0, COW_THREAD_ARGS_ADDRESS+6
     movq $0x00400000, %rax
-    addq $liteos_user_runtime_cow_worker-liteos_user_runtime_blob_start, %rax
+    addq $user_runtime_cow_worker-user_runtime_blob_start, %rax
     movq %rax, COW_THREAD_ARGS_ADDRESS+8
     movq THREAD_ARGS_ADDRESS+16, %rax
     movq %rax, COW_THREAD_ARGS_ADDRESS+16
@@ -655,7 +658,7 @@ liteos_user_runtime_blob_start:
     movq $COW_SYNC_ADDRESS, %rdi
     movl $0x11, %esi
     movq $1000000000, %rdx
-    xorl %r10d, %r10d
+    movl $FUTEX_FLAG_SHARED, %r10d
     syscall
     testq %rax, %rax
     jz .Lcow_parent_ready
@@ -1314,6 +1317,9 @@ liteos_user_runtime_blob_start:
     js .Lruntime_failure
 
     movb $17, STAGE_MARK_ADDRESS
+.Lexec_pin_test_wait:
+    cmpb $1, EXEC_PIN_ACK_ADDRESS
+    jne .Lexec_pin_test_wait
     movl $SYS_DEBUG_QUERY, %eax
     movb $0xFF, STAGE_MARK_ADDRESS
     xorl %edi, %edi
@@ -1324,6 +1330,9 @@ liteos_user_runtime_blob_start:
     jne .Lruntime_failure
 
     movb $18, STAGE_MARK_ADDRESS
+.Lexec_pin_exec_wait:
+    cmpb $1, EXEC_PIN_EXEC_ACK_ADDRESS
+    jne .Lexec_pin_exec_wait
     movl $SYS_PROCESS_EXEC, %eax
     movq $0x00402110, %rdi       /* /sbin/libc-test */
     movq $0x00402120, %rsi       /* { "/sbin/libc-test", NULL } */
@@ -1348,7 +1357,7 @@ liteos_user_runtime_blob_start:
 
 /* 子线程验证初始 RDI 参数，留下可由内核检查的标记后退出。 */
 /* 保持用户态运行足够长时间，使 LAPIC 至少产生一次可抢占定时中断。 */
-liteos_user_runtime_timer_helper:
+user_runtime_timer_helper:
     cmpq $0x5678, %rdi
     jne .Ltimer_failure
 .Ltimer_spin:
@@ -1365,7 +1374,7 @@ liteos_user_runtime_timer_helper:
     syscall
     ud2
 
-liteos_user_runtime_child:
+user_runtime_child:
     movb $0x5A, CHILD_MARK_ADDRESS
     cmpq $0x1234, %rdi
     jne .Lchild_failure
@@ -1390,7 +1399,7 @@ liteos_user_runtime_child:
     syscall
     ud2
 
-liteos_user_runtime_cow_worker:
+user_runtime_cow_worker:
     movb $1, COW_PROGRESS_ADDRESS
     cmpb $0x11, COW_PRIVATE_ADDRESS
     jne .Lcow_child_private_read_failure
@@ -1406,7 +1415,7 @@ liteos_user_runtime_cow_worker:
     movl $SYS_FUTEX_WAKE, %eax
     movq $COW_SYNC_ADDRESS, %rdi
     movl $1, %esi
-    xorl %edx, %edx
+    movl $FUTEX_FLAG_SHARED, %edx
     syscall
     testq %rax, %rax
     js .Lcow_child_futex_failure
@@ -1438,7 +1447,7 @@ liteos_user_runtime_cow_worker:
  * 与主线程共享同一个地址空间的 VM 压力线程。参数的最低位选择固定地址，
  * 每次循环都覆盖 map、缺页、protect 和 unmap，系统调用之间允许被抢占。
  */
-liteos_user_runtime_vm_worker:
+user_runtime_vm_worker:
     movq %rdi, %r12
     andq $1, %r12
     shlq $21, %r12
@@ -1512,7 +1521,7 @@ liteos_user_runtime_vm_worker:
     syscall
     ud2
 
-liteos_user_runtime_uaccess_worker:
+user_runtime_uaccess_worker:
     leaq -64(%rsp), %r13
 .Luaccess_worker_wait:
     cmpb $1, UACCESS_START_ADDRESS
@@ -1555,7 +1564,7 @@ liteos_user_runtime_uaccess_worker:
     syscall
     ud2
 
-liteos_user_runtime_wait_race_worker:
+user_runtime_wait_race_worker:
     movl $1, %r15d
 .Lwait_worker_start:
     cmpb $1, WAIT_RACE_START_ADDRESS
@@ -1598,4 +1607,4 @@ liteos_user_runtime_wait_race_worker:
     syscall
     ud2
 
-liteos_user_runtime_blob_end:
+user_runtime_blob_end:

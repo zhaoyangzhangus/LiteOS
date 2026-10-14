@@ -1,3 +1,5 @@
+#include <kernel/display.h>
+#include <kernel/qemu_stdvga.h>
 #include "internal.h"
 
 #define WINDOW_CURSOR_WIDTH 24U
@@ -702,11 +704,15 @@ void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
 
     if (g_window_server.composite_framebuffer != 0 &&
         g_window_server.composite_framebuffer !=
-            g_window_server.framebuffer) {
+            g_window_server.framebuffer &&
+        !display_core_has_native_scanout(0U) &&
+        !qemu_stdvga_page_flip_active()) {
         /*
          * The retained WB scene deliberately excludes the cursor.  Moving
          * only the pointer does not change scene pixels and must not schedule
-         * a full compositor frame.
+         * a full compositor frame. QEMU is the exception: it has no hardware
+         * cursor plane, so the old and new cursor rectangles must travel
+         * through the hidden-page flip path.
          */
         return;
     }
@@ -717,10 +723,12 @@ void window_mark_moved_cursor_locked(uint32_t old_x, uint32_t old_y,
     int32_t new_top;
 
     /* pointer_x/y 鏄?cursor hotspot锛屼笉鏄?sprite 宸︿笂瑙掋€?*/
-    old_left = (int32_t)old_x - (int32_t)WINDOW_CURSOR_HOTSPOT_X;
-    old_top = (int32_t)old_y - (int32_t)WINDOW_CURSOR_HOTSPOT_Y;
-    new_left = (int32_t)new_x - (int32_t)WINDOW_CURSOR_HOTSPOT_X;
-    new_top = (int32_t)new_y - (int32_t)WINDOW_CURSOR_HOTSPOT_Y;
+    uint32_t old_shape = g_window_server.presented_cursor_shape;
+    uint32_t new_shape = window_input_cursor_shape_locked();
+    old_left = (int32_t)old_x - (int32_t)window_cursor_hotspot_x(old_shape);
+    old_top = (int32_t)old_y - (int32_t)window_cursor_hotspot_y(old_shape);
+    new_left = (int32_t)new_x - (int32_t)window_cursor_hotspot_x(new_shape);
+    new_top = (int32_t)new_y - (int32_t)window_cursor_hotspot_y(new_shape);
 
     /*
      * Old/new cursor locations are independent damages.  Do not create a

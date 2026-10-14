@@ -1,14 +1,11 @@
 #include <kernel/package.h>
 
 static void package_lock(package_registry_t *registry) {
-    while (atomic_exchange_explicit(&registry->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&registry->lock);
 }
 
 static void package_unlock(package_registry_t *registry) {
-    atomic_store_explicit(&registry->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&registry->lock);
 }
 
 static bool package_id_equal(const uint8_t left[PACKAGE_ID_SIZE],
@@ -43,10 +40,11 @@ bool package_identity_valid(const package_identity_t *identity) {
 bool package_registry_init(package_registry_t *registry) {
     unsigned expected = 0U;
     if (registry == 0) return false;
+    if (atomic_load_explicit(&registry->init_state, memory_order_acquire) == 2U) return true;
     if (atomic_compare_exchange_strong_explicit(&registry->init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&registry->lock.state, 0U);
+        spinlock_init(&registry->lock);
         for (uint32_t i = 0; i < PACKAGE_REGISTRY_CAPACITY; ++i) {
             registry->entries[i].registered = false;
             registry->entries[i].identity = (package_identity_t){0};
@@ -61,10 +59,15 @@ bool package_registry_init(package_registry_t *registry) {
 }
 
 static package_registry_entry_t *package_find_locked(
-    package_registry_t *registry, const uint8_t package_id[PACKAGE_ID_SIZE]) {
+    package_registry_t *registry, const uint8_t package_id[PACKAGE_ID_SIZE],
+    package_registry_entry_t **first_free) {
+    if (first_free != 0) *first_free = 0;
     for (uint32_t i = 0; i < PACKAGE_REGISTRY_CAPACITY; ++i) {
-        if (registry->entries[i].registered &&
-            package_id_equal(registry->entries[i].identity.package_id, package_id)) {
+        if (!registry->entries[i].registered) {
+            if (first_free != 0 && *first_free == 0) *first_free = &registry->entries[i];
+            continue;
+        }
+        if (package_id_equal(registry->entries[i].identity.package_id, package_id)) {
             return &registry->entries[i];
         }
     }
@@ -74,9 +77,10 @@ static package_registry_entry_t *package_find_locked(
 kstatus_t package_register(package_registry_t *registry,
                            const package_identity_t *identity) {
     package_registry_entry_t *entry;
+    package_registry_entry_t *first_free;
     if (!package_registry_init(registry) || !package_identity_valid(identity)) return K_EINVAL;
     package_lock(registry);
-    entry = package_find_locked(registry, identity->package_id);
+    entry = package_find_locked(registry, identity->package_id, &first_free);
     if (entry != 0) {
         /* 同一身份只允许单调升级，防止回滚包覆盖已确认版本。 */
         if (identity->version <= entry->identity.version ||
@@ -88,13 +92,11 @@ kstatus_t package_register(package_registry_t *registry,
         package_unlock(registry);
         return K_OK;
     }
-    for (uint32_t i = 0; i < PACKAGE_REGISTRY_CAPACITY; ++i) {
-        if (!registry->entries[i].registered) {
-            registry->entries[i].identity = *identity;
-            registry->entries[i].registered = true;
-            package_unlock(registry);
-            return K_OK;
-        }
+    if (first_free != 0) {
+        first_free->identity = *identity;
+        first_free->registered = true;
+        package_unlock(registry);
+        return K_OK;
     }
     package_unlock(registry);
     return K_ENOMEM;
@@ -107,7 +109,7 @@ kstatus_t package_lookup(package_registry_t *registry,
     if (!package_registry_init(registry) || package_id == 0 || identity == 0 ||
         !package_bytes_nonzero(package_id, PACKAGE_ID_SIZE)) return K_EINVAL;
     package_lock(registry);
-    entry = package_find_locked(registry, package_id);
+    entry = package_find_locked(registry, package_id, 0);
     if (entry == 0) {
         package_unlock(registry);
         return K_ENOENT;
@@ -123,7 +125,7 @@ kstatus_t package_unregister(package_registry_t *registry,
     if (!package_registry_init(registry) || package_id == 0 ||
         !package_bytes_nonzero(package_id, PACKAGE_ID_SIZE)) return K_EINVAL;
     package_lock(registry);
-    entry = package_find_locked(registry, package_id);
+    entry = package_find_locked(registry, package_id, 0);
     if (entry == 0) {
         package_unlock(registry);
         return K_ENOENT;

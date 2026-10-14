@@ -7,6 +7,8 @@
 #include <kernel/object.h>
 #include <kernel/spinlock.h>
 #include <kernel/iommu.h>
+#include <kernel/string.h>
+#include <kernel/sched.h>
 
 #define AUDIO_MAX_PERIODS 32U
 #define AUDIO_MAX_CHANNELS 8U
@@ -69,17 +71,26 @@ static void audio_object_init(object_header_t *object) {
 }
 
 static void audio_lock(audio_stream_t *stream) {
-    while (atomic_exchange_explicit(&stream->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    sched_preempt_disable();
+    spinlock_lock(&stream->lock);
 }
 
 static void audio_unlock(audio_stream_t *stream) {
-    atomic_store_explicit(&stream->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&stream->lock);
+    sched_preempt_enable();
 }
 
 static void audio_copy_bytes(void *destination, const void *source, size_t size) {
+    if (size == 0U) return;
+    uintptr_t out_address = (uintptr_t)destination;
+    uintptr_t in_address = (uintptr_t)source;
+    uintptr_t distance = out_address >= in_address ?
+                         out_address - in_address : in_address - out_address;
+    if (distance >= size) {
+        memcpy(destination, source, size);
+        return;
+    }
+    /* Preserve the original forward-copy behavior for overlapping ranges. */
     uint8_t *out = (uint8_t *)destination;
     const uint8_t *in = (const uint8_t *)source;
     while (size-- != 0U) *out++ = *in++;
@@ -192,6 +203,7 @@ static kstatus_t audio_allocate_periods_locked(audio_stream_t *stream) {
 }
 
 bool audio_core_init(void) {
+    if (atomic_load_explicit(&g_audio_init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_audio_init_state, &expected, 1U,
                                                 memory_order_acq_rel,
@@ -228,7 +240,7 @@ kstatus_t audio_stream_create(struct device *device, audio_direction_t direction
     stream = (audio_stream_t *)kzalloc(sizeof(*stream), 0);
     if (stream == 0) return K_ENOMEM;
     audio_object_init(&stream->object);
-    atomic_init(&stream->lock.state, 0U);
+    spinlock_init(&stream->lock);
     stream->device = device;
     stream->direction = direction;
     stream->state = AUDIO_STREAM_NEW;

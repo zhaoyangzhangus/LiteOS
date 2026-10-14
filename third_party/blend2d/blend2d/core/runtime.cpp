@@ -164,8 +164,8 @@ static BL_INLINE uint32_t bl_runtime_detect_cpu_features(const asmjit::CpuInfo& 
   bl_unused(asm_cpu_info);
 #endif
 
-#if defined(BL_PLATFORM_LITEOS) && BL_TARGET_ARCH_X86
-  // LiteOS currently switches user FPU state with FXSAVE/FXRSTOR only.
+#if defined(BL_PLATFORM_FREESTANDING) && BL_TARGET_ARCH_X86
+  // The guest kernel currently switches user FPU state with FXSAVE/FXRSTOR only.
   // Until XSAVE preserves YMM/ZMM registers, AVX code is not safe even if
   // the processor reports the corresponding CPUID features.
   features &= ~(BL_RUNTIME_CPU_FEATURE_X86_AVX  |
@@ -332,7 +332,7 @@ BL_API_IMPL BLResult bl_runtime_shutdown() noexcept {
   return BL_SUCCESS;
 }
 
-#if !defined(BL_PLATFORM_LITEOS)
+#if !defined(BL_PLATFORM_FREESTANDING)
 static BL_RUNTIME_INITIALIZER BLRuntimeInitializer bl_runtime_auto_init;
 #endif
 

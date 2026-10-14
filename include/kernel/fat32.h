@@ -6,14 +6,14 @@
 #include <uapi/file.h>
 
 /* FAT32 owns its path and open-file boundary; VFS consumes these APIs. */
-#define LITEOS_FAT32_PATH_LENGTH 256U
-#define LITEOS_FAT32_MAX_OPEN_FILES 64U
+#define OS_FAT32_PATH_LENGTH 256U
+#define OS_FAT32_MAX_OPEN_FILES 512U
 
-typedef struct LITEOS_FAT32 LITEOS_FAT32;
+typedef struct OS_FAT32 OS_FAT32;
 
 typedef struct {
     BOOLEAN Used;
-    LITEOS_FAT32 *FileSystem;
+    OS_FAT32 *FileSystem;
     UINT32 FirstCluster;
     UINT64 Size;
     UINT32 Attributes;
@@ -23,10 +23,19 @@ typedef struct {
     UINT32 CursorLogicalStart;
     UINT32 CursorPhysicalStart;
     UINT32 CursorLength;
-} LITEOS_FAT32_FILE;
+    UINT32 SeekCacheCount;
+    UINT32 SeekCacheNext;
+    UINT32 SeekLogical[8];
+    UINT32 SeekPhysical[8];
+    UINT32 SeekLength[8];
+    UINT32 SeekIndexValid;
+    UINT32 SeekIndexLogical[32];
+    UINT32 SeekIndexPhysical[32];
+    UINT32 SeekIndexLength[32];
+} OS_FAT32_FILE;
 
-struct LITEOS_FAT32 {
-    LITEOS_BLOCK_DEVICE *Device;
+struct OS_FAT32 {
+    OS_BLOCK_DEVICE *Device;
     UINT32 BytesPerSector;
     UINT32 SectorsPerCluster;
     UINT32 ReservedSectorCount;
@@ -41,37 +50,52 @@ struct LITEOS_FAT32 {
     UINT64 Fat3StartLba;
     UINT32 FatType;
     BOOLEAN Fat3Available;
-    LITEOS_BLOCK_CACHE Cache;
+    OS_BLOCK_CACHE Cache;
     UINT32 OpenFileLock;
     UINT32 MutationLock;
-    LITEOS_FAT32_FILE OpenFiles[LITEOS_FAT32_MAX_OPEN_FILES];
+    OS_FAT32_FILE OpenFiles[OS_FAT32_MAX_OPEN_FILES];
     BOOLEAN Mounted;
 };
 
-BOOLEAN liteos_fat32_init(LITEOS_FAT32 *filesystem,
-                          LITEOS_BLOCK_DEVICE *device);
-BOOLEAN liteos_fat32_destroy(LITEOS_FAT32 *filesystem);
-BOOLEAN liteos_fat32_open(LITEOS_FAT32 *filesystem, const CHAR8 *path,
-                          LITEOS_FAT32_FILE **out);
-BOOLEAN liteos_fat32_close(LITEOS_FAT32_FILE *file);
-BOOLEAN liteos_fat32_stat_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+BOOLEAN fat32_init(OS_FAT32 *filesystem,
+                          OS_BLOCK_DEVICE *device);
+BOOLEAN fat32_destroy(OS_FAT32 *filesystem);
+BOOLEAN fat32_open(OS_FAT32 *filesystem, const CHAR8 *path,
+                          OS_FAT32_FILE **out);
+BOOLEAN fat32_close(OS_FAT32_FILE *file);
+BOOLEAN fat32_stat_path(OS_FAT32 *filesystem, const CHAR8 *path,
                                 os_file_info_t *info);
-BOOLEAN liteos_fat32_enumerate_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+BOOLEAN fat32_enumerate_path(OS_FAT32 *filesystem, const CHAR8 *path,
                                      UINT32 index, os_file_info_t *info);
-BOOLEAN liteos_fat32_read_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+/* Visit at most limit entries in one traversal. A false visitor result stops
+ * immediately; end-of-directory/read failure retains already visited entries. */
+typedef BOOLEAN (*fat32_directory_visitor_t)(VOID *context,
+                                                   const os_file_info_t *info);
+VOID fat32_visit_directory(OS_FAT32 *filesystem, const CHAR8 *path,
+                                  UINT32 limit, fat32_directory_visitor_t visitor,
+                                  VOID *context);
+BOOLEAN fat32_read_path(OS_FAT32 *filesystem, const CHAR8 *path,
                                 UINT64 offset, VOID *buffer, UINT32 capacity,
                                 UINT32 *read_size);
-BOOLEAN liteos_fat32_write_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+/* Read through an already-open FAT file so sequential callers retain the
+ * cluster cursor across backend/page-cache requests. */
+BOOLEAN fat32_read_file(OS_FAT32_FILE *file, UINT64 offset,
+                                VOID *buffer, UINT32 capacity,
+                                UINT32 *read_size);
+BOOLEAN fat32_write_path(OS_FAT32 *filesystem, const CHAR8 *path,
                                  UINT64 offset, const VOID *buffer, UINT32 size,
                                  UINT32 *written_size);
-BOOLEAN liteos_fat32_write_file(LITEOS_FAT32_FILE *file, UINT64 offset,
+BOOLEAN fat32_write_file(OS_FAT32_FILE *file, UINT64 offset,
                                 const VOID *buffer, UINT32 size,
                                 UINT32 *written_size);
-BOOLEAN liteos_fat32_truncate_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+BOOLEAN fat32_truncate_path(OS_FAT32 *filesystem, const CHAR8 *path,
                                     UINT64 size);
-BOOLEAN liteos_fat32_create_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+BOOLEAN fat32_truncate_file(OS_FAT32_FILE *file, UINT64 size);
+BOOLEAN fat32_create_path(OS_FAT32 *filesystem, const CHAR8 *path,
                                   BOOLEAN directory);
-BOOLEAN liteos_fat32_remove_path(LITEOS_FAT32 *filesystem, const CHAR8 *path);
-BOOLEAN liteos_fat32_rename_path(LITEOS_FAT32 *filesystem, const CHAR8 *old_path,
+BOOLEAN fat32_remove_path(OS_FAT32 *filesystem, const CHAR8 *path);
+BOOLEAN fat32_remove_path_typed(OS_FAT32 *filesystem, const CHAR8 *path,
+                                int directory);
+BOOLEAN fat32_rename_path(OS_FAT32 *filesystem, const CHAR8 *old_path,
                                   const CHAR8 *new_path);
-BOOLEAN liteos_fat32_sync(LITEOS_FAT32 *filesystem);
+BOOLEAN fat32_sync(OS_FAT32 *filesystem);

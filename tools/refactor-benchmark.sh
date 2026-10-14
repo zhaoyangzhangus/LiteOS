@@ -5,7 +5,7 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 cd "$repo_root"
 
-build_dir="${BUILD:-build-refactor}"
+build_dir="${BUILD:-build}"
 runs="${BENCHMARK_RUNS:-5}"
 cpu_count="${BENCHMARK_CPU:-4}"
 seconds="${BENCHMARK_SECONDS:-90}"
@@ -127,10 +127,10 @@ if ((no_build == 0)); then
         fail "构建失败，完整日志：$build_dir/qemu-build.log"
     fi
 fi
-[[ -f "$build_dir/esp/EFI/LITEOS/kernel.elf" ]] ||
-    fail "找不到 $build_dir/esp/EFI/LITEOS/kernel.elf"
+[[ -f "$build_dir/esp/EFI/OS/kernel.elf" ]] ||
+    fail "找不到 $build_dir/esp/EFI/OS/kernel.elf"
 
-kernel_elf_path="$build_dir/esp/EFI/LITEOS/kernel.elf"
+kernel_elf_path="$build_dir/esp/EFI/OS/kernel.elf"
 
 parse_log() {
     awk '
@@ -146,11 +146,11 @@ parse_log() {
     }
     {
         sub(/\r$/, "", $0)
-        if ($1 == "LITEOS_BENCH" || $1 == "LITEOS_BENCH_VALUE") {
+        if ($1 == "OS_BENCH" || $1 == "OS_BENCH_VALUE") {
             name = field("name"); cycles = field("cycles")
             if (cycles == "") cycles = field("value")
             if (name != "" && cycles ~ /^[0-9]+$/) print name "\t" cycles
-        } else if ($1 == "LITEOS_PERF_KMALLOC_OK") {
+        } else if ($1 == "OS_PERF_KMALLOC_OK") {
             for (i = 2; i <= NF; ++i) {
                 split($i, pair, "=")
                 if (pair[2] !~ /^[0-9]+$/) continue
@@ -188,26 +188,26 @@ for ((run = 1; run <= runs; ++run)); do
         fail "QEMU benchmark schema verification failed for round $run"
     fi
     for required_marker in \
-        'LITEOS_USER_RUNTIME_OK' \
-        'LITEOS_USER_RUNTIME_SUBTESTS_OK' \
-        'LITEOS_USERMODE_OK' \
-        'LITEOS_STAGE phase=USER_RUNTIME step=5 value=1'; do
+        'OS_USER_RUNTIME_OK' \
+        'OS_USER_RUNTIME_SUBTESTS_OK' \
+        'OS_USERMODE_OK' \
+        'OS_STAGE phase=USER_RUNTIME step=5 value=1'; do
         grep -Fq "$required_marker" "$serial_path" || {
             show_failures "$serial_path"
             fail "QEMU round $run missing runtime success marker: $required_marker"
         }
     done
-    if grep -Eq 'LITEOS_USER_RUNTIME_(FAIL_STAGE|EXEC_WARN)|LITEOS_STAGE_FAIL' \
+    if grep -Eq '^OS_USER_RUNTIME_(FAIL_STAGE=|EXEC_WARN([[:space:]]|$))|^OS_STAGE_FAIL([[:space:]]|$)' \
             "$serial_path"; then
         show_failures "$serial_path"
         fail "QEMU round $run contains runtime failure marker"
     fi
-    grep -Fq 'LITEOS_STAGE phase=REFACTOR_P0_BASELINE step=16 value=1' \
+    grep -Fq 'OS_STAGE phase=REFACTOR_P0_BASELINE step=16 value=1' \
         "$serial_path" || fail "QEMU 第 $run 轮缺少 P0 基准记录"
     run_profile=""
-    if grep -Fq 'LITEOS_USB_MSC_FOUND' "$serial_path"; then
+    if grep -Fq 'OS_USB_MSC_FOUND' "$serial_path"; then
         run_profile='usb-msc'
-    elif grep -Fq 'LITEOS_NVME_HW_OK' "$serial_path"; then
+    elif grep -Fq 'OS_NVME_HW_OK' "$serial_path"; then
         run_profile='nvme-hardware'
     else
         fail "QEMU 第 $run 轮缺少可识别的存储工作负载标记"
@@ -237,7 +237,7 @@ mkdir -p "$(dirname -- "$baseline_path")"
 baseline_tmp="$baseline_path.tmp.$$"
 trap 'rm -f -- "$baseline_tmp"' EXIT
 {
-    printf '# LiteOS refactor benchmark baseline v1\n'
+    printf '# System refactor benchmark baseline v1\n'
     printf '# runs=%s cpu=%s seconds=%s\n' "$runs" "$cpu_count" "$seconds"
     printf '# storage=%s profile=%s accel=%s\n' \
         "$storage_mode" "$benchmark_profile" "$benchmark_accel"

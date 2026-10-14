@@ -14,13 +14,13 @@ $phase2Gate = Join-Path $PSScriptRoot 'phase2_gate.ps1'
 $phase3Build = Join-Path $PSScriptRoot 'phase3_vendor_build.ps1'
 $outputRoot = Join-Path $repoRoot 'build\nvidia\phase3'
 $rmObject = Join-Path $outputRoot 'vendor-rm.o'
-$liteosLinkObject = Join-Path $outputRoot 'vendor-rm-liteos.o'
+$systemLinkObject = Join-Path $outputRoot 'vendor-rm-system.o'
 $rmReport = Join-Path $outputRoot 'vendor_rm_objects.txt'
 $abiReport = Join-Path $outputRoot 'vendor_abi_objects.txt'
 $abiLinkList = Join-Path $outputRoot 'vendor_abi_link_objects.list'
-$liteosReport = Join-Path $outputRoot 'liteos_probe_objects.txt'
+$systemReport = Join-Path $outputRoot 'system_probe_objects.txt'
 $linkLog = Join-Path $outputRoot 'vendor_rm_link.log'
-$liteosLinkLog = Join-Path $outputRoot 'vendor_rm_liteos_link.log'
+$systemLinkLog = Join-Path $outputRoot 'vendor_rm_system_link.log'
 $unresolvedReport = Join-Path $outputRoot 'vendor_rm_unresolved.txt'
 $contractsSource = Join-Path $abiRoot 'nvabi_contracts.c'
 $miscSource = Join-Path $abiRoot 'nvabi_misc.c'
@@ -92,7 +92,7 @@ if ($buildExitCode -ne 0) { Fail-Gate 'Phase 3 vendor build failed' }
 
 $summaryRows = @($buildOutput | Where-Object { $_ -like 'SUMMARY *' })
 if ($summaryRows.Count -ne 1) { Fail-Gate 'Phase 3 build summary is missing' }
-$summaryMatch = [regex]::Match($summaryRows[0], '^SUMMARY selected=(\d+);compiled=(\d+);compile_failed=(\d+);abi_selected=(\d+);abi_compiled=(\d+);abi_linkable=(\d+);abi_compile_failed=(\d+);liteos_objects=(\d+);rm_link_exit=(\d+);liteos_link_exit=(\d+);linked_unresolved=(\d+)$')
+$summaryMatch = [regex]::Match($summaryRows[0], '^SUMMARY selected=(\d+);compiled=(\d+);compile_failed=(\d+);abi_selected=(\d+);abi_compiled=(\d+);abi_linkable=(\d+);abi_compile_failed=(\d+);system_objects=(\d+);rm_link_exit=(\d+);system_link_exit=(\d+);linked_unresolved=(\d+)$')
 if (-not $summaryMatch.Success) { Fail-Gate 'malformed Phase 3 build summary' }
 if ([int]$summaryMatch.Groups[1].Value -ne 1026 -or
     [int]$summaryMatch.Groups[2].Value -ne 1026 -or
@@ -110,19 +110,19 @@ if ([int]$summaryMatch.Groups[1].Value -ne 1026 -or
 
 $rmRows = @(Assert-CompiledObjectReport $rmReport 'rm' 1026)
 $abiRows = @(Assert-CompiledObjectReport $abiReport 'vendor_abi' 12)
-$liteosRows = @(Read-DataLines $liteosReport)
-if ($liteosRows.Count -le 0) { Fail-Gate 'LiteOS support object inventory is empty' }
-foreach ($row in $liteosRows) {
+$systemRows = @(Read-DataLines $systemReport)
+if ($systemRows.Count -le 0) { Fail-Gate 'System support object inventory is empty' }
+foreach ($row in $systemRows) {
     $fields = $row -split "`t", -1
     if ($fields.Count -ne 6 -or $fields[0] -ne 'converted' -or $fields[4] -ne '0') {
-        Fail-Gate "LiteOS support object conversion failed: $row"
+        Fail-Gate "System support object conversion failed: $row"
     }
     if (-not (Test-Path -LiteralPath $fields[3] -PathType Leaf)) {
-        Fail-Gate "converted LiteOS object missing: $($fields[1])"
+        Fail-Gate "converted System object missing: $($fields[1])"
     }
 }
-if ($liteosRows.Count -ne [int]$summaryMatch.Groups[8].Value) {
-    Fail-Gate 'LiteOS object report and build summary disagree'
+if ($systemRows.Count -ne [int]$summaryMatch.Groups[8].Value) {
+    Fail-Gate 'System object report and build summary disagree'
 }
 
 $contractRows = @($abiRows | Where-Object {
@@ -141,26 +141,26 @@ $contractCalls = @(Get-Content -LiteralPath $contractsSource | Where-Object {
 })
 if ($contractCalls.Count -ne 492) { Fail-Gate "ABI contract count is $($contractCalls.Count), expected 492" }
 
-foreach ($logPath in @($linkLog, $liteosLinkLog)) {
+foreach ($logPath in @($linkLog, $systemLinkLog)) {
     $logLines = @(Get-Content -LiteralPath $logPath)
     if (@($logLines | Where-Object { $_ -match '^status=linked;exit=0;' }).Count -ne 1) {
         Fail-Gate "successful link record is missing: $logPath"
     }
 }
 if (-not (Test-Path -LiteralPath $rmObject -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $liteosLinkObject -PathType Leaf)) {
+    -not (Test-Path -LiteralPath $systemLinkObject -PathType Leaf)) {
     Fail-Gate 'RM link output is missing'
 }
 
 $unresolvedLines = @(Get-Content -LiteralPath $unresolvedReport)
 $unresolvedHeader = @($unresolvedLines | Where-Object { $_ -like '# rm_compiled=*' })
 if ($unresolvedHeader.Count -ne 1) { Fail-Gate 'unresolved report header is missing' }
-$unresolvedMatch = [regex]::Match($unresolvedHeader[0], '^# rm_compiled=(\d+);abi_compiled=(\d+);abi_linkable=(\d+);liteos_objects=(\d+);rm_link_exit=(\d+);liteos_link_exit=(\d+);linked_nm_exit=(\d+);linked_unresolved=(\d+)$')
+$unresolvedMatch = [regex]::Match($unresolvedHeader[0], '^# rm_compiled=(\d+);abi_compiled=(\d+);abi_linkable=(\d+);system_objects=(\d+);rm_link_exit=(\d+);system_link_exit=(\d+);linked_nm_exit=(\d+);linked_unresolved=(\d+)$')
 if (-not $unresolvedMatch.Success -or
     [int]$unresolvedMatch.Groups[1].Value -ne 1026 -or
     [int]$unresolvedMatch.Groups[2].Value -ne 12 -or
     [int]$unresolvedMatch.Groups[3].Value -ne 11 -or
-    [int]$unresolvedMatch.Groups[4].Value -ne $liteosRows.Count -or
+    [int]$unresolvedMatch.Groups[4].Value -ne $systemRows.Count -or
     [int]$unresolvedMatch.Groups[5].Value -ne 0 -or
     [int]$unresolvedMatch.Groups[6].Value -ne 0 -or
     [int]$unresolvedMatch.Groups[7].Value -ne 0 -or
@@ -175,14 +175,14 @@ if ($unresolvedSymbols.Count -ne 0) { Fail-Gate "required unresolved symbols rem
 
 $nmCommand = Get-Command x86_64-elf-nm -ErrorAction SilentlyContinue
 if ($null -eq $nmCommand) { $nmCommand = Get-Command nm -ErrorAction Stop }
-$finalNmLines = @(& $nmCommand.Source -u -P -- $liteosLinkObject 2>&1 |
+$finalNmLines = @(& $nmCommand.Source -u -P -- $systemLinkObject 2>&1 |
     ForEach-Object { $_.ToString() })
 $finalNmExitCode = $LASTEXITCODE
-if ($finalNmExitCode -ne 0) { Fail-Gate 'nm failed on final RM-plus-LiteOS object' }
+if ($finalNmExitCode -ne 0) { Fail-Gate 'nm failed on final RM-plus-System object' }
 $finalUndefined = @($finalNmLines | Where-Object { $_.Trim() })
 if ($finalUndefined.Count -ne 0) { Fail-Gate "nm found unresolved symbols: $($finalUndefined[0])" }
 Write-Output 'ABI_COMPILE=PASS'
-Write-Output 'NVIDIA_RM_LITEOS_LINK=PASS'
+Write-Output 'NVIDIA_RM_OS_LINK=PASS'
 Write-Output 'UNRESOLVED_REQUIRED=0'
 
 # nvabi_misc.c is reserved for the small, explicitly classified leftovers;

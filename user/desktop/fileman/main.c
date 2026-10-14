@@ -1,13 +1,15 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 #include <stdio.h>
 #endif
 
 #include <uapi/all.h>
 
-#include "../../runtime/liteos_text.h"
+#include "../../runtime/text.h"
+#include "../../runtime/caption.h"
+#include <uapi/window_theme.h>
 
 #define FILEMAN_MAP_BASE       0x0A000000ULL
 #define FILEMAN_EVENT_WAIT OS_WAIT_INFINITE
@@ -15,36 +17,35 @@
 #define FILEMAN_ENTRY_CAPACITY 64U
 
 /*
- * GNOME-Files-like client UI.
+ * Chrome-style light client UI.
  */
-#define FM4_SIDEBAR_WIDTH          198U
-#define FM4_HEADER_HEIGHT           40U
-#define FM4_HEADER_CONTROL_Y        3U
-#define FM4_HEADER_ICON_Y           12U
-#define FM4_HEADER_CLOSE_Y          8U
-#define FM4_HEADER_MENU_Y           13U
+#define FM4_SIDEBAR_WIDTH          (198U * ui_text_size() / OS_TEXT_DEFAULT_SIZE)
+#define FM4_HEADER_HEIGHT           (ui_text_line_height() + 16U > 40U ? ui_text_line_height() + 16U : 40U)
+#define FM4_HEADER_CONTROL_Y        ((FM4_HEADER_HEIGHT - 32U) / 2U)
+#define FM4_HEADER_ICON_Y           ((FM4_HEADER_HEIGHT - 16U) / 2U)
+#define FM4_HEADER_MENU_Y           ((FM4_HEADER_HEIGHT - 14U) / 2U)
 /* Blend2D's baseline puts the title strokes on the same centerline as the
  * 16px header icons. */
-#define FM4_HEADER_TEXT_Y           9U
-#define FM4_WINDOW_BORDER_COLOR     0x00D2D2D5U
+#define FM4_HEADER_TEXT_Y           ((FM4_HEADER_HEIGHT - ui_text_line_height()) / 2U)
+#define FM4_WINDOW_BORDER_COLOR     OS_THEME_BORDER
 
 #define FM4_GRID_MARGIN_X           24U
 #define FM4_GRID_MARGIN_Y           20U
 
-#define FM4_GRID_CARD_WIDTH        126U
-#define FM4_GRID_CARD_HEIGHT       136U
-#define FM4_GRID_STEP_X            148U
-#define FM4_GRID_STEP_Y            150U
+#define FM4_GRID_CARD_WIDTH        (126U * ui_text_size() / OS_TEXT_DEFAULT_SIZE)
+#define FM4_GRID_CARD_HEIGHT       (78U + 2U * ui_text_line_height() + 10U)
+#define FM4_GRID_STEP_X            (FM4_GRID_CARD_WIDTH + 22U)
+#define FM4_GRID_STEP_Y            (FM4_GRID_CARD_HEIGHT + 14U)
 
-#define FM4_CONTEXT_WIDTH          180U
-#define FM4_CONTEXT_ROW_HEIGHT      34U
+#define FM4_CONTEXT_WIDTH          (180U * ui_text_size() / OS_TEXT_DEFAULT_SIZE)
+#define FM4_CONTEXT_ROW_HEIGHT      (ui_text_line_height() + 10U)
 
 /* The sidebar is intentionally a volume shelf.  Navigation shortcuts such
  * as Home/Recent/Trash consume valuable space and do not describe storage
- * devices, which is the useful information in a small LiteOS desktop. */
+ * devices, which is the useful information in a small System desktop. */
 #define FM4_VOLUME_CAPACITY         16U
-#define FM4_VOLUME_ROW_HEIGHT       39U
-#define FM4_VOLUME_FIRST_Y          50U
+#define FM4_VOLUME_ROW_HEIGHT       (ui_text_line_height() + 15U)
+#define FM4_VOLUME_FIRST_Y          (FM4_HEADER_HEIGHT + 10U)
 
 #define FM4_HISTORY_CAPACITY        16U
 /*
@@ -233,6 +234,21 @@ static bool fm4_damage_contains(uint32_t x, uint32_t y) {
     return false;
 }
 
+static bool fm4_damage_intersects(uint32_t x, uint32_t y,
+                                  uint32_t width, uint32_t height) {
+    if (width == 0U || height == 0U) return false;
+    if (g_damage_full) return true;
+    for (uint32_t index = 0U; index < g_damage_count; ++index) {
+        const fm4_damage_rect_t *rect = &g_damage[index];
+        if (rect->width != 0U && rect->height != 0U &&
+            (uint64_t)x < (uint64_t)rect->x + rect->width &&
+            (uint64_t)rect->x < (uint64_t)x + width &&
+            (uint64_t)y < (uint64_t)rect->y + rect->height &&
+            (uint64_t)rect->y < (uint64_t)y + height) return true;
+    }
+    return false;
+}
+
 static bool fm4_damage_touches(const fm4_damage_rect_t *a,
                                const fm4_damage_rect_t *b) {
     uint32_t a_right = a->x + a->width;
@@ -262,43 +278,33 @@ static void fm4_damage_rect(uint32_t x, uint32_t y,
     candidate.width = width;
     candidate.height = height;
 
+    /* Existing regions are already disjoint. Only the new candidate can
+     * introduce another merge, so absorb into it before checking capacity.
+     * Restart after growth: its bounding box may now reach earlier regions. */
+    for (uint32_t index = 0U; index < g_damage_count;) {
+        const fm4_damage_rect_t *rect = &g_damage[index];
+        if (!fm4_damage_touches(&candidate, rect)) {
+            ++index;
+            continue;
+        }
+        uint32_t right = candidate.x + candidate.width;
+        uint32_t bottom = candidate.y + candidate.height;
+        uint32_t other_right = rect->x + rect->width;
+        uint32_t other_bottom = rect->y + rect->height;
+        if (rect->x < candidate.x) candidate.x = rect->x;
+        if (rect->y < candidate.y) candidate.y = rect->y;
+        if (other_right > right) right = other_right;
+        if (other_bottom > bottom) bottom = other_bottom;
+        candidate.width = right - candidate.x;
+        candidate.height = bottom - candidate.y;
+        g_damage[index] = g_damage[--g_damage_count];
+        index = 0U;
+    }
     if (g_damage_count >= FM4_DAMAGE_CAPACITY) {
         fm4_damage_all();
         return;
     }
     g_damage[g_damage_count++] = candidate;
-
-    /* Coalesce overlapping or adjacent regions until no pair can merge. */
-    for (;;) {
-        bool merged = false;
-        for (uint32_t first = 0U; first < g_damage_count; ++first) {
-            for (uint32_t second = first + 1U;
-                 second < g_damage_count;
-                 ++second) {
-                fm4_damage_rect_t *a = &g_damage[first];
-                fm4_damage_rect_t *b = &g_damage[second];
-                if (!fm4_damage_touches(a, b)) continue;
-                {
-                    uint32_t right = a->x + a->width;
-                    uint32_t bottom = a->y + a->height;
-                    uint32_t other_right = b->x + b->width;
-                    uint32_t other_bottom = b->y + b->height;
-                    if (b->x < a->x) a->x = b->x;
-                    if (b->y < a->y) a->y = b->y;
-                    if (other_right > right) right = other_right;
-                    if (other_bottom > bottom) bottom = other_bottom;
-                    a->width = right - a->x;
-                    a->height = bottom - a->y;
-                }
-                g_damage[second] = g_damage[g_damage_count - 1U];
-                --g_damage_count;
-                merged = true;
-                break;
-            }
-            if (merged) break;
-        }
-        if (!merged) break;
-    }
 }
 
 static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
@@ -341,8 +347,20 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
 }
 
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
-    liteos_text_draw(g_target, g_target_width, g_target_width, g_target_height,
-                     (int32_t)x, (int32_t)y, text, color);
+    if (g_damage_full) {
+        ui_text_draw(g_target, g_target_width, g_target_width, g_target_height,
+                         (int32_t)x, (int32_t)y, text, color);
+        return;
+    }
+    /* Alpha glyphs must obey the same damage bounds as their background.
+     * Otherwise every hover repaint darkens unrelated labels in the surface. */
+    for (uint32_t index = 0U; index < g_damage_count; ++index) {
+        const fm4_damage_rect_t *rect = &g_damage[index];
+        ui_text_draw_rect(g_target, g_target_width, g_target_width,
+                              g_target_height, (int32_t)x, (int32_t)y,
+                              rect->x, rect->y, rect->x + rect->width,
+                              rect->y + rect->height, text, color);
+    }
 }
 
 static bool set_path(const char *source) {
@@ -416,7 +434,7 @@ static void fm4_fit_text(char *text, uint32_t capacity,
     }
     length = text_length(text);
     if (length >= capacity) length = capacity - 1U;
-    if (liteos_text_measure(text) <= maximum_width) return;
+    if (ui_text_measure(text) <= maximum_width) return;
     for (uint32_t visible = length; visible > 0U; --visible) {
         if (visible <= 3U) {
             for (uint32_t index = 0U; index < visible; ++index) {
@@ -429,7 +447,7 @@ static void fm4_fit_text(char *text, uint32_t capacity,
             text[visible - 1U] = '.';
         }
         text[visible] = '\0';
-        if (liteos_text_measure(text) <= maximum_width) return;
+        if (ui_text_measure(text) <= maximum_width) return;
     }
     text[0] = '\0';
 }
@@ -452,7 +470,6 @@ enum {
     FM4_CONTROL_SEARCH,
     FM4_CONTROL_VIEW,
     FM4_CONTROL_SORT,
-    FM4_CONTROL_CLOSE,
 
     /* Volume controls are allocated as FM4_CONTROL_VOLUME_BASE + index. */
     FM4_CONTROL_VOLUME_BASE = 0x100U,
@@ -657,13 +674,13 @@ static void fm4_text(
 
 static uint32_t fm4_text_width(
     const char *text) {
-    uint32_t measured = liteos_text_measure(text);
-    return measured != 0U ? measured : text_length(text) * LITEOS_TEXT_WIDTH;
+    uint32_t measured = ui_text_measure(text);
+    return measured != 0U ? measured : text_length(text) * OS_TEXT_WIDTH;
 }
 
 static uint32_t fm4_text_y_centered(uint32_t y, uint32_t height) {
-    return height > LITEOS_TEXT_HEIGHT ?
-        y + (height - LITEOS_TEXT_HEIGHT) / 2U : y;
+    return height > OS_TEXT_HEIGHT ?
+        y + (height - OS_TEXT_HEIGHT) / 2U : y;
 }
 
 static void fm4_text_box_centered(uint32_t x, uint32_t y,
@@ -763,7 +780,7 @@ static void fm4_file_icon(
         y + 1U,
         48U,
         62U,
-        0x00FAFAFAU);
+        OS_THEME_SURFACE);
 
     /*
      * Folded corner.
@@ -773,7 +790,7 @@ static void fm4_file_icon(
         y + 1U,
         16U,
         16U,
-        0x00E8E8E8U);
+        OS_THEME_SELECTED);
 
     for (uint32_t line = 0U;
          line < 5U;
@@ -792,9 +809,9 @@ static void fm4_file_icon(
 static void fm4_volume_icon(uint32_t x, uint32_t y, bool active) {
     uint32_t color = active ? 0x005B6670U : 0x00666B71U;
     fm4_round_rect(x + 1U, y + 7U, 18U, 16U, color);
-    fill_rect(x + 4U, y + 11U, 12U, 2U, 0x00ECECEFU);
-    fill_rect(x + 5U, y + 18U, 2U, 2U, 0x00ECECEFU);
-    fill_rect(x + 13U, y + 18U, 2U, 2U, 0x00ECECEFU);
+    fill_rect(x + 4U, y + 11U, 12U, 2U, OS_THEME_TOOLBAR);
+    fill_rect(x + 5U, y + 18U, 2U, 2U, OS_THEME_TOOLBAR);
+    fill_rect(x + 13U, y + 18U, 2U, 2U, OS_THEME_TOOLBAR);
 }
 
 static void fm4_composite_pixel(uint32_t x, uint32_t y,
@@ -901,38 +918,13 @@ static void fm4_sort_icon(uint32_t x, uint32_t y, uint32_t color) {
     fm4_composite_bitmap(x, y, bitmap, 16U, 16U, color);
 }
 
-static void fm4_close_icon(uint32_t x, uint32_t y) {
-    static const char bitmap[16][17] = {
-        "FE30000000003EFE", "EFE300000003EFE3",
-        "3EFE3000003EFE30", "03EFE30003EFE300",
-        "003EFE303EFE3000", "0003EFE6EFE30000",
-        "00003EFFFE300000", "000006FFF6000000",
-        "00003EFFFE300000", "0003EFE6EFE30000",
-        "003EFE303EFE3000", "03EFE30003EFE300",
-        "3EFE3000003EFE30", "EFE300000003EFE3",
-        "FE30000000003EFE", "E3000000000003EF",
-    };
-    fm4_round_rect(x, y, 24U, 24U, 0x00E2E2E4U);
-    fm4_composite_bitmap(x + 4U, y + 4U, bitmap, 16U, 16U,
-                         0x00484D53U);
-}
 
-/* Client decorations own the complete surface, including the outer frame.
- * Keep this as four thin damage-aware spans so a hover or selection update
- * never forces a full-frame repaint. */
-static void fm4_window_frame(void) {
+/* A content-toolbar separator, never an outer window border. */
+static void fm4_toolbar_separator(void) {
     if (g_target_width < 2U || g_target_height < 2U) return;
 
-    fill_rect(0U, 0U, g_target_width, 1U,
-              FM4_WINDOW_BORDER_COLOR);
-    fill_rect(0U, g_target_height - 1U, g_target_width, 1U,
-              FM4_WINDOW_BORDER_COLOR);
-    fill_rect(0U, 0U, 1U, g_target_height,
-              FM4_WINDOW_BORDER_COLOR);
-    fill_rect(g_target_width - 1U, 0U, 1U, g_target_height,
-              FM4_WINDOW_BORDER_COLOR);
 
-    /* The header separator is part of the same client-owned frame. */
+    /* Separate the navigation toolbar from the file grid. */
     if (g_target_height > FM4_HEADER_HEIGHT) {
         fill_rect(0U, FM4_HEADER_HEIGHT - 1U, g_target_width, 1U,
                   FM4_WINDOW_BORDER_COLOR);
@@ -1341,25 +1333,19 @@ static void fm4_damage_control(uint32_t control) {
         x = FM4_SIDEBAR_WIDTH + 54U;
         break;
     case FM4_CONTROL_SEARCH:
-        x = g_window.width > 140U ? g_window.width - 140U : 0U;
+        x = g_window.width > 204U ? g_window.width - 204U : 0U;
         width = 32U;
         height = 32U;
         break;
     case FM4_CONTROL_VIEW:
-        x = g_window.width > 106U ? g_window.width - 106U : 0U;
+        x = g_window.width > 170U ? g_window.width - 170U : 0U;
         width = 32U;
         height = 32U;
         break;
     case FM4_CONTROL_SORT:
-        x = g_window.width > 74U ? g_window.width - 74U : 0U;
+        x = g_window.width > 138U ? g_window.width - 138U : 0U;
         width = 32U;
         height = 32U;
-        break;
-    case FM4_CONTROL_CLOSE:
-        x = g_window.width > 30U ? g_window.width - 30U : 0U;
-        y = FM4_HEADER_CLOSE_Y;
-        width = 24U;
-        height = 24U;
         break;
     default:
         if (control >= FM4_CONTROL_VOLUME_BASE &&
@@ -1540,7 +1526,7 @@ static void fm4_item_label(
         fm4_center_text(
             x,
             FM4_GRID_CARD_WIDTH,
-             y + LITEOS_TEXT_HEIGHT,
+             y + OS_TEXT_HEIGHT,
             second,
             color);
     }
@@ -1753,30 +1739,25 @@ static uint32_t fm4_control_at(
     }
 
     if (g_window.width > 140U &&
-        fm4_inside(px, py, g_window.width - 140U,
+        fm4_inside(px, py, g_window.width - 204U,
                    FM4_HEADER_CONTROL_Y, 32U, 32U)) {
 
         return FM4_CONTROL_SEARCH;
     }
 
     if (g_window.width > 106U &&
-        fm4_inside(px, py, g_window.width - 106U,
+        fm4_inside(px, py, g_window.width - 170U,
                    FM4_HEADER_CONTROL_Y, 32U, 32U)) {
 
         return FM4_CONTROL_VIEW;
     }
 
     if (g_window.width > 74U &&
-        fm4_inside(px, py, g_window.width - 74U,
+        fm4_inside(px, py, g_window.width - 138U,
                    FM4_HEADER_CONTROL_Y, 32U, 32U)) {
         return FM4_CONTROL_SORT;
     }
 
-    if (g_window.width > 40U &&
-        fm4_inside(px, py, g_window.width - 40U,
-                   FM4_HEADER_CONTROL_Y, 36U, 32U)) {
-        return FM4_CONTROL_CLOSE;
-    }
 
     for (uint32_t index = 0U; index < g_volume_count; ++index) {
         uint32_t y = FM4_VOLUME_FIRST_Y + index * FM4_VOLUME_ROW_HEIGHT;
@@ -1956,7 +1937,7 @@ static void fm4_breadcrumb(
     char *buffer,
     uint32_t capacity) {
 
-    /* Home is not a LiteOS volume/location.  At the root, use the same
+    /* Home is not a System volume/location.  At the root, use the same
      * volume name as the sidebar; below it, show the actual VFS path. */
     if (g_path[0] == '\0' ||
         (g_path[0] == '/' && g_path[1] == '\0')) {
@@ -2048,10 +2029,10 @@ static bool create_window(void) {
 
     request.flags = OS_WINDOW_VISIBLE |
                     OS_WINDOW_RESIZABLE |
-                    OS_WINDOW_CLIENT_DECORATIONS;
+                    OS_WINDOW_STANDARD_CAPTION_CONTROLS;
 
     request.background =
-        0x00FAFAFAU;
+        OS_THEME_SURFACE;
 
     request.title[0] = 'F';
     request.title[1] = 'i';
@@ -2094,6 +2075,7 @@ static bool create_window(void) {
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    request.flags = OS_WINDOW_CAPTION_HEIGHT(user_caption_height());
     uint32_t count;
 
     if (!g_damage_full && g_damage_count == 0U) return;
@@ -2149,12 +2131,12 @@ static void render(void) {
      * White content canvas.
      */
     if (g_damage_full) {
-        fill_rect(0U, 0U, g_target_width, g_target_height, 0x00FAFAFAU);
+        fill_rect(0U, 0U, g_target_width, g_target_height, OS_THEME_SURFACE);
     } else {
         for (uint32_t index = 0U; index < g_damage_count; ++index) {
             fill_rect(g_damage[index].x, g_damage[index].y,
                       g_damage[index].width, g_damage[index].height,
-                      0x00FAFAFAU);
+                      OS_THEME_SURFACE);
         }
     }
 
@@ -2166,23 +2148,21 @@ static void render(void) {
         0U,
         FM4_SIDEBAR_WIDTH,
         g_target_height,
-        0x00ECECEFU);
+        OS_THEME_TOOLBAR);
+
+    fill_rect(0U, 0U, FM4_SIDEBAR_WIDTH, FM4_HEADER_HEIGHT,
+              OS_THEME_HEADER);
 
     fill_rect(
         FM4_SIDEBAR_WIDTH - 1U,
         0U,
         1U,
         g_target_height,
-        0x00D2D2D5U);
+        OS_THEME_BORDER);
 
-    /*
-     * Sidebar title.
-     */
-    fm4_search_icon(12U, FM4_HEADER_ICON_Y, 0x00585E64U);
-    draw_text(80U, FM4_HEADER_TEXT_Y,
-              "Files", 0x00303438U);
+    /* The compositor owns the window title; keep only sidebar actions here. */
     fm4_menu_icon(FM4_SIDEBAR_WIDTH - 29U, FM4_HEADER_MENU_Y,
-                  0x00585E64U);
+                  OS_THEME_MUTED);
 
     /*
      * Volumes only.  A selected volume gets the same soft pill used by the
@@ -2193,13 +2173,13 @@ static void render(void) {
         bool active = fm4_volume_path_active(&g_volumes[index]);
 
         if (active || g_hover_control == FM4_CONTROL_VOLUME_BASE + index) {
-            fm4_round_rect(10U, y, FM4_SIDEBAR_WIDTH - 20U, 35U,
-                           active ? 0x00DCDCDFAU : 0x00E3E3E6U);
+            fm4_round_rect(10U, y, FM4_SIDEBAR_WIDTH - 20U, FM4_VOLUME_ROW_HEIGHT - 4U,
+                           active ? OS_THEME_SELECTED : OS_THEME_TOOLBAR);
         }
 
         fm4_volume_icon(22U, y + 2U, active);
-        fm4_text(50U, fm4_text_y_centered(y, 35U),
-                 g_volumes[index].label, 0x003B3F44U);
+        fm4_text(50U, fm4_text_y_centered(y, FM4_VOLUME_ROW_HEIGHT - 4U),
+                 g_volumes[index].label, OS_THEME_TEXT);
     }
 
     /*
@@ -2211,7 +2191,7 @@ static void render(void) {
         g_target_width -
             FM4_SIDEBAR_WIDTH,
         FM4_HEADER_HEIGHT,
-        0x00FAFAFAU);
+        OS_THEME_HEADER);
 
     /*
      * Back.
@@ -2224,11 +2204,11 @@ static void render(void) {
             FM4_HEADER_CONTROL_Y,
             34U,
             34U,
-            0x00ECECECU);
+            OS_THEME_HOVER);
     }
 
     fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 20U, FM4_HEADER_ICON_Y, false,
-                     g_history_index != 0U ? 0x0031373CU : 0x00BFC1C3U);
+                     g_history_index != 0U ? OS_THEME_MUTED : 0x00BFC1C3U);
 
     /*
      * Forward.
@@ -2241,12 +2221,12 @@ static void render(void) {
             FM4_HEADER_CONTROL_Y,
             34U,
             34U,
-            0x00ECECECU);
+            OS_THEME_HOVER);
     }
 
     fm4_chevron_icon(FM4_SIDEBAR_WIDTH + 60U, FM4_HEADER_ICON_Y, true,
                      g_history_index + 1U < g_history_count ?
-                     0x0031373CU : 0x00BFC1C3U);
+                     OS_THEME_MUTED : 0x00BFC1C3U);
 
     /*
      * Breadcrumb pill.
@@ -2256,7 +2236,7 @@ static void render(void) {
             FM4_SIDEBAR_WIDTH + 88U;
 
         uint32_t reserved =
-            150U;
+            214U;
 
         uint32_t width =
             g_target_width >
@@ -2271,7 +2251,7 @@ static void render(void) {
             FM4_HEADER_CONTROL_Y,
             width,
             34U,
-            0x00E9E9E9U);
+            OS_THEME_FIELD);
 
         fm4_breadcrumb(
             breadcrumb,
@@ -2282,38 +2262,37 @@ static void render(void) {
         }
 
         fm4_text(x + 14U, FM4_HEADER_TEXT_Y,
-                 breadcrumb, 0x0043484DU);
+                 breadcrumb, OS_THEME_TEXT);
     }
 
     /*
      * Search / grid controls.
      */
-    if (g_target_width > 140U) {
+    if (g_target_width > 204U) {
         if (g_hover_control == FM4_CONTROL_SEARCH) {
-            fm4_round_rect(g_target_width - 140U, FM4_HEADER_CONTROL_Y,
+            fm4_round_rect(g_target_width - 204U, FM4_HEADER_CONTROL_Y,
                            32U, 32U,
-                           0x00ECECECU);
+                           OS_THEME_HOVER);
         }
-        fm4_search_icon(g_target_width - 132U, FM4_HEADER_ICON_Y,
-                        0x003E444AU);
+        fm4_search_icon(g_target_width - 196U, FM4_HEADER_ICON_Y,
+                        OS_THEME_MUTED);
 
         if (g_hover_control == FM4_CONTROL_VIEW) {
-            fm4_round_rect(g_target_width - 106U, FM4_HEADER_CONTROL_Y,
+            fm4_round_rect(g_target_width - 170U, FM4_HEADER_CONTROL_Y,
                            32U, 32U,
-                           0x00ECECECU);
+                           OS_THEME_HOVER);
         }
-        fm4_list_icon(g_target_width - 98U, FM4_HEADER_ICON_Y,
-                      0x003E444AU);
+        fm4_list_icon(g_target_width - 162U, FM4_HEADER_ICON_Y,
+                      OS_THEME_MUTED);
 
         if (g_hover_control == FM4_CONTROL_SORT) {
-            fm4_round_rect(g_target_width - 74U, FM4_HEADER_CONTROL_Y,
+            fm4_round_rect(g_target_width - 138U, FM4_HEADER_CONTROL_Y,
                            32U, 32U,
-                           0x00ECECECU);
+                           OS_THEME_HOVER);
         }
-        fm4_sort_icon(g_target_width - 66U, FM4_HEADER_ICON_Y,
-                      0x003E444AU);
+        fm4_sort_icon(g_target_width - 130U, FM4_HEADER_ICON_Y,
+                      OS_THEME_MUTED);
 
-        fm4_close_icon(g_target_width - 30U, FM4_HEADER_CLOSE_Y);
     }
 
     /*
@@ -2343,6 +2322,12 @@ static void render(void) {
             continue;
         }
 
+        /* Icon construction and text measurement are unnecessary when no
+         * damaged pixel lies in this card. Keep per-primitive clipping for
+         * partial card damage and overlays. */
+        if (!fm4_damage_intersects(x, y, FM4_GRID_CARD_WIDTH,
+                                   FM4_GRID_CARD_HEIGHT)) continue;
+
         if ((g_selection_valid &&
              g_selected == index) ||
             g_hover_item == index) {
@@ -2354,8 +2339,8 @@ static void render(void) {
                 FM4_GRID_CARD_HEIGHT,
                 g_selection_valid &&
                 g_selected == index ?
-                    0x00E8E8E8U :
-                    0x00F1F1F1U);
+                    OS_THEME_SELECTED :
+                    OS_THEME_HOVER);
         }
 
         if (g_entries[index].info.type ==
@@ -2381,7 +2366,7 @@ static void render(void) {
             x,
             y + 78U,
             g_entries[index].info.name,
-            0x00363A3FU);
+            OS_THEME_TEXT);
     }
 
     /*
@@ -2470,7 +2455,7 @@ static void render(void) {
             g_context_y,
             FM4_CONTEXT_WIDTH,
             FM4_CONTEXT_ROW_HEIGHT * 3U,
-            0x00C9C9C9U);
+            OS_THEME_BORDER);
 
         fm4_round_rect(
             g_context_x + 1U,
@@ -2489,7 +2474,7 @@ static void render(void) {
                 FM4_CONTEXT_WIDTH - 32U,
                 FM4_CONTEXT_ROW_HEIGHT,
                 labels[i],
-                i == 1U ? 0x00B33D3DU : 0x00373B40U);
+                i == 1U ? 0x00B33D3DU : OS_THEME_TEXT);
         }
     }
 
@@ -2516,7 +2501,7 @@ static void render(void) {
             y,
             width,
             height,
-            0x00C9C9C9U);
+            OS_THEME_BORDER);
 
         fm4_round_rect(
             x + 1U,
@@ -2529,7 +2514,7 @@ static void render(void) {
             x + 20U,
             y + 20U,
             "Delete this item?",
-            0x002F3337U);
+            OS_THEME_TEXT);
 
         fm4_text(
             x + 20U,
@@ -2543,11 +2528,11 @@ static void render(void) {
             y + height - 44U,
             104U,
             30U,
-            0x00ECECECU);
+            OS_THEME_HOVER);
 
         fm4_text_box_centered(
             x + 20U, y + height - 44U, 104U, 30U,
-            "Cancel", 0x00363A3FU);
+            "Cancel", OS_THEME_TEXT);
 
         fm4_round_rect(
             x + width - 124U,
@@ -2604,11 +2589,11 @@ static void render(void) {
                 0x00E5E5E5U);
 
             fm4_text(x + 11U, fm4_text_y_centered(y, 28U),
-                     g_status, 0x0052585EU);
+                     g_status, OS_THEME_MUTED);
         }
     }
 
-    fm4_window_frame();
+    fm4_toolbar_separator();
 
     update_window();
 }
@@ -2769,14 +2754,14 @@ static void handle_key(
     }
 
     if (g_ctrl && input->code == 0x2EU) {
-        (void)liteos_text_adjust(1);
+        (void)ui_text_adjust(1);
         fm4_damage_all();
         render();
         return;
     }
 
     if (g_ctrl && input->code == 0x2DU) {
-        (void)liteos_text_adjust(-1);
+        (void)ui_text_adjust(-1);
         fm4_damage_all();
         render();
         return;
@@ -3034,7 +3019,7 @@ static void handle_event(
             OS_INPUT_REL_WHEEL) {
 
             if (g_ctrl) {
-                (void)liteos_text_adjust(event->input.value > 0 ? 1 : -1);
+                (void)ui_text_adjust(event->input.value > 0 ? 1 : -1);
                 fm4_damage_all();
                 render();
                 return;
@@ -3318,9 +3303,6 @@ static void handle_event(
                 fm4_status("SORTED BY NAME");
                 fm4_damage_status();
 
-            } else if (control == FM4_CONTROL_CLOSE) {
-                fileman_exit(0U);
-
             } else if (control >= FM4_CONTROL_VOLUME_BASE &&
                        control < FM4_CONTROL_VOLUME_BASE + g_volume_count) {
                 uint32_t volume_index = control - FM4_CONTROL_VOLUME_BASE;
@@ -3410,14 +3392,18 @@ static void handle_event(
 }
 
 int main(int argc, char **argv) {
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE)) {
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE)) {
         fileman_exit(1U);
     }
     if (argc > 1 && (argv == 0 || argv[1] == 0 || !set_path(argv[1]))) {
         fileman_exit(1U);
     }
-    if (!create_window()) fileman_exit(1U);
-    if (!load_directory()) fileman_exit(1U);
+    if (!create_window()) {
+        fileman_exit(1U);
+    }
+    if (!load_directory()) {
+        fileman_exit(1U);
+    }
 
     fm4_history_reset();
 
@@ -3433,8 +3419,8 @@ int main(int argc, char **argv) {
     fm4_status("READY");
 
     render();
-#if LITEOS_REALTEST
-    (void)fprintf(stderr, "LITEOS_FILEMAN_READY\n");
+#if OS_REALTEST
+    (void)fprintf(stderr, "OS_FILEMAN_READY\n");
 #endif
     for (;;) {
         os_window_event_read_t request = {0};

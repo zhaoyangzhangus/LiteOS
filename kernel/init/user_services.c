@@ -53,7 +53,7 @@ static kstatus_t init_load_path(const char *path, process_t *process,
                                 vaddr_t *stack_pointer) {
     file_t *file = 0;
     kstatus_t status = vfs_open_kernel(path, VFS_OPEN_READ, 0U, &file);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_LOAD, 0x1AU);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_LOAD, 0x1AU);
     if (status != K_OK) return status;
     if (file->vnode == 0 || file->vnode->size == 0 ||
         file->vnode->size > INIT_IMAGE_SIZE) {
@@ -61,16 +61,16 @@ static kstatus_t init_load_path(const char *path, process_t *process,
         return K_EINVAL;
     }
     size_t image_size = (size_t)file->vnode->size;
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_LOAD, 0x1BU);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_LOAD, 0x1BU);
     uint8_t *image = (uint8_t *)kmalloc(image_size, 0);
     if (image == 0) {
         vfs_close(file);
         return K_ENOMEM;
     }
     uint64_t bytes = 0;
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_LOAD, 0x1CU);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_LOAD, 0x1CU);
     status = vfs_read_kernel(file, image, image_size, &bytes);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_LOAD, 0x1DU);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_LOAD, 0x1DU);
     vfs_close(file);
     if (status == K_OK && bytes != image_size) status = K_EIO;
     if (status == K_OK) {
@@ -213,18 +213,18 @@ bool user_init_start(void) {
     g_user_init_stage = 0;
     g_user_init_result = 0;
     if (!g_user_init_device_registered && !init_register_device()) goto runtime_start_fail;
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_ENTER, 1U);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_ENTER, 1U);
     if (process_create(0, &process) != K_OK ||
         init_load_path("/init-runtime", process, &info, &stack_pointer) != K_OK) {
         goto runtime_start_fail;
     }
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_LOAD, 2U);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_LOAD, 2U);
     process->flags |= PROCESS_FLAG_INIT_CPU_PINNED;
     if (thread_create_user_suspended(process, info.entry, stack_pointer, 0, 0,
                                      &thread) != K_OK) {
         goto runtime_start_fail;
     }
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_CREATE, 3U);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_CREATE, 3U);
     if (thread_start(thread) != K_OK) {
         if (thread != 0) {
             (void)thread_terminate(thread, K_ECANCELED);
@@ -236,7 +236,7 @@ bool user_init_start(void) {
         g_runtime_init_started = false;
         return false;
     }
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_USER, LITEOS_DEBUG_STEP_START, 4U);
+    kernel_debug_stage(OS_DEBUG_PHASE_USER, OS_DEBUG_STEP_START, 4U);
     /* 静态引用维持 init 与其地址空间，直到系统关机或用户态自行退出。 */
     g_runtime_init_process = process;
     g_runtime_init_thread = thread;

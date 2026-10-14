@@ -1,18 +1,18 @@
     .text
     .p2align 4
-    .globl liteos_lapic_timer_entry
-    .globl liteos_lapic_spurious_entry
-    .globl liteos_smp_ipi_entry
-    .globl liteos_tlb_ipi_entry
+    .globl arch_lapic_timer_entry
+    .globl arch_lapic_spurious_entry
+    .globl arch_smp_ipi_entry
+    .globl arch_tlb_ipi_entry
 #ifndef __ELF__
-    .def liteos_lapic_timer_entry; .scl 2; .type 32; .endef
+    .def arch_lapic_timer_entry; .scl 2; .type 32; .endef
 #endif
-    .extern liteos_lapic_timer_interrupt
+    .extern lapic_timer_interrupt
     .extern x86_smp_ipi_interrupt
     .extern x86_tlb_ipi_interrupt
 
 /* LAPIC 定时器 IRQ 的通用保存、调度和恢复入口。 */
-liteos_lapic_timer_entry:
+arch_lapic_timer_entry:
     /* 与异常/SYSCALL 路径保持同一 GS 不变量：内核态始终是 CPU-local GS。 */
     testb $3, 8(%rsp)
     jz 0f
@@ -34,7 +34,7 @@ liteos_lapic_timer_entry:
     pushq %rcx
     pushq %rax
     movq %rsp, %rdi
-    call liteos_lapic_timer_interrupt
+    call lapic_timer_interrupt
     testq %rax, %rax
     je 1f
     movq %rax, %rsp
@@ -62,12 +62,12 @@ liteos_lapic_timer_entry:
 
 /* LAPIC 的 0xFF 伪中断不需要 EOI，也不能落入会停机的未注册 IRQ 入口。 */
     .p2align 4
-liteos_lapic_spurious_entry:
+arch_lapic_spurious_entry:
     iretq
 
 /* 固定 IPI 入口；既可中断内核 idle，也为今后的用户态重调度保留 swapgs 路径。 */
     .p2align 4
-liteos_smp_ipi_entry:
+arch_smp_ipi_entry:
     testb $3, 8(%rsp)
     jz 3f
     swapgs
@@ -111,7 +111,7 @@ liteos_smp_ipi_entry:
 
 /* TLB shootdown 使用独立向量，处理程序只做本地失效、应答和 EOI。 */
     .p2align 4
-liteos_tlb_ipi_entry:
+arch_tlb_ipi_entry:
     testb $3, 8(%rsp)
     jz 5f
     swapgs

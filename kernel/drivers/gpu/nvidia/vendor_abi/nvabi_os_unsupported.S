@@ -95,19 +95,6 @@ os_device_vm_present:
     ret
     .size os_device_vm_present, .-os_device_vm_present
 
-    .globl os_find_ns_pid
-    .type os_find_ns_pid, @function
-os_find_ns_pid:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_os_find_ns_pid(%rip), %rdi
-    leaq .Lnvabi_stage_os(%rip), %rsi
-    call nvabi_log_unsupported
-    movl $0x56, %eax
-    popq %rbp
-    ret
-    .size os_find_ns_pid, .-os_find_ns_pid
-
     .globl os_flush_work_queue
     .type os_flush_work_queue, @function
 os_flush_work_queue:
@@ -172,19 +159,6 @@ os_get_page_refcount:
     popq %rbp
     ret
     .size os_get_page_refcount, .-os_get_page_refcount
-
-    .globl os_get_pid_info
-    .type os_get_pid_info, @function
-os_get_pid_info:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_os_get_pid_info(%rip), %rdi
-    leaq .Lnvabi_stage_os(%rip), %rsi
-    call nvabi_log_unsupported
-    xorl %eax, %eax
-    popq %rbp
-    ret
-    .size os_get_pid_info, .-os_get_pid_info
 
     .globl os_get_random_bytes
     .type os_get_random_bytes, @function
@@ -264,19 +238,6 @@ os_iommu_sva_unbind:
     ret
     .size os_iommu_sva_unbind, .-os_iommu_sva_unbind
 
-    .globl os_is_init_ns
-    .type os_is_init_ns, @function
-os_is_init_ns:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_os_is_init_ns(%rip), %rdi
-    leaq .Lnvabi_stage_os(%rip), %rsi
-    call nvabi_log_unsupported
-    xorl %eax, %eax
-    popq %rbp
-    ret
-    .size os_is_init_ns, .-os_is_init_ns
-
     .globl os_is_queue_flush_ongoing
     .type os_is_queue_flush_ongoing, @function
 os_is_queue_flush_ongoing:
@@ -315,19 +276,6 @@ os_lookup_user_io_memory:
     popq %rbp
     ret
     .size os_lookup_user_io_memory, .-os_lookup_user_io_memory
-
-    .globl os_match_mmap_offset
-    .type os_match_mmap_offset, @function
-os_match_mmap_offset:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_os_match_mmap_offset(%rip), %rdi
-    leaq .Lnvabi_stage_os(%rip), %rsi
-    call nvabi_log_unsupported
-    movl $0x56, %eax
-    popq %rbp
-    ret
-    .size os_match_mmap_offset, .-os_match_mmap_offset
 
     .globl os_numa_add_gpu_memory
     .type os_numa_add_gpu_memory, @function
@@ -471,19 +419,6 @@ os_put_page:
     popq %rbp
     ret
     .size os_put_page, .-os_put_page
-
-    .globl os_put_pid_info
-    .type os_put_pid_info, @function
-os_put_pid_info:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_os_put_pid_info(%rip), %rdi
-    leaq .Lnvabi_stage_os(%rip), %rsi
-    call nvabi_log_unsupported
-    # void return
-    popq %rbp
-    ret
-    .size os_put_pid_info, .-os_put_pid_info
 
     .globl os_queue_work_item
     .type os_queue_work_item, @function

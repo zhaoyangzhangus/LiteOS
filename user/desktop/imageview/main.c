@@ -3,11 +3,12 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <liteos/libc.h>
+#include <libc/libc.h>
 #include <uapi/all.h>
+#include <uapi/window_theme.h>
 
-#include "../../runtime/liteos_text.h"
-#include "../../client_chrome.h"
+#include "../../runtime/text.h"
+#include "../../runtime/caption.h"
 
 #define IMAGEVIEW_DEFAULT_PATH  "/etc/desktop/wall.png"
 #define IMAGEVIEW_PATH_CAPACITY 256U
@@ -17,10 +18,10 @@
 #define IMAGEVIEW_MIN_WIDTH     640U
 #define IMAGEVIEW_MIN_HEIGHT    420U
 
-#define IMAGEVIEW_BACKGROUND     0x001B2530U
-#define IMAGEVIEW_CHECKER_LIGHT  0x00232F3BU
-#define IMAGEVIEW_CHECKER_DARK   0x001E2934U
-#define IMAGEVIEW_STATUS_TEXT    0x00545D66U
+#define IMAGEVIEW_BACKGROUND     OS_THEME_SURFACE
+#define IMAGEVIEW_CHECKER_LIGHT  OS_THEME_TOOLBAR
+#define IMAGEVIEW_CHECKER_DARK   OS_THEME_HEADER_INACTIVE
+#define IMAGEVIEW_STATUS_TEXT    OS_THEME_MUTED
 
 typedef struct imageview_window {
     uint32_t identifier;
@@ -58,13 +59,14 @@ static void imageview_cleanup(void) {
         free(g_image_pixels);
         g_image_pixels = 0;
     }
-    liteos_text_shutdown();
+    ui_text_shutdown();
 }
 
 static bool load_image_file(void) {
     int descriptor;
     off_t file_size;
     uint8_t *encoded;
+    uint8_t *pixels;
     uint64_t remaining;
 
     descriptor = open(g_path, O_RDONLY);
@@ -84,6 +86,7 @@ static bool load_image_file(void) {
     while (remaining != 0U) {
         ssize_t count = read(descriptor, encoded + ((uint64_t)file_size - remaining),
                              (size_t)remaining);
+        if (count < 0 && errno == EINTR) continue;
         if (count <= 0 || (uint64_t)count > remaining) {
             free(encoded);
             (void)close(descriptor);
@@ -98,18 +101,19 @@ static bool load_image_file(void) {
     info.hdr.version = OS_SYSCALL_ABI_VERSION;
     info.encoded = (uint64_t)(uintptr_t)encoded;
     info.encoded_size = (uint64_t)file_size;
-    if (liteos_syscall6(OS_SYS_IMAGE_INFO, (uint64_t)(uintptr_t)&info,
+    if (__libc_native_syscall6(OS_SYS_IMAGE_INFO, (uint64_t)(uintptr_t)&info,
                         0U, 0U, 0U, 0U, 0U) != 0 ||
         info.format != OS_IMAGE_PIXEL_RGBA8888 || info.width == 0U ||
-        info.height == 0U || info.stride != info.width * 4U ||
+        info.height == 0U || (uint64_t)info.width * 4U != info.stride ||
+        info.pixel_bytes != (uint64_t)info.stride * info.height ||
         info.pixel_bytes == 0U ||
         info.pixel_bytes > OS_IMAGE_MAX_PIXEL_BYTES) {
         free(encoded);
         return false;
     }
 
-    g_image_pixels = (uint8_t *)malloc((size_t)info.pixel_bytes);
-    if (g_image_pixels == 0) {
+    pixels = (uint8_t *)malloc((size_t)info.pixel_bytes);
+    if (pixels == 0) {
         free(encoded);
         return false;
     }
@@ -118,18 +122,20 @@ static bool load_image_file(void) {
     decode.hdr.version = OS_SYSCALL_ABI_VERSION;
     decode.encoded = (uint64_t)(uintptr_t)encoded;
     decode.encoded_size = (uint64_t)file_size;
-    decode.pixels = (uint64_t)(uintptr_t)g_image_pixels;
+    decode.pixels = (uint64_t)(uintptr_t)pixels;
     decode.capacity = info.pixel_bytes;
-    if (liteos_syscall6(OS_SYS_IMAGE_DECODE, (uint64_t)(uintptr_t)&decode,
+    if (__libc_native_syscall6(OS_SYS_IMAGE_DECODE, (uint64_t)(uintptr_t)&decode,
                         0U, 0U, 0U, 0U, 0U) != 0 ||
         decode.format != OS_IMAGE_PIXEL_RGBA8888 ||
         decode.width != info.width || decode.height != info.height ||
         decode.stride != info.stride || decode.bytes_written != info.pixel_bytes) {
         free(encoded);
-        imageview_cleanup();
+        free(pixels);
         return false;
     }
     free(encoded);
+    free(g_image_pixels);
+    g_image_pixels = pixels;
     g_image_width = decode.width;
     g_image_height = decode.height;
     g_image_stride = decode.stride;
@@ -165,7 +171,7 @@ static uint32_t blend_pixel(uint32_t destination, uint32_t source,
 }
 
 static void draw_text(int32_t x, int32_t y, const char *text, uint32_t color) {
-    liteos_text_draw(g_window.pixels, g_window.width,
+    ui_text_draw(g_window.pixels, g_window.width,
                      g_window.width, g_window.height,
                      x, y, text, color);
 }
@@ -215,8 +221,8 @@ static uint32_t fit_zoom(uint32_t content_width, uint32_t content_height) {
 
 static void reset_view(void) {
     uint32_t content_height = g_window.height >
-        USER_CLIENT_CHROME_HEIGHT + IMAGEVIEW_STATUS_HEIGHT ?
-        g_window.height - USER_CLIENT_CHROME_HEIGHT - IMAGEVIEW_STATUS_HEIGHT : 1U;
+        IMAGEVIEW_STATUS_HEIGHT ?
+        g_window.height - IMAGEVIEW_STATUS_HEIGHT : 1U;
     g_zoom_percent = fit_zoom(g_window.width, content_height);
     g_pan_x = 0;
     g_pan_y = 0;
@@ -228,10 +234,8 @@ static void change_zoom(int32_t delta) {
     if (next > 400) next = 400;
     g_zoom_percent = (uint32_t)next;
     clamp_pan(g_window.width,
-              g_window.height > USER_CLIENT_CHROME_HEIGHT +
-                  IMAGEVIEW_STATUS_HEIGHT ?
-                  g_window.height - USER_CLIENT_CHROME_HEIGHT -
-                      IMAGEVIEW_STATUS_HEIGHT : 1U);
+              g_window.height > IMAGEVIEW_STATUS_HEIGHT ?
+                  g_window.height - IMAGEVIEW_STATUS_HEIGHT : 1U);
 }
 
 static void draw_image(uint32_t top, uint32_t bottom) {
@@ -284,50 +288,31 @@ static void draw_image(uint32_t top, uint32_t bottom) {
 
 static void render(void) {
     char status[160];
-    uint32_t content_top = USER_CLIENT_CHROME_HEIGHT;
+    uint32_t content_top = 0U;
     uint32_t content_bottom = g_window.height > IMAGEVIEW_STATUS_HEIGHT ?
         g_window.height - IMAGEVIEW_STATUS_HEIGHT : g_window.height;
 
     if (g_window.pixels == 0 || g_window.height == 0U) return;
     fill_rect(0U, 0U, g_window.width, g_window.height, IMAGEVIEW_BACKGROUND);
-    fill_rect(0U, 0U, g_window.width, USER_CLIENT_CHROME_HEIGHT,
-              USER_CLIENT_CHROME_BACKGROUND);
-    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_window.width, 1U,
-              USER_CLIENT_CHROME_SEPARATOR);
-    user_client_chrome_app_icon(g_window.pixels, g_window.width,
-                                g_window.width, g_window.height,
-                                16U, USER_CLIENT_CHROME_TITLE_Y,
-                                USER_CLIENT_CHROME_ICON_IMAGE);
-    draw_text(50, USER_CLIENT_CHROME_TITLE_Y, "IMAGE VIEWER",
-              USER_CLIENT_CHROME_TEXT);
-    draw_text(210, USER_CLIENT_CHROME_TITLE_Y, g_path,
-              USER_CLIENT_CHROME_TEXT);
     if (content_bottom > content_top) {
         draw_checkerboard(content_top, content_bottom);
         draw_image(content_top, content_bottom);
     }
     fill_rect(0U, content_bottom, g_window.width,
-              g_window.height - content_bottom, USER_CLIENT_CHROME_CARD_BORDER);
+              g_window.height - content_bottom, OS_THEME_TOOLBAR);
     (void)snprintf(status, sizeof(status),
-                    "%ux%u  %u%%   +/- IMAGE  CTRL +/- FONT  Q CLOSE",
-                    g_image_width, g_image_height, g_zoom_percent);
-    draw_text(10, (int32_t)content_bottom - 28, status, IMAGEVIEW_STATUS_TEXT);
-    user_client_chrome_close(g_window.pixels, g_window.width,
-                             g_window.width, g_window.height,
-                             USER_CLIENT_CHROME_HEIGHT,
-                             USER_CLIENT_CHROME_CLOSE_BG,
-                             USER_CLIENT_CHROME_CLOSE_FG);
-    user_client_chrome_frame(g_window.pixels, g_window.width,
-                             g_window.width, g_window.height,
-                             USER_CLIENT_CHROME_HEIGHT);
+                    "%ux%u  %u%%   +/- IMAGE  CTRL +/- FONT  Q CLOSE  %s",
+                    g_image_width, g_image_height, g_zoom_percent, g_path);
+    draw_text(10, (int32_t)content_bottom + 4, status, IMAGEVIEW_STATUS_TEXT);
 
     os_window_update_t update = {0};
+    update.flags = OS_WINDOW_CAPTION_HEIGHT(user_caption_height());
     update.hdr.size = sizeof(update);
     update.hdr.version = OS_SYSCALL_ABI_VERSION;
     update.identifier = g_window.identifier;
     update.width = g_window.width;
     update.height = g_window.height;
-    (void)liteos_syscall6(OS_SYS_WINDOW_UPDATE, (uint64_t)(uintptr_t)&update,
+    (void)__libc_native_syscall6(OS_SYS_WINDOW_UPDATE, (uint64_t)(uintptr_t)&update,
                           0U, 0U, 0U, 0U, 0U);
 }
 
@@ -339,7 +324,7 @@ static bool create_window(void) {
 
     display.hdr.size = sizeof(display);
     display.hdr.version = OS_SYSCALL_ABI_VERSION;
-    if (liteos_syscall6(OS_SYS_DISPLAY_GET_INFO, (uint64_t)(uintptr_t)&display,
+    if (__libc_native_syscall6(OS_SYS_DISPLAY_GET_INFO, (uint64_t)(uintptr_t)&display,
                         0U, 0U, 0U, 0U, 0U) < 0 || display.width < 320U ||
         display.height < 240U) return false;
     width = display.width * 3U / 4U;
@@ -357,11 +342,11 @@ static bool create_window(void) {
     request.width = width;
     request.height = height;
     request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE |
-                    OS_WINDOW_CLIENT_DECORATIONS;
+                    OS_WINDOW_STANDARD_CAPTION_CONTROLS;
     request.background = IMAGEVIEW_BACKGROUND;
     memcpy(request.title, "IMAGE VIEWER", sizeof("IMAGE VIEWER"));
     request.address = IMAGEVIEW_MAP_BASE;
-    if (liteos_syscall6(OS_SYS_WINDOW_CREATE, (uint64_t)(uintptr_t)&request,
+    if (__libc_native_syscall6(OS_SYS_WINDOW_CREATE, (uint64_t)(uintptr_t)&request,
                         0U, 0U, 0U, 0U, 0U) != 0 ||
         request.window == OS_INVALID_HANDLE || request.address == 0U) {
         return false;
@@ -406,9 +391,9 @@ static bool handle_key(const os_window_event_t *event) {
     } else if (input->code == 0x51U) {
         g_pan_y += 32;
     } else if (g_ctrl && input->code == 0x2EU) {
-        (void)liteos_text_adjust(1);
+        (void)ui_text_adjust(1);
     } else if (g_ctrl && input->code == 0x2DU) {
-        (void)liteos_text_adjust(-1);
+        (void)ui_text_adjust(-1);
     } else if ((input->code == 0x2EU && g_shift) || input->code == '+') {
         change_zoom(25);
     } else if ((input->code == 0x2DU && !g_shift) || input->code == '-') {
@@ -440,19 +425,10 @@ static bool handle_event(const os_window_event_t *event) {
     }
     if (event->type != OS_WINDOW_EVENT_INPUT) return false;
     input = &event->input;
-    if (input->type == OS_INPUT_EVENT_BUTTON &&
-        input->code == OS_INPUT_BUTTON_LEFT &&
-        input->value == OS_INPUT_VALUE_PRESS &&
-        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
-                                     g_window.width,
-                                     USER_CLIENT_CHROME_HEIGHT)) {
-        g_running = false;
-        return true;
-    }
     if (input->type == OS_INPUT_EVENT_RELATIVE &&
         input->code == OS_INPUT_REL_WHEEL && input->value != 0) {
         if (g_ctrl) {
-            (void)liteos_text_adjust(input->value > 0 ? 1 : -1);
+            (void)ui_text_adjust(input->value > 0 ? 1 : -1);
             return true;
         }
         change_zoom(input->value > 0 ? 25 : -25);
@@ -466,7 +442,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && argv != 0 && argv[1] != 0 && argv[1][0] != '\0') {
         copy_path(argv[1]);
     }
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE)) {
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE)) {
         printf("IMAGEVIEW_FAIL stage=font\n");
         return 1;
     }
@@ -488,7 +464,7 @@ int main(int argc, char **argv) {
         request.hdr.version = OS_SYSCALL_ABI_VERSION;
         request.identifier = g_window.identifier;
         request.timeout_ns = IMAGEVIEW_EVENT_WAIT;
-        int64_t status = liteos_syscall6(
+        int64_t status = __libc_native_syscall6(
             OS_SYS_WINDOW_EVENT_READ, (uint64_t)(uintptr_t)&request,
             0U, 0U, 0U, 0U, 0U);
         if (status == 0) {

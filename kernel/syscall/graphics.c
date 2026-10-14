@@ -4,6 +4,7 @@
 #include <arch/x86_64/cpu.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/display.h>
+#include <kernel/frame_trace.h>
 #include <kernel/gpu.h>
 #include <kernel/input.h>
 #include <kernel/mm.h>
@@ -18,6 +19,7 @@
 #include <uapi/window.h>
 
 #include "internal.h"
+#include "../process/internal.h"
 
 static volatile uint32_t g_gpu_submit_progress[MAX_CPUS];
 
@@ -234,10 +236,10 @@ int64_t syscall_gpu_map(uint64_t arguments_pointer, uint64_t unused1,
                            required_rights, &allocation_object);
     if (status != K_OK) return status;
     gpu_allocation_t *allocation = (gpu_allocation_t *)allocation_object;
+    paddr_t physical;
     if (allocation->object.type != KOBJECT_TYPE_GPU_ALLOCATION ||
-        allocation->backing_page == 0 || arguments.offset > allocation->size ||
-        arguments.length > allocation->size - arguments.offset ||
-        allocation->backing_phys.value > UINT64_MAX - arguments.offset) {
+        gpu_allocation_get_physical(allocation, arguments.offset,
+                                    arguments.length, &physical) != K_OK) {
         object_put(allocation_object);
         return K_EINVAL;
     }
@@ -246,7 +248,7 @@ int64_t syscall_gpu_map(uint64_t arguments_pointer, uint64_t unused1,
     object_get(allocation);
     vm_object_t *object = 0;
     status = vm_object_create_device(
-        paddr_make(allocation->backing_phys.value + arguments.offset),
+        physical,
         arguments.length, X86_CACHE_WB, allocation, object_put, &object);
     if (status != K_OK) {
         object_put(allocation_object);
@@ -257,15 +259,13 @@ int64_t syscall_gpu_map(uint64_t arguments_pointer, uint64_t unused1,
     vaddr_t address = (vaddr_t)arguments.address;
     uint32_t vm_flags = VM_MAP_SHARED;
     if ((arguments.flags & OS_GPU_MAP_FIXED) != 0U) vm_flags |= VM_MAP_FIXED;
-    status = vm_map_object(process->vm, object, &address, 0,
+    vm_space_t *space = process_vm_reference(process);
+    status = vm_map_object(space, object, &address, 0,
                            (size_t)arguments.length,
                            VM_PROT_USER | translate_vm_protection(arguments.prot),
                            vm_flags);
     vm_object_put(object);
-    if (status != K_OK) {
-        object_put(allocation_object);
-        return status;
-    }
+    if (status != K_OK) goto done;
 
     /* 设备页必须在返回用户态前完成映射。这样既避免用户态首次写入时
        触发不可恢复的设备页缺页，也保证返回的地址已经具备有效 PTE。 */
@@ -276,20 +276,20 @@ int64_t syscall_gpu_map(uint64_t arguments_pointer, uint64_t unused1,
             .access = fault_access,
             .cpu_error = 0,
         };
-        status = vm_handle_fault(process->vm, &fault);
-        if (status != K_OK) {
-            (void)vm_unmap(process->vm, address, (size_t)arguments.length);
-            object_put(allocation_object);
-            return status;
-        }
+        status = vm_handle_fault(space, &fault);
+        if (status != K_OK) break;
     }
 
-    arguments.address = (uint64_t)address;
-    status = copy_to_user((void __user *)(uintptr_t)arguments_pointer,
-                          &arguments, sizeof(arguments));
-    if (status != K_OK) {
-        (void)vm_unmap(process->vm, address, (size_t)arguments.length);
+    if (status == K_OK) {
+        arguments.address = (uint64_t)address;
+        status = copy_to_user((void __user *)(uintptr_t)arguments_pointer,
+                              &arguments, sizeof(arguments));
     }
+    if (status != K_OK) {
+        (void)vm_unmap(space, address, (size_t)arguments.length);
+    }
+done:
+    vm_space_put(space);
     object_put(allocation_object);
     return status;
 }
@@ -382,9 +382,14 @@ int64_t syscall_window_create(uint64_t arguments_pointer, uint64_t unused1,
     process_t *process = current_process();
     os_window_create_t arguments;
     window_server_window_t *window = 0;
+    vm_space_t *space = 0;
+    bool mapped = false;
+    uint64_t buffer_size;
     handle_t handle = OS_INVALID_HANDLE;
     kstatus_t status;
+#if OS_ENABLE_FRAME_TRACE
     uint64_t create_tsc = telemetry_timestamp();
+#endif
     (void)unused1;
     (void)unused2;
     (void)unused3;
@@ -398,17 +403,22 @@ int64_t syscall_window_create(uint64_t arguments_pointer, uint64_t unused1,
     if (!versioned_header_valid(&arguments.hdr, sizeof(arguments)) ||
         arguments.reserved != 0U ||
         (arguments.flags & ~(OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE |
-                             OS_WINDOW_CLIENT_DECORATIONS)) != 0U ||
+                             OS_WINDOW_CLIENT_DECORATIONS |
+                             OS_WINDOW_PREMULTIPLIED_ALPHA |
+                             OS_WINDOW_STANDARD_CAPTION_CONTROLS)) != 0U ||
         arguments.width == 0U || arguments.height == 0U) return K_EINVAL;
     status = window_server_create(process, arguments.x, arguments.y,
                                   arguments.width, arguments.height,
                                   arguments.flags, arguments.background,
                                   arguments.title, &window);
     if (status != K_OK) return status;
+    buffer_size = window_server_window_buffer_size(window);
     status = handle_create(&process->handles, window, WINDOW_RIGHT_ALL, &handle);
     if (status == K_OK) {
-        status = window_server_map(window, process, arguments.address,
+        space = process_vm_reference(process);
+        status = window_server_map_space(window, space, arguments.address,
                                    &arguments.address);
+        mapped = status == K_OK;
     }
     if (status == K_OK) {
         status = window_server_set_owner_address(window, arguments.address);
@@ -419,22 +429,27 @@ int64_t syscall_window_create(uint64_t arguments_pointer, uint64_t unused1,
     if (status == K_OK) {
         arguments.window = handle;
         arguments.identifier = window_server_window_identifier(window);
-        arguments.buffer_size = window_server_window_buffer_size(window);
+        arguments.buffer_size = buffer_size;
         status = copy_to_user((void __user *)(uintptr_t)arguments_pointer,
                               &arguments, sizeof(arguments));
     }
-    if (status != K_OK && handle != OS_INVALID_HANDLE) {
-        (void)handle_close(&process->handles, handle);
+    if (status != K_OK) {
+        if (mapped) (void)vm_unmap(space, arguments.address, (size_t)buffer_size);
+        (void)window_server_close_owned(process, window);
+        if (handle != OS_INVALID_HANDLE) (void)handle_close(&process->handles, handle);
     }
+#if OS_ENABLE_FRAME_TRACE
     if (status == K_OK) {
         uint64_t elapsed_tsc = telemetry_timestamp() - create_tsc;
-        kernel_perf_emit_scope("window.create", create_tsc);
-        kernel_perf_emit_value(
+        kernel_frame_trace_emit_scope("window.create", create_tsc);
+        kernel_frame_trace_emit_value(
             "window_create_us",
             x86_boot_cpu_features.tsc_hz == 0U ? 0U :
                 x86_tsc_to_ns(elapsed_tsc) / 1000U);
     }
+#endif
     object_put(window);
+    vm_space_put(space);
     return status;
 }
 
@@ -455,11 +470,26 @@ int64_t syscall_window_update(uint64_t arguments_pointer, uint64_t unused1,
                             (const void __user *)(uintptr_t)arguments_pointer,
                             sizeof(arguments));
     if (status != K_OK || !versioned_header_valid(&arguments.hdr, sizeof(arguments)) ||
-        arguments.identifier == 0U || arguments.flags != 0U ||
+        arguments.identifier == 0U ||
+        (arguments.flags & ~OS_WINDOW_CAPTION_HEIGHT_MASK) != 0U ||
         ((arguments.width == 0U) != (arguments.height == 0U))) return K_EINVAL;
     return window_server_update(process, arguments.identifier, arguments.x,
                                 arguments.y, arguments.width, arguments.height,
                                 arguments.flags);
+}
+
+int64_t syscall_window_title(uint64_t pointer, uint64_t a, uint64_t b,
+                             uint64_t c, uint64_t d, uint64_t e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    process_t *process = current_process();
+    os_window_title_t request;
+    if (process == 0 || pointer == 0U) return K_EPERM;
+    kstatus_t status = copy_from_user(&request,
+        (const void __user *)(uintptr_t)pointer, sizeof(request));
+    if (status != K_OK) return status;
+    if (!versioned_header_valid(&request.hdr, sizeof(request)) ||
+        request.reserved != 0U || request.identifier == 0U) return K_EINVAL;
+    return window_server_title_owned(process, request.identifier, request.title);
 }
 
 int64_t syscall_window_enumerate(uint64_t arguments_pointer, uint64_t unused1,
@@ -527,13 +557,19 @@ int64_t syscall_window_map(uint64_t arguments_pointer, uint64_t unused1,
         window_server_put(window);
         return K_EINVAL;
     }
-    status = window_server_map(window, process, arguments.address,
+    vm_space_t *space = process_vm_reference(process);
+    status = window_server_map_space(window, space, arguments.address,
                                &arguments.address);
     arguments.length = window_server_window_buffer_size(window);
     window_server_put(window);
-    if (status != K_OK) return status;
-    return copy_to_user((void __user *)(uintptr_t)arguments_pointer,
-                        &arguments, sizeof(arguments));
+    if (status == K_OK) {
+        status = copy_to_user((void __user *)(uintptr_t)arguments_pointer,
+                              &arguments, sizeof(arguments));
+        if (status != K_OK)
+            (void)vm_unmap(space, arguments.address, (size_t)arguments.length);
+    }
+    vm_space_put(space);
+    return status;
 }
 
 int64_t syscall_window_set(uint64_t arguments_pointer, uint64_t unused1,

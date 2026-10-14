@@ -1,7 +1,9 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
+#include <fcntl.h>
 #include <poll.h>
 #include <time.h>
+#include <uapi/linux_abi.h>
 
 static bool poll_read_requested(short events) {
     return (events & (POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND)) != 0;
@@ -52,7 +54,7 @@ static int poll_wait_many(const os_handle_t *handles, size_t count,
     request.count = (uint32_t)count;
     request.handles = (uint64_t)(uintptr_t)handles;
     request.timeout_ns = timeout_ns;
-    status = liteos_syscall6(OS_SYS_WAIT_MANY,
+    status = __libc_native_syscall6(OS_SYS_WAIT_MANY,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (status == -(int64_t)ETIMEDOUT) return 0;
@@ -98,6 +100,41 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
         errno = fds == 0 && count != 0U ? EFAULT : EINVAL;
         return -1;
     }
+    /* Linux-personality sockets live in the Linux fd table.  Waiting on
+     * their public fd numbers as native System handles cannot observe data. */
+    if (count != 0U) {
+        bool all_linux = true;
+        bool any_linux = false;
+        for (index = 0U; index < count; ++index) {
+            if (fds[index].fd < 0) continue;
+            if (__libc_descriptor_is_linux_fd(fds[index].fd)) {
+                any_linux = true;
+            } else {
+                all_linux = false;
+            }
+        }
+        if (all_linux && any_linux) {
+            struct pollfd linux_fds[OS_WAIT_MAX_HANDLES];
+            int64_t status;
+            for (index = 0U; index < count; ++index) {
+                linux_fds[index] = fds[index];
+                if (fds[index].fd >= 0) {
+                    linux_fds[index].fd =
+                        __libc_linux_fd_for_descriptor(fds[index].fd);
+                    if (linux_fds[index].fd < 0) return -1;
+                }
+            }
+            status = __libc_linux_syscall6(
+                LINUX_SYS_POLL, (uint64_t)(uintptr_t)linux_fds,
+                (uint64_t)count, (uint64_t)(int64_t)timeout,
+                0U, 0U, 0U);
+            if (status < 0) return __libc_status_result(status);
+            for (index = 0U; index < count; ++index) {
+                fds[index].revents = linux_fds[index].revents;
+            }
+            return (int)status;
+        }
+    }
     for (index = 0U; index < count; ++index) {
         struct pollfd *entry = &fds[index];
         uint32_t open_flags;
@@ -137,11 +174,11 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
         }
         open_flags = __libc_descriptor_open_flags(entry->fd);
         if ((entry->events & (POLLIN | POLLRDNORM)) != 0 &&
-            (open_flags & OS_FILE_OPEN_READ) != 0U) {
+            (open_flags & O_ACCMODE) != O_WRONLY) {
             immediate |= POLLIN;
         }
         if ((entry->events & (POLLOUT | POLLWRNORM | POLLWRBAND)) != 0 &&
-            (open_flags & OS_FILE_OPEN_WRITE) != 0U) {
+            (open_flags & O_ACCMODE) != O_RDONLY) {
             immediate |= POLLOUT;
         }
         entry->revents = immediate;
@@ -155,7 +192,9 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
                                          ready_count == 0 ?
                                              poll_timeout_ns(timeout) : 0U,
                                          &signaled, &wait_value);
-        if (wait_result < 0) return -1;
+        if (wait_result < 0) {
+            return -1;
+        }
         if (wait_result > 0) {
             handle_ready[signaled] = true;
             handle_values[signaled] = wait_value;
@@ -166,7 +205,9 @@ int poll(struct pollfd *fds, nfds_t count, int timeout) {
             if (handle_ready[index]) continue;
             wait_result = poll_wait_many(&handles[index], 1U, 0U, &ignored,
                                          &ignored_value);
-            if (wait_result < 0) return -1;
+            if (wait_result < 0) {
+                return -1;
+            }
             if (wait_result > 0) {
                 handle_ready[index] = true;
                 handle_values[index] = ignored_value;

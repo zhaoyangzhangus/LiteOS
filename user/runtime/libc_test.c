@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <complex.h>
+#include <dlfcn.h>
 #include <dirent.h>
 #include <fenv.h>
 #include <fcntl.h>
@@ -11,7 +12,8 @@
 #include <glob.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <liteos/libc.h>
+#include <libc/libc.h>
+#include <linux/futex.h>
 #include <signal.h>
 #include <locale.h>
 #include <math.h>
@@ -25,7 +27,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/mman.h>
+#include <sys/epoll.h>
 #include <sys/select.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -37,18 +41,21 @@
 #include <wctype.h>
 
 #include <blend2d/blend2d.h>
+#include <uapi/network.h>
+#include <uapi/linux_abi.h>
+#include <uapi/socket.h>
 
-#include "liteos_gfx.h"
+#include "graphics.h"
 #include "blend2d_api_test.h"
-#include "liteos_text.h"
+#include "text.h"
 
 static int libc_test_fail(const char *stage) {
-    printf("LITEOS_LIBC_TEST_FAIL stage=%s errno=%d\n", stage, errno);
+    printf("OS_LIBC_TEST_FAIL stage=%s errno=%d\n", stage, errno);
     return 1;
 }
 
 static int libc_test_detail_fail(const char *stage) {
-    printf("LITEOS_LIBC_TEST_DETAIL_FAIL stage=%s errno=%d\n", stage, errno);
+    printf("OS_LIBC_TEST_DETAIL_FAIL stage=%s errno=%d\n", stage, errno);
     return 0;
 }
 
@@ -63,15 +70,15 @@ static int test_blend2d(void) {
     if (bl_runtime_init() != BL_SUCCESS) return 0;
     runtime_ready = true;
 
-    liteos_gfx_clear(pixels, width, width, height, 0x00112233U);
+    gfx_clear(pixels, width, width, height, 0x00112233U);
     if (pixels[0] != 0xFF112233U) goto cleanup;
 
-    liteos_gfx_fill_rect(pixels, width, width, height, 4, 4, 8, 8,
+    gfx_fill_rect(pixels, width, width, height, 4, 4, 8, 8,
                          0x0000FF00U);
     if (pixels[4U + 4U * width] != 0xFF00FF00U ||
         pixels[3U + 3U * width] != 0xFF112233U) goto cleanup;
 
-    liteos_gfx_gradient_rect(pixels, width, width, height, 16, 16, 16, 16,
+    gfx_gradient_rect(pixels, width, width, height, 16, 16, 16, 16,
                              0x000000FFU, 0x00FF0000U);
     gradient_top = pixels[16U + 16U * width];
     gradient_bottom = pixels[16U + 31U * width];
@@ -79,7 +86,7 @@ static int test_blend2d(void) {
         gradient_top == 0xFF112233U || gradient_top == gradient_bottom ||
         gradient_bottom != 0xFFFF0000U) goto cleanup;
 
-    liteos_gfx_frame(pixels, width, width, height, 2U, 0x00FFFFFFU);
+    gfx_frame(pixels, width, width, height, 2U, 0x00FFFFFFU);
     success = pixels[0] == 0xFFFFFFFFU &&
               pixels[1U + width] == 0xFFFFFFFFU &&
               pixels[2U + 2U * width] == 0xFF112233U;
@@ -95,22 +102,22 @@ static int test_blend2d_font_zoom(void) {
     uint32_t base_height;
     int success = 0;
 
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE)) return 0;
-    base_size = liteos_text_size();
-    base_width = liteos_text_measure("MMMM");
-    base_height = liteos_text_line_height();
-    if (base_size != LITEOS_TEXT_DEFAULT_SIZE || base_width == 0U ||
-        base_height == 0U || !liteos_text_adjust(1) ||
-        liteos_text_size() != base_size + LITEOS_TEXT_SIZE_STEP ||
-        liteos_text_measure("MMMM") <= base_width ||
-        liteos_text_line_height() <= base_height) {
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE)) return 0;
+    base_size = ui_text_size();
+    base_width = ui_text_measure("MMMM");
+    base_height = ui_text_line_height();
+    if (base_size != OS_TEXT_DEFAULT_SIZE || base_width == 0U ||
+        base_height == 0U || !ui_text_adjust(1) ||
+        ui_text_size() != base_size + OS_TEXT_SIZE_STEP ||
+        ui_text_measure("MMMM") <= base_width ||
+        ui_text_line_height() <= base_height) {
         goto done;
     }
-    if (!liteos_text_adjust(-1) || liteos_text_size() != base_size) goto done;
+    if (!ui_text_adjust(-1) || ui_text_size() != base_size) goto done;
     success = 1;
 
 done:
-    liteos_text_shutdown();
+    ui_text_shutdown();
     return success;
 }
 
@@ -160,7 +167,7 @@ static int integer_compare(const void *left, const void *right) {
 }
 
 static int test_strings(void) {
-    char text[64] = "liteos";
+    char text[64] = "system";
     char separator_text[] = "abc:def";
     char tokens[32] = "one,two,,three";
     char basename_path[] = "/tmp/image.png";
@@ -173,14 +180,14 @@ static int test_strings(void) {
 
     strcat(text, "-runtime");
     strncat(text, "-ignored", 3U);
-    if (strcmp(text, "liteos-runtime-ig") != 0 ||
+    if (strcmp(text, "system-runtime-ig") != 0 ||
         memrchr(text, 'i', strlen(text)) != text + 15U ||
         strspn("123abc", "0123456789") != 3U ||
         strcspn(separator_text, ":") != 3U ||
         strpbrk(separator_text, ":;") != separator_text + 3U) {
         return 0;
     }
-    if (strcasecmp("LiTeOs", "liteos") != 0 ||
+    if (strcasecmp("SyStEm", "system") != 0 ||
         strncasecmp("runtime", "RUNTimes", 7U) != 0 ||
         strcmp(strerror(ENOENT), "No such file or directory") != 0 ||
         strerror_r(EINVAL, error_text, sizeof(error_text)) != 0 ||
@@ -300,7 +307,7 @@ static int test_entropy(void) {
 }
 
 static int test_environment_and_time(void) {
-    char assignment[] = "LITEOS_LIBC_TEST=putenv";
+    char assignment[] = "OS_LIBC_TEST=putenv";
     char formatted[64];
     char cwd[PATH_MAX];
     char configured_path[16];
@@ -320,14 +327,14 @@ static int test_environment_and_time(void) {
     int clock_ok = 1;
     int realtime_saved = 0;
 
-    if (setenv("LITEOS_LIBC_TEST", "setenv", 1) != 0 ||
-        strcmp(getenv("LITEOS_LIBC_TEST"), "setenv") != 0 ||
-        strcmp(secure_getenv("LITEOS_LIBC_TEST"), "setenv") != 0 ||
-        setenv("LITEOS_LIBC_TEST", "ignored", 0) != 0 ||
-        strcmp(getenv("LITEOS_LIBC_TEST"), "setenv") != 0 ||
+    if (setenv("OS_LIBC_TEST", "setenv", 1) != 0 ||
+        strcmp(getenv("OS_LIBC_TEST"), "setenv") != 0 ||
+        strcmp(secure_getenv("OS_LIBC_TEST"), "setenv") != 0 ||
+        setenv("OS_LIBC_TEST", "ignored", 0) != 0 ||
+        strcmp(getenv("OS_LIBC_TEST"), "setenv") != 0 ||
         putenv(assignment) != 0 ||
-        strcmp(getenv("LITEOS_LIBC_TEST"), "putenv") != 0 ||
-        unsetenv("LITEOS_LIBC_TEST") != 0 || getenv("LITEOS_LIBC_TEST") != 0) {
+        strcmp(getenv("OS_LIBC_TEST"), "putenv") != 0 ||
+        unsetenv("OS_LIBC_TEST") != 0 || getenv("OS_LIBC_TEST") != 0) {
         return 0;
     }
     if (gmtime_r(&epoch, &broken_down) == 0 || broken_down.tm_year != 70 ||
@@ -403,42 +410,79 @@ static int test_environment_and_time(void) {
 
 static int test_virtual_memory(void) {
     unsigned char *mapping;
+    unsigned char *madvise_mapping;
     size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (page_size != 4096U || getpagesize() != 4096) return 0;
-    mapping = (unsigned char *)mmap(0, page_size + 1U,
+
+    /* Linux permits MADV_DONTNEED on untouched pages and across adjacent
+     * VMAs with different protections. PartitionAlloc relies on both when
+     * releasing/decommitting its reserved address-space ranges. */
+    madvise_mapping = (unsigned char *)mmap(
+        0, page_size * 3U, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (madvise_mapping == MAP_FAILED) return 0;
+    if (madvise(madvise_mapping, page_size * 3U, MADV_DONTNEED) != 0 ||
+        madvise_mapping[0] != 0U || madvise_mapping[page_size] != 0U ||
+        madvise_mapping[page_size * 2U] != 0U) {
+        (void)munmap(madvise_mapping, page_size * 3U);
+        return 0;
+    }
+    madvise_mapping[0] = 0x5AU;
+    madvise_mapping[page_size * 2U] = 0xC3U;
+    if (mprotect(madvise_mapping + page_size, page_size, PROT_NONE) != 0 ||
+        madvise(madvise_mapping, page_size * 3U, MADV_DONTNEED) != 0 ||
+        mprotect(madvise_mapping + page_size, page_size,
+                 PROT_READ | PROT_WRITE) != 0 ||
+        madvise_mapping[0] != 0U || madvise_mapping[page_size] != 0U ||
+        madvise_mapping[page_size * 2U] != 0U ||
+        munmap(madvise_mapping, page_size * 3U) != 0) {
+        (void)munmap(madvise_mapping, page_size * 3U);
+        return 0;
+    }
+
+    mapping = (unsigned char *)mmap(0, page_size * 3U,
                                     PROT_READ | PROT_WRITE,
                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapping == MAP_FAILED) return 0;
     mapping[0] = 0x5A;
     mapping[page_size] = 0xA5;
-    int msync_result = msync(mapping, page_size + 1U, MS_SYNC);
-    int normal_result = madvise(mapping, page_size + 1U, MADV_NORMAL);
-    int dontneed_result = madvise(mapping, page_size + 1U, MADV_DONTNEED);
-    if (mapping[0] != 0x5A || mapping[page_size] != 0xA5 ||
-        msync_result != 0 || normal_result != 0 || dontneed_result != 0) {
-        (void)munmap(mapping, page_size + 1U);
+    mapping[page_size * 2U] = 0xC3;
+    int msync_result = msync(mapping, page_size * 3U, MS_SYNC);
+    int normal_result = madvise(mapping, page_size * 3U, MADV_NORMAL);
+    int dontneed_result = madvise(mapping + page_size, page_size,
+                                  MADV_DONTNEED);
+    int dontdump_result = madvise(mapping, page_size * 3U, MADV_DONTDUMP);
+    int dodump_result = madvise(mapping, page_size * 3U, MADV_DODUMP);
+    if (mapping[0] != 0x5A || mapping[page_size] != 0U ||
+        mapping[page_size * 2U] != 0xC3 ||
+        msync_result != 0 || normal_result != 0 || dontneed_result != 0 ||
+        dontdump_result != 0 || dodump_result != 0) {
+        (void)munmap(mapping, page_size * 3U);
         return 0;
     }
     errno = 0;
     msync_result = msync((void *)((uintptr_t)mapping + 1U), page_size,
                          MS_ASYNC);
     if (msync_result != -1 || errno != EINVAL) {
-        (void)munmap(mapping, page_size + 1U);
+        (void)munmap(mapping, page_size * 3U);
         return 0;
     }
     errno = 0;
     int invalid_madvise = madvise(mapping, page_size, MADV_DONTNEED + 1);
     if (invalid_madvise != -1 || errno != EINVAL) {
-        (void)munmap(mapping, page_size + 1U);
+        (void)munmap(mapping, page_size * 3U);
         return 0;
     }
-    int protect_result = mprotect(mapping, page_size + 1U, PROT_READ);
+    mapping[page_size] = 0xA5;
+    int protect_result = mprotect(mapping, page_size * 3U, PROT_READ);
     if (protect_result != 0) {
-        (void)munmap(mapping, page_size + 1U);
+        (void)munmap(mapping, page_size * 3U);
         return 0;
     }
-    if (mapping[0] != 0x5A || munmap(mapping, page_size + 1U) != 0) {
-        (void)munmap(mapping, page_size + 1U);
+    if (mapping[0] != 0x5A || mapping[page_size] != 0xA5 ||
+        mapping[page_size * 2U] != 0xC3 ||
+        munmap(mapping, page_size * 3U) != 0) {
+        (void)munmap(mapping, page_size * 3U);
         return 0;
     }
     errno = EIO;
@@ -517,10 +561,441 @@ static int test_network_addresses(void) {
     return 1;
 }
 
+static int test_linux_resolved_ids(void) {
+    uint32_t real_uid = UINT32_MAX;
+    uint32_t effective_uid = UINT32_MAX;
+    uint32_t saved_uid = UINT32_MAX;
+    uint32_t real_gid = UINT32_MAX;
+    uint32_t effective_gid = UINT32_MAX;
+    uint32_t saved_gid = UINT32_MAX;
+
+    /* The normal libc-test image is a native System ELF.  Keep this Linux
+     * personality regression active for the Chromium-style PT_INTERP image,
+     * while allowing the native suite to run without manufacturing Linux
+     * syscall traps that the native dispatcher must reject. */
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+
+    errno = 0;
+    if (syscall(__NR_getresuid, &real_uid, &effective_uid, &saved_uid) != 0 ||
+        real_uid != 0U || effective_uid != 0U || saved_uid != 0U) {
+        return 0;
+    }
+    errno = 0;
+    if (syscall(__NR_getresgid, &real_gid, &effective_gid, &saved_gid) != 0 ||
+        real_gid != 0U || effective_gid != 0U || saved_gid != 0U) {
+        return 0;
+    }
+
+    errno = 0;
+    if (syscall(__NR_getresuid, (void *)(uintptr_t)1U, &effective_uid,
+                &saved_uid) != -1 || errno != EFAULT) {
+        return 0;
+    }
+    errno = 0;
+    if (syscall(__NR_getresgid, &real_gid, (void *)(uintptr_t)1U,
+                &saved_gid) != -1 || errno != EFAULT) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_linux_sysconf_cpu_count(void) {
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+
+    FILE *cpuinfo = fopen("/proc/cpuinfo", "r");
+    if (cpuinfo == 0) return libc_test_detail_fail("linux-cpuinfo-open");
+    long count = 0L;
+    char line[32];
+    while (fgets(line, sizeof(line), cpuinfo) != 0) {
+        if (strncmp(line, "processor", 9U) == 0) ++count;
+    }
+    int close_result = fclose(cpuinfo);
+    if (close_result != 0 || count <= 0L ||
+        sysconf(_SC_NPROCESSORS_CONF) != count ||
+        sysconf(_SC_NPROCESSORS_ONLN) != count) {
+        return libc_test_detail_fail("linux-sysconf-cpu-count");
+    }
+    return 1;
+}
+
+static int test_linux_proc_fd_directory(void) {
+    int sentinel = -1;
+    int directory_descriptor = -1;
+    int found_sentinel = 0;
+    int close_status;
+    char sentinel_name[16];
+    DIR *directory = 0;
+    struct dirent *entry;
+
+    /* The native libc-test image has no Linux procfs personality. */
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+    sentinel = open("/dev/null", O_RDONLY);
+    if (sentinel < 0 ||
+        snprintf(sentinel_name, sizeof(sentinel_name), "%d", sentinel) < 0) {
+        goto fail;
+    }
+    directory_descriptor = open("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+    if (directory_descriptor < 0) goto fail;
+    directory = fdopendir(directory_descriptor);
+    if (directory == 0) goto fail;
+    directory_descriptor = -1;
+
+    while ((entry = readdir(directory)) != 0) {
+        if (strcmp(entry->d_name, sentinel_name) == 0) {
+            found_sentinel = 1;
+        }
+    }
+    close_status = closedir(directory);
+    directory = 0;
+    if (close_status != 0 || !found_sentinel) goto fail;
+    close_status = close(sentinel);
+    sentinel = -1;
+    if (close_status != 0) goto fail;
+    return 1;
+
+fail:
+    if (directory != 0) (void)closedir(directory);
+    else if (directory_descriptor >= 0) (void)close(directory_descriptor);
+    if (sentinel >= 0) (void)close(sentinel);
+    return libc_test_detail_fail("linux-proc-fd-directory");
+}
+
+static int create_explicit_native_udp_socket(uint32_t flags) {
+    os_handle_t handle = OS_INVALID_HANDLE;
+    int64_t status = __libc_native_syscall6(
+        OS_SYS_SOCKET_CREATE, AF_INET, SOCK_DGRAM, 0U,
+        (uint64_t)(uintptr_t)&handle,
+        (flags & O_CLOEXEC) != 0U ? OS_SOCKET_CREATE_FLAG_CLOEXEC : 0U,
+        0U);
+    if (status < 0) return __libc_status_result(status);
+    return __libc_install_handle(handle, O_RDWR | flags, true, AF_INET);
+}
+
+static int test_linux_native_socket_messages(void) {
+    struct iovec vector = {0};
+    struct msghdr message = {0};
+    char byte = 0;
+    int descriptor;
+
+    /* An explicitly native socket must remain usable even in a Linux-
+     * personality process, although libc socket() now returns a Linux fd. */
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+    descriptor = create_explicit_native_udp_socket(O_NONBLOCK | O_CLOEXEC);
+    if (descriptor < 0) return 0;
+    vector.iov_base = &byte;
+    vector.iov_len = sizeof(byte);
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1U;
+    errno = 0;
+    if (recvmsg(descriptor, &message, MSG_DONTWAIT) != -1 || errno != EAGAIN) {
+        (void)close(descriptor);
+        return 0;
+    }
+    return close(descriptor) == 0;
+}
+
+static int test_linux_fd_dup_identity(void) {
+    enum { native_limit = 64 };
+    int native_descriptors[native_limit];
+    int native_count = 0;
+    int first_free_linux_fd = -1;
+    int pair[2] = {-1, -1};
+    int duplicate = -1;
+    int duplicate_minimum = -1;
+    char received = 0;
+    const char sent = 'd';
+
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+    for (int candidate = 3; candidate < 1024; ++candidate) {
+        int64_t status = __libc_linux_syscall6(
+            LINUX_SYS_FCNTL, (uint64_t)(uint32_t)candidate,
+            LINUX_F_GETFD, 0U, 0U, 0U, 0U);
+        if (status < 0) {
+            first_free_linux_fd = candidate;
+            break;
+        }
+    }
+    if (first_free_linux_fd < 0) goto fail;
+
+    /* Keep a native handle at the first free Linux fd number.  The next
+     * Linux socketpair is relocated by __libc_adopt_linux_fd(); a subsequent
+     * dup() must also keep its public fd equal to its kernel Linux fd. */
+    while (native_count < native_limit) {
+        int descriptor = create_explicit_native_udp_socket(O_CLOEXEC);
+        if (descriptor < 0) goto fail;
+        native_descriptors[native_count++] = descriptor;
+        if (descriptor >= first_free_linux_fd) break;
+    }
+    if (native_count == native_limit &&
+        native_descriptors[native_count - 1] < first_free_linux_fd) {
+        goto fail;
+    }
+    if (__libc_descriptor_is_linux_fd(first_free_linux_fd) ||
+        __libc_handle_for_descriptor(first_free_linux_fd) ==
+            OS_INVALID_HANDLE ||
+        __libc_linux_syscall6(
+            LINUX_SYS_FCNTL, (uint64_t)(uint32_t)first_free_linux_fd,
+            LINUX_F_GETFD, 0U, 0U, 0U, 0U) >= 0) {
+        goto fail;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) goto fail;
+    duplicate = dup(pair[0]);
+    if (duplicate < 0 ||
+        __libc_linux_fd_for_descriptor(duplicate) != duplicate) {
+        goto fail;
+    }
+    duplicate_minimum = fcntl(pair[1], F_DUPFD_CLOEXEC, 202);
+    if (duplicate_minimum < 202 ||
+        __libc_linux_fd_for_descriptor(duplicate_minimum) !=
+            duplicate_minimum) {
+        goto fail;
+    }
+    if (close(pair[0]) != 0) goto fail;
+    pair[0] = -1;
+    if (send(duplicate, &sent, sizeof(sent), 0) != (ssize_t)sizeof(sent) ||
+        recv(pair[1], &received, sizeof(received), 0) !=
+            (ssize_t)sizeof(received) || received != sent) {
+        goto fail;
+    }
+    (void)close(duplicate_minimum);
+    (void)close(duplicate);
+    (void)close(pair[1]);
+    while (native_count != 0) {
+        (void)close(native_descriptors[--native_count]);
+    }
+    return 1;
+
+fail:
+    if (duplicate_minimum >= 0) (void)close(duplicate_minimum);
+    if (duplicate >= 0) (void)close(duplicate);
+    if (pair[0] >= 0) (void)close(pair[0]);
+    if (pair[1] >= 0) (void)close(pair[1]);
+    while (native_count != 0) {
+        (void)close(native_descriptors[--native_count]);
+    }
+    return libc_test_detail_fail("linux-fd-dup-identity");
+}
+
+static int test_connected_ipv4_udp_binding(void) {
+    static const char payload = 'u';
+    struct sockaddr_in receiver_address = {0};
+    struct sockaddr_in local_address = {0};
+    struct sockaddr_in source_address = {0};
+    socklen_t local_length = sizeof(local_address);
+    socklen_t source_length = sizeof(source_address);
+    char received = 0;
+    int receiver = -1;
+    int sender = -1;
+    int wildcard_sender = -1;
+    ssize_t result;
+
+    /* POSIX connect() on an unbound datagram socket assigns the local
+     * endpoint before a subsequent send() uses the connected peer.  This is
+     * the exact path Chromium's UDP DNS socket takes. */
+    receiver = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    sender = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (receiver < 0 || sender < 0) goto fail;
+    receiver_address.sin_family = AF_INET;
+    receiver_address.sin_addr.s_addr = htonl(0x7F000001U);
+    receiver_address.sin_port = htons(18081U);
+    if (bind(receiver, (const struct sockaddr *)&receiver_address,
+             sizeof(receiver_address)) != 0 ||
+        connect(sender, (const struct sockaddr *)&receiver_address,
+                sizeof(receiver_address)) != 0 ||
+        getsockname(sender, (struct sockaddr *)&local_address,
+                    &local_length) != 0 ||
+        local_length != sizeof(local_address) ||
+        local_address.sin_family != AF_INET || local_address.sin_port == 0U) {
+        goto fail;
+    }
+    result = send(sender, &payload, sizeof(payload), 0);
+    if (result != (ssize_t)sizeof(payload)) goto fail;
+    /* recvfrom() must populate a zero-initialized source-address buffer.
+     * DNS uses precisely this call after poll reports its UDP reply. */
+    result = recvfrom(receiver, &received, sizeof(received), MSG_DONTWAIT,
+                      (struct sockaddr *)&source_address, &source_length);
+    if (result != (ssize_t)sizeof(received) || received != payload ||
+        source_length != sizeof(source_address) ||
+        source_address.sin_family != AF_INET ||
+        source_address.sin_addr.s_addr != local_address.sin_addr.s_addr ||
+        source_address.sin_port != local_address.sin_port) goto fail;
+    (void)close(sender);
+    sender = -1;
+
+    /* Chromium may reserve a port with INADDR_ANY before connect().  The
+     * connected socket still needs a concrete source address for wire I/O. */
+    wildcard_sender = socket(AF_INET,
+                             SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (wildcard_sender < 0 ||
+        bind(wildcard_sender, (const struct sockaddr *)&(struct sockaddr_in){
+                 .sin_family = AF_INET,
+                 .sin_port = htons(18082U),
+                 .sin_addr.s_addr = htonl(0U)},
+             sizeof(struct sockaddr_in)) != 0 ||
+        connect(wildcard_sender, (const struct sockaddr *)&receiver_address,
+                sizeof(receiver_address)) != 0 ||
+        getsockname(wildcard_sender, (struct sockaddr *)&local_address,
+                    &local_length) != 0 ||
+        local_length != sizeof(local_address) ||
+        local_address.sin_family != AF_INET ||
+        local_address.sin_addr.s_addr == htonl(0U) ||
+        local_address.sin_port != htons(18082U)) goto fail;
+    result = send(wildcard_sender, &payload, sizeof(payload), 0);
+    if (result != (ssize_t)sizeof(payload)) goto fail;
+    result = recv(receiver, &received, sizeof(received), MSG_DONTWAIT);
+    if (result != (ssize_t)sizeof(received) || received != payload) goto fail;
+    (void)close(wildcard_sender);
+    (void)close(receiver);
+    return 1;
+
+fail:
+    if (sender >= 0) (void)close(sender);
+    if (wildcard_sender >= 0) (void)close(wildcard_sender);
+    if (receiver >= 0) (void)close(receiver);
+    return 0;
+}
+
+static int test_linux_epoll_syscall_arguments(void) {
+    struct epoll_event events[1] = {0};
+    int descriptor;
+
+    /* epoll_* is exposed through the Linux varargs syscall wrapper.  Keep
+     * this before the broad compatibility suite so a missing argument-count
+     * entry cannot be hidden by a later environment failure. */
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+    descriptor = epoll_create(1);
+    if (descriptor < 0) return 0;
+    errno = 0;
+    if (epoll_wait(descriptor, events, 1, 0) != 0) {
+        (void)close(descriptor);
+        return 0;
+    }
+    return close(descriptor) == 0;
+}
+
+static int test_linux_futex_wait_bitset_private(void) {
+    uint32_t *word;
+    void *mapping;
+    long result;
+
+    /* Abseil uses WAIT_BITSET with PRIVATE and CLOCK_REALTIME even for an
+     * infinite wait.  A mismatched value makes this a non-blocking probe.
+     * Start with an untouched anonymous page to cover private-futex demand
+     * faulting without requiring a physical-address lookup. */
+    if (__libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U,
+                              0U) != -38LL) {
+        return 1;
+    }
+    mapping = mmap(0, 4096U, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return 0;
+    word = (uint32_t *)mapping;
+
+    errno = 0;
+    result = syscall(__NR_futex, word,
+                     FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1U, 0U, 0U, 0U);
+    if (result != 0) {
+        (void)munmap(mapping, 4096U);
+        return 0;
+    }
+
+    errno = 0;
+    if (syscall(__NR_futex, word,
+                FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG |
+                    FUTEX_CLOCK_REALTIME,
+                1U, 0U, 0U, FUTEX_BITSET_MATCH_ANY) != -1 ||
+        errno != EAGAIN) {
+        (void)munmap(mapping, 4096U);
+        return 0;
+    }
+
+    if (munmap(mapping, 4096U) != 0) return 0;
+    errno = 0;
+    if (syscall(__NR_futex, word,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG, 1U, 0U, 0U, 0U) != -1 ||
+        errno != EFAULT) {
+        return 0;
+    }
+    return 1;
+}
+
+static int test_ipv4_ephemeral_binding(void) {
+    os_net_status_t network = {0};
+    struct sockaddr_in peer = {0};
+    struct sockaddr_in local = {0};
+    socklen_t local_length = sizeof(local);
+    uint32_t destination;
+    int descriptor;
+
+    network.hdr.size = sizeof(network);
+    network.hdr.version = OS_SYSCALL_ABI_VERSION;
+    if (__libc_native_syscall6(OS_SYS_NET_GET_STATUS,
+                        (uint64_t)(uintptr_t)&network,
+                        0U, 0U, 0U, 0U, 0U) < 0 ||
+        (network.flags & OS_NET_STATUS_LINK_UP) == 0U ||
+        network.ipv4_address == 0U) {
+        /* The libc suite also runs without a NIC; that is not a binding bug. */
+        return 1;
+    }
+
+    descriptor = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (descriptor < 0) return 0;
+    destination = network.ipv4_gateway != 0U ? network.ipv4_gateway :
+                  network.ipv4_address;
+    peer.sin_family = AF_INET;
+    peer.sin_port = htons(9U);
+    peer.sin_addr.s_addr = htonl(destination);
+    /* The first nonblocking connect may only enqueue ARP.  Retry briefly so
+     * the regression also observes the first TCP packet after neighbor
+     * resolution instead of validating the local bind and stopping there. */
+    for (unsigned int attempt = 0U; attempt < 8U; ++attempt) {
+        struct timespec retry = {0, 10000000L};
+        int connect_status;
+        errno = 0;
+        connect_status = connect(descriptor, (const struct sockaddr *)&peer,
+                                  sizeof(peer));
+        if (connect_status == 0 || errno == EISCONN) break;
+        if (errno != EAGAIN && errno != EINPROGRESS && errno != EALREADY) {
+            break;
+        }
+        (void)nanosleep(&retry, 0);
+    }
+    if (getsockname(descriptor, (struct sockaddr *)&local, &local_length) != 0) {
+        (void)close(descriptor);
+        return 0;
+    }
+    (void)close(descriptor);
+    return local_length == sizeof(local) && local.sin_family == AF_INET &&
+           local.sin_addr.s_addr == htonl(network.ipv4_address) &&
+           local.sin_port != 0U;
+}
+
 static int test_poll_and_name_resolution(void) {
+    typedef int (*getaddrinfo_fn)(const char *, const char *,
+                                  const struct addrinfo *,
+                                  struct addrinfo **);
     struct pollfd event;
     struct addrinfo hints = {0};
     struct addrinfo *result = 0;
+    getaddrinfo_fn rtld_next_getaddrinfo;
     struct hostent *legacy_host;
     struct hostent legacy_host_storage;
     struct hostent *legacy_host_result = 0;
@@ -609,7 +1084,12 @@ static int test_poll_and_name_resolution(void) {
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_CANONNAME | AI_NUMERICHOST | AI_NUMERICSERV;
-    if (getaddrinfo("127.0.0.1", "80", &hints, &result) != 0 ||
+    rtld_next_getaddrinfo =
+        (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+    if (rtld_next_getaddrinfo == 0) {
+        return libc_test_detail_fail("rtld-next-getaddrinfo");
+    }
+    if (rtld_next_getaddrinfo("127.0.0.1", "80", &hints, &result) != 0 ||
         result == 0 || result->ai_family != AF_INET ||
         result->ai_socktype != SOCK_STREAM || result->ai_addrlen != sizeof(*address) ||
         result->ai_canonname == 0 || strcmp(result->ai_canonname, "127.0.0.1") != 0) {
@@ -712,6 +1192,16 @@ static volatile int g_key_reuse_release;
 static volatile int g_key_reuse_failed;
 static volatile int g_key_reuse_destructor_calls;
 
+enum {
+    MUTEX_CONTENTION_THREAD_COUNT = 4,
+    MUTEX_CONTENTION_ITERATIONS = 2000,
+};
+static pthread_mutex_t g_mutex_contention_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile uint32_t g_mutex_contention_ready;
+static volatile uint32_t g_mutex_contention_start;
+static volatile uint32_t g_mutex_contention_error;
+static uint32_t g_mutex_contention_counter;
+
 static void thread_key_destructor(void *value) {
     if (value != 0) ++g_thread_destructor_calls;
 }
@@ -737,6 +1227,65 @@ static void *thread_test_entry(void *argument) {
     (void)pthread_cond_signal(&g_thread_condition);
     (void)pthread_mutex_unlock(&g_thread_mutex);
     return argument;
+}
+
+static void *mutex_contention_entry(void *argument) {
+    (void)argument;
+    (void)__atomic_add_fetch(&g_mutex_contention_ready, 1U, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&g_mutex_contention_start, __ATOMIC_ACQUIRE) == 0U) {
+        (void)sched_yield();
+    }
+    for (uint32_t iteration = 0U;
+         iteration < MUTEX_CONTENTION_ITERATIONS; ++iteration) {
+        if (pthread_mutex_lock(&g_mutex_contention_lock) != 0) {
+            __atomic_store_n(&g_mutex_contention_error, 1U, __ATOMIC_RELEASE);
+            return (void *)1U;
+        }
+        ++g_mutex_contention_counter;
+        if (pthread_mutex_unlock(&g_mutex_contention_lock) != 0) {
+            __atomic_store_n(&g_mutex_contention_error, 1U, __ATOMIC_RELEASE);
+            return (void *)1U;
+        }
+    }
+    return 0;
+}
+
+static int test_mutex_contention(void) {
+    pthread_t workers[MUTEX_CONTENTION_THREAD_COUNT] = {0};
+    uint32_t created = 0U;
+    int failed = 0;
+
+    g_mutex_contention_ready = 0U;
+    g_mutex_contention_start = 0U;
+    g_mutex_contention_error = 0U;
+    g_mutex_contention_counter = 0U;
+    for (; created < MUTEX_CONTENTION_THREAD_COUNT; ++created) {
+        if (pthread_create(&workers[created], 0, mutex_contention_entry, 0) != 0) {
+            failed = 1;
+            break;
+        }
+    }
+    while (__atomic_load_n(&g_mutex_contention_ready, __ATOMIC_ACQUIRE) <
+           created) {
+        (void)sched_yield();
+    }
+    __atomic_store_n(&g_mutex_contention_start, 1U, __ATOMIC_RELEASE);
+    for (uint32_t index = 0U; index < created; ++index) {
+        void *result = 0;
+        if (pthread_join(workers[index], &result) != 0 || result != 0) {
+            failed = 1;
+        }
+    }
+    if (created != MUTEX_CONTENTION_THREAD_COUNT || failed ||
+        __atomic_load_n(&g_mutex_contention_error, __ATOMIC_ACQUIRE) != 0U ||
+        g_mutex_contention_counter !=
+            MUTEX_CONTENTION_THREAD_COUNT * MUTEX_CONTENTION_ITERATIONS ||
+        pthread_mutex_trylock(&g_mutex_contention_lock) != 0 ||
+        pthread_mutex_unlock(&g_mutex_contention_lock) != 0 ||
+        pthread_mutex_destroy(&g_mutex_contention_lock) != 0) {
+        return 0;
+    }
+    return 1;
 }
 
 static void key_reuse_destructor(void *value) {
@@ -856,6 +1405,30 @@ static void *thread_fp_entry(void *argument) {
     return 0;
 }
 
+static int test_main_thread_stack_bounds(void) {
+    pthread_attr_t attribute;
+    void *stack_address = 0;
+    size_t stack_size = 0U;
+    volatile uint8_t stack_marker = 0U;
+    uintptr_t stack_low;
+    uintptr_t stack_high;
+    uintptr_t marker_address = (uintptr_t)&stack_marker;
+    int passed = 0;
+
+    if (pthread_getattr_np(pthread_self(), &attribute) != 0) return 0;
+    if (pthread_attr_getstack(&attribute, &stack_address, &stack_size) == 0 &&
+        stack_address != 0 &&
+        (uintptr_t)stack_address <= UINTPTR_MAX - stack_size) {
+        stack_low = (uintptr_t)stack_address;
+        stack_high = stack_low + stack_size;
+        passed = stack_low == (uintptr_t)OS_LINUX_USER_STACK_BASE &&
+                 stack_size == (size_t)OS_LINUX_USER_STACK_SIZE &&
+                 marker_address >= stack_low && marker_address < stack_high;
+    }
+    (void)pthread_attr_destroy(&attribute);
+    return passed;
+}
+
 static int test_threads(void) {
     pthread_attr_t attribute;
     pthread_t thread;
@@ -885,7 +1458,7 @@ static int test_threads(void) {
         (void)pthread_key_delete(g_thread_key);
         return 0;
     }
-    if (!test_key_reuse()) return 0;
+    if (!test_key_reuse() || !test_mutex_contention()) return 0;
     if (pthread_create(&fp_threads[0], 0, thread_fp_entry, (void *)0U) != 0 ||
         pthread_create(&fp_threads[1], 0, thread_fp_entry, (void *)1U) != 0 ||
         pthread_join(fp_threads[0], 0) != 0 ||
@@ -1001,6 +1574,90 @@ cleanup:
     if (worker != 0 && !success) (void)pthread_join(worker, 0);
     if (mutex_initialized) (void)pthread_mutex_destroy(&mutex);
     if (attribute_initialized) (void)pthread_mutexattr_destroy(&attribute);
+    return success;
+}
+
+static int condition_timeout_elapsed(pthread_cond_t *condition,
+                                     pthread_mutex_t *mutex,
+                                     clockid_t clock_id) {
+    struct timespec start;
+    struct timespec deadline;
+    struct timespec end;
+    uint64_t elapsed_ns;
+    uint64_t elapsed_seconds;
+    int64_t elapsed_nanoseconds;
+    int wait_status;
+
+    if (clock_gettime(clock_id, &start) != 0) return 0;
+    deadline = start;
+    deadline.tv_nsec += 50L * 1000L * 1000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    if (pthread_mutex_lock(mutex) != 0) return 0;
+    wait_status = pthread_cond_timedwait(condition, mutex, &deadline);
+    if (pthread_mutex_unlock(mutex) != 0 ||
+        clock_gettime(clock_id, &end) != 0 || wait_status != ETIMEDOUT) {
+        return 0;
+    }
+
+    elapsed_seconds = (uint64_t)(end.tv_sec - start.tv_sec);
+    elapsed_nanoseconds = end.tv_nsec - start.tv_nsec;
+    if (elapsed_nanoseconds < 0) {
+        if (elapsed_seconds == 0U) return 0;
+        --elapsed_seconds;
+        elapsed_nanoseconds += 1000000000L;
+    }
+    elapsed_ns = elapsed_seconds * 1000000000ULL +
+                 (uint64_t)elapsed_nanoseconds;
+    return elapsed_ns >= 15000000ULL && elapsed_ns < 2000000000ULL;
+}
+
+static int test_condvar_clock_and_attribute_abi(void) {
+    struct guarded_mutexattr {
+        uint32_t before;
+        pthread_mutexattr_t attribute;
+        uint32_t after;
+    } mutex_guard = {0x13579BDFU, {0U}, 0x2468ACE0U};
+    struct guarded_condattr {
+        uint32_t before;
+        pthread_condattr_t attribute;
+        uint32_t after;
+    } cond_guard = {0x89ABCDEFU, {0U}, 0x76543210U};
+    pthread_cond_t monotonic_condition = PTHREAD_COND_INITIALIZER;
+    pthread_cond_t realtime_condition = PTHREAD_COND_INITIALIZER;
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    clockid_t selected_clock = CLOCK_REALTIME;
+    int success = 0;
+
+    if (sizeof(pthread_mutexattr_t) != sizeof(uint32_t) ||
+        sizeof(pthread_condattr_t) != sizeof(uint32_t) ||
+        pthread_mutexattr_init(&mutex_guard.attribute) != 0 ||
+        mutex_guard.before != 0x13579BDFU ||
+        mutex_guard.after != 0x2468ACE0U ||
+        pthread_condattr_init(&cond_guard.attribute) != 0 ||
+        cond_guard.before != 0x89ABCDEFU ||
+        cond_guard.after != 0x76543210U ||
+        pthread_condattr_setclock(&cond_guard.attribute,
+                                  CLOCK_MONOTONIC) != 0 ||
+        pthread_condattr_getclock(&cond_guard.attribute,
+                                  &selected_clock) != 0 ||
+        selected_clock != CLOCK_MONOTONIC ||
+        pthread_cond_init(&monotonic_condition,
+                          &cond_guard.attribute) != 0) {
+        goto cleanup;
+    }
+
+    success = condition_timeout_elapsed(&monotonic_condition, &mutex,
+                                        CLOCK_MONOTONIC) &&
+              condition_timeout_elapsed(&realtime_condition, &mutex,
+                                        CLOCK_REALTIME);
+cleanup:
+    (void)pthread_cond_destroy(&monotonic_condition);
+    (void)pthread_mutex_destroy(&mutex);
+    (void)pthread_condattr_destroy(&cond_guard.attribute);
+    (void)pthread_mutexattr_destroy(&mutex_guard.attribute);
     return success;
 }
 
@@ -1292,7 +1949,7 @@ static int test_floating_point(void) {
         return libc_test_detail_fail("floating-remquo-remainder");
     }
     if (quotient != 3) {
-        printf("LITEOS_LIBC_TEST_DETAIL_VALUE remquo-quotient=%d\n", quotient);
+        printf("OS_LIBC_TEST_DETAIL_VALUE remquo-quotient=%d\n", quotient);
         return libc_test_detail_fail("floating-remquo-quotient");
     }
     if (
@@ -1306,7 +1963,7 @@ static int test_floating_point(void) {
     if (nextafterl(0.0L, 1.0L) != LDBL_TRUE_MIN) {
         return libc_test_detail_fail("floating-nextafterl");
     }
-    if (!isnan(nan("liteos"))) {
+    if (!isnan(nan("system"))) {
         return libc_test_detail_fail("floating-nan");
     }
     if (
@@ -1369,9 +2026,9 @@ done:
     return success ? 1 : libc_test_detail_fail("floating-environment");
 }
 
-#define LITEOS_TEST_SSE __attribute__((target("sse")))
+#define OS_TEST_SSE __attribute__((target("sse")))
 
-static int LITEOS_TEST_SSE test_complex_and_unicode(void) {
+static int OS_TEST_SSE test_complex_and_unicode(void) {
     const double pi = 3.141592653589793238462643383279502884;
     const char smile[] = "\xf0\x9f\x98\x80";
     float complex float_value = CMPLXF(1.0F, 2.0F);
@@ -1484,7 +2141,140 @@ static int LITEOS_TEST_SSE test_complex_and_unicode(void) {
     return 1;
 }
 
-#undef LITEOS_TEST_SSE
+#undef OS_TEST_SSE
+
+typedef struct process_exit_group_test_state {
+    int ready_descriptor;
+    int stop_descriptor;
+} process_exit_group_test_state_t;
+
+static void *process_exit_group_test_worker(void *raw_state) {
+    process_exit_group_test_state_t *state =
+        (process_exit_group_test_state_t *)raw_state;
+    const char ready = 'R';
+    char stop;
+    if (write(state->ready_descriptor, &ready, sizeof(ready)) !=
+        (ssize_t)sizeof(ready)) return 0;
+    for (;;) {
+        (void)getpid();
+        ssize_t result = read(state->stop_descriptor, &stop, sizeof(stop));
+        if (result == (ssize_t)sizeof(stop)) return 0;
+        if (result < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+        return 0;
+    }
+}
+
+static int wait_for_child_exit_bounded(pid_t child, int *wait_status,
+                                       unsigned int attempts) {
+    const struct timespec retry = {0, 1000000L};
+    for (unsigned int attempt = 0U; attempt < attempts; ++attempt) {
+        pid_t result = waitpid(child, wait_status, WNOHANG);
+        if (result == child) return 1;
+        if (result < 0 && errno != EINTR) return -1;
+        (void)nanosleep(&retry, 0);
+    }
+    return 0;
+}
+
+static int test_process_exit_group(void) {
+    int ready_pipe[2] = {-1, -1};
+    int control_pipe[2] = {-1, -1};
+    int stop_pipe[2] = {-1, -1};
+    process_exit_group_test_state_t worker_state;
+    const struct timespec retry = {0, 1000000L};
+    int wait_status = 0;
+    pid_t child;
+    int child_reaped = 0;
+    int ready = 0;
+    int exited_before_cleanup = 0;
+    char token;
+
+    if (pipe2(ready_pipe, O_NONBLOCK | O_CLOEXEC) != 0 ||
+        pipe2(control_pipe, O_NONBLOCK | O_CLOEXEC) != 0 ||
+        pipe2(stop_pipe, O_NONBLOCK | O_CLOEXEC) != 0) {
+        goto cleanup;
+    }
+    child = fork();
+    if (child < 0) goto cleanup;
+    if (child == 0) {
+        pthread_t worker;
+        (void)close(ready_pipe[0]);
+        (void)close(control_pipe[1]);
+        (void)close(stop_pipe[1]);
+        worker_state.ready_descriptor = ready_pipe[1];
+        worker_state.stop_descriptor = stop_pipe[0];
+        if (pthread_create(&worker, 0, process_exit_group_test_worker,
+                           &worker_state) != 0) {
+            _exit(90);
+        }
+        for (;;) {
+            ssize_t result = read(control_pipe[0], &token, sizeof(token));
+            if (result == (ssize_t)sizeof(token)) break;
+            if (result < 0 && (errno == EAGAIN || errno == EINTR)) {
+                (void)getpid();
+                continue;
+            }
+            _exit(91);
+        }
+        _exit(token == 'X' ? 42 : 92);
+    }
+
+    (void)close(ready_pipe[1]);
+    ready_pipe[1] = -1;
+    /* Keep local read ends open until reaping so timeout cleanup writes can
+     * never raise SIGPIPE if the child exits between the poll and write. */
+
+    for (unsigned int attempt = 0U; attempt < 2000U; ++attempt) {
+        ssize_t result = read(ready_pipe[0], &token, sizeof(token));
+        if (result == (ssize_t)sizeof(token)) {
+            ready = token == 'R';
+            break;
+        }
+        if (result < 0 && errno != EAGAIN && errno != EINTR) break;
+        pid_t waited = waitpid(child, &wait_status, WNOHANG);
+        if (waited == child) {
+            child_reaped = 1;
+            break;
+        }
+        if (waited < 0) break;
+        (void)nanosleep(&retry, 0);
+    }
+
+    if (ready && write(control_pipe[1], "X", 1U) == 1) {
+        int waited = wait_for_child_exit_bounded(child, &wait_status, 2000U);
+        if (waited == 1) {
+            child_reaped = 1;
+            exited_before_cleanup = 1;
+        } else if (waited < 0) {
+            child_reaped = 1;
+        }
+    }
+
+    if (!child_reaped) {
+        /* Let the worker return if the exit-group regression is present. */
+        (void)write(stop_pipe[1], "S", 1U);
+        (void)write(control_pipe[1], "X", 1U);
+        child_reaped = wait_for_child_exit_bounded(child, &wait_status,
+                                                   2000U) == 1;
+    }
+
+    (void)close(ready_pipe[0]);
+    (void)close(control_pipe[0]);
+    (void)close(control_pipe[1]);
+    (void)close(stop_pipe[0]);
+    (void)close(stop_pipe[1]);
+    return exited_before_cleanup && child_reaped &&
+           WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 42;
+
+cleanup:
+    if (ready_pipe[0] >= 0) (void)close(ready_pipe[0]);
+    if (ready_pipe[1] >= 0) (void)close(ready_pipe[1]);
+    if (control_pipe[0] >= 0) (void)close(control_pipe[0]);
+    if (control_pipe[1] >= 0) (void)close(control_pipe[1]);
+    if (stop_pipe[0] >= 0) (void)close(stop_pipe[0]);
+    if (stop_pipe[1] >= 0) (void)close(stop_pipe[1]);
+    return 0;
+}
 
 static int test_process_lifecycle(void) {
     volatile int cow_marker = 1;
@@ -1501,7 +2291,81 @@ static int test_process_lifecycle(void) {
     if (result != child || !WIFEXITED(wait_status) ||
         WEXITSTATUS(wait_status) != 7 || cow_marker != 3) return 0;
     errno = 0;
-    return waitpid(child, 0, WNOHANG) == -1 && errno == ECHILD;
+    return waitpid(child, 0, WNOHANG) == -1 && errno == ECHILD &&
+           test_process_exit_group();
+}
+
+typedef struct fork_fd_stress_state {
+    volatile uint32_t stop;
+    volatile uint32_t errors;
+    int descriptor;
+} fork_fd_stress_state_t;
+
+static void *fork_fd_stress_worker(void *raw_state) {
+    fork_fd_stress_state_t *state = (fork_fd_stress_state_t *)raw_state;
+    while (__atomic_load_n(&state->stop, __ATOMIC_ACQUIRE) == 0U) {
+        int duplicate = fcntl(state->descriptor, F_DUPFD, 3);
+        if (duplicate < 0) {
+            __atomic_fetch_add(&state->errors, 1U, __ATOMIC_RELAXED);
+            continue;
+        }
+        if (close(duplicate) != 0) {
+            __atomic_fetch_add(&state->errors, 1U, __ATOMIC_RELAXED);
+        }
+    }
+    return 0;
+}
+
+static int wait_for_fork_fd_child(pid_t child, int *wait_status) {
+    const struct timespec retry = {0, 1000000L};
+    for (unsigned int attempt = 0U; attempt < 1000U; ++attempt) {
+        pid_t result = waitpid(child, wait_status, WNOHANG);
+        if (result == child) return 1;
+        if (result < 0) return 0;
+        (void)nanosleep(&retry, 0);
+    }
+    (void)kill(child, SIGKILL);
+    (void)waitpid(child, wait_status, 0);
+    return 0;
+}
+
+static int test_fork_fd_table_synchronization(void) {
+    fork_fd_stress_state_t state = {0};
+    pthread_t worker;
+    int descriptors[2] = {-1, -1};
+    int success = 0;
+
+    if (pipe(descriptors) != 0) return 0;
+    state.descriptor = descriptors[0];
+    if (close(descriptors[1]) != 0 ||
+        pthread_create(&worker, 0, fork_fd_stress_worker, &state) != 0) {
+        (void)close(descriptors[0]);
+        return 0;
+    }
+
+    success = 1;
+    for (unsigned int attempt = 0U; attempt < 12U; ++attempt) {
+        int wait_status = 0;
+        pid_t child = fork();
+        if (child == 0) {
+            int duplicate = fcntl(state.descriptor, F_DUPFD, 3);
+            if (duplicate < 0 || close(duplicate) != 0) _exit(41);
+            _exit(0);
+        }
+        if (child < 0 || !wait_for_fork_fd_child(child, &wait_status) ||
+            !WIFEXITED(wait_status) || WEXITSTATUS(wait_status) != 0) {
+            success = 0;
+            break;
+        }
+    }
+
+    __atomic_store_n(&state.stop, 1U, __ATOMIC_RELEASE);
+    if (pthread_join(worker, 0) != 0 ||
+        __atomic_load_n(&state.errors, __ATOMIC_RELAXED) != 0U) {
+        success = 0;
+    }
+    if (close(descriptors[0]) != 0) success = 0;
+    return success;
 }
 
 static int test_exec_descriptor_child(int argc, char **argv) {
@@ -1510,8 +2374,8 @@ static int test_exec_descriptor_child(int argc, char **argv) {
     if (argc != 4 || argv == 0) return 1;
     inherited = (int)strtol(argv[2], 0, 10);
     closed = (int)strtol(argv[3], 0, 10);
-    if (getenv("LITEOS_EXEC_ENV") == 0 ||
-        strcmp(getenv("LITEOS_EXEC_ENV"), "ok") != 0 ||
+    if (getenv("OS_EXEC_ENV") == 0 ||
+        strcmp(getenv("OS_EXEC_ENV"), "ok") != 0 ||
         fcntl(inherited, F_GETFD) < 0) return 2;
     errno = 0;
     if (fcntl(closed, F_GETFD) >= 0 || errno != EBADF) return 3;
@@ -1521,7 +2385,7 @@ static int test_exec_descriptor_child(int argc, char **argv) {
 static int test_cloexec_exec(void) {
     char inherited_text[16];
     char closed_text[16];
-    char environment_text[] = "LITEOS_EXEC_ENV=ok";
+    char environment_text[] = "OS_EXEC_ENV=ok";
     char *arguments[5];
     char *environment[] = {environment_text, 0};
     int inherited = open("/etc/vfsmap.tst", O_RDONLY);
@@ -1579,7 +2443,7 @@ static int remove_path_direct(const char *path) {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.path = (uint64_t)(uintptr_t)path;
-    return liteos_syscall6(OS_SYS_FILE_REMOVE, (uint64_t)(uintptr_t)&request,
+    return __libc_native_syscall6(OS_SYS_FILE_REMOVE, (uint64_t)(uintptr_t)&request,
                            0U, 0U, 0U, 0U, 0U) >= 0;
 }
 
@@ -1591,7 +2455,7 @@ static int refresh_directory_direct(const char *path) {
         request.hdr.version = OS_SYSCALL_ABI_VERSION;
         request.path = (uint64_t)(uintptr_t)path;
         request.index = index;
-        status = liteos_syscall6(OS_SYS_FILE_ENUMERATE,
+        status = __libc_native_syscall6(OS_SYS_FILE_ENUMERATE,
                                  (uint64_t)(uintptr_t)&request,
                                  0U, 0U, 0U, 0U, 0U);
         if (status == -2) return 1;
@@ -1617,7 +2481,7 @@ static int refresh_fileman_direct(void) {
             request.hdr.version = OS_SYSCALL_ABI_VERSION;
             request.path = (uint64_t)(uintptr_t)containers[container];
             request.index = index;
-            result = liteos_syscall6(OS_SYS_FILE_ENUMERATE,
+            result = __libc_native_syscall6(OS_SYS_FILE_ENUMERATE,
                                      (uint64_t)(uintptr_t)&request,
                                      0U, 0U, 0U, 0U, 0U);
             if (result == -2) break;
@@ -1717,7 +2581,7 @@ static int test_extended_runtime(void) {
     size_t line_capacity = 0U;
     char utf8[32];
     wchar_t wide[16];
-    const char *multibyte = "LiteOS \xe4\xb8\xad";
+    const char *multibyte = "System \xe4\xb8\xad";
     struct dirent **entries = 0;
     struct iovec vectors[2];
     char first[] = "hello";
@@ -1733,7 +2597,7 @@ static int test_extended_runtime(void) {
 
     if (fnmatch("*.tst", "vfsmap.tst", 0) != 0 ||
         fnmatch("*.tst", "etc/vfsmap.tst", FNM_PATHNAME) != FNM_NOMATCH ||
-        fnmatch("[a-z]iteos", "liteos", 0) != 0) {
+        fnmatch("[a-z]ystem", "system", 0) != 0) {
         return libc_test_detail_fail("extended-fnmatch");
     }
 
@@ -1747,7 +2611,7 @@ static int test_extended_runtime(void) {
     }
 
     if (mbstowcs(wide, multibyte, sizeof(wide) / sizeof(wide[0])) != 8U ||
-        !iswalpha(wide[0]) || wcscmp(wide, L"LiteOS \x4e2d") != 0 ||
+        !iswalpha(wide[0]) || wcscmp(wide, L"System \x4e2d") != 0 ||
         wcstombs(utf8, wide, sizeof(utf8)) != strlen(multibyte) ||
         strcmp(utf8, multibyte) != 0 || wcswidth(wide, 8U) != 8) {
         return libc_test_detail_fail("extended-wide");
@@ -2001,6 +2865,15 @@ static int test_files(void) {
         (void)close(descriptor);
         return libc_test_detail_fail("files-content");
     }
+    if (lseek(descriptor, 6, SEEK_SET) != 6 ||
+        read(descriptor, bytes, sizeof(bytes) - 1U) != 0) {
+        (void)close(descriptor);
+        return libc_test_detail_fail("files-read-eof");
+    }
+    if (lseek(descriptor, 0, SEEK_SET) != 0) {
+        (void)close(descriptor);
+        return libc_test_detail_fail("files-read-eof-reset");
+    }
     errno = 0;
     if (fcntl(descriptor, 0x7fffffff) != -1 || errno != EINVAL) {
         (void)close(descriptor);
@@ -2168,7 +3041,66 @@ static int test_files(void) {
         realpath(path, resolved) == 0 || strcmp(resolved, path) != 0) {
         return libc_test_detail_fail("files-directory-final");
     }
+    if (!test_linux_proc_fd_directory()) return 0;
     return test_nasm_output_recreate();
+}
+
+extern int statfs(const char *path, void *status);
+extern ssize_t sendfile(int output, int input, off_t *offset, size_t count);
+
+static bool test_sendfile_transfer(void) {
+    char source_path[] = "/tmp/sendfile-source-XXXXXX";
+    char output_path[] = "/tmp/sendfile-output-XXXXXX";
+    unsigned char source[20003], observed[20003];
+    int input = mkstemp(source_path);
+    int output = -1;
+    bool success = false;
+    if (input < 0) return false;
+    output = mkstemp(output_path);
+    if (output < 0) goto done;
+    for (size_t i = 0U; i < sizeof(source); ++i) source[i] = (unsigned char)(i * 31U);
+    if (write(input, source, sizeof(source)) != (ssize_t)sizeof(source) ||
+        lseek(input, 0, SEEK_SET) != 0) goto done;
+    off_t offset = 0;
+    if (sendfile(output, input, &offset, sizeof(source) + 10U) != (ssize_t)sizeof(source) ||
+        offset != (off_t)sizeof(source) || lseek(input, 0, SEEK_CUR) != 0 ||
+        sendfile(output, input, &offset, 1U) != 0 ||
+        lseek(output, 0, SEEK_SET) != 0 ||
+        read(output, observed, sizeof(observed)) != (ssize_t)sizeof(observed) ||
+        memcmp(source, observed, sizeof(source)) != 0) goto done;
+    if (lseek(output, 0, SEEK_SET) != 0 ||
+        sendfile(output, input, 0, sizeof(source)) != (ssize_t)sizeof(source) ||
+        lseek(input, 0, SEEK_CUR) != (off_t)sizeof(source) ||
+        sendfile(output, input, 0, 1U) != 0 ||
+        lseek(output, 0, SEEK_SET) != 0 ||
+        read(output, observed, sizeof(observed)) != (ssize_t)sizeof(observed) ||
+        memcmp(source, observed, sizeof(source)) != 0) goto done;
+    success = true;
+done:
+    if (output >= 0) { (void)close(output); (void)unlink(output_path); }
+    (void)close(input); (void)unlink(source_path);
+    return success;
+}
+
+static bool test_statfs_output_layout(void) {
+    struct {
+        uint64_t before;
+        uint64_t words[15]; /* x86-64 statfs: 120 bytes, not statvfs's 112. */
+        uint64_t after;
+    } output;
+    memset(&output, 0xa5, sizeof(output));
+    uint64_t guard = output.before;
+    if (statfs("/dev/shm", output.words) != 0 ||
+        output.before != guard || output.after != guard ||
+        output.words[0] != 0U || output.words[1] != 4096U ||
+        output.words[2] != 2097152U || output.words[3] != 1048576U ||
+        output.words[4] != 1048576U || output.words[5] != 65536U ||
+        output.words[6] != 65535U || output.words[7] != 0U ||
+        output.words[8] != 255U || output.words[9] != 4096U) return false;
+    for (size_t i = 10U; i < 15U; ++i) {
+        if (output.words[i] != 0U) return false;
+    }
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -2184,48 +3116,96 @@ int main(int argc, char **argv) {
     if (argc >= 2 && argv != 0 && strcmp(argv[1], "--fd-check") == 0) {
         return test_exec_descriptor_child(argc, argv);
     }
+    if (argc >= 2 && argv != 0 && strcmp(argv[1], "--sync-check") == 0) {
+        if (!test_threads()) return libc_test_fail("threads");
+        printf("OS_PTHREAD_THREADS_MUTEX_OK\n");
+        if (!test_condvar_clock_and_attribute_abi()) {
+            return libc_test_fail("condvar-clock-attribute-abi");
+        }
+        printf("OS_PTHREAD_CONDVAR_CLOCK_ABI_OK\n");
+        if (!test_c11_threads()) return libc_test_fail("c11-threads");
+        printf("OS_PTHREAD_RECURSIVE_ERRORCHECK_COND_OK\n");
+        return 0;
+    }
 
     if (argc < 1 || argv == 0 || !test_strings()) {
         return libc_test_fail("strings");
+    }
+    /* Run the Linux-personality pointer-safety regression before the larger
+     * native compatibility suite.  A Linux image may still stop later on an
+     * unrelated compatibility gap, but that must not hide getresuid/getresgid
+     * coverage.  Native images skip inside the test itself. */
+    if (!test_linux_resolved_ids()) return libc_test_fail("linux-resolved-ids");
+    if (!test_linux_sysconf_cpu_count()) {
+        return libc_test_fail("linux-sysconf-cpu-count");
+    }
+    if (!test_linux_futex_wait_bitset_private()) {
+        return libc_test_fail("linux-futex-wait-bitset");
+    }
+    if (!test_linux_native_socket_messages()) {
+        return libc_test_fail("linux-native-socket-messages");
+    }
+    if (!test_linux_fd_dup_identity()) {
+        return libc_test_fail("linux-fd-dup-identity");
+    }
+    if (!test_connected_ipv4_udp_binding()) {
+        return libc_test_fail("connected-ipv4-udp-binding");
+    }
+    if (!test_linux_epoll_syscall_arguments()) {
+        return libc_test_fail("linux-epoll-syscall-arguments");
     }
     if (!test_standard_utilities()) return libc_test_fail("utilities");
     if (!test_entropy()) return libc_test_fail("entropy");
     if (!test_environment_and_time()) return libc_test_fail("environment");
     if (!test_files()) return libc_test_fail("files");
+    if (!test_statfs_output_layout()) return libc_test_fail("statfs-layout");
+    printf("OS_STATFS_LAYOUT_OK\n");
+    if (!test_sendfile_transfer()) return libc_test_fail("sendfile-transfer");
+    printf("OS_SENDFILE_TRANSFER_OK\n");
     if (!test_pipes()) return libc_test_fail("pipes");
     if (!test_virtual_memory()) return libc_test_fail("virtual-memory");
     if (!test_network_addresses()) return libc_test_fail("network");
+    if (!test_ipv4_ephemeral_binding()) {
+        return libc_test_fail("ipv4-ephemeral-binding");
+    }
     if (!test_poll_and_name_resolution()) {
         return libc_test_fail("poll-name-resolution");
     }
     if (!test_command_line_and_glob()) return libc_test_fail("command-line");
     if (!test_extended_runtime()) return libc_test_fail("extended");
+    if (!test_main_thread_stack_bounds()) {
+        return libc_test_fail("main-thread-stack-bounds");
+    }
     if (!test_threads()) return libc_test_fail("threads");
+    if (!test_condvar_clock_and_attribute_abi()) {
+        return libc_test_fail("condvar-clock-attribute-abi");
+    }
     if (!test_c11_threads()) return libc_test_fail("c11-threads");
     if (!test_floating_point()) return libc_test_fail("floating-point");
     if (!test_floating_environment()) return libc_test_fail("floating-environment");
     if (!test_complex_and_unicode()) return libc_test_fail("complex-unicode");
     if (!test_signals()) return libc_test_fail("signals");
-    if (!test_process_lifecycle() || !test_cloexec_exec()) {
+    if (!test_process_lifecycle() ||
+        !test_fork_fd_table_synchronization() || !test_cloexec_exec()) {
         return libc_test_fail("process");
     }
     if (!test_blend2d()) return libc_test_fail("blend2d");
-    printf("LITEOS_BLEND2D_TEST_OK\n");
-    if (!liteos_blend2d_api_test()) return libc_test_fail("blend2d-api");
-    printf("LITEOS_BLEND2D_API_TEST_OK\n");
+    printf("OS_BLEND2D_TEST_OK\n");
+    if (!blend2d_api_test()) return libc_test_fail("blend2d-api");
+    printf("OS_BLEND2D_API_TEST_OK\n");
     if (!test_blend2d_font_zoom()) {
         return libc_test_fail("blend2d-font-zoom");
     }
-    printf("LITEOS_BLEND2D_FONT_ZOOM_OK\n");
+    printf("OS_BLEND2D_FONT_ZOOM_OK\n");
 
-    strcpy(source, "liteos-c-runtime");
+    strcpy(source, "system-c-runtime");
     memcpy(copy, source, strlen(source) + 1U);
     memmove(copy + 1U, copy, 6U);
     parsed = strtol("0x2a", &end, 0);
     heap = (char *)malloc(64U);
     zero = (uint8_t *)calloc(8U, 8U);
     if (parsed != 42L || end == 0 || *end != '\0' ||
-        strncmp(copy, "lliteos", 7U) != 0 || heap == 0 || zero == 0 ||
+        strncmp(copy, "ssystem", 7U) != 0 || heap == 0 || zero == 0 ||
         clock_gettime(CLOCK_REALTIME, &now) != 0 ||
         snprintf(formatted, sizeof(formatted), "argc=%d value=%lld hex=%zx", argc,
                  (long long)now.tv_sec, (size_t)0x2aU) < 0 ||
@@ -2236,6 +3216,6 @@ int main(int argc, char **argv) {
     }
     free(heap);
     free(zero);
-    printf("LITEOS_LIBC_TEST_OK %s\n", formatted);
+    printf("OS_LIBC_TEST_OK %s\n", formatted);
     return 0;
 }

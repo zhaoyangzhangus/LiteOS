@@ -2,10 +2,48 @@
 
 #include <arch/x86_64/uaccess.h>
 #include <kernel/console.h>
+#include <kernel/process.h>
+#include <kernel/vfs.h>
+#include <arch/x86_64/acpi.h>
+#include <arch/x86_64/reboot.h>
 
 #include "internal.h"
 
 #define DEBUG_WRITE_MAX_BYTES 240U
+
+int64_t syscall_system_power(uint64_t action, uint64_t unused1,
+                             uint64_t unused2, uint64_t unused3,
+                             uint64_t unused4, uint64_t unused5) {
+    (void)unused1; (void)unused2; (void)unused3; (void)unused4; (void)unused5;
+    static atomic_bool busy;
+    if (action > 1U) return K_EINVAL;
+    if (current_process() == 0) return K_EPERM;
+    if (atomic_exchange_explicit(&busy, true, memory_order_acq_rel)) return K_EBUSY;
+    kstatus_t status = vfs_sync_all();
+    if (status == K_OK) {
+        if (action == 0U) x86_system_reboot();
+        status = x86_acpi_poweroff();
+    }
+    atomic_store_explicit(&busy, false, memory_order_release);
+    return status == K_OK ? K_EIO : status; /* Firmware returned without powering off. */
+}
+
+#ifndef OS_DEBUG_SERIAL
+#define OS_DEBUG_SERIAL 0
+#endif
+
+/* Temporary Chrome-only stderr capture for diagnosing guest aborts. */
+#define OS_CHROME_DEBUG_SERIAL 1
+
+static bool debug_write_from_chrome(void) {
+    static const char chrome_path[] = "/sbin/chrome";
+    process_t *process = current_process();
+    if (process == 0) return false;
+    for (size_t index = 0U; index < sizeof(chrome_path); ++index) {
+        if (process->linux_exe[index] != chrome_path[index]) return false;
+    }
+    return true;
+}
 
 int64_t syscall_debug_write(uint64_t buffer, uint64_t length,
                             uint64_t unused2, uint64_t unused3,
@@ -22,6 +60,17 @@ int64_t syscall_debug_write(uint64_t buffer, uint64_t length,
                             (size_t)length);
     if (status != K_OK) return status;
     text[length] = '\0';
-    liteos_serial_write_serial_only(text);
+#if OS_DEBUG_SERIAL
+    kernel_serial_write_serial_only(text);
+#elif OS_CHROME_DEBUG_SERIAL
+    if (debug_write_from_chrome()) {
+        /* serial_only itself is gated off in normal builds. Use the same
+         * bounded capture as Linux write(2), without enabling global UART
+         * logging or drawing diagnostics into the framebuffer. */
+        linux_chrome_stderr_write(current_process(), text, (size_t)length);
+    }
+#else
+    (void)text;
+#endif
     return (int64_t)length;
 }

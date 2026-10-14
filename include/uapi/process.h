@@ -1,5 +1,4 @@
 #pragma once
-#pragma once
 #include "abi.h"
 
 typedef struct os_thread_create {
@@ -42,6 +41,35 @@ typedef struct os_process_info {
 
 #define OS_PROCESS_NAME_MAX 32U
 #define OS_THREAD_NAME_MAX  32U
+
+/* Additive monitor ABI: existing enumeration layouts remain unchanged. */
+#define OS_TASK_PROTECTED (1U << 0)
+typedef struct os_task_info {
+    os_versioned_header_t hdr;
+    uint64_t pid;
+    uint64_t tid; /* Zero queries the complete process. */
+    uint64_t create_time_ns;
+    uint64_t runtime_ns;
+    uint64_t rss_bytes;
+    uint64_t committed_bytes;
+    uint32_t cpu_count;
+    uint32_t flags;
+    uint32_t state;
+    uint32_t thread_count;
+} os_task_info_t;
+
+typedef struct os_process_terminate {
+    os_versioned_header_t hdr;
+    uint64_t pid;
+    uint64_t create_time_ns; /* Match the confirmed snapshot, not a stale row. */
+} os_process_terminate_t;
+
+typedef struct os_thread_terminate {
+    os_versioned_header_t hdr;
+    uint64_t pid;
+    uint64_t tid;
+    uint64_t create_time_ns;
+} os_thread_terminate_t;
 
 /* Stable read-only process snapshot used by system monitors. */
 typedef struct os_process_snapshot {
@@ -87,7 +115,7 @@ typedef struct os_thread_enumerate {
 #define OS_EXEC_FD_PIPE       (1U << 1)
 #define OS_EXEC_FD_PIPE_READ  (1U << 2)
 #define OS_EXEC_FD_DEBUG      (1U << 3)
-#define OS_AUX_LITEOS_FD_MAP  0x6F534446U
+#define OS_AUX_FD_MAP  0x6F534446U
 
 typedef struct os_exec_fd_entry {
     uint32_t descriptor;

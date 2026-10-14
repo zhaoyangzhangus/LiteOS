@@ -34,7 +34,7 @@
   #endif
 
   // These OSes use 64-bit API by default.
-  #if defined(BL_PLATFORM_LITEOS) || \
+  #if defined(BL_PLATFORM_FREESTANDING) || \
       defined(__APPLE__    ) || \
       defined(__HAIKU__    ) || \
       defined(__bsdi__     ) || \

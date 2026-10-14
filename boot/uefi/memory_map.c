@@ -29,7 +29,7 @@ static BOOLEAN can_merge_usable_memory(const EFI_MEMORY_DESCRIPTOR *left,
     return 1;
 }
 
-UINTN liteos_merge_usable_memory_map(EFI_MEMORY_DESCRIPTOR *memory_map,
+UINTN boot_merge_usable_memory_map(EFI_MEMORY_DESCRIPTOR *memory_map,
                                      UINTN memory_map_size,
                                      UINTN descriptor_size) {
     if (memory_map == 0 || descriptor_size < sizeof(EFI_MEMORY_DESCRIPTOR) ||

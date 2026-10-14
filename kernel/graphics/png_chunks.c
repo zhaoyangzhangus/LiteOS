@@ -1,4 +1,5 @@
 #include "png_internal.h"
+#include <kernel/crc32.h>
 
 /* REFACTOR_P7A_PNG_CHUNK_OWNER: PNG container/chunk validation and IDAT
  * collection are kept out of the DEFLATE and pixel conversion unit. */
@@ -14,23 +15,8 @@ static bool png_type_is(const uint8_t *type, char a, char b, char c, char d) {
 
 static uint32_t png_crc32(const uint8_t *type, const uint8_t *data,
                           size_t length) {
-    uint32_t crc = 0xFFFFFFFFU;
-
-    for (uint32_t index = 0U; index < 4U; ++index) {
-        crc ^= type[index];
-        for (uint32_t bit = 0U; bit < 8U; ++bit) {
-            crc = (crc >> 1U) ^
-                  ((crc & 1U) != 0U ? 0xEDB88320U : 0U);
-        }
-    }
-    for (size_t index = 0U; index < length; ++index) {
-        crc ^= data[index];
-        for (uint32_t bit = 0U; bit < 8U; ++bit) {
-            crc = (crc >> 1U) ^
-                  ((crc & 1U) != 0U ? 0xEDB88320U : 0U);
-        }
-    }
-    return crc ^ 0xFFFFFFFFU;
+    uint32_t crc = crc32_ieee_update(UINT32_MAX, type, 4U);
+    return ~crc32_ieee_update(crc, data, length);
 }
 
 static bool png_signature_valid(const uint8_t *data, size_t size) {

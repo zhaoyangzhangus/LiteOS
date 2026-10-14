@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <assert.h>
 #include <string.h>
 #include <kernel/block_device.h>
 #include <kernel/fat32.h>
@@ -132,11 +133,209 @@ static void make_disk(void) {
     memcpy(disk + 8U * 512U, "nested", 6U);
 }
 
+static void rename_writeback_failure_test(void) {
+    const char *sources[] = {"hello.txt", "hello.txt", "Long File Name.txt", "hello.txt"};
+    const char *destinations[] = {"DIR/renamed-long-file-name.txt", "new.txt", "short.txt",
+                                "DIR/extended-long-file-name.txt"};
+    UINT32 failure_points = 0U;
+    for (UINT32 scenario = 0U; scenario < 4U; ++scenario) {
+    const char *source = sources[scenario];
+    const char *destination = destinations[scenario];
+    const char *expected = scenario == 2U ? "long " : "hello";
+    UINT32 flush_writes = 0U;
+    for (UINT32 failure = 0U; failure == 0U || failure <= flush_writes; ++failure) {
+        OS_BLOCK_MANAGER blocks = {0};
+        OS_BLOCK_DEVICE *device = 0;
+        OS_FAT32 fat = {0};
+        OS_FAT32_FILE *file = 0;
+        os_file_info_t info = {0};
+        CHAR8 bytes[5];
+        UINT32 size = 0U;
+        make_disk();
+        if (scenario == 3U) {
+            /* Fill all remaining slots to force allocation and linking of
+             * another directory cluster before rename publication. */
+            for (UINT32 slot = 1U; slot < 16U; ++slot) {
+                UINT8 *entry = disk + 7U * 512U + slot * 32U;
+                memcpy(entry, "FILL0000TXT", 11U);
+                entry[6] = (UINT8)('0' + slot / 10U);
+                entry[7] = (UINT8)('0' + slot % 10U);
+                entry[11] = 0x20U;
+            }
+        }
+        assert(block_manager_init(&blocks));
+        assert(block_register(&blocks, "rename0", 512U, TEST_SECTORS,
+                                     read_disk, write_disk, 0, disk, &device));
+        assert(fat32_init(&fat, device));
+        assert(fat32_open(&fat, source, &file));
+        /* An open destination cannot yet be detached. Refuse it without
+         * changing either payload or the open source coordinates. */
+        if (failure == 0U) {
+            assert(fat32_create_path(&fat, "protected.txt", 0));
+            assert(fat32_write_path(&fat, "protected.txt", 0U, "keep!", 5U, &size));
+            OS_FAT32_FILE *protected_file = 0;
+            assert(fat32_open(&fat, "protected.txt", &protected_file));
+            UINT64 source_lba = file->DirectoryLba;
+            UINT32 source_offset = file->DirectoryOffset;
+            assert(!fat32_rename_path(&fat, source, "protected.txt"));
+            assert(file->DirectoryLba == source_lba && file->DirectoryOffset == source_offset);
+            assert(fat32_read_path(&fat, "protected.txt", 0U, bytes, sizeof(bytes), &size));
+            assert(size == 5U && memcmp(bytes, "keep!", 5U) == 0);
+            assert(fat32_read_file(file, 0U, bytes, sizeof(bytes), &size));
+            assert(size == 5U && memcmp(bytes, expected, 5U) == 0);
+            assert(fat32_close(protected_file));
+            assert(fat32_remove_path(&fat, "protected.txt"));
+        }
+        UINT64 old_lba = file->DirectoryLba;
+        UINT32 old_offset = file->DirectoryOffset;
+        write_count = 0U;
+        fail_write_number = failure;
+        BOOLEAN renamed = fat32_rename_path(&fat, source, destination);
+        if (failure == 0U) {
+            assert(renamed);
+            flush_writes = write_count;
+            assert(flush_writes >= 1U);
+        } else {
+            assert(!renamed);
+            ++failure_points;
+            assert(file->DirectoryLba == old_lba && file->DirectoryOffset == old_offset);
+        }
+        const char *retained = renamed ? destination : source;
+        const char *absent = renamed ? source : destination;
+        assert(fat32_stat_path(&fat, retained, &info));
+        assert(!fat32_stat_path(&fat, absent, &info));
+        assert(fat32_read_file(file, 0U, bytes, sizeof(bytes), &size));
+        assert(size == 5U && memcmp(bytes, expected, 5U) == 0);
+        fail_write_number = 0U;
+        assert(fat32_close(file));
+        assert(fat32_destroy(&fat));
+        if (scenario == 3U && failure != 0U) {
+            /* Cluster 4 was free before directory extension. Both FAT
+             * copies and the original parent link must be restored. */
+            assert(disk[512U + 16U] == 0 && disk[1024U + 16U] == 0);
+            /* FAT accepts every value from 0x0FFFFFF8 through 0x0FFFFFFF
+             * as end-of-chain; recovery may normalize the original marker. */
+            assert(disk[512U + 24U] >= 0xF8 && disk[512U + 25U] == 0xFF &&
+                   disk[512U + 26U] == 0xFF && (disk[512U + 27U] & 0x0F) == 0x0F);
+            assert(memcmp(disk + 512U + 24U, disk + 1024U + 24U, 4U) == 0);
+        }
+        /* Reload through a fresh cache to verify recovery reached the media. */
+        fat = (OS_FAT32){0};
+        assert(fat32_init(&fat, device));
+        assert(fat32_stat_path(&fat, retained, &info));
+        assert(!fat32_stat_path(&fat, absent, &info));
+        assert(fat32_read_path(&fat, retained, 0U, bytes, sizeof(bytes), &size));
+        assert(size == 5U && memcmp(bytes, expected, 5U) == 0);
+        assert(fat32_destroy(&fat));
+        assert(block_unregister(&blocks, device));
+        assert(block_manager_destroy(&blocks));
+    }
+    }
+    printf("FAT rename: %u single-write failure points across cross-directory, same-directory, reused LFN slots and full-directory extension restore source/name/handle/FAT links and survive fresh-cache reload\n", failure_points);
+}
+
+static void replacement_corrupt_chain_test(void) {
+    for (UINT32 scenario = 0U; scenario < 4U; ++scenario) {
+        OS_BLOCK_MANAGER blocks = {0}; OS_BLOCK_DEVICE *device = 0;
+        OS_FAT32 fat = {0}; OS_FAT32_FILE *file = 0;
+        UINT8 before[TEST_SECTORS * 512U];
+        make_disk();
+        /* hello starts at 3, Long File Name starts at 5. Both already
+         * contain valid data. Build shared tails or malformed cycles. */
+        for (UINT32 copy = 1U; copy <= 2U; ++copy) {
+            UINT8 *table = disk + copy * 512U;
+            if (scenario == 0U) put32(table + 3U * 4U, 5U);
+            if (scenario == 1U) {
+                put32(table + 3U * 4U, 8U); put32(table + 5U * 4U, 8U);
+                put32(table + 8U * 4U, 9U); put32(table + 9U * 4U, 0x0FFFFFFFU);
+            }
+            if (scenario == 2U) {put32(table + 3U * 4U, 8U); put32(table + 8U * 4U, 3U);}
+            if (scenario == 3U) put32(table + 5U * 4U, 5U);
+        }
+        memcpy(before, disk, sizeof(before));
+        assert(block_manager_init(&blocks));
+        assert(block_register(&blocks, "corrupt0", 512U, TEST_SECTORS, read_disk, write_disk, 0, disk, &device));
+        assert(fat32_init(&fat, device)); assert(fat32_open(&fat, "hello.txt", &file));
+        UINT64 old_lba = file->DirectoryLba; UINT32 old_offset = file->DirectoryOffset;
+        write_count = 0U;
+        assert(!fat32_rename_path(&fat, "hello.txt", "Long File Name.txt"));
+        assert(!write_count && !memcmp(disk, before, sizeof(before)));
+        assert(file->DirectoryLba == old_lba && file->DirectoryOffset == old_offset);
+        assert(fat32_close(file));
+        if (scenario >= 2U) {
+            const char *cyclic = scenario == 2U ? "hello.txt" : "Long File Name.txt";
+            assert(!fat32_remove_path(&fat, cyclic));
+            os_file_info_t info = {0};
+            assert(fat32_stat_path(&fat, cyclic, &info));
+            assert(!memcmp(disk, before, sizeof(before)));
+        }
+        assert(fat32_destroy(&fat));
+        assert(block_unregister(&blocks, device)); assert(block_manager_destroy(&blocks));
+    }
+    puts("FAT replacement corruption: shared tails and source/target cycles rejected without disk writes");
+}
+
+static void replacement_writeback_test(void) {
+    UINT32 failures = 0U;
+    for (UINT32 scenario = 0U; scenario < 3U; ++scenario) {
+        const char *source = scenario == 0U ? "hello.txt" : "Long File Name.txt";
+        const char *target = scenario == 2U ? "DIR/Existing Long Target.txt" : "Existing Long Target.txt";
+        const char *expected = scenario == 0U ? "hello" : "long ";
+        UINT32 writes = 0U;
+        for (UINT32 failure = 0U; failure == 0U || failure <= writes; ++failure) {
+            OS_BLOCK_MANAGER blocks = {0}; OS_BLOCK_DEVICE *device = 0;
+            OS_FAT32 fat = {0}; OS_FAT32_FILE *file = 0;
+            CHAR8 bytes[5]; UINT32 size = 0U; os_file_info_t info = {0};
+            make_disk();
+            assert(block_manager_init(&blocks));
+            assert(block_register(&blocks, "replace0", 512U, TEST_SECTORS, read_disk, write_disk, 0, disk, &device));
+            assert(fat32_init(&fat, device));
+            assert(fat32_create_path(&fat, target, 0));
+            assert(fat32_write_path(&fat, target, 0U, "keep!", 5U, &size));
+            OS_FAT32_FILE *old_target = 0;
+            assert(fat32_open(&fat, target, &old_target));
+            UINT32 retired_cluster = old_target->FirstCluster;
+            assert(retired_cluster >= 2U && fat.FatCount == 2U);
+            assert(fat32_close(old_target));
+            assert(fat32_sync(&fat));
+            assert(fat32_open(&fat, source, &file));
+            UINT64 old_lba = file->DirectoryLba; UINT32 old_offset = file->DirectoryOffset;
+            write_count = 0U; fail_write_number = failure;
+            BOOLEAN replaced = fat32_rename_path(&fat, source, target);
+            fail_write_number = 0U;
+            if (failure == 0U) { assert(replaced); writes = write_count; assert(writes); }
+            else { assert(!replaced); ++failures; assert(file->DirectoryLba == old_lba && file->DirectoryOffset == old_offset); }
+            for (UINT32 copy = 0U; copy < fat.FatCount; ++copy) {
+                /* This fixture has one FAT sector per copy. */
+                UINT8 *entry = disk + (fat.FatStartLba + copy) * 512U + retired_cluster * 4U;
+                UINT32 value = (UINT32)entry[0] | ((UINT32)entry[1] << 8U) |
+                    ((UINT32)entry[2] << 16U) | ((UINT32)(entry[3] & 15U) << 24U);
+                if (!(replaced ? value == 0U : value >= 0x0FFFFFF8U))
+                    fprintf(stderr, "replacement FAT mismatch scenario=%u failure=%u copy=%u cluster=%u value=%x replaced=%u\n",
+                        scenario, failure, copy, retired_cluster, value, replaced);
+                assert(replaced ? value == 0U : value >= 0x0FFFFFF8U);
+            }
+            assert(fat32_read_path(&fat, target, 0U, bytes, 5U, &size));
+            assert(size == 5U && memcmp(bytes, replaced ? expected : "keep!", 5U) == 0);
+            assert(fat32_stat_path(&fat, source, &info) == !replaced);
+            assert(fat32_read_file(file, 0U, bytes, 5U, &size));
+            assert(size == 5U && memcmp(bytes, expected, 5U) == 0);
+            assert(fat32_close(file)); assert(fat32_destroy(&fat));
+            fat = (OS_FAT32){0}; assert(fat32_init(&fat, device));
+            assert(fat32_read_path(&fat, target, 0U, bytes, 5U, &size));
+            assert(size == 5U && memcmp(bytes, replaced ? expected : "keep!", 5U) == 0);
+            assert(fat32_stat_path(&fat, source, &info) == !replaced);
+            assert(fat32_destroy(&fat));assert(block_unregister(&blocks, device));assert(block_manager_destroy(&blocks));
+        }
+    }
+    printf("FAT replacement: %u write failure points, short/long source names, same/cross directory, source handle and fresh-cache recovery passed\n", failures);
+}
+
 int main(void) {
-    LITEOS_BLOCK_MANAGER blocks = {0};
-    LITEOS_BLOCK_DEVICE *device = 0;
-    LITEOS_FAT32 fat = {0};
-    LITEOS_FAT32_FILE *rollback_file = 0;
+    OS_BLOCK_MANAGER blocks = {0};
+    OS_BLOCK_DEVICE *device = 0;
+    OS_FAT32 fat = {0};
+    OS_FAT32_FILE *rollback_file = 0;
     CHAR8 buffer[6] = {0};
     CHAR8 nested_buffer[7] = {0};
     UINT8 extension[600];
@@ -144,92 +343,113 @@ int main(void) {
     UINT32 hello_data_reads;
     UINT32 size = 0;
     for (UINT32 i = 0; i < sizeof(extension); ++i) extension[i] = (UINT8)(i ^ 0x5AU);
+    rename_writeback_failure_test();
+    replacement_writeback_test();
+    replacement_corrupt_chain_test();
     make_disk();
-    if (!liteos_block_manager_init(&blocks) ||
-        !liteos_block_register(&blocks, "mem0", 512U, TEST_SECTORS,
+    if (!block_manager_init(&blocks) ||
+        !block_register(&blocks, "mem0", 512U, TEST_SECTORS,
                                read_disk, write_disk, 0, disk, &device)) return 1;
-    if (!liteos_fat32_init(&fat, device)) return 2;
-    if (!liteos_fat32_read_path(&fat, "hello.txt", 0U, buffer, 5U, &size) ||
+    if (!fat32_init(&fat, device)) return 2;
+    if (!fat32_read_path(&fat, "hello.txt", 0U, buffer, 5U, &size) ||
         size != 5U || strcmp(buffer, "hello") != 0) return 3;
-    if (!liteos_fat32_read_path(&fat, "Long File Name.txt", 0U,
+    if (!fat32_read_path(&fat, "Long File Name.txt", 0U,
                                 buffer, 5U, &size) || size != 5U ||
         memcmp(buffer, "long ", 5U) != 0 ||
-        !liteos_fat32_read_path(&fat, "DIR/NESTED.TXT", 0U,
+        !fat32_read_path(&fat, "DIR/NESTED.TXT", 0U,
                                 nested_buffer, 6U, &size) || size != 6U ||
         memcmp(nested_buffer, "nested", 6U) != 0 ||
-        !liteos_fat32_write_path(&fat, "hello.txt", 0U, "world", 5U, &size) ||
+        !fat32_write_path(&fat, "hello.txt", 0U, "world", 5U, &size) ||
         size != 5U) return 4;
     memset(full_sector, 0xA5, sizeof(full_sector));
     memcpy(full_sector, "world", 5U);
-    if (!liteos_block_cache_invalidate(&fat.Cache, HELLO_DATA_LBA)) return 5;
+    if (!block_cache_invalidate(&fat.Cache, HELLO_DATA_LBA)) return 5;
     hello_data_reads = read_counts[HELLO_DATA_LBA];
-    if (!liteos_fat32_write_path(&fat, "hello.txt", 0U, full_sector,
+    if (!fat32_write_path(&fat, "hello.txt", 0U, full_sector,
                                  sizeof(full_sector), &size) ||
         size != sizeof(full_sector) || read_counts[HELLO_DATA_LBA] != hello_data_reads) return 5;
-    if (!liteos_block_cache_invalidate(&fat.Cache, HELLO_DATA_LBA)) return 5;
+    if (!block_cache_invalidate(&fat.Cache, HELLO_DATA_LBA)) return 5;
     hello_data_reads = read_counts[HELLO_DATA_LBA];
-    if (!liteos_fat32_write_path(&fat, "hello.txt", 510U, "xy", 2U, &size) ||
+    if (!fat32_write_path(&fat, "hello.txt", 510U, "xy", 2U, &size) ||
         size != 2U ||
         read_counts[HELLO_DATA_LBA] != hello_data_reads + 1U ||
-        !liteos_block_cache_read(&fat.Cache, HELLO_DATA_LBA, full_sector) ||
+        !block_cache_read(&fat.Cache, HELLO_DATA_LBA, full_sector) ||
         memcmp(full_sector, "world", 5U) != 0 || full_sector[509U] != 0xA5U ||
         full_sector[510U] != 'x' || full_sector[511U] != 'y') return 5;
-    if (!liteos_fat32_write_path(&fat, "hello.txt", 5U, extension,
+    if (!fat32_write_path(&fat, "hello.txt", 5U, extension,
                                  sizeof(extension), &size) ||
         size != sizeof(extension) ||
-        !liteos_fat32_sync(&fat) ||
+        !fat32_sync(&fat) ||
         memcmp(disk + 5U * 512U, extension + 507U, 93U) != 0 ||
         disk[3U * 512U + 28U] != (UINT8)(5U + sizeof(extension)) ||
         disk[512U + 16U] != 0xF8U || disk[1024U + 16U] != 0xF8U ||
-        !liteos_fat32_create_path(&fat, "new.bin", 0) ||
-        liteos_fat32_create_path(&fat, "new.bin", 0) ||
-        !liteos_fat32_create_path(&fat, "Long Created File.txt", 0) ||
-        !liteos_fat32_write_path(&fat, "Long Created File.txt", 0U,
+        !fat32_create_path(&fat, "new.bin", 0) ||
+        fat32_create_path(&fat, "new.bin", 0) ||
+        !fat32_create_path(&fat, "Long Created File.txt", 0) ||
+        !fat32_write_path(&fat, "Long Created File.txt", 0U,
                                  "lfn", 3U, &size) || size != 3U ||
-        !liteos_fat32_sync(&fat)) return 5;
+        !fat32_sync(&fat)) return 5;
     /* 注入第二次目录写失败，验证短名已删除时 LFN 失败会恢复原目录项。 */
     fat.Cache.Initialized = 0U;
-    if (!liteos_fat32_open(&fat, "Long Created File.txt", &rollback_file) ||
-        !liteos_fat32_close(rollback_file)) return 5;
+    if (!fat32_open(&fat, "Long Created File.txt", &rollback_file) ||
+        !fat32_close(rollback_file)) return 5;
     fail_write_number = 2U;
     write_count = 0U;
-    BOOLEAN removed_after_failure = liteos_fat32_remove_path(&fat, "Long Created File.txt");
-    BOOLEAN found_after_failure = liteos_fat32_open(&fat, "Long Created File.txt", &rollback_file);
+    BOOLEAN removed_after_failure = fat32_remove_path(&fat, "Long Created File.txt");
+    BOOLEAN found_after_failure = fat32_open(&fat, "Long Created File.txt", &rollback_file);
     if (removed_after_failure || !found_after_failure) return 5;
-    if (!liteos_fat32_close(rollback_file)) return 5;
+    if (!fat32_close(rollback_file)) return 5;
     fail_write_number = 0U;
     fat.Cache.Initialized = 1U;
-    if (!liteos_fat32_remove_path(&fat, "Long Created File.txt") ||
-        !liteos_fat32_create_path(&fat, "ninechars.txt", 0) ||
-        !liteos_fat32_write_path(&fat, "ninechars.txt", 0U,
+    if (!fat32_remove_path(&fat, "Long Created File.txt") ||
+        !fat32_create_path(&fat, "ninechars.txt", 0) ||
+        !fat32_write_path(&fat, "ninechars.txt", 0U,
                                  "chain", 5U, &size) || size != 5U ||
-        !liteos_fat32_sync(&fat)) return 5;
+        !fat32_sync(&fat)) return 5;
     /* 目录短名和 LFN 各写一次，随后在 FAT 副本写入阶段注入失败。 */
     fat.Cache.Initialized = 0U;
     fail_write_number = 4U;
     write_count = 0U;
     BOOLEAN removed_during_fat_failure =
-        liteos_fat32_remove_path(&fat, "ninechars.txt");
+        fat32_remove_path(&fat, "ninechars.txt");
     BOOLEAN found_during_fat_failure =
-        liteos_fat32_open(&fat, "ninechars.txt", &rollback_file);
+        fat32_open(&fat, "ninechars.txt", &rollback_file);
     if (removed_during_fat_failure || !found_during_fat_failure) return 5;
-    if (!liteos_fat32_close(rollback_file)) return 5;
+    if (!fat32_close(rollback_file)) return 5;
     fail_write_number = 0U;
     fat.Cache.Initialized = 1U;
-    if (!liteos_fat32_remove_path(&fat, "ninechars.txt") ||
-        !liteos_fat32_create_path(&fat, "Long Folder Name", 1) ||
-        !liteos_fat32_create_path(&fat, "Long Folder Name/Long Child Name.txt", 0) ||
-        !liteos_fat32_remove_path(&fat, "Long Folder Name/Long Child Name.txt") ||
-        !liteos_fat32_remove_path(&fat, "Long Folder Name") ||
-        !liteos_fat32_create_path(&fat, "folder", 1) ||
-        !liteos_fat32_create_path(&fat, "folder/child.bin", 0) ||
-        liteos_fat32_remove_path(&fat, "folder") ||
-        !liteos_fat32_remove_path(&fat, "folder/child.bin") ||
-        !liteos_fat32_remove_path(&fat, "folder") ||
-        !liteos_fat32_remove_path(&fat, "new.bin")) return 5;
-    if (!liteos_fat32_destroy(&fat) ||
+    if (!fat32_remove_path(&fat, "ninechars.txt") ||
+        !fat32_create_path(&fat, "Long Folder Name", 1) ||
+        !fat32_create_path(&fat, "Long Folder Name/Long Child Name.txt", 0) ||
+        !fat32_remove_path(&fat, "Long Folder Name/Long Child Name.txt") ||
+        !fat32_remove_path(&fat, "Long Folder Name") ||
+        !fat32_create_path(&fat, "folder", 1) ||
+        !fat32_create_path(&fat, "folder/child.bin", 0) ||
+        fat32_remove_path(&fat, "folder") ||
+        !fat32_remove_path(&fat, "folder/child.bin") ||
+        !fat32_remove_path(&fat, "folder") ||
+        !fat32_remove_path(&fat, "new.bin")) return 5;
+    /* Cached-handle read/write/truncate coherence, as used by VFS. */
+    OS_FAT32_FILE *coherent = 0;
+    char current[32] = {0};
+    const char manifest[] = "MANIFEST-000001\n";
+    if (!fat32_create_path(&fat, "current", 0) ||
+        !fat32_open(&fat, "current", &coherent) ||
+        !fat32_write_file(coherent, 0, manifest,
+                                  sizeof(manifest) - 1U, &size) ||
+        coherent->Size != sizeof(manifest) - 1U ||
+        !fat32_read_file(coherent, 0, current, sizeof(current), &size) ||
+        size != sizeof(manifest) - 1U || memcmp(current, manifest, size) ||
+        !fat32_truncate_file(coherent, 0) || coherent->Size != 0 ||
+        !fat32_read_file(coherent, 0, current, sizeof(current), &size) ||
+        size != 0 ||
+        !fat32_write_file(coherent, 0, "new\n", 4, &size) ||
+        !fat32_read_file(coherent, 0, current, sizeof(current), &size) ||
+        size != 4 || memcmp(current, "new\n", 4) ||
+        !fat32_close(coherent)) return 7;
+    if (!fat32_destroy(&fat) ||
         memcmp(disk + 4U * 512U, "world", 5U) != 0 ||
-        !liteos_block_unregister(&blocks, device) || !liteos_block_manager_destroy(&blocks)) return 6;
+        !block_unregister(&blocks, device) || !block_manager_destroy(&blocks)) return 6;
     puts("fat32: ok");
     return 0;
 }

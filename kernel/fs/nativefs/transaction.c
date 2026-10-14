@@ -2,7 +2,7 @@
 
 /* REFACTOR_FS_FAT32_TRANSACTION_OWNER: cluster-chain rollback and release. */
 
-#ifdef LITEOS_KERNEL_BUILD
+#ifdef OS_KERNEL_BUILD
 #include <kernel/kmem.h>
 #else
 #include <stdlib.h>
@@ -19,7 +19,7 @@ typedef struct fat_chain_snapshot {
 } FAT_CHAIN_SNAPSHOT;
 
 static VOID *fat_transaction_alloc(size_t size) {
-#ifdef LITEOS_KERNEL_BUILD
+#ifdef OS_KERNEL_BUILD
     return kmalloc(size, 0);
 #else
     return malloc(size);
@@ -27,7 +27,7 @@ static VOID *fat_transaction_alloc(size_t size) {
 }
 
 static VOID fat_transaction_free(VOID *memory) {
-#ifdef LITEOS_KERNEL_BUILD
+#ifdef OS_KERNEL_BUILD
     kfree(memory);
 #else
     free(memory);
@@ -78,9 +78,23 @@ static BOOLEAN fat_snapshot_reserve(FAT_CHAIN_SNAPSHOT *snapshot) {
     return 1;
 }
 
-static BOOLEAN fat_snapshot_chain(const LITEOS_FAT32 *filesystem, UINT32 first,
+/* Brent guard shared by non-mutating validation and rollback snapshots. */
+static BOOLEAN fat_chain_cycle_step(UINT32 next, UINT32 *checkpoint,
+                                    UINT32 *distance, UINT32 *window) {
+    if (next == *checkpoint) return 0;
+    if (++*distance == *window) {
+        *checkpoint = next;
+        *distance = 0U;
+        if (*window <= UINT32_MAX / 2U) *window *= 2U;
+        else *window = UINT32_MAX;
+    }
+    return 1;
+}
+
+static BOOLEAN fat_snapshot_chain(const OS_FAT32 *filesystem, UINT32 first,
                                   FAT_CHAIN_SNAPSHOT *snapshot) {
     UINT32 cluster = first;
+    UINT32 checkpoint = first, distance = 0U, window = 1U;
     if (filesystem == 0 || snapshot == 0 || first == 0U ||
         !fat32_cluster_valid(filesystem, first)) return first == 0U;
     snapshot->FatCount = filesystem->FatCount;
@@ -98,12 +112,34 @@ static BOOLEAN fat_snapshot_chain(const LITEOS_FAT32 *filesystem, UINT32 first,
         ++snapshot->Count;
         if (!fat32_read_next_cluster(filesystem, cluster, &next)) return 0;
         if (next == 0U) return 1;
+        if (!fat_chain_cycle_step(next, &checkpoint, &distance, &window)) return 0;
         cluster = next;
     }
     return 0;
 }
 
-static VOID fat_snapshot_restore(LITEOS_FAT32 *filesystem,
+/* Source links are retained, not mutated: validate their tail without a
+ * rollback snapshot or copying every FAT replica into heap allocations. */
+static BOOLEAN fat_chain_tail(const OS_FAT32 *filesystem, UINT32 first,
+                              UINT32 *tail) {
+    UINT32 cluster = first;
+    UINT32 checkpoint = first, distance = 0U, window = 1U;
+    *tail = 0U;
+    if (first == 0U) return 1;
+    for (UINT32 hops = 0U; hops < filesystem->ClusterCount; ++hops) {
+        UINT32 next;
+        if (!fat32_cluster_valid(filesystem, cluster) ||
+            !fat32_read_next_cluster(filesystem, cluster, &next)) return 0;
+        if (next == 0U) { *tail = cluster; return 1; }
+        /* Brent cycle detection: one FAT read per hop, no visited-set heap.
+         * Keep the volume bound as a final guard and saturate window growth. */
+        if (!fat_chain_cycle_step(next, &checkpoint, &distance, &window)) return 0;
+        cluster = next;
+    }
+    return 0;
+}
+
+static VOID fat_snapshot_restore(OS_FAT32 *filesystem,
                                   const FAT_CHAIN_SNAPSHOT *snapshot,
                                   UINT32 count) {
     if (filesystem == 0 || snapshot == 0 || snapshot->Values == 0) return;
@@ -118,7 +154,7 @@ static VOID fat_snapshot_restore(LITEOS_FAT32 *filesystem,
     }
 }
 
-BOOLEAN fat32_free_cluster_chain(LITEOS_FAT32 *filesystem, UINT32 first) {
+BOOLEAN fat32_free_cluster_chain(OS_FAT32 *filesystem, UINT32 first) {
     FAT_CHAIN_SNAPSHOT snapshot = {0};
     if (first == 0U) return 1;
     if (!fat_snapshot_chain(filesystem, first, &snapshot)) {
@@ -137,7 +173,57 @@ BOOLEAN fat32_free_cluster_chain(LITEOS_FAT32 *filesystem, UINT32 first) {
     return 1;
 }
 
-void fat32_rollback_directory_extensions(LITEOS_FAT32 *filesystem,
+/* Caller holds the mutation lock. Keep both names and FAT copies available
+ * for recovery until writeback commits; target LFN/name slots stay intact. */
+BOOLEAN fat32_replace_file_entry(OS_FAT32 *filesystem,
+    UINT64 source_lba, UINT32 source_offset,
+    const UINT64 lfn_lba[20], const UINT32 lfn_offset[20], UINT32 lfn_count,
+    UINT64 target_lba, UINT32 target_offset) {
+    UINT8 source[32], target[32], replacement[32], lfn[20][32];
+    FAT_CHAIN_SNAPSHOT retired = {0};
+    UINT32 retained_tail = 0U, retired_tail = 0U;
+    BOOLEAN success = 0;
+    if (lfn_count > 20U ||
+        !fat32_read_directory_slot(filesystem, source_lba, source_offset, source) ||
+        !fat32_read_directory_slot(filesystem, target_lba, target_offset, target) ||
+        ((source[11] | target[11]) & 0x10U) != 0U ||
+        fat32_file_is_open_at(filesystem, target_lba, target_offset)) return 0;
+    for (UINT32 i = 0U; i < lfn_count; ++i)
+        if (!fat32_read_directory_slot(filesystem, lfn_lba[i], lfn_offset[i], lfn[i])) return 0;
+    if (!fat_chain_tail(filesystem, fat32_entry_cluster(source), &retained_tail) ||
+        !fat_chain_tail(filesystem, fat32_entry_cluster(target), &retired_tail)) goto done;
+    /* Both chains reached EOC under the mutation lock. In a singly linked
+     * FAT, intersecting chains share their entire suffix and final cluster.
+     * Comparing tails avoids O(source_count * target_count) work. Cycles and
+     * invalid links were already rejected by the bounded traversals. */
+    if (retired_tail != 0U && retired_tail == retained_tail) goto done;
+    if (!fat_snapshot_chain(filesystem, fat32_entry_cluster(target), &retired)) goto done;
+    for (UINT32 i = 0U; i < 32U; ++i) replacement[i] = source[i];
+    for (UINT32 i = 0U; i < 11U; ++i) replacement[i] = target[i];
+    replacement[12] = target[12]; /* Preserve short-name case flags. */
+    if (!fat32_write_directory_slot(filesystem, target_lba, target_offset, replacement) ||
+        !fat32_delete_directory_slot(filesystem, source_lba, source_offset)) goto rollback;
+    for (UINT32 i = 0U; i < lfn_count; ++i)
+        if (!fat32_delete_directory_slot(filesystem, lfn_lba[i], lfn_offset[i])) goto rollback;
+    for (UINT32 i = 0U; i < retired.Count; ++i)
+        if (!fat32_write_file_fat_value(filesystem, retired.Clusters[i], 0U, 0U)) goto rollback;
+    if (!fat32_writeback(filesystem)) goto rollback;
+    fat32_rebind_open_file(filesystem, source_lba, source_offset, target_lba, target_offset);
+    success = 1;
+    goto done;
+rollback:
+    fat_snapshot_restore(filesystem, &retired, retired.Count);
+    (void)fat32_write_directory_slot(filesystem, target_lba, target_offset, target);
+    (void)fat32_write_directory_slot(filesystem, source_lba, source_offset, source);
+    for (UINT32 i = 0U; i < lfn_count; ++i)
+        (void)fat32_write_directory_slot(filesystem, lfn_lba[i], lfn_offset[i], lfn[i]);
+    (void)fat32_writeback(filesystem);
+done:
+    fat_snapshot_destroy(&retired);
+    return success;
+}
+
+void fat32_rollback_directory_extensions(OS_FAT32 *filesystem,
                                           UINT32 anchor,
                                           const UINT32 clusters[21],
                                           UINT32 count) {

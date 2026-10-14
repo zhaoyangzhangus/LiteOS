@@ -16,7 +16,7 @@ window_server_window_t *window_scene_keyboard_locked(void) {
         (window->flags & OS_WINDOW_VISIBLE) != 0U) return window;
     for (uint32_t index = g_window_server.count; index != 0U; --index) {
         window = g_window_server.windows[index - 1U];
-        if (window != 0 && !window->minimized &&
+        if (window != 0 && !window->minimized && !window->client_show_inactive &&
             (window->flags & OS_WINDOW_VISIBLE) != 0U) {
             window_scene_set_focus_identifier_locked(window->identifier);
             return window;

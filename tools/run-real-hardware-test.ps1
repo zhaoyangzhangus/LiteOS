@@ -8,6 +8,22 @@ param(
     [switch]$ReuseNvidiaPhase4Build,
     [switch]$NvidiaPhase5,
     [switch]$ReuseNvidiaPhase5Build,
+    [switch]$NvidiaPhase6,
+    [switch]$ReuseNvidiaPhase6Build,
+    [switch]$NvidiaPhase8,
+    [switch]$ReuseNvidiaPhase8Build,
+    [switch]$NvidiaPhase9,
+    [switch]$ReuseNvidiaPhase9Build,
+    [switch]$NvidiaPhase10,
+    [switch]$ReuseNvidiaPhase10Build,
+    [switch]$NvidiaPhase11,
+    [switch]$ReuseNvidiaPhase11Build,
+    [switch]$NvidiaPhase12,
+    [switch]$ReuseNvidiaPhase12Build,
+    [switch]$NvidiaPhaseW3,
+    [switch]$ReuseNvidiaPhaseW3Build,
+    [switch]$NvidiaCubeDemo,
+    [switch]$ReuseNvidiaCubeDemoBuild,
     [switch]$DiagnosticBot,
     [switch]$Rtl8126FirmwareDownload,
     [switch]$ForceReboot,
@@ -21,7 +37,7 @@ $runId = Get-Date -Format 'yyyyMMdd-HHmmss'
 $runDirectory = Join-Path (Join-Path $projectRoot $Build) "real-hardware\$runId"
 $backupDirectory = Join-Path $runDirectory 'backup'
 $runOncePath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
-$runOnceName = "LiteOSRealTest_$($runId.Replace('-', '_'))"
+$runOnceName = "SystemRealTest_$($runId.Replace('-', '_'))"
 $bootSequenceSet = $false
 $firmwareGuid = '{4c495445-4f53-5254-4553-544355524e31}'
 
@@ -29,7 +45,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
-public static class LiteOsFirmwareEnvironment {
+public static class SystemFirmwareEnvironment {
     [StructLayout(LayoutKind.Sequential)]
     public struct Luid { public UInt32 LowPart; public Int32 HighPart; }
     [StructLayout(LayoutKind.Sequential)]
@@ -66,14 +82,38 @@ if ($letter.Length -ne 1) { throw "DriveLetter must be one letter: $DriveLetter"
 if ($DiskNumber -lt 0 -or $PartitionNumber -lt 1) {
     throw 'DiskNumber and PartitionNumber are invalid.'
 }
-if ($NvidiaPhase4 -and $NvidiaPhase5) {
-    throw 'NvidiaPhase4 and NvidiaPhase5 are mutually exclusive.'
+if (@($NvidiaPhase4, $NvidiaPhase5, $NvidiaPhase6, $NvidiaPhase8, $NvidiaPhase9, $NvidiaPhase10, $NvidiaPhase11, $NvidiaPhase12, $NvidiaPhaseW3, $NvidiaCubeDemo).Where({ $_ }).Count -gt 1) {
+    throw 'NVIDIA phase switches are mutually exclusive.'
 }
 if ($ReuseNvidiaPhase4Build -and -not $NvidiaPhase4) {
     throw 'ReuseNvidiaPhase4Build requires NvidiaPhase4.'
 }
 if ($ReuseNvidiaPhase5Build -and -not $NvidiaPhase5) {
     throw 'ReuseNvidiaPhase5Build requires NvidiaPhase5.'
+}
+if ($ReuseNvidiaPhase6Build -and -not $NvidiaPhase6) {
+    throw 'ReuseNvidiaPhase6Build requires NvidiaPhase6.'
+}
+if ($ReuseNvidiaPhase8Build -and -not $NvidiaPhase8) {
+    throw 'ReuseNvidiaPhase8Build requires NvidiaPhase8.'
+}
+if ($ReuseNvidiaPhase9Build -and -not $NvidiaPhase9) {
+    throw 'ReuseNvidiaPhase9Build requires NvidiaPhase9.'
+}
+if ($ReuseNvidiaPhase10Build -and -not $NvidiaPhase10) {
+    throw 'ReuseNvidiaPhase10Build requires NvidiaPhase10.'
+}
+if ($ReuseNvidiaPhase11Build -and -not $NvidiaPhase11) {
+    throw 'ReuseNvidiaPhase11Build requires NvidiaPhase11.'
+}
+if ($ReuseNvidiaPhase12Build -and -not $NvidiaPhase12) {
+    throw 'ReuseNvidiaPhase12Build requires NvidiaPhase12.'
+}
+if ($ReuseNvidiaPhaseW3Build -and -not $NvidiaPhaseW3) {
+    throw 'ReuseNvidiaPhaseW3Build requires NvidiaPhaseW3.'
+}
+if ($ReuseNvidiaCubeDemoBuild -and -not $NvidiaCubeDemo) {
+    throw 'ReuseNvidiaCubeDemoBuild requires NvidiaCubeDemo.'
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -99,8 +139,8 @@ function Save-Text([string]$Path, [string]$Text) {
 
 function Set-FirmwareState([string]$state) {
     $bytes = [Text.Encoding]::ASCII.GetBytes($state)
-    if (-not [LiteOsFirmwareEnvironment]::EnableFirmwarePrivilege()) { return $false }
-    return [LiteOsFirmwareEnvironment]::SetFirmwareEnvironmentVariableEx(
+    if (-not [SystemFirmwareEnvironment]::EnableFirmwarePrivilege()) { return $false }
+    return [SystemFirmwareEnvironment]::SetFirmwareEnvironmentVariableEx(
         'LiteOSRealTestState', $firmwareGuid, $bytes, [uint32]$bytes.Length, 7)
 }
 
@@ -187,6 +227,7 @@ $firmwareBefore = Invoke-NativeChecked 'bcdedit.exe' @('/enum', 'firmware', '/v'
 Save-Text (Join-Path $runDirectory 'bcd-firmware-before.txt') $firmwareBefore
 
 $firmwareId = $null
+$matchingFirmware = @()
 $firmwareBlocks = $firmwareBefore -split '(?:\r?\n){2,}'
 foreach ($block in $firmwareBlocks) {
     if ($block -notmatch "(?im)^\s*path\s+.*\\EFI\\BOOT\\BOOTX64\.EFI\s*$" -or
@@ -195,9 +236,24 @@ foreach ($block in $firmwareBlocks) {
     }
     $match = [regex]::Match($block, '(?im)^\s*identifier\s+(\{[^}]+\})\s*$')
     if ($match.Success) {
-        if ($firmwareId) { throw "Multiple firmware entries point to $letter`:." }
-        $firmwareId = $match.Groups[1].Value
+        $description = [regex]::Match(
+            $block, '(?im)^\s*description\s+(.+?)\s*$')
+        $matchingFirmware += [pscustomobject]@{
+            Identifier = $match.Groups[1].Value
+            Description = if ($description.Success) {
+                $description.Groups[1].Value.Trim()
+            } else { '' }
+        }
     }
+}
+$preferredFirmware = @($matchingFirmware |
+    Where-Object { $_.Description -in @("System USB $letter", "LiteOS USB $letter") })
+if ($preferredFirmware.Count -eq 1) {
+    $firmwareId = $preferredFirmware[0].Identifier
+} elseif ($matchingFirmware.Count -eq 1) {
+    $firmwareId = $matchingFirmware[0].Identifier
+} elseif ($preferredFirmware.Count -gt 1) {
+    throw "Multiple System firmware entries point to $letter`: ."
 }
 if (-not $firmwareId) {
     throw "No UEFI firmware entry for $letter`: \\EFI\\BOOT\\BOOTX64.EFI was found."
@@ -206,13 +262,13 @@ if (-not $firmwareId) {
 $espPath = $null
 if ($NvidiaPhase4) {
     # This switch is intentionally opt-in.  The ordinary real-test path keeps
-    # building the production LiteOS image; the NVIDIA path must use the
+    # building the production System image; the NVIDIA path must use the
     # strong Phase 4 vendor-RM link produced by phase4_build.ps1.
     $espPath = Join-Path $projectRoot 'build\nvidia\phase4\esp'
     if ($ReuseNvidiaPhase4Build) {
         foreach ($required in @(
             (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
-            (Join-Path $espPath 'EFI\LITEOS\kernel.elf')
+            (Join-Path $espPath 'EFI\OS\kernel.elf')
         )) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
                 throw "Cannot reuse incomplete NVIDIA Phase 4 image: $required"
@@ -235,8 +291,8 @@ elseif ($NvidiaPhase5) {
     if ($ReuseNvidiaPhase5Build) {
         foreach ($required in @(
             (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
-            (Join-Path $espPath 'EFI\LITEOS\kernel.elf'),
-            (Join-Path $espPath 'EFI\LITEOS\firmware\gsp_ga10x.bin')
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin')
         )) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
                 throw "Cannot reuse incomplete NVIDIA Phase 5 image: $required"
@@ -248,6 +304,229 @@ elseif ($NvidiaPhase5) {
         $buildScript = Join-Path $projectRoot 'tools\nvidia\phase5_build.ps1'
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
         if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 5 build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhase6) {
+    # Phase 6 reuses the verified Phase 5 ESP and replaces only the bridge
+    # closure plus the RM/CE probe.  -FullGate is explicit so a normal Phase 6
+    # image cannot silently claim the 20-cycle hardware Gate.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase6\esp'
+    if ($ReuseNvidiaPhase6Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 6 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 6 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase6_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript -FullGate
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 6 build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhase8) {
+    # Phase 8 is the first image that contains the Linux personality NVIDIA
+    # frontend.  Build it from the verified Phase 6 ESP and stage the real
+    # glibc probe; no QEMU image can provide the required NVIDIA nodes.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase8\esp'
+    if ($ReuseNvidiaPhase8Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin'),
+            (Join-Path $espPath 'tests\p8-frontend'),
+            (Join-Path $espPath 'lib64\ld-linux-x86-64.so.2'),
+            (Join-Path $espPath 'lib\x86_64-linux-gnu\libc.so.6')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 8 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 8 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase8_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 8 build failed ($LASTEXITCODE)." }
+        $stageScript = Join-Path $projectRoot 'tools\nvidia\phase8_stage.ps1'
+        $stageArguments = @(
+            '-Build', 'build/nvidia/phase8',
+            '-GlibcRoot', 'build-phase7/host-deps/glibc',
+            '-TestBinary', 'build-phase8/phase8-frontend/p8-frontend'
+        )
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stageScript @stageArguments
+        if ($LASTEXITCODE -ne 0) { throw "Phase 8 probe staging failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhase9) {
+    # Phase 9 keeps the verified P8 kernel/RM/GSP image and adds only the
+    # matching 595.84 Linux userspace closure plus its loader probe.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase9\esp'
+    if ($ReuseNvidiaPhase9Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin'),
+            (Join-Path $espPath 'tests\p9-userspace-load'),
+            (Join-Path $espPath 'lib64\ld-linux-x86-64.so.2'),
+            (Join-Path $espPath 'lib\x86_64-linux-gnu\libc.so.6'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL.so.1'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL_nvidia.so.0')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 9 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 9 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase9_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 9 build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhase10) {
+    # Phase 10 keeps the verified P9 driver/userspace closure and adds only
+    # the real EGL device/context acceptance probe.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase10\esp'
+    if ($ReuseNvidiaPhase10Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin'),
+            (Join-Path $espPath 'tests\p10-egl-context'),
+            (Join-Path $espPath 'lib64\ld-linux-x86-64.so.2'),
+            (Join-Path $espPath 'lib\x86_64-linux-gnu\libc.so.6'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL.so.1'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL_nvidia.so.0')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 10 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 10 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase10_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 10 build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhase11) {
+    # Phase 11 keeps the verified P10 EGL/userspace closure and adds only the
+    # real triangle/readback probe and its matching kernel runner.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase11\esp'
+    if ($ReuseNvidiaPhase11Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin'),
+            (Join-Path $espPath 'tests\p11-triangle'),
+            (Join-Path $espPath 'lib64\ld-linux-x86-64.so.2'),
+            (Join-Path $espPath 'lib\x86_64-linux-gnu\libc.so.6'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL.so.1'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL_nvidia.so.0')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 11 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 11 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase11_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 11 build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaCubeDemo) {
+    # The cube demo reuses the verified Phase 12 kernel and GLVND closure,
+    # replacing only the userspace test image in its own incremental ESP.
+    $espPath = Join-Path $projectRoot 'build\nvidia\cube-demo\esp'
+    if ($ReuseNvidiaCubeDemoBuild) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin'),
+            (Join-Path $espPath 'tests\p12-window'),
+            (Join-Path $espPath 'lib64\ld-linux-x86-64.so.2'),
+            (Join-Path $espPath 'lib\x86_64-linux-gnu\libc.so.6'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL.so.1'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL_nvidia.so.0')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA cube demo image: $required"
+            }
+        }
+        Write-Host "Reusing NVIDIA cube demo image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\cube_demo_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "NVIDIA cube demo build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhase12) {
+    # Phase 12 keeps the verified P11 EGL/GL closure and adds the CPU
+    # glReadPixels -> shared System window surface -> compositor bridge.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase12\esp'
+    if ($ReuseNvidiaPhase12Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin'),
+            (Join-Path $espPath 'tests\p12-window'),
+            (Join-Path $espPath 'lib64\ld-linux-x86-64.so.2'),
+            (Join-Path $espPath 'lib\x86_64-linux-gnu\libc.so.6'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL.so.1'),
+            (Join-Path $espPath 'compat\linux\lib\x86_64-linux-gnu\libEGL_nvidia.so.0')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA Phase 12 image: $required"
+            }
+        }
+        Write-Host "Reusing verified NVIDIA Phase 12 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase12_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA Phase 12 build failed ($LASTEXITCODE)." }
+    }
+}
+elseif ($NvidiaPhaseW3) {
+    # W3 uses the verified Phase 9 ESP for the loader, matching GSP firmware,
+    # and 595.84 user assets, then replaces only the W3 REALTEST kernel.
+    $espPath = Join-Path $projectRoot 'build\nvidia\phase-w3\esp'
+    if ($ReuseNvidiaPhaseW3Build) {
+        foreach ($required in @(
+            (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
+            (Join-Path $espPath 'EFI\OS\kernel.elf'),
+            (Join-Path $espPath 'EFI\OS\loader.conf'),
+            (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin')
+        )) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+                throw "Cannot reuse incomplete NVIDIA W3 image: $required"
+            }
+        }
+        $loaderText = [IO.File]::ReadAllText((Join-Path $espPath 'EFI\OS\loader.conf'))
+        if ($loaderText -notmatch '(?im)^cmdline=.*\brealtest=1\b') {
+            throw 'Cannot reuse W3 image without cmdline=realtest=1.'
+        }
+        Write-Host "Reusing verified NVIDIA W3 image at $espPath"
+    }
+    else {
+        $buildScript = Join-Path $projectRoot 'tools\nvidia\phase-w3_build.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript -RealTest
+        if ($LASTEXITCODE -ne 0) { throw "Physical NVIDIA W3 build failed ($LASTEXITCODE)." }
+        $stageScript = Join-Path $projectRoot 'tools\nvidia\phase-w3_stage.ps1'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $stageScript `
+            -Build build/nvidia/phase-w3 -BaseEsp build/nvidia/phase9/esp
+        if ($LASTEXITCODE -ne 0) { throw "NVIDIA W3 staging failed ($LASTEXITCODE)." }
     }
 }
 else {
@@ -270,21 +549,21 @@ if ($Rtl8126FirmwareDownload) {
 
 foreach ($required in @(
     'EFI\BOOT\BOOTX64.EFI',
-    'EFI\LITEOS\kernel.elf',
-    'EFI\LITEOS\loader.conf'
+    'EFI\OS\kernel.elf',
+    'EFI\OS\loader.conf'
 )) {
     if (-not (Test-Path -LiteralPath (Join-Path $espPath $required))) {
         throw "Build is missing ESP file: $required"
     }
 }
-if ($NvidiaPhase5 -and
-    -not (Test-Path -LiteralPath (Join-Path $espPath 'EFI\LITEOS\firmware\gsp_ga10x.bin') -PathType Leaf)) {
-    throw 'Phase 5 ESP is missing EFI\LITEOS\firmware\gsp_ga10x.bin'
+if (($NvidiaPhase5 -or $NvidiaPhase6 -or $NvidiaPhase8 -or $NvidiaPhase9 -or $NvidiaPhase10 -or $NvidiaPhase11 -or $NvidiaPhase12 -or $NvidiaPhaseW3 -or $NvidiaCubeDemo) -and
+    -not (Test-Path -LiteralPath (Join-Path $espPath 'EFI\OS\firmware\gsp_ga10x.bin') -PathType Leaf)) {
+    throw 'NVIDIA ESP is missing EFI\OS\firmware\gsp_ga10x.bin'
 }
 
 foreach ($relative in @(
     'EFI\BOOT\BOOTX64.EFI',
-    'EFI\LITEOS',
+    'EFI\OS',
     'etc',
     'lib',
     'sbin',
@@ -294,7 +573,7 @@ foreach ($relative in @(
     Backup-Target $relative $volumeRoot
 }
 
-Remove-Item -LiteralPath (Join-Path $volumeRoot 'EFI\LITEOS\realtest.log'),
+Remove-Item -LiteralPath (Join-Path $volumeRoot 'EFI\OS\realtest.log'),
     (Join-Path $volumeRoot 'realtest.log') -Force -ErrorAction SilentlyContinue
 $script:deploymentCopiedFiles = 0
 $script:deploymentSkippedFiles = 0
@@ -322,8 +601,8 @@ Write-Host ("Incremental deployment: copied {0} file(s), skipped {1} unchanged f
 
 $sourceBoot = Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'
 $targetBoot = Join-Path $volumeRoot 'EFI\BOOT\BOOTX64.EFI'
-$sourceKernel = Join-Path $espPath 'EFI\LITEOS\kernel.elf'
-$targetKernel = Join-Path $volumeRoot 'EFI\LITEOS\kernel.elf'
+$sourceKernel = Join-Path $espPath 'EFI\OS\kernel.elf'
+$targetKernel = Join-Path $volumeRoot 'EFI\OS\kernel.elf'
 foreach ($pair in @(
     @($sourceBoot, $targetBoot),
     @($sourceKernel, $targetKernel)
@@ -403,13 +682,13 @@ try {
         "BootNext firmware entry: $firmwareId`r`nTarget: $letter`:\EFI\BOOT\BOOTX64.EFI`r`n"
     )
     if ($NoReboot) {
-        Write-Host "Prepared one-time LiteOS boot for $letter`:; reboot was not requested."
+        Write-Host "Prepared one-time System boot for $letter`:; reboot was not requested."
         exit 0
     }
-    Write-Host "Starting one-time LiteOS boot from $letter`:. Windows will resume after LiteOS resets."
+    Write-Host "Starting one-time System boot from $letter`:. Windows will resume after System resets."
     $shutdownArguments = @('/r')
     if ($ForceReboot) { $shutdownArguments += '/f' }
-    $shutdownArguments += @('/t', '0', '/d', 'p:4:1', '/c', 'LiteOS real hardware test')
+    $shutdownArguments += @('/t', '0', '/d', 'p:4:1', '/c', 'System real hardware test')
     & shutdown.exe @shutdownArguments
     if ($LASTEXITCODE -ne 0) { throw "shutdown.exe failed ($LASTEXITCODE)." }
 }

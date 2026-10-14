@@ -1,5 +1,5 @@
 # metric|profile
-# Metrics required by LiteOS_Kernel_Refactoring_Roadmap.md Phase 0.
+# Required baseline metrics for the kernel refactoring benchmark.
 scheduler.schedule|common
 scheduler.enqueue|common
 scheduler.dequeue|common

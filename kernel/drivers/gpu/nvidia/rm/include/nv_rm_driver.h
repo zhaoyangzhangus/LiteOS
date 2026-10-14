@@ -48,6 +48,27 @@ typedef struct nv_gpu_device {
     kstatus_t failure_status;
 } nv_gpu_device_t;
 
+/*
+ * Copy of the firmware framebuffer description used by the NVIDIA OS ABI.
+ * The vendor RM asks the host OS for this information while deciding whether
+ * BAR1 contains a client-owned UEFI console.  Keep only validated scalar
+ * values here; the RM never receives a boot-info pointer.
+ */
+typedef struct nv_rm_screen_info {
+    uint64_t physical_base;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t pitch;
+    uint64_t size;
+    bool valid;
+} nv_rm_screen_info_t;
+
 kstatus_t nv_rm_driver_probe(void);
 
 const nv_gpu_device_t *nv_rm_driver_current(void);
+
+void nv_rm_driver_set_screen_info(uint64_t physical_base, uint32_t width,
+                                  uint32_t height, uint32_t depth,
+                                  uint32_t pitch, uint64_t size);
+bool nv_rm_driver_get_screen_info(nv_rm_screen_info_t *info);

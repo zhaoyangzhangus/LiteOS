@@ -1,61 +1,259 @@
 #include <kernel/block_cache.h>
+#include <kernel/string.h>
+#ifdef OS_KERNEL_BUILD
+#include <kernel/process.h>
+#include <kernel/sched.h>
+#endif
 
-static VOID copy_bytes(UINT8 *destination, const UINT8 *source, UINT32 size) {
-    for (UINT32 i = 0; i < size; ++i) destination[i] = source[i];
+#ifndef OS_BLOCK_CACHE_READ_AHEAD_BLOCKS
+/* Leave room for hot FAT/directory sectors when admitting a data extent.
+ * Filling all cache slots on every miss defeats LRU and repeatedly reloads
+ * metadata between otherwise sequential file reads. */
+#define OS_BLOCK_CACHE_READ_AHEAD_BLOCKS (OS_BLOCK_CACHE_ENTRY_COUNT - 1U)
+#endif
+
+static atomic_flag g_block_cache_diag_lock = ATOMIC_FLAG_INIT;
+
+static VOID block_cache_diag_putc(char value) {
+    for (UINT32 attempt = 0U; attempt < 100000U; ++attempt) {
+        UINT8 ready;
+        __asm__ volatile ("inb %w1, %0" : "=a"(ready) : "d"(0x3FDU));
+        if ((ready & 0x20U) != 0U) break;
+        __asm__ volatile ("pause");
+    }
+    __asm__ volatile ("outb %0, %w1" : : "a"((UINT8)value), "d"(0x3F8U));
 }
 
-static VOID cache_lock(LITEOS_BLOCK_CACHE *cache) {
-    while (__atomic_exchange_n(&cache->Lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
-        __asm__ volatile ("pause");
+static VOID block_cache_diag_text(const char *text) {
+    while (*text != '\0') block_cache_diag_putc(*text++);
+}
+
+static VOID block_cache_diag_hex(UINT64 value) {
+    static const char digits[] = "0123456789abcdef";
+    block_cache_diag_text("0x");
+    for (INT32 shift = 60; shift >= 0; shift -= 4) {
+        block_cache_diag_putc(digits[(value >> (UINT32)shift) & 0xFU]);
     }
 }
 
-static VOID cache_unlock(LITEOS_BLOCK_CACHE *cache) {
+static VOID block_cache_diag(UINT32 stage, UINT64 lba,
+                             const OS_BLOCK_CACHE *cache) {
+    UINT64 current_pid = 0U;
+    UINT64 current_tid = 0U;
+    UINT64 owner_tid = 0U;
+    (void)cache;
+#ifdef OS_KERNEL_BUILD
+    thread_t *current = sched_current_thread();
+    if (current != 0) {
+        current_tid = current->tid;
+        if (current->process != 0) current_pid = current->process->pid;
+    }
+    if (cache != 0 && cache->WaitLock.owner != 0) {
+        owner_tid = cache->WaitLock.owner->tid;
+    }
+#endif
+    while (atomic_flag_test_and_set_explicit(&g_block_cache_diag_lock,
+                                              memory_order_acquire)) {
+        __asm__ volatile ("pause");
+    }
+    block_cache_diag_text("OS_BLOCK_CACHE_READ_FAIL stage=");
+    block_cache_diag_hex(stage);
+    block_cache_diag_text(" lba=");
+    block_cache_diag_hex(lba);
+    block_cache_diag_text(" pid=");
+    block_cache_diag_hex(current_pid);
+    block_cache_diag_text(" tid=");
+    block_cache_diag_hex(current_tid);
+    block_cache_diag_text(" owner_tid=");
+    block_cache_diag_hex(owner_tid);
+    block_cache_diag_text("\r\n");
+    atomic_flag_clear_explicit(&g_block_cache_diag_lock, memory_order_release);
+}
+
+static VOID copy_bytes(UINT8 *destination, const UINT8 *source, UINT32 size) {
+    memmove(destination, source, size);
+}
+
+static BOOLEAN cache_lock(OS_BLOCK_CACHE *cache, UINT64 lba) {
+#ifdef OS_KERNEL_BUILD
+    thread_t *current = sched_current_thread();
+    if (current != 0) {
+        if (current->sched_class == SCHED_CLASS_IDLE) {
+            kstatus_t status;
+            do {
+                status = kmutex_try_lock(&cache->WaitLock);
+                if (status == K_EAGAIN) __asm__ volatile ("pause");
+            } while (status == K_EAGAIN);
+            if (status != K_OK) block_cache_diag((UINT32)status, lba, cache);
+            return status == K_OK;
+        }
+        kstatus_t status = kmutex_lock(&cache->WaitLock, UINT64_MAX);
+        if (status != K_OK) block_cache_diag((UINT32)status, lba, cache);
+        return status == K_OK;
+    }
+#else
+    (void)cache;
+    (void)lba;
+#endif
+
+    /* Before the scheduler has a current thread, boot I/O is BSP-confined. */
+    while (__atomic_exchange_n(&cache->Lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
+        __asm__ volatile ("pause");
+    }
+    return 1;
+}
+
+static VOID cache_unlock(OS_BLOCK_CACHE *cache) {
+#ifdef OS_KERNEL_BUILD
+    thread_t *current = sched_current_thread();
+    if (current != 0) {
+        kstatus_t status = kmutex_unlock(&cache->WaitLock);
+        if (status != K_OK) block_cache_diag((UINT32)status, 0U, cache);
+        return;
+    }
+#endif
     __atomic_store_n(&cache->Lock, 0U, __ATOMIC_RELEASE);
 }
 
-static LITEOS_BLOCK_CACHE_ENTRY *find_entry_locked(LITEOS_BLOCK_CACHE *cache,
+static OS_BLOCK_CACHE_ENTRY *find_entry_locked(OS_BLOCK_CACHE *cache,
                                                    UINT64 lba) {
-    for (UINT32 i = 0; i < LITEOS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
-        LITEOS_BLOCK_CACHE_ENTRY *entry = &cache->Entries[i];
+    for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+        OS_BLOCK_CACHE_ENTRY *entry = &cache->Entries[i];
         if (entry->Valid && entry->Lba == lba) return entry;
     }
     return 0;
 }
 
-static BOOLEAN flush_entry_locked(LITEOS_BLOCK_CACHE *cache,
-                                  LITEOS_BLOCK_CACHE_ENTRY *entry) {
+static BOOLEAN flush_entry_locked(OS_BLOCK_CACHE *cache,
+                                  OS_BLOCK_CACHE_ENTRY *entry) {
     if (!entry->Valid || !entry->Dirty) return 1;
-    if (!liteos_block_write(cache->Device, entry->Lba, 1U, entry->Data)) return 0;
+    if (!block_write(cache->Device, entry->Lba, 1U, entry->Data)) return 0;
     entry->Dirty = 0;
     return 1;
 }
 
-static LITEOS_BLOCK_CACHE_ENTRY *select_entry_locked(LITEOS_BLOCK_CACHE *cache) {
-    LITEOS_BLOCK_CACHE_ENTRY *selected = 0;
-    for (UINT32 i = 0; i < LITEOS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
-        LITEOS_BLOCK_CACHE_ENTRY *entry = &cache->Entries[i];
+/* Zero mask is an ordinary write victim; prefetch excludes its reserved slots.
+ * Both paths prefer the first invalid slot, then the first oldest LRU slot. */
+static OS_BLOCK_CACHE_ENTRY *select_entry_locked(
+    OS_BLOCK_CACHE *cache, UINT32 reserved_mask) {
+    _Static_assert(OS_BLOCK_CACHE_ENTRY_COUNT <= 32U,
+                   "prefetch reservation mask must cover every cache slot");
+    OS_BLOCK_CACHE_ENTRY *selected = 0;
+    for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+        OS_BLOCK_CACHE_ENTRY *entry = &cache->Entries[i];
+        if ((reserved_mask & (1U << i)) != 0U) continue;
         if (!entry->Valid) return entry;
-        if (selected == 0 || entry->LastUse < selected->LastUse) selected = entry;
+        if (selected == 0 || entry->LastUse < selected->LastUse) {
+            selected = entry;
+        }
     }
     return selected;
 }
 
-static BOOLEAN load_entry_locked(LITEOS_BLOCK_CACHE *cache, UINT64 lba,
-                                 LITEOS_BLOCK_CACHE_ENTRY **result) {
-    LITEOS_BLOCK_CACHE_ENTRY *entry;
+/* Writes need both hit lookup and a victim. Do not stop at an invalid slot:
+ * a later matching block must win over eviction. */
+static OS_BLOCK_CACHE_ENTRY *find_write_entry_locked(
+    OS_BLOCK_CACHE *cache, UINT64 lba, BOOLEAN *hit) {
+    OS_BLOCK_CACHE_ENTRY *selected = 0;
+    *hit = 0;
+    for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+        OS_BLOCK_CACHE_ENTRY *entry = &cache->Entries[i];
+        if (entry->Valid && entry->Lba == lba) {
+            *hit = 1;
+            return entry;
+        }
+        if (selected == 0 || (selected->Valid &&
+            (!entry->Valid || entry->LastUse < selected->LastUse))) {
+            selected = entry;
+        }
+    }
+    return selected;
+}
+
+static BOOLEAN load_entry_locked(OS_BLOCK_CACHE *cache, UINT64 lba,
+                                 OS_BLOCK_CACHE_ENTRY **result) {
+    OS_BLOCK_CACHE_ENTRY *entry;
     if (cache == 0 || result == 0 || !cache->Initialized ||
-        cache->Device == 0 || cache->Device->BlockSize > LITEOS_BLOCK_CACHE_MAX_SIZE ||
-        lba >= cache->Device->BlockCount) return 0;
+        cache->Device == 0 || cache->Device->BlockSize > OS_BLOCK_CACHE_MAX_SIZE ||
+        lba >= cache->Device->BlockCount) {
+        block_cache_diag(2U, lba, cache);
+        return 0;
+    }
 
     entry = find_entry_locked(cache, lba);
     if (entry == 0) {
-        entry = select_entry_locked(cache);
-        if (entry == 0 || !flush_entry_locked(cache, entry) ||
-            !liteos_block_read(cache->Device, lba, 1U, entry->Data)) return 0;
-        entry->Valid = 1;
-        entry->Dirty = 0;
-        entry->Lba = lba;
+        OS_BLOCK_CACHE_ENTRY *reserved[OS_BLOCK_CACHE_READ_AHEAD_BLOCKS];
+        UINT32 reserved_mask = 0U;
+        UINT8 staging[OS_BLOCK_CACHE_READ_AHEAD_BLOCKS * 512U];
+        UINT32 prefetch_limit = sizeof(staging) /
+                                cache->Device->BlockSize;
+        UINT32 reserved_count = 0U;
+
+        if (prefetch_limit == 0U) prefetch_limit = 1U;
+        if (prefetch_limit > OS_BLOCK_CACHE_READ_AHEAD_BLOCKS) {
+            prefetch_limit = OS_BLOCK_CACHE_READ_AHEAD_BLOCKS;
+        }
+        /* Bound speculative admission so the last few demanded sectors
+         * survive interleaved metadata/data reads.  Older demand entries
+         * remain normal LRU victims; this is not permanent pinning. */
+        UINT32 hot_count = 0U;
+        for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+            OS_BLOCK_CACHE_ENTRY *candidate = &cache->Entries[i];
+            if (candidate->Valid && candidate->LastUse != 0U &&
+                cache->Clock - candidate->LastUse < 4U &&
+                /* Just-consumed sequential sectors need not displace the
+                 * next extent; distant metadata still gets protection. */
+                !(candidate->Lba < lba && lba - candidate->Lba <= 4U)) {
+                ++hot_count;
+            }
+        }
+        UINT32 admission_limit = OS_BLOCK_CACHE_ENTRY_COUNT - hot_count;
+        if (admission_limit == 0U) admission_limit = 1U;
+        if (prefetch_limit > admission_limit) prefetch_limit = admission_limit;
+
+        /* A FAT read commonly spans one or two 4 KiB pages.  Reserve the
+         * cache slots first, then issue one contiguous request and split it
+         * into the reserved slots.  The staging buffer is deliberately
+         * separate from the first entry: the NVMe backend may use a compound
+         * two-page DMA buffer for a 16-sector read. */
+        while (reserved_count < prefetch_limit &&
+               reserved_count < cache->Device->BlockCount - lba) {
+            uint64_t next_lba = lba + reserved_count;
+            if (find_entry_locked(cache, next_lba) != 0) break;
+            entry = select_entry_locked(cache, reserved_mask);
+            if (entry == 0 || !flush_entry_locked(cache, entry)) {
+                block_cache_diag(3U, lba, cache);
+                return 0;
+            }
+            entry->Valid = 0;
+            entry->Dirty = 0;
+            reserved_mask |= 1U << (UINT32)(entry - cache->Entries);
+            reserved[reserved_count++] = entry;
+        }
+        if (reserved_count == 0U ||
+            !block_read(cache->Device, lba, reserved_count,
+                               staging)) {
+            block_cache_diag(reserved_count == 0U ? 4U : 5U, lba, cache);
+            for (UINT32 i = 0; i < reserved_count; ++i) {
+                reserved[i]->Valid = 0;
+                reserved[i]->Dirty = 0;
+            }
+            return 0;
+        }
+        for (UINT32 i = 0; i < reserved_count; ++i) {
+            entry = reserved[i];
+            copy_bytes(entry->Data,
+                       staging + i * cache->Device->BlockSize,
+                       cache->Device->BlockSize);
+            entry->Valid = 1;
+            entry->Dirty = 0;
+            entry->Lba = lba + i;
+            /* Speculative sectors are cold until actually requested.  Giving
+             * the entire extent demand-read recency evicts hot FAT/directory
+             * sectors merely because a different file triggered read-ahead. */
+            entry->LastUse = 0U;
+        }
+        entry = reserved[0];
     }
 
     ++cache->Clock;
@@ -64,26 +262,29 @@ static BOOLEAN load_entry_locked(LITEOS_BLOCK_CACHE *cache, UINT64 lba,
     return 1;
 }
 
-static BOOLEAN writeback_cache_locked(LITEOS_BLOCK_CACHE *cache) {
-    for (UINT32 i = 0; i < LITEOS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+static BOOLEAN writeback_cache_locked(OS_BLOCK_CACHE *cache) {
+    for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
         if (!flush_entry_locked(cache, &cache->Entries[i])) return 0;
     }
     return 1;
 }
 
-static BOOLEAN flush_cache_locked(LITEOS_BLOCK_CACHE *cache) {
-    return writeback_cache_locked(cache) && liteos_block_flush(cache->Device);
+static BOOLEAN flush_cache_locked(OS_BLOCK_CACHE *cache) {
+    return writeback_cache_locked(cache) && block_flush(cache->Device);
 }
 
-BOOLEAN liteos_block_cache_init(LITEOS_BLOCK_CACHE *cache,
-                                const LITEOS_BLOCK_DEVICE *device) {
+BOOLEAN block_cache_init(OS_BLOCK_CACHE *cache,
+                                const OS_BLOCK_DEVICE *device) {
     if (cache == 0 || device == 0 || !device->Registered || device->BlockSize == 0U ||
-        device->BlockSize > LITEOS_BLOCK_CACHE_MAX_SIZE || cache->Initialized) return 0;
+        device->BlockSize > OS_BLOCK_CACHE_MAX_SIZE || cache->Initialized) return 0;
 
     cache->Device = device;
     cache->Clock = 0;
     cache->Lock = 0U;
-    for (UINT32 i = 0; i < LITEOS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+#ifdef OS_KERNEL_BUILD
+    kmutex_init(&cache->WaitLock, false);
+#endif
+    for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
         cache->Entries[i].Valid = 0;
         cache->Entries[i].Dirty = 0;
         cache->Entries[i].Lba = 0;
@@ -93,13 +294,13 @@ BOOLEAN liteos_block_cache_init(LITEOS_BLOCK_CACHE *cache,
     return 1;
 }
 
-BOOLEAN liteos_block_cache_read(LITEOS_BLOCK_CACHE *cache, UINT64 lba,
+BOOLEAN block_cache_read(OS_BLOCK_CACHE *cache, UINT64 lba,
                                 VOID *buffer) {
-    LITEOS_BLOCK_CACHE_ENTRY *entry;
+    OS_BLOCK_CACHE_ENTRY *entry;
     BOOLEAN success = 0;
 
     if (cache == 0 || buffer == 0) return 0;
-    cache_lock(cache);
+    if (!cache_lock(cache, lba)) return 0;
     if (load_entry_locked(cache, lba, &entry)) {
         copy_bytes((UINT8 *)buffer, entry->Data, cache->Device->BlockSize);
         success = 1;
@@ -108,23 +309,82 @@ BOOLEAN liteos_block_cache_read(LITEOS_BLOCK_CACHE *cache, UINT64 lba,
     return success;
 }
 
-BOOLEAN liteos_block_cache_write(LITEOS_BLOCK_CACHE *cache, UINT64 lba,
+BOOLEAN block_cache_read_range(OS_BLOCK_CACHE *cache, UINT64 lba,
+                                      UINT32 count, VOID *buffer) {
+    if (cache == 0 || buffer == 0 || count == 0U || count > 128U) return 0;
+    if (!cache_lock(cache, lba)) return 0;
+    const OS_BLOCK_DEVICE *device = cache->Device;
+    if (!cache->Initialized || device == 0 || device->BlockSize == 0U ||
+        device->BlockSize > OS_BLOCK_CACHE_MAX_SIZE ||
+        lba >= device->BlockCount || count > device->BlockCount - lba) {
+        cache_unlock(cache);
+        return 0;
+    }
+    /* One bounded metadata scan for the whole extent. The lock keeps these
+     * slot indices valid across the backend read; bulk misses never evict.
+     * One byte per requested sector avoids a 128-pointer stack allocation. */
+    _Static_assert(OS_BLOCK_CACHE_ENTRY_COUNT < 256U, "range slot index fits byte");
+    UINT8 slots[128];
+    for (UINT32 offset = 0U; offset < count; ++offset)
+        slots[offset] = OS_BLOCK_CACHE_ENTRY_COUNT;
+    if (count == 1U) {
+        OS_BLOCK_CACHE_ENTRY *single = find_entry_locked(cache, lba);
+        if (single != 0) slots[0] = (UINT8)(single - cache->Entries);
+    } else {
+        for (UINT32 index = 0U; index < OS_BLOCK_CACHE_ENTRY_COUNT; ++index) {
+            OS_BLOCK_CACHE_ENTRY *candidate = &cache->Entries[index];
+            if (!candidate->Valid || candidate->Lba < lba) continue;
+            UINT64 offset = candidate->Lba - lba;
+            if (offset < count && slots[offset] == OS_BLOCK_CACHE_ENTRY_COUNT)
+                slots[offset] = (UINT8)index;
+        }
+    }
+    UINT32 done = 0U;
+    while (done < count) {
+        OS_BLOCK_CACHE_ENTRY *entry = slots[done] < OS_BLOCK_CACHE_ENTRY_COUNT ?
+            &cache->Entries[slots[done]] : 0;
+        UINT8 *out = (UINT8 *)buffer + (size_t)done * device->BlockSize;
+        if (entry != 0) {
+            copy_bytes(out, entry->Data, device->BlockSize);
+            entry->LastUse = ++cache->Clock;
+            ++done;
+            continue;
+        }
+        UINT32 run = 1U;
+        while (run < count - done) {
+            if (slots[done + run] < OS_BLOCK_CACHE_ENTRY_COUNT) break;
+            ++run;
+        }
+        /* Keep the cache lock across the backend read: a concurrent dirty
+         * write must not disappear behind an older on-disk version. Bulk
+         * misses do not evict hot FAT metadata or need speculative slots. */
+        if (!block_read(device, lba + done, run, out)) {
+            cache_unlock(cache);
+            return 0;
+        }
+        done += run;
+    }
+    cache_unlock(cache);
+    return 1;
+}
+
+BOOLEAN block_cache_write(OS_BLOCK_CACHE *cache, UINT64 lba,
                                  const VOID *buffer) {
-    LITEOS_BLOCK_CACHE_ENTRY *entry;
+    OS_BLOCK_CACHE_ENTRY *entry;
 
     if (cache == 0 || buffer == 0) return 0;
-    cache_lock(cache);
+    if (!cache_lock(cache, lba)) return 0;
 
     if (!cache->Initialized || cache->Device == 0 ||
-        cache->Device->BlockSize > LITEOS_BLOCK_CACHE_MAX_SIZE ||
+        cache->Device->BlockSize > OS_BLOCK_CACHE_MAX_SIZE ||
         lba >= cache->Device->BlockCount) {
         cache_unlock(cache);
         return 0;
     }
 
-    entry = find_entry_locked(cache, lba);
-    if (entry == 0) {
-        entry = select_entry_locked(cache);
+    BOOLEAN hit;
+    entry = find_write_entry_locked(cache, lba, &hit);
+    if (!hit) {
         if (entry == 0 || !flush_entry_locked(cache, entry)) {
             cache_unlock(cache);
             return 0;
@@ -143,11 +403,11 @@ BOOLEAN liteos_block_cache_write(LITEOS_BLOCK_CACHE *cache, UINT64 lba,
     return 1;
 }
 
-BOOLEAN liteos_block_cache_flush(LITEOS_BLOCK_CACHE *cache) {
+BOOLEAN block_cache_flush(OS_BLOCK_CACHE *cache) {
     BOOLEAN success;
     if (cache == 0) return 0;
 
-    cache_lock(cache);
+    if (!cache_lock(cache, 0U)) return 0;
     if (!cache->Initialized || cache->Device == 0) {
         cache_unlock(cache);
         return 0;
@@ -158,11 +418,11 @@ BOOLEAN liteos_block_cache_flush(LITEOS_BLOCK_CACHE *cache) {
     return success;
 }
 
-BOOLEAN liteos_block_cache_writeback(LITEOS_BLOCK_CACHE *cache) {
+BOOLEAN block_cache_writeback(OS_BLOCK_CACHE *cache) {
     BOOLEAN success;
     if (cache == 0) return 0;
 
-    cache_lock(cache);
+    if (!cache_lock(cache, 0U)) return 0;
     if (!cache->Initialized || cache->Device == 0) {
         cache_unlock(cache);
         return 0;
@@ -173,10 +433,10 @@ BOOLEAN liteos_block_cache_writeback(LITEOS_BLOCK_CACHE *cache) {
     return success;
 }
 
-BOOLEAN liteos_block_cache_destroy(LITEOS_BLOCK_CACHE *cache) {
+BOOLEAN block_cache_destroy(OS_BLOCK_CACHE *cache) {
     if (cache == 0) return 0;
 
-    cache_lock(cache);
+    if (!cache_lock(cache, 0U)) return 0;
     if (!cache->Initialized || cache->Device == 0 || !flush_cache_locked(cache)) {
         cache_unlock(cache);
         return 0;
@@ -185,7 +445,7 @@ BOOLEAN liteos_block_cache_destroy(LITEOS_BLOCK_CACHE *cache) {
     cache->Initialized = 0;
     cache->Device = 0;
     cache->Clock = 0;
-    for (UINT32 i = 0; i < LITEOS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
+    for (UINT32 i = 0; i < OS_BLOCK_CACHE_ENTRY_COUNT; ++i) {
         cache->Entries[i].Valid = 0;
         cache->Entries[i].Dirty = 0;
         cache->Entries[i].Lba = 0;
@@ -196,11 +456,11 @@ BOOLEAN liteos_block_cache_destroy(LITEOS_BLOCK_CACHE *cache) {
     return 1;
 }
 
-BOOLEAN liteos_block_cache_invalidate(LITEOS_BLOCK_CACHE *cache, UINT64 lba) {
-    LITEOS_BLOCK_CACHE_ENTRY *entry;
+BOOLEAN block_cache_invalidate(OS_BLOCK_CACHE *cache, UINT64 lba) {
+    OS_BLOCK_CACHE_ENTRY *entry;
     if (cache == 0) return 0;
 
-    cache_lock(cache);
+    if (!cache_lock(cache, lba)) return 0;
     if (!cache->Initialized) {
         cache_unlock(cache);
         return 0;

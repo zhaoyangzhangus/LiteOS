@@ -2,10 +2,12 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <signal.h>
 #include <time.h>
+#include <sched.h>
 
-struct liteos_pthread;
-typedef struct liteos_pthread *pthread_t;
+struct libc_pthread;
+typedef struct libc_pthread *pthread_t;
 
 typedef struct pthread_attr {
     void *stack_address;
@@ -14,14 +16,14 @@ typedef struct pthread_attr {
     int detach_state;
 } pthread_attr_t;
 
+/* glibc's x86-64 opaque mutex/condition attributes are one 32-bit word.
+ * Chromium is built against that ABI and calls these System implementations. */
 typedef struct pthread_mutexattr {
-    int type;
-    int process_shared;
+    uint32_t value;
 } pthread_mutexattr_t;
 
 typedef struct pthread_condattr {
-    clockid_t clock_id;
-    int process_shared;
+    uint32_t value;
 } pthread_condattr_t;
 
 typedef struct pthread_mutex {
@@ -30,6 +32,7 @@ typedef struct pthread_mutex {
 
 typedef struct pthread_cond {
     volatile uint32_t sequence;
+    uint32_t clock_id;
 } pthread_cond_t;
 
 typedef struct pthread_once {
@@ -68,6 +71,7 @@ typedef struct pthread_spinlock {
 #define PTHREAD_MUTEX_DEFAULT PTHREAD_MUTEX_NORMAL
 #define PTHREAD_MUTEX_RECURSIVE 1
 #define PTHREAD_MUTEX_ERRORCHECK 2
+#define PTHREAD_PRIO_INHERIT 1
 
 #define PTHREAD_STACK_MIN 16384U
 #define PTHREAD_CANCELED ((void *)-1)
@@ -76,9 +80,13 @@ typedef struct pthread_spinlock {
 #define PTHREAD_BARRIER_SERIAL_THREAD (-1)
 
 #define PTHREAD_MUTEX_INITIALIZER {0U}
-#define PTHREAD_COND_INITIALIZER {0U}
+#define PTHREAD_COND_INITIALIZER {0U, (uint32_t)CLOCK_REALTIME}
 #define PTHREAD_ONCE_INIT {0U}
 #define PTHREAD_RWLOCK_INITIALIZER {0U}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 int pthread_attr_init(pthread_attr_t *attribute);
 int pthread_attr_destroy(pthread_attr_t *attribute);
@@ -90,6 +98,7 @@ int pthread_attr_setstack(pthread_attr_t *attribute, void *address,
                           size_t size);
 int pthread_attr_getstack(const pthread_attr_t *attribute, void **address,
                           size_t *size);
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attribute);
 int pthread_attr_setdetachstate(pthread_attr_t *attribute, int state);
 int pthread_attr_getdetachstate(const pthread_attr_t *attribute, int *state);
 
@@ -100,6 +109,8 @@ int pthread_mutexattr_gettype(const pthread_mutexattr_t *attribute, int *type);
 int pthread_mutexattr_setpshared(pthread_mutexattr_t *attribute, int shared);
 int pthread_mutexattr_getpshared(const pthread_mutexattr_t *attribute,
                                  int *shared);
+int pthread_mutexattr_setprotocol(pthread_mutexattr_t *attribute,
+                                  int protocol);
 int pthread_mutex_init(pthread_mutex_t *mutex,
                        const pthread_mutexattr_t *attribute);
 int pthread_mutex_destroy(pthread_mutex_t *mutex);
@@ -170,3 +181,17 @@ int pthread_detach(pthread_t thread);
 void pthread_exit(void *result) __attribute__((noreturn));
 pthread_t pthread_self(void);
 int pthread_equal(pthread_t left, pthread_t right);
+int pthread_kill(pthread_t thread, int signal);
+int pthread_setname_np(pthread_t thread, const char *name);
+int pthread_getname_np(pthread_t thread, char *name, size_t length);
+int pthread_getschedparam(pthread_t thread, int *policy,
+                          struct sched_param *parameter);
+int pthread_setschedparam(pthread_t thread, int policy,
+                          const struct sched_param *parameter);
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *old_set);
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+                   void (*child)(void));
+
+#ifdef __cplusplus
+}
+#endif

@@ -17,7 +17,7 @@ SERIAL = BUILD / "qemu-serial.log"
 MONITOR = Path(
     os.environ.get(
         "QEMU_MONITOR_SOCKET",
-        str(Path(tempfile.gettempdir()) / "liteos-xhci-hub-wakeup-probe.sock"),
+        str(Path(tempfile.gettempdir()) / "system-xhci-hub-wakeup-probe.sock"),
     )
 )
 MOUSE_EVENT_DELAY = float(os.environ.get("XHCI_TEST_MOUSE_DELAY", "0.006"))
@@ -94,9 +94,9 @@ def print_new_diag(baseline_len):
     wanted = []
     for line in text.splitlines():
         if (
-            "LITEOS_DIAG_" in line
-            or "LITEOS_USB_RUNTIME_HUB_CHANGE" in line
-            or "LITEOS_XHCI_FAIL" in line
+            "OS_DIAG_" in line
+            or "OS_USB_RUNTIME_HUB_CHANGE" in line
+            or "OS_XHCI_FAIL" in line
         ):
             wanted.append(line)
 
@@ -141,7 +141,7 @@ def main():
             return 2
 
         if not wait_for(
-            lambda: "LITEOS_XHCI_HUB_RUNTIME_OK" in serial_text(),
+            lambda: "OS_XHCI_HUB_RUNTIME_OK" in serial_text(),
             BOOT_READY_TIMEOUT,
             "Hub runtime ready",
         ):
@@ -152,12 +152,12 @@ def main():
         # device, so a recovery probe cannot turn a slow self-test into a
         # misleading stage failure.
         if not wait_for(
-            lambda: "LITEOS_USER_RUNTIME_SUBTESTS_OK" in serial_text(),
+            lambda: "OS_USER_RUNTIME_SUBTESTS_OK" in serial_text(),
             BOOT_READY_TIMEOUT,
             "boot runtime self-tests ready",
         ):
             return 4
-        if "LITEOS_STAGE_FAIL" in serial_text():
+        if "OS_STAGE_FAIL" in serial_text():
             return 5
 
         # Attach HMP only after the boot-critical user-runtime self-test.  A
@@ -185,10 +185,9 @@ def main():
 
         baseline_text = serial_text()
         baseline_len = len(baseline_text)
-        baseline_transfer = baseline_text.count("LITEOS_DIAG_HUB_TRANSFER_EVENT")
-        baseline_change = baseline_text.count("LITEOS_USB_RUNTIME_HUB_CHANGE")
+        baseline_change = baseline_text.count("OS_USB_RUNTIME_HUB_CHANGE")
 
-        hmp.cmd("device_del liteos-nested-mouse")
+        hmp.cmd("device_del vm-nested-mouse")
 
         for delay in (0.2, 1.0, 5.0):
             time.sleep(delay if delay == 0.2 else delay - (0.2 if delay == 1.0 else 1.0))
@@ -200,22 +199,20 @@ def main():
             print_new_diag(baseline_len)
 
         print()
-        print("Waiting up to 40s for a Hub Transfer Event ...")
-        got_transfer = wait_for(
-            lambda: serial_text().count("LITEOS_DIAG_HUB_TRANSFER_EVENT")
-                    > baseline_transfer,
+        print("Waiting up to 40s for a runtime Hub change ...")
+        got_change = wait_for(
+            lambda: serial_text().count("OS_USB_RUNTIME_HUB_CHANGE")
+                    > baseline_change,
             40.0,
-            "Hub Transfer Event after nested detach",
+            "Runtime Hub change after nested detach",
         )
 
-        got_change = serial_text().count("LITEOS_USB_RUNTIME_HUB_CHANGE") > baseline_change
-        stage_failed = "LITEOS_STAGE_FAIL" in serial_text()
+        stage_failed = "OS_STAGE_FAIL" in serial_text()
 
         print_new_diag(baseline_len)
 
         print()
         print("=== RESULT ===")
-        print("hub_transfer_event:", "YES" if got_transfer else "NO")
         print("runtime_hub_change:", "YES" if got_change else "NO")
         print("stage_failure:", "YES" if stage_failed else "NO")
 
@@ -226,7 +223,7 @@ def main():
                 print("=== QEMU STDERR TAIL ===")
                 print(qemu_err[-6000:])
 
-        return 0 if got_transfer and not stage_failed else 1
+        return 0 if got_change and not stage_failed else 1
 
     finally:
         if hmp is not None:

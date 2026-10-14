@@ -43,15 +43,15 @@ static void xhci_msix_handler(uint8_t vector, struct arch_trap_frame *frame,
     if (state == 0 || !state->initialized || state->irq_vector == 0U) return;
     if (!atomic_exchange_explicit(&g_xhci_irq_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_write_serial_only("LITEOS_XHCI_IRQ_FIRED\r\n");
+        kernel_serial_write_serial_only("OS_XHCI_IRQ_FIRED\r\n");
     }
     atomic_bool *controller_irq_seen =
         state == xhci_hid_controller_state() ?
             &g_xhci_aux_irq_seen : &g_xhci_primary_irq_seen;
     if (!atomic_exchange_explicit(controller_irq_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_XHCI_IRQ_CONTROLLER=%s VECTOR=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_XHCI_IRQ_CONTROLLER=%s VECTOR=%u\r\n",
             state == xhci_hid_controller_state() ? "AUX" : "PRIMARY",
             vector);
     }
@@ -81,8 +81,8 @@ static void xhci_report_msix_metadata(const pci_device_t *device) {
         length_low = (uint32_t)bar->length;
         length_high = (uint32_t)(bar->length >> 32);
     }
-    liteos_serial_printf_serial_only(
-        "LITEOS_XHCI_MSIX_DETAIL CAP=%u BAR=%u OFF=%u ENTRIES=%u "
+    kernel_serial_printf_serial_only(
+        "OS_XHCI_MSIX_DETAIL CAP=%u BAR=%u OFF=%u ENTRIES=%u "
         "ADDR_LO=%u ADDR_HI=%u LEN_LO=%u LEN_HI=%u\r\n",
         device->msix_capability, device->msix_table_bar,
         device->msix_table_offset, device->msix_table_size,
@@ -128,9 +128,9 @@ bool xhci_core_bind_msix(xhci_state_t *state) {
     if (status != K_OK) {
         g_xhci_msix_failure_stage = 5U;
         if (use_msix) xhci_report_msix_metadata(state->pci);
-        liteos_serial_printf_serial_only(use_msix ?
-            "LITEOS_XHCI_MSIX_CONFIG_STATUS=%u\r\n" :
-            "LITEOS_XHCI_MSI_CONFIG_STATUS=%u\r\n",
+        kernel_serial_printf_serial_only(use_msix ?
+            "OS_XHCI_MSIX_CONFIG_STATUS=%u\r\n" :
+            "OS_XHCI_MSI_CONFIG_STATUS=%u\r\n",
             (uint32_t)(-status));
         (void)irq_unregister(vector, xhci_msix_handler, state);
         state->irq_vector = 0U;
@@ -141,8 +141,8 @@ bool xhci_core_bind_msix(xhci_state_t *state) {
         if (status != K_OK) {
             g_xhci_msix_failure_stage = 6U;
             xhci_report_msix_metadata(state->pci);
-            liteos_serial_printf_serial_only(
-                "LITEOS_XHCI_MSIX_MASK_STATUS=%u\r\n",
+            kernel_serial_printf_serial_only(
+                "OS_XHCI_MSIX_MASK_STATUS=%u\r\n",
                 (uint32_t)(-status));
             (void)irq_unregister(vector, xhci_msix_handler, state);
             state->irq_vector = 0U;
@@ -151,7 +151,7 @@ bool xhci_core_bind_msix(xhci_state_t *state) {
     }
     state->irq_msi = !use_msix;
     if (!use_msix) {
-        liteos_serial_write_serial_only("LITEOS_XHCI_MSI_FALLBACK_OK\r\n");
+        kernel_serial_write_serial_only("OS_XHCI_MSI_FALLBACK_OK\r\n");
     }
     return true;
 }

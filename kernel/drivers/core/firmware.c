@@ -1,16 +1,5 @@
 #include <kernel/firmware.h>
 
-static void firmware_lock(firmware_manager_t *manager) {
-    while (atomic_exchange_explicit(&manager->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
-}
-
-static void firmware_unlock(firmware_manager_t *manager) {
-    atomic_store_explicit(&manager->lock.state, 0U, memory_order_release);
-}
-
 static bool firmware_byte_is_name_char(char value) {
     return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') ||
            (value >= '0' && value <= '9') || value == '_' || value == '-' ||
@@ -20,6 +9,7 @@ static bool firmware_byte_is_name_char(char value) {
 bool firmware_logical_name_valid(const char *logical_name) {
     uint32_t length = 0U;
     uint32_t component_length = 0U;
+    bool component_is_dots = true;
     if (logical_name == 0 || logical_name[0] == '/' || logical_name[0] == '\0') {
         return false;
     }
@@ -28,20 +18,18 @@ bool firmware_logical_name_valid(const char *logical_name) {
         if (value == '\0') break;
         if (!firmware_byte_is_name_char(value)) return false;
         if (value == '/') {
-            if (component_length == 0U) return false;
+            if (component_length == 0U ||
+                (component_length == 2U && component_is_dots)) return false;
             component_length = 0U;
+            component_is_dots = true;
         } else {
             ++component_length;
+            component_is_dots = component_is_dots && value == '.';
         }
     }
     if (length == 0U || length == FIRMWARE_NAME_CAP || component_length == 0U) return false;
-    /* 禁止把路径逃逸语义交给底层 provider。 */
-    for (uint32_t i = 0U; i + 1U < length; ++i) {
-        if (logical_name[i] == '.' && logical_name[i + 1U] == '.' &&
-            (i == 0U || logical_name[i - 1U] == '/') &&
-            (i + 2U == length || logical_name[i + 2U] == '/')) return false;
-    }
-    return true;
+    /* Reject a parent component without a second pass over the path. */
+    return component_length != 2U || !component_is_dots;
 }
 
 static bool firmware_bytes_nonzero(const uint8_t *bytes, uint32_t length) {
@@ -66,10 +54,12 @@ kstatus_t firmware_manager_init(firmware_manager_t *manager,
                                 void *context) {
     unsigned expected = 0U;
     if (manager == 0 || resolve == 0 || release == 0) return K_EINVAL;
+    if (atomic_load_explicit(&manager->init_state, memory_order_acquire) == 2U) {
+        return manager->resolve == resolve && manager->release == release ? K_OK : K_EBUSY;
+    }
     if (atomic_compare_exchange_strong_explicit(&manager->init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&manager->lock.state, 0U);
         manager->resolve = resolve;
         manager->release = release;
         manager->context = context;
@@ -95,12 +85,11 @@ kstatus_t firmware_request(firmware_manager_t *manager,
         return K_EINVAL;
     }
     *out = (firmware_blob_t){0};
-    /* 供应者可能访问文件系统或等待 I/O，不能在自旋锁内执行外部回调。 */
-    firmware_lock(manager);
+    /* The acquire-ready check above publishes the immutable provider fields.
+     * Providers may access files or wait for I/O; no registry lock is needed. */
     resolve = manager->resolve;
     release = manager->release;
     context = manager->context;
-    firmware_unlock(manager);
     status = resolve(logical_name, minimum_version, out, context);
     if (status != K_OK) return status;
     if (!firmware_blob_valid(out, minimum_version)) {
@@ -116,10 +105,8 @@ void firmware_release(firmware_manager_t *manager, firmware_blob_t *blob) {
     void *context;
     if (manager == 0 || blob == 0 || blob->data == 0 ||
         atomic_load_explicit(&manager->init_state, memory_order_acquire) != 2U) return;
-    firmware_lock(manager);
     release = manager->release;
     context = manager->context;
-    firmware_unlock(manager);
     release(blob, context);
     *blob = (firmware_blob_t){0};
 }
@@ -128,7 +115,7 @@ typedef struct firmware_test_source {
     uint32_t releases;
 } firmware_test_source_t;
 
-static const uint8_t g_firmware_test_image[] = "LiteOS test firmware";
+static const uint8_t g_firmware_test_image[] = "System test firmware";
 
 static kstatus_t firmware_test_resolve(const char *logical_name,
                                        uint64_t minimum_version,

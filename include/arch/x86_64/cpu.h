@@ -1,5 +1,5 @@
-#ifndef LITEOS_ARCH_X86_64_CPU_H
-#define LITEOS_ARCH_X86_64_CPU_H
+#ifndef OS_ARCH_X86_64_CPU_H
+#define OS_ARCH_X86_64_CPU_H
 
 #include <kernel/base.h>
 #include <kernel/cpumask.h>
@@ -66,7 +66,7 @@ _Static_assert(__builtin_offsetof(x86_cpu_local_t, SyscallActive) ==
 /*
  * Fast local helpers are valid after x86 CPU-local setup.  They deliberately
  * do not perform Self/MAX_CPUS validation; allocator hot paths call them only
- * after liteos_arch_cpu_init() and liteos_mm_init() boot ordering is complete.
+ * after arch_cpu_init() and mm_boot_init() boot ordering is complete.
  */
 static inline uint32_t x86_current_cpu_index_fast(void) {
     uint32_t cpu;
@@ -124,7 +124,7 @@ uint64_t x86_timeout_ns_to_tsc(uint64_t timeout_ns);
 uint64_t x86_tsc_to_ns(uint64_t tsc);
 
 /* 现有启动路径的兼容接口。 */
-BOOLEAN liteos_arch_cpu_init(void);
-BOOLEAN liteos_arch_set_kernel_stack(UINT64 stack_base, UINT64 stack_size);
+BOOLEAN arch_cpu_init(void);
+BOOLEAN arch_set_kernel_stack(UINT64 stack_base, UINT64 stack_size);
 
 #endif

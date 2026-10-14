@@ -9,7 +9,7 @@ struct dirent {
     char d_name[256];
 };
 
-typedef struct liteos_dir {
+typedef struct libc_dir {
     int descriptor;
     unsigned int index;
     char path[256];
@@ -19,6 +19,7 @@ typedef struct liteos_dir {
 #define DT_UNKNOWN 0
 #define DT_REG 8
 #define DT_DIR 4
+#define DT_LNK 10
 
 DIR *opendir(const char *path);
 DIR *fdopendir(int descriptor);

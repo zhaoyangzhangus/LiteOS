@@ -7,22 +7,20 @@ static struct {
 } g_services;
 
 static void service_lock(void) {
-    while (atomic_exchange_explicit(&g_services.lock.state, 1U,
-                                     memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_services.lock);
 }
 
 static void service_unlock(void) {
-    atomic_store_explicit(&g_services.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_services.lock);
 }
 
 bool service_manager_init(void) {
+    if (atomic_load_explicit(&g_services.init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_services.init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_services.lock.state, 0U);
+        spinlock_init(&g_services.lock);
         for (uint32_t i = 0; i < SERVICE_MANAGER_MAX_SERVICES; ++i) {
             g_services.services[i].registered = false;
             atomic_init(&g_services.services[i].state, SERVICE_STOPPED);
@@ -37,11 +35,15 @@ bool service_manager_init(void) {
 }
 
 static bool service_known_locked(const service_t *service) {
-    if (service == 0) return false;
-    for (uint32_t i = 0; i < SERVICE_MANAGER_MAX_SERVICES; ++i) {
-        if (&g_services.services[i] == service) return service->registered;
+    uintptr_t address = (uintptr_t)service;
+    uintptr_t base = (uintptr_t)g_services.services;
+    if (address < base) return false;
+    uintptr_t offset = address - base;
+    /* Reject foreign/interior pointers before dereferencing them. */
+    if (offset >= sizeof(g_services.services) || offset % sizeof(service_t) != 0U) {
+        return false;
     }
-    return false;
+    return g_services.services[offset / sizeof(service_t)].registered;
 }
 
 kstatus_t service_register(const char *name, service_start_fn start,

@@ -49,7 +49,7 @@ typedef struct os_socket_ipv6_async_send {
     uint16_t flags;
 } os_socket_ipv6_async_send_t;
 
-/* LiteOS ABI 1 的 IPv4 socket 参数使用主机端整数，协议层负责 wire 字节序。 */
+/* System ABI 1 的 IPv4 socket 参数使用主机端整数，协议层负责 wire 字节序。 */
 typedef struct os_socket_ipv4_endpoint {
     uint32_t address;
     uint16_t port;
@@ -109,3 +109,9 @@ typedef struct os_socket_shutdown {
     uint32_t how;
     uint32_t reserved;
 } os_socket_shutdown_t;
+
+/* Additive options; existing native structure layouts and numbers stay fixed. */
+#define OS_SOCKET_OPTION_KEEPALIVE 9U
+#define OS_SOCKET_OPTION_KEEPIDLE 10U
+#define OS_SOCKET_OPTION_KEEPINTVL 11U
+#define OS_SOCKET_OPTION_KEEPCNT 12U

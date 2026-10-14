@@ -62,8 +62,9 @@ typedef struct {
     bool reset_supported;
 } x86_acpi_platform_t;
 
-bool x86_acpi_discover(const LITEOS_BOOT_INFO *boot_info);
+bool x86_acpi_discover(const OS_BOOT_INFO *boot_info);
 const x86_acpi_platform_t *x86_acpi_platform(void);
 bool x86_acpi_sleep_supported(void);
 kstatus_t x86_acpi_enter_sleep(uint8_t sleep_state);
 bool x86_acpi_reset(void);
+kstatus_t x86_acpi_poweroff(void);

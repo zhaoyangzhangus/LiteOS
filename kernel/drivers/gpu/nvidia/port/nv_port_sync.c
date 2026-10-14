@@ -103,53 +103,100 @@ void nv_port_rwlock_init(nv_port_rwlock_t *lock) {
     if (lock == 0) return;
     atomic_init(&lock->state, 0U);
     atomic_init(&lock->writers_waiting, 0U);
+#ifndef NV_PORT_HOST_TEST
+    wait_queue_init(&lock->readers_waitq);
+    wait_queue_init(&lock->writers_waitq);
+#endif
 }
 
-void nv_port_rwlock_read_lock(nv_port_rwlock_t *lock) {
-    if (lock == 0) return;
+bool nv_port_rwlock_read_try_lock(nv_port_rwlock_t *lock) {
+    unsigned state;
+
+    if (lock == 0) return false;
+    state = atomic_load_explicit(&lock->state, memory_order_acquire);
+    if ((state & NV_PORT_RW_WRITER) != 0U ||
+        atomic_load_explicit(&lock->writers_waiting,
+                             memory_order_acquire) != 0U ||
+        state >= NV_PORT_RW_WRITER - 1U)
+        return false;
+    return atomic_compare_exchange_strong_explicit(
+        &lock->state, &state, state + 1U,
+        memory_order_acquire, memory_order_relaxed);
+}
+
+static bool nv_port_rwlock_read_ready(void *context) {
+    nv_port_rwlock_t *lock = (nv_port_rwlock_t *)context;
+    unsigned state = atomic_load_explicit(&lock->state, memory_order_acquire);
     for (;;) {
-        unsigned state = atomic_load_explicit(&lock->state,
-                                              memory_order_acquire);
         if ((state & NV_PORT_RW_WRITER) != 0U ||
             atomic_load_explicit(&lock->writers_waiting,
-                                 memory_order_acquire) != 0U) {
-            __asm__ volatile ("pause");
-            continue;
-        }
-        if (state >= NV_PORT_RW_WRITER - 1U) {
-            __asm__ volatile ("pause");
-            continue;
-        }
+                                 memory_order_acquire) != 0U ||
+            state >= NV_PORT_RW_WRITER - 1U) return false;
+        /* Another reader's CAS is contention, not a condition to sleep on:
+         * it may leave no writer that would subsequently wake this reader. */
         if (atomic_compare_exchange_weak_explicit(
-                &lock->state, &state, state + 1U, memory_order_acquire,
-                memory_order_relaxed)) return;
+                &lock->state, &state, state + 1U,
+                memory_order_acquire, memory_order_relaxed)) return true;
     }
 }
 
+static bool nv_port_rwlock_write_ready(void *context) {
+    nv_port_rwlock_t *lock = (nv_port_rwlock_t *)context;
+    unsigned expected = 0U;
+    return atomic_compare_exchange_strong_explicit(
+        &lock->state, &expected, NV_PORT_RW_WRITER,
+        memory_order_acquire, memory_order_relaxed);
+}
+
+void nv_port_rwlock_read_lock(nv_port_rwlock_t *lock) {
+    if (lock == 0 || nv_port_rwlock_read_ready(lock)) return;
+#ifdef NV_PORT_HOST_TEST
+    while (!nv_port_rwlock_read_ready(lock)) thrd_yield();
+#else
+    /* The predicate acquires the lock under wait publication protection,
+     * including a release racing with subscription. Never spin out a holder. */
+    while (wait_on_queue(&lock->readers_waitq, nv_port_rwlock_read_ready,
+                          lock, UINT64_MAX) != K_OK) {}
+#endif
+}
+
 void nv_port_rwlock_read_unlock(nv_port_rwlock_t *lock) {
-    if (lock != 0) atomic_fetch_sub_explicit(&lock->state, 1U,
-                                              memory_order_release);
+    if (lock == 0) return;
+    unsigned previous = atomic_fetch_sub_explicit(&lock->state, 1U,
+                                                   memory_order_release);
+#ifndef NV_PORT_HOST_TEST
+    if (previous == 1U) wake_one(&lock->writers_waitq);
+    if (previous == NV_PORT_RW_WRITER - 1U) wake_all(&lock->readers_waitq);
+#else
+    (void)previous;
+#endif
 }
 
 void nv_port_rwlock_write_lock(nv_port_rwlock_t *lock) {
     if (lock == 0) return;
     atomic_fetch_add_explicit(&lock->writers_waiting, 1U, memory_order_acq_rel);
-    for (;;) {
-        unsigned expected = 0U;
-        if (atomic_compare_exchange_weak_explicit(
-                &lock->state, &expected, NV_PORT_RW_WRITER,
-                memory_order_acquire, memory_order_relaxed)) {
-            atomic_fetch_sub_explicit(&lock->writers_waiting, 1U,
-                                      memory_order_release);
-            return;
-        }
-        __asm__ volatile ("pause");
+    if (!nv_port_rwlock_write_ready(lock)) {
+#ifdef NV_PORT_HOST_TEST
+        while (!nv_port_rwlock_write_ready(lock)) thrd_yield();
+#else
+        while (wait_on_queue(&lock->writers_waitq, nv_port_rwlock_write_ready,
+                              lock, UINT64_MAX) != K_OK) {}
+#endif
     }
+    atomic_fetch_sub_explicit(&lock->writers_waiting, 1U,
+                              memory_order_release);
 }
 
 void nv_port_rwlock_write_unlock(nv_port_rwlock_t *lock) {
-    if (lock != 0) atomic_store_explicit(&lock->state, 0U,
-                                         memory_order_release);
+    if (lock == 0) return;
+    atomic_store_explicit(&lock->state, 0U, memory_order_release);
+#ifndef NV_PORT_HOST_TEST
+    /* Always notify both classes. A waiting writer can be between its count
+     * increment and subscription; skipping readers based on that count
+     * could strand them when the writer has already acquired/released. */
+    wake_one(&lock->writers_waitq);
+    wake_all(&lock->readers_waitq);
+#endif
 }
 
 #ifndef NV_PORT_HOST_TEST

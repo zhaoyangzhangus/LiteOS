@@ -22,36 +22,19 @@ if ! command -v "$objdump" >/dev/null 2>&1; then
     exit 1
 fi
 
-loader_headers="$($objdump -p "$loader")"
-library_headers="$($objdump -p "$library")"
-test_headers="$($objdump -p "$test_image")"
-test_interpreter="$($objdump -s -j .interp "$test_image")"
+python3 "$(dirname -- "$0")/verify-elf-runtime.py" "$loader" "$library" "$test_image" libsystemc.so.1
 library_symbols="$($objdump -T "$library")"
 test_relocations="$($objdump -R "$test_image")"
 
-if grep -Fq 'NEEDED' <<<"$loader_headers" ||
-   grep -Fq 'NEEDED' <<<"$library_headers"; then
-    printf 'libc: loader or libc has an external dependency\n' >&2
-    exit 1
-fi
-if ! grep -Fq 'INTERP' <<<"$test_headers" ||
-   ! grep -Fq '2f6c6962' <<<"$test_interpreter" ||
-   ! grep -Fq '6c697465' <<<"$test_interpreter" ||
-   ! grep -Fq '6f732e73' <<<"$test_interpreter" ||
-   ! grep -Fq '6f2e3100' <<<"$test_interpreter"; then
-    printf 'libc: test image has no LiteOS interpreter\n' >&2
-    exit 1
-fi
-if ! grep -Fq 'NEEDED' <<<"$test_headers" ||
-   ! grep -Fq 'libliteosc.so.1' <<<"$test_headers"; then
-    printf 'libc: test image has no libc dependency\n' >&2
-    exit 1
-fi
 if grep -Fq '*UND*' <<<"$library_symbols"; then
     printf 'libc: shared library has unresolved dynamic symbols\n' >&2
     exit 1
 fi
 for symbol in \
+    __libc_native_syscall6 __libc_linux_syscall6 \
+    __system_free __system_realloc __system_malloc_usable_size \
+    _Z7readdirP8libc_dir _Z8closedirP8libc_dir \
+    _Z6setjmpP14libc_jmp_state _Z7longjmpP14libc_jmp_statei \
     memcpy memmove memset strlen strcpy memmem mempcpy memccpy strchrnul ffs strtok_r strerror strsignal atof strtoimax strtol \
     strtoull malloc calloc realloc aligned_alloc free qsort getenv setenv \
     exit printf snprintf sscanf asprintf fopen fread fwrite fread_unlocked \
@@ -86,7 +69,7 @@ for symbol in \
      catanhf catanh catanhl __mulsc3 __muldc3 __mulxc3 __divsc3 __divdc3 \
      __divxc3 mbrtoc16 c16rtomb mbrtoc32 c32rtomb thrd_create thrd_join \
      mtx_init mtx_lock cnd_wait call_once tss_create; do
-    if ! grep -Fq "$symbol" <<<"$library_symbols"; then
+    if ! awk -v symbol="$symbol" '$NF == symbol && $0 !~ /\*UND\*/ {found=1} END {exit !found}' <<<"$library_symbols"; then
         printf 'libc: missing exported symbol: %s\n' "$symbol" >&2
         exit 1
     fi

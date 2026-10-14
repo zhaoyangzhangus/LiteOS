@@ -63,32 +63,28 @@ static void gpu_submission_unlink(gpu_pending_submission_t *submission) {
     submission->node.prev = &submission->node;
 }
 
-static void gpu_context_lock(gpu_context_t *context) {
+/* Inline the locking boundary so caller accesses see its acquire/release,
+ * rather than relying on interprocedural mod/ref summaries of debug hooks. */
+static inline __attribute__((always_inline)) void gpu_context_lock(gpu_context_t *context) {
     gpu_context_debug_set(1U, context);
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&context->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&context->lock);
     gpu_context_debug_set(2U, context);
 }
 
-static void gpu_context_unlock(gpu_context_t *context) {
-    atomic_store_explicit(&context->lock.state, 0U, memory_order_release);
+static inline __attribute__((always_inline)) void gpu_context_unlock(gpu_context_t *context) {
+    spinlock_unlock(&context->lock);
     gpu_context_debug_set(0U, 0);
     sched_preempt_enable();
 }
 
-static void gpu_fence_lock(gpu_fence_t *fence) {
+static inline __attribute__((always_inline)) void gpu_fence_lock(gpu_fence_t *fence) {
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&fence->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&fence->lock);
 }
 
-static void gpu_fence_unlock(gpu_fence_t *fence) {
-    atomic_store_explicit(&fence->lock.state, 0U, memory_order_release);
+static inline __attribute__((always_inline)) void gpu_fence_unlock(gpu_fence_t *fence) {
+    spinlock_unlock(&fence->lock);
     sched_preempt_enable();
 }
 
@@ -112,7 +108,11 @@ static void gpu_fence_destroy(void *object) {
 
 static void gpu_allocation_destroy(void *object) {
     gpu_allocation_t *allocation = (gpu_allocation_t *)object;
-    if (allocation->backing_page != 0) {
+    if (allocation->backend_ops != 0 && allocation->backend_ops->release != 0) {
+        allocation->backend_ops->release(allocation,
+                                         allocation->backend_private);
+        allocation->backend_private = 0;
+    } else if (allocation->backing_page != 0) {
         page_free((page_t *)allocation->backing_page);
         allocation->backing_page = 0;
     }
@@ -148,10 +148,7 @@ static const object_ops_t g_gpu_context_ops = {
 
 static void gpu_object_init(object_header_t *object, object_type_id_t type,
                             const object_ops_t *ops) {
-    refcount_init(&object->refs, 1U);
-    object->type = type;
-    object->flags = 0U;
-    object->ops = ops;
+    object_header_init(object, type, ops);
 }
 
 kstatus_t gpu_allocation_create(uint64_t size, gpu_allocation_t **out) {
@@ -179,7 +176,9 @@ kstatus_t gpu_allocation_create(uint64_t size, gpu_allocation_t **out) {
     va = atomic_fetch_add_explicit(&g_next_gpu_va, allocation->size,
                                    memory_order_relaxed);
     allocation->gpu_va = gpu_va_make(va);
-    allocation->backend = 0;
+    allocation->backend_kind = GPU_ALLOCATION_BACKEND_CPU_WB;
+    allocation->backend_ops = 0;
+    allocation->backend_private = 0;
     page_count = allocation->size >> PAGE_SHIFT;
     while (capacity_pages < page_count) {
         if (backing_order == BUDDY_MAX_ORDER) {
@@ -206,6 +205,168 @@ kstatus_t gpu_allocation_create(uint64_t size, gpu_allocation_t **out) {
     return K_OK;
 }
 
+kstatus_t gpu_allocation_create_with_backend(
+    uint64_t size, uint32_t domain, uint32_t flags,
+    gpu_allocation_backend_t backend_kind, gpu_va_t gpu_va,
+    const gpu_allocation_backend_ops_t *backend_ops,
+    void *backend_private, gpu_allocation_t **out) {
+    gpu_allocation_t *allocation;
+
+    if (out == 0 || size == 0U || size > UINT64_MAX - (PAGE_SIZE - 1U) ||
+        backend_kind == GPU_ALLOCATION_BACKEND_CPU_WB ||
+        backend_kind > GPU_ALLOCATION_BACKEND_NVIDIA_GPU ||
+        backend_ops == 0 || backend_ops->release == 0) {
+        return K_EINVAL;
+    }
+
+    allocation = (gpu_allocation_t *)kzalloc(sizeof(*allocation), 0);
+    if (allocation == 0) return K_ENOMEM;
+    gpu_object_init(&allocation->object, KOBJECT_TYPE_GPU_ALLOCATION,
+                    &g_gpu_allocation_ops);
+    allocation->size = (size + PAGE_SIZE - 1U) &
+                       ~(uint64_t)(PAGE_SIZE - 1U);
+    allocation->domain = domain;
+    allocation->flags = flags;
+    allocation->gpu_va = gpu_va;
+    allocation->backend_kind = backend_kind;
+    allocation->backend_ops = backend_ops;
+    allocation->backend_private = backend_private;
+    allocation->backing = 0;
+    allocation->backing_phys = paddr_make(0U);
+    allocation->backing_size = 0U;
+    allocation->backing_page = 0;
+    allocation->backing_order = 0U;
+    atomic_init(&allocation->pin_count, 0U);
+    atomic_init(&allocation->residency_state, 1U);
+    *out = allocation;
+    return K_OK;
+}
+
+gpu_allocation_backend_t gpu_allocation_backend(
+    const gpu_allocation_t *allocation) {
+    if (allocation == 0 ||
+        allocation->object.type != KOBJECT_TYPE_GPU_ALLOCATION) {
+        return GPU_ALLOCATION_BACKEND_CPU_WB;
+    }
+    return allocation->backend_kind;
+}
+
+kstatus_t gpu_allocation_pin(gpu_allocation_t *allocation) {
+    kstatus_t status;
+    unsigned previous;
+
+    if (allocation == 0 ||
+        allocation->object.type != KOBJECT_TYPE_GPU_ALLOCATION) {
+        return K_EINVAL;
+    }
+    if (allocation->backend_ops != 0 && allocation->backend_ops->pin != 0) {
+        status = allocation->backend_ops->pin(
+            allocation, allocation->backend_private);
+        if (status != K_OK) return status;
+    }
+    previous = atomic_fetch_add_explicit(&allocation->pin_count, 1U,
+                                         memory_order_acq_rel);
+    if (previous == UINT32_MAX) {
+        atomic_fetch_sub_explicit(&allocation->pin_count, 1U,
+                                  memory_order_acq_rel);
+        if (allocation->backend_ops != 0 &&
+            allocation->backend_ops->unpin != 0) {
+            allocation->backend_ops->unpin(
+                allocation, allocation->backend_private);
+        }
+        return K_EOVERFLOW;
+    }
+    return K_OK;
+}
+
+kstatus_t gpu_allocation_unpin(gpu_allocation_t *allocation) {
+    unsigned current;
+
+    if (allocation == 0 ||
+        allocation->object.type != KOBJECT_TYPE_GPU_ALLOCATION) {
+        return K_EINVAL;
+    }
+    current = atomic_load_explicit(&allocation->pin_count,
+                                   memory_order_acquire);
+    for (;;) {
+        if (current == 0U) return K_EINVAL;
+        if (atomic_compare_exchange_weak_explicit(
+                &allocation->pin_count, &current, current - 1U,
+                memory_order_acq_rel, memory_order_acquire)) {
+            break;
+        }
+    }
+    if (allocation->backend_ops != 0 && allocation->backend_ops->unpin != 0) {
+        allocation->backend_ops->unpin(allocation,
+                                       allocation->backend_private);
+    }
+    return K_OK;
+}
+
+static bool gpu_allocation_range_valid(const gpu_allocation_t *allocation,
+                                       uint64_t offset, uint64_t length) {
+    return allocation != 0 &&
+           allocation->object.type == KOBJECT_TYPE_GPU_ALLOCATION &&
+           offset <= allocation->size && length <= allocation->size - offset;
+}
+
+kstatus_t gpu_allocation_cpu_map(gpu_allocation_t *allocation,
+                                 uint64_t offset, uint64_t length,
+                                 void **address) {
+    if (address == 0 || length == 0U ||
+        !gpu_allocation_range_valid(allocation, offset, length)) {
+        return K_EINVAL;
+    }
+    *address = 0;
+    if (allocation->backend_ops != 0 &&
+        allocation->backend_ops->map_cpu != 0) {
+        return allocation->backend_ops->map_cpu(
+            allocation, allocation->backend_private, offset, length, address);
+    }
+    if ((allocation->backend_kind != GPU_ALLOCATION_BACKEND_CPU_WB &&
+         allocation->backend_kind != GPU_ALLOCATION_BACKEND_CPU_WC) ||
+        allocation->backing == 0) {
+        return K_ENOSYS;
+    }
+    *address = (void *)((uintptr_t)allocation->backing + (uintptr_t)offset);
+    return K_OK;
+}
+
+void gpu_allocation_cpu_unmap(gpu_allocation_t *allocation, void *address,
+                              uint64_t length) {
+    if (allocation == 0 || allocation->object.type != KOBJECT_TYPE_GPU_ALLOCATION ||
+        allocation->backend_ops == 0 ||
+        allocation->backend_ops->unmap_cpu == 0) {
+        return;
+    }
+    allocation->backend_ops->unmap_cpu(allocation,
+                                       allocation->backend_private,
+                                       address, length);
+}
+
+kstatus_t gpu_allocation_get_physical(gpu_allocation_t *allocation,
+                                      uint64_t offset, uint64_t length,
+                                      paddr_t *physical) {
+    if (physical == 0 || length == 0U ||
+        !gpu_allocation_range_valid(allocation, offset, length)) {
+        return K_EINVAL;
+    }
+    if (allocation->backend_ops != 0 &&
+        allocation->backend_ops->get_physical != 0) {
+        return allocation->backend_ops->get_physical(
+            allocation, allocation->backend_private, offset, length, physical);
+    }
+    if ((allocation->backend_kind != GPU_ALLOCATION_BACKEND_CPU_WB &&
+         allocation->backend_kind != GPU_ALLOCATION_BACKEND_CPU_WC) ||
+        allocation->backing_page == 0 || offset > allocation->backing_size ||
+        length > allocation->backing_size - offset ||
+        allocation->backing_phys.value > UINT64_MAX - offset) {
+        return K_ENOSYS;
+    }
+    *physical = paddr_make(allocation->backing_phys.value + offset);
+    return K_OK;
+}
+
 kstatus_t gpu_context_create(struct device *device, struct process *process,
                              gpu_context_t **out) {
     gpu_context_t *context;
@@ -218,7 +379,7 @@ kstatus_t gpu_context_create(struct device *device, struct process *process,
     context->process = process;
     context->gpu_vm = 0;
     context->backend = 0;
-    atomic_init(&context->lock.state, 0U);
+    spinlock_init(&context->lock);
     list_init(&context->submissions);
     atomic_init(&context->state, GPU_CONTEXT_RUNNING);
     *out = context;
@@ -233,7 +394,7 @@ kstatus_t gpu_fence_create(gpu_fence_t **out) {
     gpu_object_init(&fence->object, KOBJECT_TYPE_GPU_FENCE, &g_gpu_fence_ops);
     atomic_init(&fence->completed_value, 0U);
     atomic_init(&fence->status, K_OK);
-    atomic_init(&fence->lock.state, 0U);
+    spinlock_init(&fence->lock);
     wait_queue_init(&fence->waitq);
     fence->backend = 0;
     *out = fence;
@@ -317,8 +478,7 @@ static void gpu_complete_submission(void *argument) {
     if (!atomic_load_explicit(&submission->canceled, memory_order_acquire)) {
         (void)gpu_fence_signal(fence, signal_value);
     }
-    atomic_fetch_sub_explicit(&allocation->pin_count, 1U,
-                              memory_order_acq_rel);
+    (void)gpu_allocation_unpin(allocation);
     gpu_context_unlock(context);
 
     (void)telemetry_record_latency(TELEMETRY_CATEGORY_GPU_SUBMIT,
@@ -365,6 +525,7 @@ static kstatus_t gpu_submit_locked(gpu_context_t *context,
     unsigned state;
     uint64_t start_tsc;
     gpu_pending_submission_t *pending;
+    kstatus_t pin_status;
     if (context == 0 || allocation == 0 || fence == 0 || command_length == 0U ||
         signal_value == 0U || context->object.type != KOBJECT_TYPE_GPU_CONTEXT ||
         allocation->object.type != KOBJECT_TYPE_GPU_ALLOCATION ||
@@ -390,14 +551,20 @@ static kstatus_t gpu_submit_locked(gpu_context_t *context,
     object_get(context);
     object_get(allocation);
     object_get(fence);
-    atomic_fetch_add_explicit(&allocation->pin_count, 1U, memory_order_acq_rel);
+    pin_status = gpu_allocation_pin(allocation);
+    if (pin_status != K_OK) {
+        object_put(fence);
+        object_put(allocation);
+        object_put(context);
+        kfree(pending);
+        return pin_status;
+    }
     gpu_submission_link(context, pending);
     gpu_context_debug_set(6U, context);
     gpu_context_debug_set(7U, context);
     if (!deferred_schedule(gpu_complete_submission, pending)) {
         gpu_submission_unlink(pending);
-        atomic_fetch_sub_explicit(&allocation->pin_count, 1U,
-                                  memory_order_acq_rel);
+        (void)gpu_allocation_unpin(allocation);
         object_put(fence);
         object_put(allocation);
         object_put(context);

@@ -1,15 +1,30 @@
 #include <kernel/window_geometry.h>
+#include <uapi/chrome_caption.h>
 
 /* REFACTOR_P7A_GEOMETRY_OWNER: one Rect/decoration/corner geometry source. */
 
-#define WINDOW_CORNER_RADIUS 6U
-
-static const uint8_t g_window_corner_inset[WINDOW_CORNER_RADIUS] = {
-    4U, 3U, 2U, 1U, 1U, 0U,
-};
 
 bool window_client_decorations(uint32_t flags) {
     return (flags & OS_WINDOW_CLIENT_DECORATIONS) != 0U;
+}
+
+bool window_standard_caption(uint32_t flags) {
+    return (flags & OS_WINDOW_STANDARD_CAPTION_CONTROLS) != 0U;
+}
+
+bool window_caption_button_rect(uint32_t flags, int32_t x, int32_t y,
+                                uint32_t width, uint32_t button,
+                                int32_t *out_x, int32_t *out_y) {
+    if (!window_client_decorations(flags) && !window_standard_caption(flags))
+        return window_title_button_rect(x, y, width, button, out_x, out_y);
+    if (!window_standard_caption(flags) || width < 96U ||
+        !out_x || !out_y || button < WINDOW_TITLE_BUTTON_MINIMIZE ||
+        button > WINDOW_TITLE_BUTTON_CLOSE) return false;
+    int64_t left = (int64_t)x + window_outer_width(width, flags) - (4U - button) * 32U;
+    if (left < INT32_MIN || left > INT32_MAX) return false;
+    *out_x = (int32_t)left;
+    *out_y = y;
+    return true;
 }
 
 uint32_t window_frame_border(uint32_t flags) {
@@ -21,7 +36,8 @@ uint32_t window_frame_extra(uint32_t flags) {
 }
 
 uint32_t window_titlebar_height(uint32_t flags) {
-    return window_client_decorations(flags) ? 0U : WINDOW_TITLEBAR_HEIGHT;
+    return window_client_decorations(flags) ? 0U :
+           window_standard_caption(flags) ? os_window_caption_height(flags) : WINDOW_TITLEBAR_HEIGHT;
 }
 
 uint32_t window_client_offset_y(uint32_t flags) {
@@ -46,7 +62,8 @@ bool window_client_drag_region(uint32_t flags, int32_t window_x,
     int64_t relative_x;
     int64_t relative_y;
 
-    if (!window_client_decorations(flags)) {
+    if (!window_client_decorations(flags) ||
+        (flags & OS_WINDOW_EXPLICIT_MOVE_RESIZE) != 0U) {
         return false;
     }
 
@@ -54,7 +71,7 @@ bool window_client_drag_region(uint32_t flags, int32_t window_x,
     relative_y = (int64_t)pointer_y - window_y;
     if (relative_x < 0 || relative_y < 0 ||
         relative_x >= (int64_t)window_width ||
-        relative_y >= WINDOW_CLIENT_DRAG_REGION_HEIGHT) {
+        relative_y >= (window_standard_caption(flags) ? os_window_caption_height(flags) : WINDOW_CLIENT_DRAG_REGION_HEIGHT)) {
         return false;
     }
 
@@ -70,12 +87,7 @@ bool window_client_drag_region(uint32_t flags, int32_t window_x,
 
 uint32_t window_corner_inset(uint32_t row, uint32_t width,
                              uint32_t height) {
-    if (width < WINDOW_CORNER_RADIUS * 2U ||
-        height < WINDOW_CORNER_RADIUS * 2U || row >= height) return 0U;
-    if (row < WINDOW_CORNER_RADIUS) return g_window_corner_inset[row];
-    row = height - 1U - row;
-    if (row < WINDOW_CORNER_RADIUS) return g_window_corner_inset[row];
-    return 0U;
+    return chrome_frame_row_inset(row, width, height);
 }
 
 uint32_t compositor_corner_inset(uint32_t row, uint32_t width,

@@ -31,13 +31,46 @@ enum gpu_context_state {
     GPU_CONTEXT_RESETTING = 2,
 };
 
-typedef struct gpu_allocation {
+/*
+ * A Window owns only a gpu_allocation_t reference.  Backend-private RM/KMS
+ * handles stay behind this enum and callback table; generic graphics code
+ * never interprets backend_private.
+ */
+typedef enum gpu_allocation_backend {
+    GPU_ALLOCATION_BACKEND_CPU_WB = 0,
+    GPU_ALLOCATION_BACKEND_CPU_WC = 1,
+    GPU_ALLOCATION_BACKEND_NVIDIA_GPU = 2,
+} gpu_allocation_backend_t;
+
+typedef struct gpu_allocation gpu_allocation_t;
+
+typedef struct gpu_allocation_backend_ops {
+    /* Release backend ownership; the allocation object itself is freed by
+     * GPU core after this callback returns. */
+    void (*release)(gpu_allocation_t *allocation, void *backend_private);
+    kstatus_t (*pin)(gpu_allocation_t *allocation, void *backend_private);
+    void (*unpin)(gpu_allocation_t *allocation, void *backend_private);
+    kstatus_t (*map_cpu)(gpu_allocation_t *allocation, void *backend_private,
+                         uint64_t offset, uint64_t length, void **address);
+    void (*unmap_cpu)(gpu_allocation_t *allocation, void *backend_private,
+                      void *address, uint64_t length);
+    kstatus_t (*get_physical)(gpu_allocation_t *allocation,
+                              void *backend_private, uint64_t offset,
+                              uint64_t length, paddr_t *physical);
+} gpu_allocation_backend_ops_t;
+
+struct gpu_allocation {
     object_header_t object;
     uint64_t size;
     uint32_t domain;
     uint32_t flags;
     gpu_va_t gpu_va;
-    void *backend;
+    gpu_allocation_backend_t backend_kind;
+    const gpu_allocation_backend_ops_t *backend_ops;
+    void *backend_private;
+
+    /* CPU_WB/CPU_WC backing only.  NVIDIA backend state is never stored in
+     * these fields and is never exposed to user space. */
     void *backing;
     paddr_t backing_phys;
     uint64_t backing_size;
@@ -45,7 +78,7 @@ typedef struct gpu_allocation {
     uint8_t backing_order;
     atomic_uint pin_count;
     atomic_uint residency_state;
-} gpu_allocation_t;
+};
 
 typedef struct gpu_fence {
     object_header_t object;
@@ -78,6 +111,23 @@ typedef struct gpu_submission {
 } gpu_submission_t;
 
 kstatus_t gpu_allocation_create(uint64_t size, gpu_allocation_t **out);
+kstatus_t gpu_allocation_create_with_backend(
+    uint64_t size, uint32_t domain, uint32_t flags,
+    gpu_allocation_backend_t backend_kind, gpu_va_t gpu_va,
+    const gpu_allocation_backend_ops_t *backend_ops,
+    void *backend_private, gpu_allocation_t **out);
+gpu_allocation_backend_t gpu_allocation_backend(
+    const gpu_allocation_t *allocation);
+kstatus_t gpu_allocation_pin(gpu_allocation_t *allocation);
+kstatus_t gpu_allocation_unpin(gpu_allocation_t *allocation);
+kstatus_t gpu_allocation_cpu_map(gpu_allocation_t *allocation,
+                                 uint64_t offset, uint64_t length,
+                                 void **address);
+void gpu_allocation_cpu_unmap(gpu_allocation_t *allocation, void *address,
+                              uint64_t length);
+kstatus_t gpu_allocation_get_physical(gpu_allocation_t *allocation,
+                                      uint64_t offset, uint64_t length,
+                                      paddr_t *physical);
 kstatus_t gpu_context_create(struct device *device, struct process *process,
                              gpu_context_t **out);
 kstatus_t gpu_fence_create(gpu_fence_t **out);

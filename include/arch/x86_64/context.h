@@ -1,5 +1,5 @@
-#ifndef LITEOS_ARCH_X86_64_CONTEXT_H
-#define LITEOS_ARCH_X86_64_CONTEXT_H
+#ifndef OS_ARCH_X86_64_CONTEXT_H
+#define OS_ARCH_X86_64_CONTEXT_H
 
 #include <kernel/base.h>
 #include "uefi.h"
@@ -62,6 +62,14 @@ void x86_kernel_thread_start(void);
 typedef void (*x86_stack_continuation_t)(void *context);
 __attribute__((noreturn))
 void x86_rebase_stack_and_call(uint64_t virtual_delta,
+                               x86_stack_continuation_t continuation,
+                               void *context);
+
+/* Switch to an explicitly supplied, already mapped stack alias and enter a
+ * fresh continuation.  The runtime uses this at the post-scheduler boundary
+ * so it does not depend on the caller's scheduler stack remaining mapped. */
+__attribute__((noreturn))
+void x86_switch_stack_and_call(uint64_t stack_top,
                                x86_stack_continuation_t continuation,
                                void *context);
 

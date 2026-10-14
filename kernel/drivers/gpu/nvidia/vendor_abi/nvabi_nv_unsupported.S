@@ -160,19 +160,6 @@ nv_acquire_mmap_lock:
     ret
     .size nv_acquire_mmap_lock, .-nv_acquire_mmap_lock
 
-    .globl nv_add_mapping_context_to_file
-    .type nv_add_mapping_context_to_file, @function
-nv_add_mapping_context_to_file:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_add_mapping_context_to_file(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    movl $0x56, %eax
-    popq %rbp
-    ret
-    .size nv_add_mapping_context_to_file, .-nv_add_mapping_context_to_file
-
     .globl nv_alias_pages
     .type nv_alias_pages, @function
 nv_alias_pages:
@@ -186,7 +173,7 @@ nv_alias_pages:
     ret
     .size nv_alias_pages, .-nv_alias_pages
 
-#ifndef LITEOS_NVIDIA_PHASE5
+#ifndef OS_NVIDIA_PHASE5
     .globl nv_alloc_kernel_mapping
     .type nv_alloc_kernel_mapping, @function
 nv_alloc_kernel_mapping:
@@ -200,19 +187,6 @@ nv_alloc_kernel_mapping:
     ret
     .size nv_alloc_kernel_mapping, .-nv_alloc_kernel_mapping
 #endif
-
-    .globl nv_alloc_user_mapping
-    .type nv_alloc_user_mapping, @function
-nv_alloc_user_mapping:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_alloc_user_mapping(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    movl $0x56, %eax
-    popq %rbp
-    ret
-    .size nv_alloc_user_mapping, .-nv_alloc_user_mapping
 
     .globl nv_allow_runtime_suspend
     .type nv_allow_runtime_suspend, @function
@@ -552,7 +526,7 @@ nv_flush_coherent_cpu_cache_range:
     ret
     .size nv_flush_coherent_cpu_cache_range, .-nv_flush_coherent_cpu_cache_range
 
-#ifndef LITEOS_NVIDIA_PHASE5
+#ifndef OS_NVIDIA_PHASE5
     .globl nv_free_kernel_mapping
     .type nv_free_kernel_mapping, @function
 nv_free_kernel_mapping:
@@ -566,19 +540,6 @@ nv_free_kernel_mapping:
     ret
     .size nv_free_kernel_mapping, .-nv_free_kernel_mapping
 #endif
-
-    .globl nv_free_user_mapping
-    .type nv_free_user_mapping, @function
-nv_free_user_mapping:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_free_user_mapping(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    # void return
-    popq %rbp
-    ret
-    .size nv_free_user_mapping, .-nv_free_user_mapping
 
     .globl nv_get_adapter_state
     .type nv_get_adapter_state, @function
@@ -605,19 +566,6 @@ nv_get_all_mappings_revoked_locked:
     popq %rbp
     ret
     .size nv_get_all_mappings_revoked_locked, .-nv_get_all_mappings_revoked_locked
-
-    .globl nv_get_ctl_state
-    .type nv_get_ctl_state, @function
-nv_get_ctl_state:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_get_ctl_state(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    xorl %eax, %eax
-    popq %rbp
-    ret
-    .size nv_get_ctl_state, .-nv_get_ctl_state
 
     .globl nv_get_current_irq_priv_data
     .type nv_get_current_irq_priv_data, @function
@@ -697,20 +645,7 @@ nv_get_event:
     ret
     .size nv_get_event, .-nv_get_event
 
-    .globl nv_get_file_private
-    .type nv_get_file_private, @function
-nv_get_file_private:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_get_file_private(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    xorl %eax, %eax
-    popq %rbp
-    ret
-    .size nv_get_file_private, .-nv_get_file_private
-
-#ifndef LITEOS_NVIDIA_PHASE5
+#ifndef OS_NVIDIA_PHASE5
     .globl nv_get_firmware
     .type nv_get_firmware, @function
 nv_get_firmware:
@@ -750,19 +685,6 @@ nv_get_num_dpaux_instances:
     popq %rbp
     ret
     .size nv_get_num_dpaux_instances, .-nv_get_num_dpaux_instances
-
-    .globl nv_get_screen_info
-    .type nv_get_screen_info, @function
-nv_get_screen_info:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_get_screen_info(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    # void return
-    popq %rbp
-    ret
-    .size nv_get_screen_info, .-nv_get_screen_info
 
     .globl nv_get_syncpoint_aperture
     .type nv_get_syncpoint_aperture, @function
@@ -985,19 +907,6 @@ nv_is_chassis_notebook:
     ret
     .size nv_is_chassis_notebook, .-nv_is_chassis_notebook
 
-    .globl nv_is_gpu_accessible
-    .type nv_is_gpu_accessible, @function
-nv_is_gpu_accessible:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_is_gpu_accessible(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    xorl %eax, %eax
-    popq %rbp
-    ret
-    .size nv_is_gpu_accessible, .-nv_is_gpu_accessible
-
     .globl nv_log_error
     .type nv_log_error, @function
 nv_log_error:
@@ -1076,20 +985,7 @@ nv_post_event:
     ret
     .size nv_post_event, .-nv_post_event
 
-    .globl nv_put_file_private
-    .type nv_put_file_private, @function
-nv_put_file_private:
-    pushq %rbp
-    movq %rsp, %rbp
-    leaq .Lnvabi_msg_nv_put_file_private(%rip), %rdi
-    leaq .Lnvabi_stage_nv(%rip), %rsi
-    call nvabi_log_unsupported
-    # void return
-    popq %rbp
-    ret
-    .size nv_put_file_private, .-nv_put_file_private
-
-#ifndef LITEOS_NVIDIA_PHASE5
+#ifndef OS_NVIDIA_PHASE5
     .globl nv_put_firmware
     .type nv_put_firmware, @function
 nv_put_firmware:
@@ -1572,8 +1468,6 @@ nv_unregister_user_pages:
     .asciz "nv_get_max_freq"
 .Lnvabi_msg_nv_get_num_dpaux_instances:
     .asciz "nv_get_num_dpaux_instances"
-.Lnvabi_msg_nv_get_screen_info:
-    .asciz "nv_get_screen_info"
 .Lnvabi_msg_nv_get_syncpoint_aperture:
     .asciz "nv_get_syncpoint_aperture"
 .Lnvabi_msg_nv_get_tegra_brightness_level:

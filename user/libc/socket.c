@@ -1,14 +1,18 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdlib.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <uapi/socket.h>
+#include <uapi/linux_abi.h>
+#include <netinet/tcp.h>
 
 static int socket_error(int error_number) {
     errno = error_number;
@@ -21,6 +25,10 @@ static ssize_t socket_count_result(int64_t status) {
         return -1;
     }
     return (ssize_t)status;
+}
+
+static bool libc_linux_personality(void) {
+    return __libc_linux_personality();
 }
 
 static int socket_handle(int descriptor, os_handle_t *handle,
@@ -134,6 +142,10 @@ static bool parse_ipv6(const char *text, uint8_t output[16]) {
     }
     return true;
 }
+
+const struct in6_addr in6addr_any = {{{0}}};
+const struct in6_addr in6addr_loopback =
+    {{{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}}};
 
 uint16_t htons(uint16_t value) {
     return (uint16_t)((value << 8U) | (value >> 8U));
@@ -334,11 +346,38 @@ int socket(int domain, int type, int protocol) {
     int base_type = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
     int descriptor;
     int64_t status;
+    if (libc_linux_personality() &&
+        (domain == AF_UNIX || domain == AF_INET || domain == AF_INET6)) {
+        uint64_t linux_type = (uint64_t)base_type;
+        int open_flags = O_RDWR;
+        if ((type & SOCK_NONBLOCK) != 0) {
+            linux_type |= LINUX_SOCK_NONBLOCK;
+            open_flags |= O_NONBLOCK;
+        }
+        if ((type & SOCK_CLOEXEC) != 0) {
+            linux_type |= LINUX_SOCK_CLOEXEC;
+            open_flags |= O_CLOEXEC;
+        }
+        status = __libc_linux_syscall6(
+            LINUX_SYS_SOCKET, (uint64_t)(uint32_t)domain, linux_type,
+            (uint64_t)(uint32_t)protocol, 0U, 0U, 0U);
+        if (status < 0) return __libc_status_result(status);
+        descriptor = __libc_adopt_linux_fd((int)status, open_flags);
+        if (descriptor < 0) return -1;
+        if (__libc_mark_linux_socket_descriptor(
+                descriptor, (uint32_t)domain) < 0) {
+            int saved_errno = errno;
+            (void)close(descriptor);
+            errno = saved_errno;
+            return -1;
+        }
+        return descriptor;
+    }
     if (domain != AF_INET && domain != AF_INET6) return socket_error(EAFNOSUPPORT);
     if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM) {
         return socket_error(ESOCKTNOSUPPORT);
     }
-    status = liteos_syscall6(OS_SYS_SOCKET_CREATE, (uint64_t)domain,
+    status = __libc_native_syscall6(OS_SYS_SOCKET_CREATE, (uint64_t)domain,
                              (uint64_t)base_type, (uint64_t)protocol,
                              (uint64_t)(uintptr_t)&handle,
                              (type & SOCK_CLOEXEC) != 0 ?
@@ -367,14 +406,23 @@ int bind(int descriptor, const struct sockaddr *address, socklen_t length) {
     uint16_t host_port;
     uint8_t address6[16];
     int64_t status;
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        status = __libc_linux_syscall6(
+            LINUX_SYS_BIND, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)address, (uint64_t)length, 0U, 0U, 0U);
+        return __libc_status_result(status);
+    }
     if (socket_handle(descriptor, &handle, &family) < 0) return -1;
     if (family == AF_INET) {
         if (decode_ipv4_address(address, length, &host_address, &host_port) < 0) return -1;
-        status = liteos_syscall6(OS_SYS_SOCKET_BIND, handle, host_address,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_BIND, handle, host_address,
                                  host_port, 0U, 0U, 0U);
     } else {
         if (decode_ipv6_address(address, length, address6, &host_port) < 0) return -1;
-        status = liteos_syscall6(OS_SYS_SOCKET_BIND6, handle,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_BIND6, handle,
                                  (uint64_t)(uintptr_t)address6, host_port,
                                  0U, 0U, 0U);
     }
@@ -388,14 +436,23 @@ int connect(int descriptor, const struct sockaddr *address, socklen_t length) {
     uint16_t host_port;
     uint8_t address6[16];
     int64_t status;
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        status = __libc_linux_syscall6(
+            LINUX_SYS_CONNECT, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)address, (uint64_t)length, 0U, 0U, 0U);
+        return __libc_status_result(status);
+    }
     if (socket_handle(descriptor, &handle, &family) < 0) return -1;
     if (family == AF_INET) {
         if (decode_ipv4_address(address, length, &host_address, &host_port) < 0) return -1;
-        status = liteos_syscall6(OS_SYS_SOCKET_CONNECT, handle, host_address,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_CONNECT, handle, host_address,
                                  host_port, 0U, 0U, 0U);
     } else {
         if (decode_ipv6_address(address, length, address6, &host_port) < 0) return -1;
-        status = liteos_syscall6(OS_SYS_SOCKET_CONNECT6, handle,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_CONNECT6, handle,
                                  (uint64_t)(uintptr_t)address6, host_port,
                                  0U, 0U, 0U);
     }
@@ -404,11 +461,17 @@ int connect(int descriptor, const struct sockaddr *address, socklen_t length) {
 
 int listen(int descriptor, int backlog) {
     os_handle_t handle;
-    if (backlog <= 0 || socket_handle(descriptor, &handle, 0) < 0) {
-        if (backlog <= 0) errno = EINVAL;
-        return -1;
+    if (backlog <= 0) return socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_LISTEN, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uint32_t)backlog, 0U, 0U, 0U, 0U));
     }
-    return __libc_status_result(liteos_syscall6(OS_SYS_SOCKET_LISTEN, handle,
+    if (socket_handle(descriptor, &handle, 0) < 0) return -1;
+    return __libc_status_result(__libc_native_syscall6(OS_SYS_SOCKET_LISTEN, handle,
                                                  (uint64_t)(unsigned int)backlog,
                                                  0U, 0U, 0U, 0U));
 }
@@ -419,8 +482,35 @@ static int accept_with_flags(int descriptor, struct sockaddr *address,
     os_handle_t accepted = OS_INVALID_HANDLE;
     int64_t status;
     if ((address == 0) != (length == 0)) return socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        uint32_t linux_flags = 0U;
+        int accepted_descriptor;
+        if (linux_descriptor < 0) return -1;
+        if ((flags & SOCK_NONBLOCK) != 0) linux_flags |= LINUX_SOCK_NONBLOCK;
+        if ((flags & SOCK_CLOEXEC) != 0) linux_flags |= LINUX_SOCK_CLOEXEC;
+        status = __libc_linux_syscall6(
+            LINUX_SYS_ACCEPT4, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)address, (uint64_t)(uintptr_t)length,
+            linux_flags, 0U, 0U);
+        if (status < 0) return __libc_status_result(status);
+        accepted_descriptor = __libc_adopt_linux_fd(
+            (int)status, O_RDWR |
+            ((flags & SOCK_NONBLOCK) != 0 ? O_NONBLOCK : 0) |
+            ((flags & SOCK_CLOEXEC) != 0 ? O_CLOEXEC : 0));
+        if (accepted_descriptor < 0) return -1;
+        if (__libc_mark_linux_socket_descriptor(
+                accepted_descriptor, __libc_socket_family(descriptor)) < 0) {
+            int saved_errno = errno;
+            (void)close(accepted_descriptor);
+            errno = saved_errno;
+            return -1;
+        }
+        return accepted_descriptor;
+    }
     if (socket_handle(descriptor, &handle, 0) < 0) return -1;
-    status = liteos_syscall6(OS_SYS_SOCKET_ACCEPT, handle,
+    status = __libc_native_syscall6(OS_SYS_SOCKET_ACCEPT, handle,
                              (__libc_descriptor_open_flags(descriptor) &
                               O_NONBLOCK) != 0U ? 0U : OS_WAIT_INFINITE,
                              (uint64_t)(uintptr_t)&accepted,
@@ -477,10 +567,21 @@ ssize_t sendto(int descriptor, const void *buffer, size_t length, int flags,
     uint16_t host_port = 0U;
     uint8_t address6[16] = {0};
     int64_t status;
-    if ((flags & ~MSG_DONTWAIT) != 0) {
+    if ((flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) != 0) {
         return (ssize_t)socket_error(EOPNOTSUPP);
     }
     if (buffer == 0 && length != 0U) return (ssize_t)socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        status = __libc_linux_syscall6(
+            LINUX_SYS_SENDTO, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)buffer, (uint64_t)length,
+            (uint64_t)(uint32_t)flags, (uint64_t)(uintptr_t)address,
+            (uint64_t)address_length);
+        return socket_count_result(status);
+    }
     if (socket_handle(descriptor, &handle, &family) < 0) return -1;
     if (address != 0) {
         if (family == AF_INET) {
@@ -492,11 +593,11 @@ ssize_t sendto(int descriptor, const void *buffer, size_t length, int flags,
         }
     }
     if (family == AF_INET) {
-        status = liteos_syscall6(OS_SYS_SOCKET_SEND, handle,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_SEND, handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  host_address, host_port, 0U);
     } else {
-        status = liteos_syscall6(OS_SYS_SOCKET_SEND6, handle,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_SEND6, handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  (uint64_t)(uintptr_t)address6, host_port, 0U);
     }
@@ -513,7 +614,9 @@ static int validate_receive_address(const struct sockaddr *address,
                          sizeof(struct sockaddr_in6);
     if (address == 0) return 0;
     if (length == 0 || *length < required) return socket_error(EINVAL);
-    return address->sa_family == family ? 0 : socket_error(EAFNOSUPPORT);
+    /* recvfrom() writes this address.  Callers may pass a zeroed buffer; its
+     * incoming sa_family is not an input parameter to validate. */
+    return 0;
 }
 
 ssize_t recvfrom(int descriptor, void *buffer, size_t length, int flags,
@@ -524,23 +627,35 @@ ssize_t recvfrom(int descriptor, void *buffer, size_t length, int flags,
     uint16_t source_port = 0U;
     uint8_t source_address6[16] = {0};
     int64_t status;
-    if ((flags & ~MSG_DONTWAIT) != 0) {
-        return (ssize_t)socket_error(EOPNOTSUPP);
-    }
     if (buffer == 0 && length != 0U) return (ssize_t)socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        if ((flags & ~(MSG_DONTWAIT | MSG_PEEK)) != 0)
+            return (ssize_t)socket_error(EOPNOTSUPP);
+        status = __libc_linux_syscall6(
+            LINUX_SYS_RECVFROM, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)buffer, (uint64_t)length,
+            (uint64_t)(uint32_t)flags, (uint64_t)(uintptr_t)address,
+            (uint64_t)(uintptr_t)address_length);
+        return socket_count_result(status);
+    }
+    if ((flags & ~MSG_DONTWAIT) != 0)
+        return (ssize_t)socket_error(EOPNOTSUPP);
     if (socket_handle(descriptor, &handle, &family) < 0) return -1;
     if (validate_receive_address(address, address_length, family) < 0) return -1;
     uint64_t timeout = ((flags & MSG_DONTWAIT) != 0 ||
                         (__libc_descriptor_open_flags(descriptor) &
                          O_NONBLOCK) != 0U) ? 0U : OS_WAIT_INFINITE;
     if (family == AF_INET) {
-        status = liteos_syscall6(OS_SYS_SOCKET_RECV, handle,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_RECV, handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  (uint64_t)(uintptr_t)&source_address,
                                  (uint64_t)(uintptr_t)&source_port,
                                  timeout);
     } else {
-        status = liteos_syscall6(OS_SYS_SOCKET_RECV6, handle,
+        status = __libc_native_syscall6(OS_SYS_SOCKET_RECV6, handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  (uint64_t)(uintptr_t)source_address6,
                                  (uint64_t)(uintptr_t)&source_port,
@@ -641,21 +756,197 @@ static void message_copy_from_buffer(const unsigned char *buffer,
     }
 }
 
+/* Linux x86-64 keeps the msghdr layout independent from the public libc
+ * wrapper.  In particular, msg_namelen is a 32-bit field followed by explicit
+ * padding, while the System-facing struct msghdr is allowed to evolve. */
+typedef struct libc_linux_msghdr {
+    uint64_t name;
+    uint32_t name_length;
+    uint32_t name_padding;
+    uint64_t iov_pointer;
+    uint64_t iov_length;
+    uint64_t control;
+    uint64_t control_length;
+    uint32_t flags;
+    uint32_t flags_padding;
+} libc_linux_msghdr_t;
+
+static int linux_translate_send_control(const struct msghdr *message,
+                                        unsigned char **copy_output) {
+    struct msghdr copy_message;
+    size_t offset = 0U;
+    if (copy_output == 0 || message == 0) return socket_error(EINVAL);
+    *copy_output = 0;
+    if (message->msg_controllen == 0U) return 0;
+    if (message->msg_control == 0) return socket_error(EINVAL);
+    *copy_output = (unsigned char *)malloc(message->msg_controllen);
+    if (*copy_output == 0) return -1;
+    memcpy(*copy_output, message->msg_control, message->msg_controllen);
+    copy_message = *message;
+    copy_message.msg_control = *copy_output;
+    while (offset < copy_message.msg_controllen) {
+        struct cmsghdr *header = (struct cmsghdr *)(uintptr_t)(
+            (uintptr_t)copy_message.msg_control + offset);
+        size_t remaining = copy_message.msg_controllen - offset;
+        size_t aligned_length;
+        size_t data_length;
+        if (remaining < sizeof(*header) || header->cmsg_len < CMSG_LEN(0) ||
+            header->cmsg_len > remaining) {
+            free(*copy_output);
+            *copy_output = 0;
+            return socket_error(EINVAL);
+        }
+        data_length = header->cmsg_len - CMSG_LEN(0);
+        if (header->cmsg_level == SOL_SOCKET &&
+            header->cmsg_type == SCM_RIGHTS) {
+            if ((data_length % sizeof(int)) != 0U) {
+                free(*copy_output);
+                *copy_output = 0;
+                return socket_error(EINVAL);
+            }
+            int *descriptors = (int *)CMSG_DATA(header);
+            for (size_t index = 0U; index < data_length / sizeof(int);
+                 ++index) {
+                int linux_descriptor =
+                    __libc_linux_fd_for_descriptor(descriptors[index]);
+                if (linux_descriptor < 0) {
+                    free(*copy_output);
+                    *copy_output = 0;
+                    return -1;
+                }
+                descriptors[index] = linux_descriptor;
+            }
+        }
+        aligned_length = CMSG_ALIGN(header->cmsg_len);
+        if (aligned_length > remaining) {
+            if (header->cmsg_len != remaining) {
+                free(*copy_output);
+                *copy_output = 0;
+                return socket_error(EINVAL);
+            }
+            break;
+        }
+        offset += aligned_length;
+    }
+    return 0;
+}
+
+static int linux_adopt_received_control(struct msghdr *message, int flags) {
+    size_t offset = 0U;
+    if (message == 0 || message->msg_controllen == 0U) return 0;
+    if (message->msg_control == 0) return socket_error(EINVAL);
+    while (offset < message->msg_controllen) {
+        struct cmsghdr *header = (struct cmsghdr *)(uintptr_t)(
+            (uintptr_t)message->msg_control + offset);
+        size_t remaining = message->msg_controllen - offset;
+        size_t aligned_length;
+        size_t data_length;
+        if (remaining < sizeof(*header) || header->cmsg_len < CMSG_LEN(0) ||
+            header->cmsg_len > remaining) return socket_error(EINVAL);
+        data_length = header->cmsg_len - CMSG_LEN(0);
+        if (header->cmsg_level == SOL_SOCKET &&
+            header->cmsg_type == SCM_RIGHTS) {
+            if ((data_length % sizeof(int)) != 0U) return socket_error(EINVAL);
+            int *descriptors = (int *)CMSG_DATA(header);
+            for (size_t index = 0U; index < data_length / sizeof(int);
+                 ++index) {
+                int open_flags = O_RDWR;
+                int descriptor;
+                if ((flags & MSG_CMSG_CLOEXEC) != 0) open_flags |= O_CLOEXEC;
+                descriptor = __libc_adopt_linux_fd(
+                    descriptors[index], open_flags);
+                if (descriptor < 0) return -1;
+                descriptors[index] = descriptor;
+            }
+        }
+        aligned_length = CMSG_ALIGN(header->cmsg_len);
+        if (aligned_length > remaining) {
+            if (header->cmsg_len != remaining) return socket_error(EINVAL);
+            break;
+        }
+        offset += aligned_length;
+    }
+    return 0;
+}
+
+static ssize_t linux_sendmsg(int descriptor, const struct msghdr *message,
+                             int flags) {
+    unsigned char *control_copy = 0;
+    int linux_descriptor;
+    int control_status;
+    void *control;
+    libc_linux_msghdr_t linux_message = {
+        .name = (uint64_t)(uintptr_t)message->msg_name,
+        .name_length = message->msg_namelen,
+        .iov_pointer = (uint64_t)(uintptr_t)message->msg_iov,
+        .iov_length = message->msg_iovlen,
+        .control = 0U,
+        .control_length = message->msg_controllen,
+    };
+    linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+    if (linux_descriptor < 0) return -1;
+    control_status = linux_translate_send_control(message, &control_copy);
+    if (control_status < 0) return -1;
+    control = control_copy != 0 ? (void *)control_copy : message->msg_control;
+    linux_message.control = (uint64_t)(uintptr_t)control;
+    int64_t result = __libc_linux_syscall6(
+        LINUX_SYS_SENDMSG, (uint64_t)(uint32_t)linux_descriptor,
+        (uint64_t)(uintptr_t)&linux_message, (uint64_t)(uint32_t)flags,
+        0U, 0U, 0U);
+    free(control_copy);
+    if (result < 0) {
+        (void)__libc_status_result(result);
+        return -1;
+    }
+    return result > (int64_t)SSIZE_MAX ? (errno = EOVERFLOW, -1) :
+           (ssize_t)result;
+}
+
+static ssize_t linux_recvmsg(int descriptor, struct msghdr *message,
+                             int flags) {
+    int linux_descriptor;
+    libc_linux_msghdr_t linux_message = {
+        .name = (uint64_t)(uintptr_t)message->msg_name,
+        .name_length = message->msg_namelen,
+        .iov_pointer = (uint64_t)(uintptr_t)message->msg_iov,
+        .iov_length = message->msg_iovlen,
+        .control = (uint64_t)(uintptr_t)message->msg_control,
+        .control_length = message->msg_controllen,
+    };
+    linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+    if (linux_descriptor < 0) return -1;
+    int64_t result = __libc_linux_syscall6(
+        LINUX_SYS_RECVMSG, (uint64_t)(uint32_t)linux_descriptor,
+        (uint64_t)(uintptr_t)&linux_message, (uint64_t)(uint32_t)flags,
+        0U, 0U, 0U);
+    if (result < 0) {
+        (void)__libc_status_result(result);
+        return -1;
+    }
+    message->msg_namelen = (socklen_t)linux_message.name_length;
+    message->msg_controllen = (size_t)linux_message.control_length;
+    message->msg_flags = (int)linux_message.flags;
+    if (linux_adopt_received_control(message, flags) < 0) return -1;
+    return result > (int64_t)SSIZE_MAX ? (errno = EOVERFLOW, -1) :
+           (ssize_t)result;
+}
+
 ssize_t sendmsg(int descriptor, const struct msghdr *message, int flags) {
     unsigned char *buffer = 0;
     size_t length;
     ssize_t result;
-    if ((flags & ~MSG_DONTWAIT) != 0) {
+    if ((flags & ~(MSG_DONTWAIT | MSG_NOSIGNAL)) != 0) {
         return (ssize_t)socket_error(EOPNOTSUPP);
     }
     if (message == 0 ||
         (message->msg_name == 0 && message->msg_namelen != 0U)) {
         return (ssize_t)socket_error(EINVAL);
     }
-    if (message->msg_control != 0 || message->msg_controllen != 0U) {
-        return (ssize_t)socket_error(EOPNOTSUPP);
-    }
     if (message_iov_size(message, &length) < 0) return -1;
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        return linux_sendmsg(descriptor, message, flags);
+    }
     if (length != 0U) {
         buffer = (unsigned char *)malloc(length);
         if (buffer == 0) return -1;
@@ -675,14 +966,16 @@ ssize_t recvmsg(int descriptor, struct msghdr *message, int flags) {
     socklen_t source_length = sizeof(source);
     ssize_t result;
     bool capture_source = false;
-    if ((flags & ~MSG_DONTWAIT) != 0) {
-        return (ssize_t)socket_error(EOPNOTSUPP);
-    }
     if (message == 0) return (ssize_t)socket_error(EINVAL);
-    if (message->msg_control != 0 || message->msg_controllen != 0U) {
-        return (ssize_t)socket_error(EOPNOTSUPP);
-    }
     if (message_iov_size(message, &length) < 0) return -1;
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        if ((flags & ~(MSG_DONTWAIT | MSG_CMSG_CLOEXEC | MSG_PEEK)) != 0)
+            return (ssize_t)socket_error(EOPNOTSUPP);
+        return linux_recvmsg(descriptor, message, flags);
+    }
+    if ((flags & ~(MSG_DONTWAIT | MSG_CMSG_CLOEXEC)) != 0)
+        return (ssize_t)socket_error(EOPNOTSUPP);
     if (message->msg_name != 0) {
         uint32_t family = __libc_socket_family(descriptor);
         socklen_t required = family == AF_INET ? sizeof(struct sockaddr_in) :
@@ -724,9 +1017,21 @@ int shutdown(int descriptor, int how) {
     if (how < OS_SOCKET_SHUT_READ || how > OS_SOCKET_SHUT_BOTH) {
         return socket_error(EINVAL);
     }
+    /* socketpair() is provided by the Linux ABI shim and returns a Linux
+     * descriptor, not a native System object handle.  Keep shutdown on the
+     * same ABI path; passing that descriptor to the native socket syscall
+     * would look it up in the native handle table and return ENOTSOCK. */
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_SHUTDOWN, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uint32_t)how, 0U, 0U, 0U, 0U));
+    }
     if (socket_handle(descriptor, &arguments.socket, 0) < 0) return -1;
     arguments.how = (uint32_t)how;
-    return __libc_status_result(liteos_syscall6(OS_SYS_SOCKET_SHUTDOWN,
+    return __libc_status_result(__libc_native_syscall6(OS_SYS_SOCKET_SHUTDOWN,
         (uint64_t)(uintptr_t)&arguments, 0U, 0U, 0U, 0U, 0U));
 }
 
@@ -735,12 +1040,22 @@ int getsockname(int descriptor, struct sockaddr *address, socklen_t *length) {
         .hdr = {sizeof(os_socket_info_t), OS_SYSCALL_ABI_VERSION, 0U}
     };
     os_handle_t handle;
+    if (address == 0 || length == 0) return socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_GETSOCKNAME, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)address, (uint64_t)(uintptr_t)length,
+            0U, 0U, 0U));
+    }
     if (address == 0 || length == 0 || socket_handle(descriptor, &handle, 0) < 0) {
         if (address == 0 || length == 0) errno = EINVAL;
         return -1;
     }
     info.socket = handle;
-    if (__libc_status_result(liteos_syscall6(OS_SYS_SOCKET_GET_INFO,
+    if (__libc_status_result(__libc_native_syscall6(OS_SYS_SOCKET_GET_INFO,
             (uint64_t)(uintptr_t)&info, 0U, 0U, 0U, 0U, 0U)) < 0) return -1;
     if (info.family == AF_INET) {
         struct sockaddr_in result = {0};
@@ -767,12 +1082,22 @@ int getpeername(int descriptor, struct sockaddr *address, socklen_t *length) {
         .hdr = {sizeof(os_socket_info_t), OS_SYSCALL_ABI_VERSION, 0U}
     };
     os_handle_t handle;
+    if (address == 0 || length == 0) return socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_GETPEERNAME, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uintptr_t)address, (uint64_t)(uintptr_t)length,
+            0U, 0U, 0U));
+    }
     if (address == 0 || length == 0 || socket_handle(descriptor, &handle, 0) < 0) {
         if (address == 0 || length == 0) errno = EINVAL;
         return -1;
     }
     info.socket = handle;
-    if (__libc_status_result(liteos_syscall6(OS_SYS_SOCKET_GET_INFO,
+    if (__libc_status_result(__libc_native_syscall6(OS_SYS_SOCKET_GET_INFO,
             (uint64_t)(uintptr_t)&info, 0U, 0U, 0U, 0U, 0U)) < 0) return -1;
     if ((info.flags & OS_SOCKET_INFO_CONNECTED) == 0U) return socket_error(ENOTCONN);
     if (info.family == AF_INET) {
@@ -795,7 +1120,16 @@ int getpeername(int descriptor, struct sockaddr *address, socklen_t *length) {
     return 0;
 }
 
-static uint32_t socket_option_number(int option) {
+static uint32_t socket_option_number(int level, int option) {
+    if (level == IPPROTO_TCP) {
+        switch (option) {
+        case TCP_KEEPIDLE: return OS_SOCKET_OPTION_KEEPIDLE;
+        case TCP_KEEPINTVL: return OS_SOCKET_OPTION_KEEPINTVL;
+        case TCP_KEEPCNT: return OS_SOCKET_OPTION_KEEPCNT;
+        default: return 0U;
+        }
+    }
+    if (level != SOL_SOCKET) return 0U;
     switch (option) {
     case SO_REUSEADDR: return OS_SOCKET_OPTION_REUSE_ADDRESS;
     case SO_ERROR: return OS_SOCKET_OPTION_ERROR;
@@ -805,6 +1139,7 @@ static uint32_t socket_option_number(int option) {
     case SO_ACCEPTCONN: return OS_SOCKET_OPTION_ACCEPT_CONNECTION;
     case SO_RCVBUF: return OS_SOCKET_OPTION_RECEIVE_BUFFER;
     case SO_SNDBUF: return OS_SOCKET_OPTION_SEND_BUFFER;
+    case SO_KEEPALIVE: return OS_SOCKET_OPTION_KEEPALIVE;
     default: return 0U;
     }
 }
@@ -814,13 +1149,22 @@ int setsockopt(int descriptor, int level, int option, const void *value,
     os_socket_option_value_t arguments = {
         .hdr = {sizeof(os_socket_option_value_t), OS_SYSCALL_ABI_VERSION, 0U}
     };
-    uint32_t kernel_option = socket_option_number(option);
-    if (socket_handle(descriptor, &arguments.socket, 0) < 0) return -1;
-    if (level != SOL_SOCKET || kernel_option == 0U) return socket_error(ENOPROTOOPT);
+    uint32_t kernel_option = socket_option_number(level, option);
+    if (kernel_option == 0U) return socket_error(ENOPROTOOPT);
     if (value == 0 || length < sizeof(int)) return socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_SETSOCKOPT, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uint32_t)level, (uint64_t)(uint32_t)option,
+            (uint64_t)(uintptr_t)value, (uint64_t)length, 0U));
+    }
+    if (socket_handle(descriptor, &arguments.socket, 0) < 0) return -1;
     arguments.option = kernel_option;
     arguments.value = *(const int *)value;
-    return __libc_status_result(liteos_syscall6(OS_SYS_SOCKET_SET_OPTION,
+    return __libc_status_result(__libc_native_syscall6(OS_SYS_SOCKET_SET_OPTION,
         (uint64_t)(uintptr_t)&arguments, 0U, 0U, 0U, 0U, 0U));
 }
 
@@ -829,12 +1173,22 @@ int getsockopt(int descriptor, int level, int option, void *value,
     os_socket_option_value_t arguments = {
         .hdr = {sizeof(os_socket_option_value_t), OS_SYSCALL_ABI_VERSION, 0U}
     };
-    uint32_t kernel_option = socket_option_number(option);
-    if (socket_handle(descriptor, &arguments.socket, 0) < 0) return -1;
-    if (level != SOL_SOCKET || kernel_option == 0U) return socket_error(ENOPROTOOPT);
+    uint32_t kernel_option = socket_option_number(level, option);
+    if (kernel_option == 0U) return socket_error(ENOPROTOOPT);
     if (value == 0 || length == 0 || *length < sizeof(int)) return socket_error(EINVAL);
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int linux_descriptor = __libc_linux_fd_for_descriptor(descriptor);
+        if (linux_descriptor < 0) return -1;
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_GETSOCKOPT, (uint64_t)(uint32_t)linux_descriptor,
+            (uint64_t)(uint32_t)level, (uint64_t)(uint32_t)option,
+            (uint64_t)(uintptr_t)value, (uint64_t)(uintptr_t)length,
+            0U));
+    }
+    if (socket_handle(descriptor, &arguments.socket, 0) < 0) return -1;
     arguments.option = kernel_option;
-    if (__libc_status_result(liteos_syscall6(OS_SYS_SOCKET_GET_OPTION,
+    if (__libc_status_result(__libc_native_syscall6(OS_SYS_SOCKET_GET_OPTION,
             (uint64_t)(uintptr_t)&arguments, 0U, 0U, 0U, 0U, 0U)) < 0) return -1;
     *(int *)value = arguments.value;
     *length = sizeof(int);

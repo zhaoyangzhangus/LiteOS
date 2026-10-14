@@ -1,3 +1,8 @@
+#if defined(NV_PORT_HOST_TEST) && !defined(_WIN32) && \
+    !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "nv_port.h"
 
 #ifndef NV_PORT_HOST_TEST
@@ -6,6 +11,8 @@
 #include <kernel/timer.h>
 #else
 #include <threads.h>
+#include <time.h>
+#ifdef _WIN32
 typedef struct nv_port_qpc_value {
     int64_t QuadPart;
 } nv_port_qpc_value_t;
@@ -14,6 +21,7 @@ __declspec(dllimport) int __stdcall QueryPerformanceCounter(
 __declspec(dllimport) int __stdcall QueryPerformanceFrequency(
     nv_port_qpc_value_t *value);
 #endif
+#endif
 
 static uint64_t nv_port_saturating_add(uint64_t left, uint64_t right) {
     return right > UINT64_MAX - left ? UINT64_MAX : left + right;
@@ -21,6 +29,7 @@ static uint64_t nv_port_saturating_add(uint64_t left, uint64_t right) {
 
 #ifdef NV_PORT_HOST_TEST
 static uint64_t nv_port_host_now_ns(void) {
+#ifdef _WIN32
     nv_port_qpc_value_t counter;
     nv_port_qpc_value_t frequency;
     long double nanoseconds;
@@ -33,6 +42,20 @@ static uint64_t nv_port_host_now_ns(void) {
                   (long double)frequency.QuadPart;
     return nanoseconds >= (long double)UINT64_MAX ? UINT64_MAX :
            (uint64_t)nanoseconds;
+#else
+    struct timespec now;
+    uint64_t seconds;
+    uint64_t nanoseconds;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0) return 0U;
+    seconds = (uint64_t)now.tv_sec;
+    nanoseconds = (uint64_t)now.tv_nsec;
+    if (seconds > (UINT64_MAX - nanoseconds) / 1000000000ULL) {
+        return UINT64_MAX;
+    }
+    return seconds * 1000000000ULL + nanoseconds;
+#endif
 }
 #endif
 

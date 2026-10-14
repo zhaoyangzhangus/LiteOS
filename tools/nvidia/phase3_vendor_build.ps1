@@ -15,8 +15,8 @@ $outputRoot = Join-Path $repoRoot 'build\nvidia\phase3'
 $objectRoot = Join-Path $outputRoot 'objects\rm'
 $abiSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\vendor_abi'
 $abiObjectRoot = Join-Path $outputRoot 'objects\vendor_abi'
-$liteosInputRoot = Join-Path $repoRoot 'build\kernel'
-$liteosObjectRoot = Join-Path $outputRoot 'objects\liteos'
+$systemInputRoot = Join-Path $repoRoot 'build\kernel'
+$systemObjectRoot = Join-Path $outputRoot 'objects\system'
 $generatedRoot = Join-Path $outputRoot 'generated\rm'
 $sourceReport = Join-Path $outputRoot 'vendor_rm_sources.txt'
 $objectReport = Join-Path $outputRoot 'vendor_rm_objects.txt'
@@ -30,10 +30,10 @@ $abiObjectReport = Join-Path $outputRoot 'vendor_abi_objects.txt'
 $abiCompileLog = Join-Path $outputRoot 'vendor_abi_compile.log'
 $abiObjectList = Join-Path $outputRoot 'vendor_abi_objects.list'
 $abiLinkObjectList = Join-Path $outputRoot 'vendor_abi_link_objects.list'
-$liteosObjectReport = Join-Path $outputRoot 'liteos_probe_objects.txt'
-$liteosObjectList = Join-Path $outputRoot 'liteos_probe_objects.list'
-$liteosLinkLog = Join-Path $outputRoot 'vendor_rm_liteos_link.log'
-$liteosLinkObject = Join-Path $outputRoot 'vendor-rm-liteos.o'
+$systemObjectReport = Join-Path $outputRoot 'system_probe_objects.txt'
+$systemObjectList = Join-Path $outputRoot 'system_probe_objects.list'
+$systemLinkLog = Join-Path $outputRoot 'vendor_rm_system_link.log'
+$systemLinkObject = Join-Path $outputRoot 'vendor-rm-system.o'
 $tab = [char]9
 
 function Write-AsciiLines([string]$Path, [System.Collections.IEnumerable]$Lines) {
@@ -68,7 +68,7 @@ if (-not (Test-Path -LiteralPath $abiSourceRoot -PathType Container)) {
 }
 New-Item -ItemType Directory -Path $objectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $abiObjectRoot -Force | Out-Null
-New-Item -ItemType Directory -Path $liteosObjectRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $systemObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $generatedRoot -Force | Out-Null
 
 $versionPath = Join-Path $vendorRoot 'VENDOR_VERSION'
@@ -154,7 +154,7 @@ foreach ($line in @(Get-Content -LiteralPath $sourceListPath)) {
 # It is generated outside the immutable vendor tree and is a link input only.
 $nvidSource = Join-Path $generatedRoot 'g_nvid_string.c'
 Write-AsciiLines $nvidSource @(
-    'const char NVRM_ID[] = "nvidia id: UNIX Open Kernel Module for LiteOS RM, baseline 595.84";',
+    'const char NVRM_ID[] = "nvidia id: UNIX Open Kernel Module for System RM, baseline 595.84";',
     'const char *const pNVRM_ID = NVRM_ID + 11;'
 )
 $sourceIndex++
@@ -173,7 +173,7 @@ $records.Add([PSCustomObject]@{
 })
 
 $sourceReportLines = New-Object 'System.Collections.Generic.List[string]'
-$sourceReportLines.Add('# LiteOS Phase 3 RM vendor source selection')
+$sourceReportLines.Add('# System Phase 3 RM vendor source selection')
 $sourceReportLines.Add('# Authority: upstream src/nvidia/srcs.mk plus generated NVRM_ID link input')
 $sourceReportLines.Add('# kernel-open/ and src/nvidia-modeset/ are not part of the Phase 3 RM closure')
 $sourceReportLines.Add(('# component{0}language{0}source{0}origin' -f $tab))
@@ -246,7 +246,7 @@ $defines = @(
     '-DNV_PRINTF_STRINGS_ALLOWED=0', '-DNV_ASSERT_FAILED_USES_STRINGS=0',
     '-DPORT_ASSERT_FAILED_USES_STRINGS=0'
 )
-$abiDefines = $defines + '-DLITEOS_KERNEL_BUILD'
+$abiDefines = $defines + '-DOS_KERNEL_BUILD'
 
 # Match the upstream RM profile. Prefer the repository's freestanding ELF
 # cross toolchain so the relocatable link has the same object format as the
@@ -287,8 +287,8 @@ $abiAsmFlags = @(
 if ($useKernelCodeModel) { $abiAsmFlags += '-mcmodel=kernel' }
 
 $compileLogLines = New-Object 'System.Collections.Generic.List[string]'
-$compileLogLines.Add('# LiteOS Phase 3 RM vendor compile log')
-$compileLogLines.Add('# profile=upstream-NVRM-LiteOS-host-probe')
+$compileLogLines.Add('# System Phase 3 RM vendor compile log')
+$compileLogLines.Add('# profile=upstream-NVRM-System-host-probe')
 $compileLogLines.Add('# vendor semantic patches=0; immutable vendor tree verified')
 $compileLogLines.Add(('# compiler={0}' -f $compiler))
 $compileLogLines.Add(('# linker={0}; nm={1}; objcopy={2}' -f $linker, $nm, $objcopy))
@@ -340,7 +340,7 @@ if (-not $SkipCompile) {
 Write-AsciiLines $compileLog $compileLogLines
 
 $objectReportLines = New-Object 'System.Collections.Generic.List[string]'
-$objectReportLines.Add('# LiteOS Phase 3 RM vendor object inventory')
+$objectReportLines.Add('# System Phase 3 RM vendor object inventory')
 $objectReportLines.Add(('# status{0}component{0}language{0}id{0}source{0}object{0}exit_code{0}diagnostic_count' -f $tab))
 foreach ($record in $records) {
     $objectReportLines.Add(('{0}{8}{1}{8}{2}{8}{3}{8}{4}{8}{5}{8}{6}{8}{7}' -f $record.Status, $record.Component, $record.Language, $record.Id, $record.Source, $record.Object, $record.ExitCode, $record.DiagnosticCount, $tab))
@@ -351,7 +351,7 @@ $compiledRecords = @($records | Where-Object Status -eq 'compiled')
 if ($compiledRecords.Count -eq 0) { throw 'no RM vendor object compiled' }
 Write-AsciiLines $objectList @($compiledRecords | ForEach-Object { $_.Object.Replace('\', '/') })
 
-# Compile the LiteOS-side ABI closure outside the immutable vendor tree.  C
+# Compile the System-side ABI closure outside the immutable vendor tree.  C
 # adapters are compiled with the vendor ABI headers; assembly adapters are
 # deliberately limited to fail-closed return paths and are type-checked by
 # nvabi_contracts.c.
@@ -388,7 +388,7 @@ foreach ($abiFile in $abiFiles) {
 if ($abiRecords.Count -eq 0) { throw 'no vendor ABI source found' }
 
 $abiSourceReportLines = New-Object 'System.Collections.Generic.List[string]'
-$abiSourceReportLines.Add('# LiteOS Phase 3 vendor ABI source selection')
+$abiSourceReportLines.Add('# System Phase 3 vendor ABI source selection')
 $abiSourceReportLines.Add('# C prototypes are imported from immutable NVIDIA 595.84 headers')
 $abiSourceReportLines.Add('# Phase 5-only adapters are intentionally excluded from this baseline graph')
 $abiSourceReportLines.Add(('# id{0}component{0}language{0}source' -f $tab))
@@ -398,7 +398,7 @@ foreach ($record in $abiRecords) {
 Write-AsciiLines $abiSourceReport ( $abiSourceReportLines )
 
 $abiCompileLogLines = New-Object 'System.Collections.Generic.List[string]'
-$abiCompileLogLines.Add('# LiteOS Phase 3 vendor ABI compile log')
+$abiCompileLogLines.Add('# System Phase 3 vendor ABI compile log')
 $abiCompileLogLines.Add('# unsupported adapters fail closed and log symbol plus caller stage')
 $abiCompileLogLines.Add(('# compiler={0}; object_format=ELF' -f $compiler))
 $abiCompileLogLines.Add(('# abi_sources={0}' -f $abiRecords.Count))
@@ -443,7 +443,7 @@ if (-not $SkipCompile) {
 Write-AsciiLines $abiCompileLog $abiCompileLogLines
 
 $abiObjectReportLines = New-Object 'System.Collections.Generic.List[string]'
-$abiObjectReportLines.Add('# LiteOS Phase 3 vendor ABI object inventory')
+$abiObjectReportLines.Add('# System Phase 3 vendor ABI object inventory')
 $abiObjectReportLines.Add(('# status{0}component{0}language{0}id{0}source{0}object{0}exit_code{0}diagnostic_count' -f $tab))
 foreach ($record in $abiRecords) {
     $abiObjectReportLines.Add(('{0}{8}{1}{8}{2}{8}{3}{8}{4}{8}{5}{8}{6}{8}{7}' -f $record.Status, $record.Component, $record.Language, $record.Id, $record.Source, $record.Object, $record.ExitCode, $record.DiagnosticCount, $tab))
@@ -457,7 +457,7 @@ $abiLinkRecords = @($abiCompiledRecords | Where-Object { $_.Source -notlike '*ve
 if ($abiLinkRecords.Count -eq 0) { throw 'no linkable vendor ABI object compiled' }
 
 $linkLogLines = New-Object 'System.Collections.Generic.List[string]'
-$linkLogLines.Add('# LiteOS Phase 3 RM vendor relocatable link log')
+$linkLogLines.Add('# System Phase 3 RM vendor relocatable link log')
 $linkLogLines.Add('# link=all successfully compiled RM objects + upstream export roots')
 $linkExitCode = 0
 if (-not $SkipLink) {
@@ -495,41 +495,41 @@ Write-AsciiLines $linkLog $linkLogLines
 
 # The production kernel is built by Phase 3 Gate before this probe runs.  Its
 # normal MinGW objects are PE/COFF; convert copies into the build directory so
-# the NVIDIA ELF RM object can be checked against the real LiteOS support
+# the NVIDIA ELF RM object can be checked against the real System support
 # closure without changing any production object or vendor source.
-$liteosRecords = New-Object 'System.Collections.Generic.List[object]'
-$liteosIndex = 0
-$liteosFiles = @()
-if (Test-Path -LiteralPath $liteosInputRoot -PathType Container) {
-    $liteosFiles = @(Get-ChildItem -LiteralPath $liteosInputRoot -File -Filter '*.o' | Sort-Object Name)
+$systemRecords = New-Object 'System.Collections.Generic.List[object]'
+$systemIndex = 0
+$systemFiles = @()
+if (Test-Path -LiteralPath $systemInputRoot -PathType Container) {
+    $systemFiles = @(Get-ChildItem -LiteralPath $systemInputRoot -File -Filter '*.o' | Sort-Object Name)
 }
-foreach ($liteosFile in $liteosFiles) {
-    $liteosIndex++
-    $liteosRecords.Add([PSCustomObject]@{
-        Id = 'liteos-{0:D4}' -f $liteosIndex
-        Source = Get-RelativeRepoPath $liteosFile.FullName
-        SourceFullPath = $liteosFile.FullName
-        Object = Join-Path $liteosObjectRoot ('{0:D4}.elf.o' -f $liteosIndex)
+foreach ($systemFile in $systemFiles) {
+    $systemIndex++
+    $systemRecords.Add([PSCustomObject]@{
+        Id = 'system-{0:D4}' -f $systemIndex
+        Source = Get-RelativeRepoPath $systemFile.FullName
+        SourceFullPath = $systemFile.FullName
+        Object = Join-Path $systemObjectRoot ('{0:D4}.elf.o' -f $systemIndex)
         Status = 'planned'
         ExitCode = ''
         DiagnosticCount = 0
     })
 }
 
-$liteosLinkLogLines = New-Object 'System.Collections.Generic.List[string]'
-$liteosLinkLogLines.Add('# LiteOS Phase 3 RM -> LiteOS support closure probe')
-$liteosLinkLogLines.Add('# bridge=build-only PE/COFF-to-ELF object conversion; production sources are unchanged')
-$liteosLinkLogLines.Add(('# pe_objcopy={0}; input_objects={1}' -f $peObjcopy, $liteosRecords.Count))
-$liteosLinkExitCode = 0
+$systemLinkLogLines = New-Object 'System.Collections.Generic.List[string]'
+$systemLinkLogLines.Add('# System Phase 3 RM -> System support closure probe')
+$systemLinkLogLines.Add('# bridge=build-only PE/COFF-to-ELF object conversion; production sources are unchanged')
+$systemLinkLogLines.Add(('# pe_objcopy={0}; input_objects={1}' -f $peObjcopy, $systemRecords.Count))
+$systemLinkExitCode = 0
 if (-not $SkipLink) {
-    if ($liteosRecords.Count -eq 0) {
-        $liteosLinkLogLines.Add('status=link_failed;reason=production kernel object directory is empty')
-        $liteosLinkExitCode = 1
+    if ($systemRecords.Count -eq 0) {
+        $systemLinkLogLines.Add('status=link_failed;reason=production kernel object directory is empty')
+        $systemLinkExitCode = 1
     } else {
-        for ($liteosRecordIndex = 0; $liteosRecordIndex -lt $liteosRecords.Count; $liteosRecordIndex++) {
-            $record = $liteosRecords[$liteosRecordIndex]
+        for ($systemRecordIndex = 0; $systemRecordIndex -lt $systemRecords.Count; $systemRecordIndex++) {
+            $record = $systemRecords[$systemRecordIndex]
             New-Item -ItemType Directory -Path (Split-Path -Parent $record.Object) -Force | Out-Null
-            $liteosLinkLogLines.Add(('--- convert {0} {1} ---' -f $record.Id, $record.Source))
+            $systemLinkLogLines.Add(('--- convert {0} {1} ---' -f $record.Id, $record.Source))
             $previousErrorActionPreference = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
@@ -538,58 +538,58 @@ if (-not $SkipLink) {
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference
             }
-            foreach ($diagnostic in $diagnostics) { $liteosLinkLogLines.Add($diagnostic) }
+            foreach ($diagnostic in $diagnostics) { $systemLinkLogLines.Add($diagnostic) }
             $record.ExitCode = $exitCode
             $record.DiagnosticCount = $diagnostics.Count
             if (($exitCode -eq 0) -and (Test-Path -LiteralPath $record.Object -PathType Leaf)) {
                 $record.Status = 'converted'
             } else {
                 $record.Status = 'convert_failed'
-                $liteosLinkExitCode = 1
+                $systemLinkExitCode = 1
             }
         }
     }
 } else {
-    $liteosLinkLogLines.Add('# conversion and link skipped by -SkipLink')
-    foreach ($record in $liteosRecords) {
+    $systemLinkLogLines.Add('# conversion and link skipped by -SkipLink')
+    foreach ($record in $systemRecords) {
         if (Test-Path -LiteralPath $record.Object -PathType Leaf) { $record.Status = 'converted' }
         else { $record.Status = 'convert_failed'; $record.ExitCode = 'skipped-missing' }
     }
 }
 
-$liteosObjectReportLines = New-Object 'System.Collections.Generic.List[string]'
-$liteosObjectReportLines.Add('# LiteOS Phase 3 build-only object-format bridge inventory')
-$liteosObjectReportLines.Add(('# status{0}id{0}source{0}object{0}exit_code{0}diagnostic_count' -f $tab))
-foreach ($record in $liteosRecords) {
-    $liteosObjectReportLines.Add(('{0}{6}{1}{6}{2}{6}{3}{6}{4}{6}{5}' -f $record.Status, $record.Id, $record.Source, $record.Object, $record.ExitCode, $record.DiagnosticCount, $tab))
+$systemObjectReportLines = New-Object 'System.Collections.Generic.List[string]'
+$systemObjectReportLines.Add('# System Phase 3 build-only object-format bridge inventory')
+$systemObjectReportLines.Add(('# status{0}id{0}source{0}object{0}exit_code{0}diagnostic_count' -f $tab))
+foreach ($record in $systemRecords) {
+    $systemObjectReportLines.Add(('{0}{6}{1}{6}{2}{6}{3}{6}{4}{6}{5}' -f $record.Status, $record.Id, $record.Source, $record.Object, $record.ExitCode, $record.DiagnosticCount, $tab))
 }
-Write-AsciiLines $liteosObjectReport $liteosObjectReportLines
-$liteosConvertedRecords = @($liteosRecords | Where-Object Status -eq 'converted')
-if ($liteosLinkExitCode -eq 0) {
-    if ($liteosConvertedRecords.Count -ne $liteosRecords.Count) {
-        $liteosLinkExitCode = 1
+Write-AsciiLines $systemObjectReport $systemObjectReportLines
+$systemConvertedRecords = @($systemRecords | Where-Object Status -eq 'converted')
+if ($systemLinkExitCode -eq 0) {
+    if ($systemConvertedRecords.Count -ne $systemRecords.Count) {
+        $systemLinkExitCode = 1
     } else {
-        Write-AsciiLines $liteosObjectList @($liteosConvertedRecords | ForEach-Object { $_.Object.Replace('\', '/') })
+        Write-AsciiLines $systemObjectList @($systemConvertedRecords | ForEach-Object { $_.Object.Replace('\', '/') })
         Write-AsciiLines $abiLinkObjectList @($abiLinkRecords | ForEach-Object { $_.Object.Replace('\', '/') })
         $linkerScript = Join-Path $rmSourceRoot 'nv-kernel.ld'
         $exportsFile = Join-Path $rmSourceRoot 'exports_link_command.txt'
-        $liteosLinkArgs = @(
+        $systemLinkArgs = @(
             '--gc-sections', '--allow-multiple-definition', '-T', $linkerScript,
-            '-r', '-o', $liteosLinkObject,
+            '-r', '-o', $systemLinkObject,
             ('@' + $objectList), ('@' + $abiLinkObjectList),
-            ('@' + $liteosObjectList), ('@' + $exportsFile)
+            ('@' + $systemObjectList), ('@' + $exportsFile)
         )
         $previousErrorActionPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $liteosLinkDiagnostics = @(& $linker @liteosLinkArgs 2>&1 | ForEach-Object { $_.ToString() })
-            $liteosLinkExitCode = $LASTEXITCODE
+            $systemLinkDiagnostics = @(& $linker @systemLinkArgs 2>&1 | ForEach-Object { $_.ToString() })
+            $systemLinkExitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
-        foreach ($line in $liteosLinkDiagnostics) { $liteosLinkLogLines.Add($line) }
-        if ($liteosLinkExitCode -eq 0 -and (Test-Path -LiteralPath $liteosLinkObject -PathType Leaf)) {
-            $objcopyArgs = @('--localize-symbol=memset', '--localize-symbol=memcpy', '--remove-section=.note.gnu.property', $liteosLinkObject)
+        foreach ($line in $systemLinkDiagnostics) { $systemLinkLogLines.Add($line) }
+        if ($systemLinkExitCode -eq 0 -and (Test-Path -LiteralPath $systemLinkObject -PathType Leaf)) {
+            $objcopyArgs = @('--localize-symbol=memset', '--localize-symbol=memcpy', '--remove-section=.note.gnu.property', $systemLinkObject)
             $previousErrorActionPreference = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
@@ -598,13 +598,13 @@ if ($liteosLinkExitCode -eq 0) {
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference
             }
-            foreach ($line in $objcopyDiagnostics) { $liteosLinkLogLines.Add($line) }
-            if ($objcopyExitCode -ne 0) { $liteosLinkExitCode = $objcopyExitCode }
+            foreach ($line in $objcopyDiagnostics) { $systemLinkLogLines.Add($line) }
+            if ($objcopyExitCode -ne 0) { $systemLinkExitCode = $objcopyExitCode }
         }
     }
 }
-$liteosLinkLogLines.Add(('status={0};exit={1};object={2}' -f $(if ($liteosLinkExitCode -eq 0) { 'linked' } else { 'link_failed' }), $liteosLinkExitCode, $liteosLinkObject))
-Write-AsciiLines $liteosLinkLog $liteosLinkLogLines
+$systemLinkLogLines.Add(('status={0};exit={1};object={2}' -f $(if ($systemLinkExitCode -eq 0) { 'linked' } else { 'link_failed' }), $systemLinkExitCode, $systemLinkObject))
+Write-AsciiLines $systemLinkLog $systemLinkLogLines
 
 $undefined = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
 $defined = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
@@ -626,12 +626,12 @@ foreach ($record in $compiledRecords) {
     }
 }
 
-# The final RM-plus-LiteOS linked object is the Gate input. A relocatable link
+# The final RM-plus-System linked object is the Gate input. A relocatable link
 # preserves unresolved relocations, allowing us to inspect the complete graph.
 $linkedUndefined = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
 $linkedNmExitCode = 1
-if (Test-Path -LiteralPath $liteosLinkObject -PathType Leaf) {
-    $linkedNmLines = @(& $nm -u -P -- $liteosLinkObject 2>&1 | ForEach-Object { $_.ToString() })
+if (Test-Path -LiteralPath $systemLinkObject -PathType Leaf) {
+    $linkedNmLines = @(& $nm -u -P -- $systemLinkObject 2>&1 | ForEach-Object { $_.ToString() })
     $linkedNmExitCode = $LASTEXITCODE
     foreach ($nmLine in $linkedNmLines) {
         $fields = $nmLine.Trim() -split '\s+'
@@ -644,16 +644,16 @@ if (Test-Path -LiteralPath $liteosLinkObject -PathType Leaf) {
 # diagnostic as a conservative fallback.  A successful empty `nm -u` result
 # is the required zero-unresolved result and must not be replaced by the raw
 # vendor inventory.
-if (-not (Test-Path -LiteralPath $liteosLinkObject -PathType Leaf) -or $linkedNmExitCode -ne 0) {
+if (-not (Test-Path -LiteralPath $systemLinkObject -PathType Leaf) -or $linkedNmExitCode -ne 0) {
     foreach ($symbol in $undefined) {
         if (-not $defined.Contains($symbol)) { [void]$linkedUndefined.Add($symbol) }
     }
 }
 
 $unresolvedLines = New-Object 'System.Collections.Generic.List[string]'
-$unresolvedLines.Add('# LiteOS Phase 3 RM vendor unresolved symbol inventory after ABI closure')
-$unresolvedLines.Add(('# rm_compiled={0};abi_compiled={1};abi_linkable={2};liteos_objects={3};rm_link_exit={4};liteos_link_exit={5};linked_nm_exit={6};linked_unresolved={7}' -f $compiledRecords.Count, $abiCompiledRecords.Count, $abiLinkRecords.Count, $liteosConvertedRecords.Count, $linkExitCode, $liteosLinkExitCode, $linkedNmExitCode, $linkedUndefined.Count))
-$unresolvedLines.Add('# The final input is the build-only RM-plus-LiteOS relocatable link.')
+$unresolvedLines.Add('# System Phase 3 RM vendor unresolved symbol inventory after ABI closure')
+$unresolvedLines.Add(('# rm_compiled={0};abi_compiled={1};abi_linkable={2};system_objects={3};rm_link_exit={4};system_link_exit={5};linked_nm_exit={6};linked_unresolved={7}' -f $compiledRecords.Count, $abiCompiledRecords.Count, $abiLinkRecords.Count, $systemConvertedRecords.Count, $linkExitCode, $systemLinkExitCode, $linkedNmExitCode, $linkedUndefined.Count))
+$unresolvedLines.Add('# The final input is the build-only RM-plus-System relocatable link.')
 $unresolvedLines.Add(('[unresolved_external_symbols]'))
 $unresolvedLines.Add(('# symbol'))
 foreach ($symbol in @($linkedUndefined | Sort-Object)) { $unresolvedLines.Add($symbol) }
@@ -666,12 +666,12 @@ Write-Output ('LINK_LOG={0}' -f $linkLog)
 Write-Output ('ABI_SOURCE_REPORT={0}' -f $abiSourceReport)
 Write-Output ('ABI_OBJECT_REPORT={0}' -f $abiObjectReport)
 Write-Output ('ABI_COMPILE_LOG={0}' -f $abiCompileLog)
-Write-Output ('LITEOS_OBJECT_REPORT={0}' -f $liteosObjectReport)
-Write-Output ('LITEOS_LINK_LOG={0}' -f $liteosLinkLog)
+Write-Output ('OS_OBJECT_REPORT={0}' -f $systemObjectReport)
+Write-Output ('OS_LINK_LOG={0}' -f $systemLinkLog)
 Write-Output ('UNRESOLVED_REPORT={0}' -f $unresolvedReport)
-Write-Output ('SUMMARY selected={0};compiled={1};compile_failed={2};abi_selected={3};abi_compiled={4};abi_linkable={5};abi_compile_failed={6};liteos_objects={7};rm_link_exit={8};liteos_link_exit={9};linked_unresolved={10}' -f $records.Count, $compiledRecords.Count, @($records | Where-Object Status -eq 'compile_failed').Count, $abiRecords.Count, $abiCompiledRecords.Count, $abiLinkRecords.Count, $abiCompileFailures, $liteosConvertedRecords.Count, $linkExitCode, $liteosLinkExitCode, $linkedUndefined.Count)
+Write-Output ('SUMMARY selected={0};compiled={1};compile_failed={2};abi_selected={3};abi_compiled={4};abi_linkable={5};abi_compile_failed={6};system_objects={7};rm_link_exit={8};system_link_exit={9};linked_unresolved={10}' -f $records.Count, $compiledRecords.Count, @($records | Where-Object Status -eq 'compile_failed').Count, $abiRecords.Count, $abiCompiledRecords.Count, $abiLinkRecords.Count, $abiCompileFailures, $systemConvertedRecords.Count, $linkExitCode, $systemLinkExitCode, $linkedUndefined.Count)
 
 if (@($records | Where-Object Status -eq 'compile_failed').Count -ne 0) { exit 2 }
 if ($linkExitCode -ne 0) { exit 3 }
 if ($abiCompileFailures -ne 0) { exit 4 }
-if ($liteosLinkExitCode -ne 0) { exit 5 }
+if ($systemLinkExitCode -ne 0) { exit 5 }

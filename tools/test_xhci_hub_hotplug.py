@@ -19,7 +19,7 @@ SERIAL = BUILD / "qemu-serial.log"
 MONITOR = Path(
     os.environ.get(
         "QEMU_MONITOR_SOCKET",
-        str(Path(tempfile.gettempdir()) / "liteos-xhci-hub-hotplug.sock"),
+        str(Path(tempfile.gettempdir()) / "system-xhci-hub-hotplug.sock"),
     )
 )
 
@@ -77,13 +77,13 @@ def wait_until(predicate, label, timeout=15.0):
 
 def hub_change_count():
     return serial_text().count(
-        "LITEOS_USB_RUNTIME_HUB_CHANGE"
+        "OS_USB_RUNTIME_HUB_CHANGE"
     )
 
 
 def latest_device_count():
     matches = re.findall(
-        r"LITEOS_USB_DEVICE_COUNT=(\d+)",
+        r"OS_USB_DEVICE_COUNT=(\d+)",
         serial_text()
     )
 
@@ -271,8 +271,8 @@ def print_serial_tail():
         line
         for line in s.splitlines()
         if (
-            "LITEOS_XHCI" in line or
-            "LITEOS_USB" in line
+            "OS_XHCI" in line or
+            "OS_USB" in line
         )
     ]
 
@@ -340,7 +340,7 @@ def main():
 
         wait_until(
             lambda:
-                "LITEOS_XHCI_MSIX_OK"
+                "OS_XHCI_MSIX_OK"
                 in serial_text(),
             "MSI-X runtime ready",
             BOOT_READY_TIMEOUT
@@ -361,7 +361,7 @@ def main():
         #
         wait_until(
             lambda:
-                "LITEOS_DEFERRED_WORKER_OK"
+                "OS_DEFERRED_WORKER_OK"
                 in serial_text(),
             "persistent deferred worker ready",
             BOOT_READY_TIMEOUT
@@ -372,7 +372,7 @@ def main():
         # input, otherwise the first report can race window-worker startup.
         wait_until(
             lambda:
-                "LITEOS_WINDOW_WORKER_OK"
+                "OS_WINDOW_WORKER_OK"
                 in serial_text(),
             "window worker ready",
             BOOT_READY_TIMEOUT
@@ -384,13 +384,13 @@ def main():
         # hotplug test can manufacture an unrelated USER_RUNTIME timeout.
         wait_until(
             lambda:
-                "LITEOS_USER_RUNTIME_SUBTESTS_OK"
+                "OS_USER_RUNTIME_SUBTESTS_OK"
                 in serial_text(),
             "boot runtime self-tests ready",
             BOOT_READY_TIMEOUT
         )
 
-        if "LITEOS_STAGE_FAIL" in serial_text():
+        if "OS_STAGE_FAIL" in serial_text():
             fail(
                 "boot runtime self-test failed before hotplug"
             )
@@ -422,13 +422,13 @@ def main():
 
         wait_until(
             lambda:
-                "LITEOS_USB_MOUSE_EVENT_OK"
+                "OS_USB_MOUSE_EVENT_OK"
                 in serial_text(),
             "initial nested mouse works",
             MOUSE_READY_TIMEOUT
         )
 
-        if "LITEOS_XHCI_HID_EVENTS_256" in serial_text():
+        if "OS_XHCI_HID_EVENTS_256" in serial_text():
             fail(
                 "256 HID milestone occurred before hotplug test"
             )
@@ -458,7 +458,7 @@ def main():
         )
 
         hmp.command(
-            "device_del liteos-nested-mouse"
+            "device_del vm-nested-mouse"
         )
 
         wait_until(
@@ -469,7 +469,7 @@ def main():
             10.0
         )
 
-        if "LITEOS_XHCI_FAIL=" in serial_text():
+        if "OS_XHCI_FAIL=" in serial_text():
             fail(
                 "xHCI failure during subtree removal"
             )
@@ -494,8 +494,8 @@ def main():
 
         hmp.command(
             "device_add usb-mouse,"
-            "id=liteos-nested-mouse,"
-            "bus=liteos-xhci.0,"
+            "id=vm-nested-mouse,"
+            "bus=vm-xhci.0,"
             "port=1.1.1"
         )
 
@@ -512,7 +512,7 @@ def main():
         # joining QEMU's active-mouse list.
         time.sleep(HUB_SETTLE_SECONDS)
 
-        if "LITEOS_XHCI_FAIL=" in serial_text():
+        if "OS_XHCI_FAIL=" in serial_text():
             fail(
                 "xHCI failure during child re-enumeration"
             )
@@ -539,17 +539,17 @@ def main():
 
         wait_until(
             lambda:
-                "LITEOS_XHCI_HID_EVENTS_256"
+                "OS_XHCI_HID_EVENTS_256"
                 in serial_text(),
             "replugged mouse reached >=256 HID completions",
             12.0
         )
 
         if (
-            "LITEOS_XHCI_FAIL="
+            "OS_XHCI_FAIL="
             in serial_text() or
-            "LITEOS_XHCI_MSIX_FAIL" in serial_text() or
-            "LITEOS_STAGE_FAIL" in serial_text()
+            "OS_XHCI_MSIX_FAIL" in serial_text() or
+            "OS_STAGE_FAIL" in serial_text()
         ):
             fail(
                 "runtime xHCI or boot-stage failure after replug"

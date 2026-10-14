@@ -1,10 +1,14 @@
 #include <arch/x86_64/context.h>
 #include <arch/x86_64/cpu.h>
+#include <arch/x86_64/smp.h>
 #include <arch/x86_64/paging.h>
 #include <kernel/elf_loader.h>
 #include <kernel/debug_stage.h>
 #include <kernel/process.h>
 #include <kernel/resource.h>
+#include <kernel/file_lock.h>
+#include <kernel/linux_abi.h>
+#include <kernel/string.h>
 #include <kernel/sched.h>
 #include <kernel/wait.h>
 #include <kernel/window_server.h>
@@ -22,9 +26,15 @@ static atomic_uint_fast64_t g_next_task_id;
 static atomic_uint g_process_init_state;
 static spinlock_t g_process_registry_lock;
 static list_head_t g_process_registry;
+/* Borrowed only under registry_lock; every membership change invalidates it. */
+static list_head_t *g_process_enumeration_cursor;
+static uint32_t g_process_enumeration_index;
+static list_head_t *g_process_monitor_cursor;
 static spinlock_t g_process_teardown_lock;
 static process_teardown_callback_t
     g_process_teardown_callbacks[PROCESS_TEARDOWN_CALLBACK_MAX];
+/* Registration is append-only; this dense prefix is protected by its lock. */
+static uint32_t g_process_teardown_count;
 
 extern void x86_user_thread_start(void);
 
@@ -46,11 +56,18 @@ static void process_registry_unlock(void) {
     sched_preempt_enable();
 }
 
+static void process_registry_invalidate_cursors_locked(void) {
+    g_process_enumeration_cursor = 0;
+    g_process_enumeration_index = 0U;
+    g_process_monitor_cursor = 0;
+}
+
 static void process_registry_remove(process_t *process) {
     bool removed = false;
     if (process == 0) return;
     process_registry_lock();
     if (process->global_registered) {
+        process_registry_invalidate_cursors_locked();
         list_del(&process->global_node);
         process->global_registered = false;
         removed = true;
@@ -91,15 +108,11 @@ static void process_teardown_unlock(void) {
 
 static uint32_t process_snapshot_teardown_callbacks(
     process_teardown_callback_t *callbacks) {
-    uint32_t count = 0U;
     if (callbacks == 0) return 0U;
     process_teardown_lock();
-    for (uint32_t index = 0U;
-         index < PROCESS_TEARDOWN_CALLBACK_MAX; ++index) {
-        process_teardown_callback_t callback =
-            g_process_teardown_callbacks[index];
-        if (callback != 0) callbacks[count++] = callback;
-    }
+    uint32_t count = g_process_teardown_count;
+    __builtin_memcpy(callbacks, g_process_teardown_callbacks,
+                     count * sizeof(*callbacks));
     process_teardown_unlock();
     return count;
 }
@@ -180,6 +193,10 @@ static void process_detach_from_parent(process_t *process) {
 
     if (detached) object_put(process); /* parent child-list reference */
     if (related) object_put(parent);   /* child parent-relation reference */
+    /* A waiter may be sleeping on a live child that failed construction or
+     * was aborted. Removal changes its predicate to ECHILD just as reaping
+     * does. Keep the lookup reference until notification has finished. */
+    if (detached) (void)wake_all(&parent->child_waitq);
     object_put(parent);                /* temporary lookup reference */
 }
 
@@ -211,10 +228,50 @@ static bool process_wait_predicate(void *opaque) {
             context->candidate = child;
             break;
         }
+        /* A positive PID names one child. Its live match already determines
+         * this predicate; unrelated following children cannot satisfy it. */
+        if (context->pid > 0) break;
     }
     process_children_unlock(context->parent);
     /* A disappearing child is also a terminal result for this wait. */
     return !context->has_child || context->candidate != 0;
+}
+
+/* Called only by the owner of the locked transition to PROCESS_DEAD.
+ * The caller retains the process; callbacks and notifications run unlocked. */
+static void process_publish_exit(process_t *process) {
+    process_registry_remove(process);
+    process_orphan_children(process);
+    process_teardown_callback_t callbacks[PROCESS_TEARDOWN_CALLBACK_MAX];
+    uint32_t count = process_snapshot_teardown_callbacks(callbacks);
+    for (uint32_t index = 0U; index < count; ++index) callbacks[index](process);
+    object_notify_signaled(process);
+    process_notify_parent(process);
+}
+
+bool process_begin_exit(process_t *process, int64_t status, uint32_t signal) {
+    if (process == 0) return false;
+
+    bool first_exit = false;
+    bool empty = false;
+    process_thread_lock(process);
+    if (atomic_load_explicit(&process->state, memory_order_acquire) ==
+        PROCESS_RUNNING) {
+        process->exit_code = status;
+        process->exit_signal = signal;
+        empty = process->thread_count == 0U;
+        atomic_store_explicit(&process->state,
+                              empty ? PROCESS_DEAD : PROCESS_EXITING,
+                              memory_order_release);
+        first_exit = true;
+    }
+    process_thread_unlock(process);
+    if (empty) {
+        process_publish_exit(process);
+        /* No execution reaper exists to release an empty process's resources. */
+        process_release_runtime_resources(process);
+    }
+    return first_exit;
 }
 
 void process_detach_thread(thread_t *thread) {
@@ -223,6 +280,11 @@ void process_detach_thread(thread_t *thread) {
     bool notify_process = false;
     process_thread_lock(process);
     if (thread->process_node.next != &thread->process_node) {
+        uint64_t runtime = __atomic_load_n(&thread->sched.runtime_ns, __ATOMIC_RELAXED);
+        process->retired_cpu_ns = process->retired_cpu_ns > UINT64_MAX - runtime ?
+                                 UINT64_MAX : process->retired_cpu_ns + runtime;
+        if (process->monitor_thread_cursor == &thread->process_node)
+            process->monitor_thread_cursor = 0;
         list_del(&thread->process_node);
         if (process->thread_count != 0) --process->thread_count;
         if (process->thread_count == 0 &&
@@ -236,20 +298,7 @@ void process_detach_thread(thread_t *thread) {
         }
     }
     process_thread_unlock(process);
-    if (notify_process) process_registry_remove(process);
-    if (notify_process) {
-        process_orphan_children(process);
-        process_teardown_callback_t callbacks[PROCESS_TEARDOWN_CALLBACK_MAX];
-        uint32_t callback_count =
-            process_snapshot_teardown_callbacks(callbacks);
-        for (uint32_t index = 0U; index < callback_count; ++index) {
-            callbacks[index](process);
-        }
-    }
-    if (notify_process) {
-        object_notify_signaled(process);
-        process_notify_parent(process);
-    }
+    if (notify_process) process_publish_exit(process);
 }
 
 static bool process_is_signaled(const void *object) {
@@ -281,17 +330,22 @@ void process_set_name(process_t *process, const char *path) {
     sched_preempt_enable();
 }
 
+/* Caller owns or retains process; no registry/thread lock is needed for names. */
+static void process_snapshot_name(process_t *process, char *name, size_t capacity) {
+    size_t copied = capacity < OS_PROCESS_NAME_MAX ? capacity : OS_PROCESS_NAME_MAX;
+    sched_preempt_disable();
+    spinlock_lock(&process->info_lock);
+    memcpy(name, process->name, copied);
+    spinlock_unlock(&process->info_lock);
+    sched_preempt_enable();
+    if (capacity > copied) memset(name + copied, 0, capacity - copied);
+}
+
 static void process_copy_name(process_t *destination,
                               process_t *source) {
     char name[OS_PROCESS_NAME_MAX];
     if (destination == 0 || source == 0) return;
-    sched_preempt_disable();
-    spinlock_lock(&source->info_lock);
-    for (size_t index = 0U; index < sizeof(name); ++index) {
-        name[index] = source->name[index];
-    }
-    spinlock_unlock(&source->info_lock);
-    sched_preempt_enable();
+    process_snapshot_name(source, name, sizeof(name));
     process_set_name(destination, name);
 }
 
@@ -299,10 +353,24 @@ kstatus_t process_enumerate(uint32_t index, os_process_snapshot_t *snapshot) {
     uint32_t current = 0U;
     if (snapshot == 0) return K_EINVAL;
     process_registry_lock();
-    for (list_head_t *node = g_process_registry.next;
+    list_head_t *start = g_process_registry.next;
+    if (g_process_enumeration_cursor != 0 &&
+        index >= g_process_enumeration_index) {
+        start = g_process_enumeration_cursor;
+        current = g_process_enumeration_index;
+        if (index > current) {
+            start = start->next;
+            ++current;
+        }
+    }
+    for (list_head_t *node = start;
          node != &g_process_registry; node = node->next) {
         process_t *process = list_entry(node, process_t, global_node);
         if (current++ != index) continue;
+        g_process_enumeration_cursor = node;
+        g_process_enumeration_index = index;
+        object_get(process);
+        process_registry_unlock();
         snapshot->hdr.size = sizeof(*snapshot);
         snapshot->hdr.version = OS_SYSCALL_ABI_VERSION;
         snapshot->hdr.flags = 0U;
@@ -316,15 +384,8 @@ kstatus_t process_enumerate(uint32_t index, os_process_snapshot_t *snapshot) {
         snapshot->exit_code = process->exit_code;
         process_thread_unlock(process);
         snapshot->create_time_ns = process->create_time_ns;
-        sched_preempt_disable();
-        spinlock_lock(&process->info_lock);
-        for (uint32_t name_index = 0U; name_index < OS_PROCESS_NAME_MAX;
-             ++name_index) {
-            snapshot->name[name_index] = process->name[name_index];
-        }
-        spinlock_unlock(&process->info_lock);
-        sched_preempt_enable();
-        process_registry_unlock();
+        process_snapshot_name(process, snapshot->name, sizeof(snapshot->name));
+        object_put(process);
         return K_OK;
     }
     process_registry_unlock();
@@ -333,17 +394,31 @@ kstatus_t process_enumerate(uint32_t index, os_process_snapshot_t *snapshot) {
 
 kstatus_t process_enumerate_thread(uint32_t index,
                                    os_thread_snapshot_t *snapshot) {
-    uint32_t current = 0U;
+    uint32_t remaining = index;
     if (snapshot == 0) return K_EINVAL;
     process_registry_lock();
     for (list_head_t *process_node = g_process_registry.next;
          process_node != &g_process_registry; process_node = process_node->next) {
         process_t *process = list_entry(process_node, process_t, global_node);
         process_thread_lock(process);
-        for (list_head_t *thread_node = process->threads.next;
-             thread_node != &process->threads; thread_node = thread_node->next) {
-            if (current++ != index) continue;
+        /* Membership and count share thread_lock. Skip whole preceding
+         * lists without walking their threads on every indexed query.
+         * Subtraction also avoids overflow when summing global counts. */
+        if (remaining >= process->thread_count) {
+            remaining -= process->thread_count;
+            process_thread_unlock(process);
+            continue;
+        }
+        /* Membership is locked and counted: start at the nearer end while
+         * preserving the externally visible forward enumeration order. */
+        bool reverse = remaining > (process->thread_count - 1U) / 2U;
+        if (reverse) remaining = process->thread_count - 1U - remaining;
+        for (list_head_t *thread_node = reverse ? process->threads.prev : process->threads.next;
+             thread_node != &process->threads;
+             thread_node = reverse ? thread_node->prev : thread_node->next) {
+            if (remaining-- != 0U) continue;
             thread_t *thread = list_entry(thread_node, thread_t, process_node);
+            process->monitor_thread_cursor = thread_node;
             snapshot->hdr.size = sizeof(*snapshot);
             snapshot->hdr.version = OS_SYSCALL_ABI_VERSION;
             snapshot->hdr.flags = 0U;
@@ -352,23 +427,274 @@ kstatus_t process_enumerate_thread(uint32_t index,
             snapshot->state = atomic_load_explicit(&thread->state,
                                                    memory_order_acquire);
             snapshot->current_cpu = thread->current_cpu;
-            sched_preempt_disable();
-            spinlock_lock(&process->info_lock);
-            for (uint32_t name_index = 0U; name_index < OS_THREAD_NAME_MAX;
-                 ++name_index) {
-                snapshot->name[name_index] = name_index < OS_PROCESS_NAME_MAX ?
-                    process->name[name_index] : '\0';
-            }
-            spinlock_unlock(&process->info_lock);
-            sched_preempt_enable();
+            /* The snapshot no longer needs the thread itself. Retain only
+             * its process while reading the name, without global-list lock. */
+            object_get(process);
+            /* The next monitor query usually consumes this very snapshot.
+             * Seed the PID hint while registry membership is still locked;
+             * removal invalidates it before dropping registry ownership. */
+            g_process_monitor_cursor = &process->global_node;
             process_thread_unlock(process);
             process_registry_unlock();
+            process_snapshot_name(process, snapshot->name, sizeof(snapshot->name));
+            object_put(process);
             return K_OK;
         }
         process_thread_unlock(process);
     }
     process_registry_unlock();
     return K_ENOENT;
+}
+
+static process_t *process_monitor_find(uint64_t pid) {
+    process_t *found = 0;
+    process_registry_lock();
+    /* Resource queries normally follow enumeration or repeat a parent PID
+     * for its threads. Both borrowed hints are valid only under this lock. */
+    list_head_t *hint = g_process_monitor_cursor;
+    if (hint == 0 || list_entry(hint, process_t, global_node)->pid != pid) {
+        hint = g_process_enumeration_cursor;
+    }
+    if (hint != 0 && list_entry(hint, process_t, global_node)->pid == pid) {
+        found = list_entry(hint, process_t, global_node);
+    } else {
+        for (list_head_t *node = g_process_registry.next; node != &g_process_registry; node = node->next) {
+            process_t *candidate = list_entry(node, process_t, global_node);
+            if (candidate->pid == pid) { found = candidate; break; }
+        }
+    }
+    if (found != 0) {
+        object_get(found);
+        g_process_monitor_cursor = &found->global_node;
+    }
+    process_registry_unlock();
+    return found;
+}
+
+/* Caller holds thread_lock, including the VM lifetime guard. */
+static bool process_monitor_protected(const process_t *process) {
+    return process->pid <= 1U || process->vm == 0 ||
+        (__atomic_load_n(&process->flags, __ATOMIC_RELAXED) & PROCESS_FLAG_INIT_CPU_PINNED) != 0U;
+}
+
+static bool process_monitor_terminable(const process_t *process, uint64_t create_time_ns) {
+    return !process_monitor_protected(process) &&
+        process->create_time_ns == create_time_ns &&
+        atomic_load_explicit(&process->state, memory_order_acquire) == PROCESS_RUNNING;
+}
+
+/* The returned thread is borrowed and may only be used under thread_lock. */
+static thread_t *process_monitor_thread_locked(process_t *process, uint64_t tid) {
+    list_head_t *hint = process->monitor_thread_cursor;
+    if (hint != 0) {
+        thread_t *thread = list_entry(hint, thread_t, process_node);
+        if (thread->tid == tid) return thread;
+    }
+    for (list_head_t *node = process->threads.next; node != &process->threads; node = node->next) {
+        thread_t *thread = list_entry(node, thread_t, process_node);
+        if (thread->tid == tid) {
+            process->monitor_thread_cursor = node;
+            return thread;
+        }
+    }
+    return 0;
+}
+
+uint64_t linux_thread_visible_tid(const thread_t *thread) {
+    process_t *process = thread->process;
+    return process != 0 && linux_process_is(process) &&
+           thread->tid == process->linux_thread_group_leader_tid ?
+           process->pid : thread->tid;
+}
+
+static thread_t *process_linux_thread_reference(process_t *process, uint64_t tid) {
+    thread_t *found = 0;
+    process_thread_lock(process);
+    for (list_head_t *node = process->threads.next;
+         node != &process->threads; node = node->next) {
+        thread_t *thread = list_entry(node, thread_t, process_node);
+        if (linux_thread_visible_tid(thread) == tid &&
+            atomic_load_explicit(&thread->state, memory_order_acquire) != THREAD_DEAD) {
+            object_get(thread);
+            found = thread;
+            break;
+        }
+    }
+    process_thread_unlock(process);
+    return found;
+}
+
+thread_t *linux_thread_reference_by_tid(uint64_t tid) {
+    thread_t *current = sched_current_thread();
+    if (tid == 0U || (current != 0 && linux_thread_visible_tid(current) == tid)) {
+        if (current != 0) object_get(current);
+        return current;
+    }
+    /* The common pthread query stays within its own process. Registry lock
+     * precedes thread_lock for foreign tasks, matching enumeration/removal. */
+    thread_t *found = current != 0 && current->process != 0 ?
+        process_linux_thread_reference(current->process, tid) : 0;
+    if (found != 0) return found;
+    process_registry_lock();
+    for (list_head_t *node = g_process_registry.next;
+         node != &g_process_registry; node = node->next) {
+        process_t *process = list_entry(node, process_t, global_node);
+        if (current != 0 && process == current->process) continue;
+        found = process_linux_thread_reference(process, tid);
+        if (found != 0) break;
+    }
+    process_registry_unlock();
+    return found;
+}
+
+kstatus_t process_task_query(uint64_t pid, uint64_t tid, os_task_info_t *info) {
+    if (info == 0 || pid == 0U) return K_EINVAL;
+    process_t *process = process_monitor_find(pid);
+    if (process == 0) return K_ENOENT;
+    *info = (os_task_info_t){0};
+    info->hdr.size = sizeof(*info); info->hdr.version = OS_SYSCALL_ABI_VERSION;
+    info->pid = pid; info->tid = tid; info->create_time_ns = process->create_time_ns;
+    info->cpu_count = x86_smp_started_count();
+    if (info->cpu_count == 0U) info->cpu_count = 1U;
+    process_thread_lock(process);
+    info->state = atomic_load_explicit(&process->state, memory_order_acquire);
+    info->thread_count = process->thread_count;
+    info->flags = process_monitor_protected(process) ? OS_TASK_PROTECTED : 0U;
+    if (process->vm != 0) {
+        info->rss_bytes = atomic_load_explicit(&process->vm->rss_pages, memory_order_relaxed) * PAGE_SIZE;
+        info->committed_bytes = atomic_load_explicit(&process->vm->commit_pages, memory_order_relaxed) * PAGE_SIZE;
+    }
+    info->runtime_ns = tid == 0U ? process->retired_cpu_ns : 0U;
+    bool found = true;
+    if (tid != 0U) {
+        thread_t *thread = process_monitor_thread_locked(process, tid);
+        found = thread != 0;
+        if (found) {
+            info->runtime_ns = __atomic_load_n(&thread->sched.runtime_ns, __ATOMIC_RELAXED);
+            info->state = atomic_load_explicit(&thread->state, memory_order_acquire);
+        }
+    } else {
+        for (list_head_t *node = process->threads.next;
+             node != &process->threads && info->runtime_ns != UINT64_MAX; node = node->next) {
+            thread_t *thread = list_entry(node, thread_t, process_node);
+            uint64_t runtime = __atomic_load_n(&thread->sched.runtime_ns, __ATOMIC_RELAXED);
+            info->runtime_ns = info->runtime_ns > UINT64_MAX - runtime ? UINT64_MAX : info->runtime_ns + runtime;
+        }
+    }
+    process_thread_unlock(process);
+    object_put(process);
+    return found ? K_OK : K_ENOENT;
+}
+
+/* Allocation-free fallback for low memory; no live thread pointer survives
+ * unlocking without an object reference. */
+static void process_terminate_threads_fallback(process_t *process, thread_t *exclude, int64_t status) {
+    uint64_t after_tid = 0U;
+    for (;;) {
+        thread_t *targets[16];
+        uint32_t count = 0U;
+        process_thread_lock(process);
+        for (list_head_t *node = process->threads.next; node != &process->threads; node = node->next) {
+            thread_t *candidate = list_entry(node, thread_t, process_node);
+            if (candidate == exclude || atomic_load_explicit(&candidate->state, memory_order_acquire) == THREAD_DEAD) continue;
+            if (candidate->tid <= after_tid) continue;
+            /* The list need not be TID ordered. Keep its lowest next IDs;
+             * no list cursor or unreferenced pointer survives unlocking. */
+            uint32_t position = count;
+            while (position != 0U && targets[position - 1U]->tid > candidate->tid) --position;
+            if (position == 16U) continue;
+            if (count < 16U) ++count;
+            for (uint32_t index = count - 1U; index > position; --index) {
+                targets[index] = targets[index - 1U];
+            }
+            targets[position] = candidate;
+        }
+        for (uint32_t index = 0U; index < count; ++index) {
+            object_get(targets[index]);
+        }
+        if (count != 0U) after_tid = targets[count - 1U]->tid;
+        process_thread_unlock(process);
+        for (uint32_t index = 0U; index < count; ++index) {
+            (void)thread_terminate(targets[index], status);
+            object_put(targets[index]);
+        }
+        if (count < 16U) break;
+    }
+}
+
+void process_terminate_siblings(process_t *process, thread_t *exclude, int64_t status) {
+    /* EXITING forbids new attachment. The count can only shrink while the
+     * snapshot storage is allocated outside thread_lock. */
+    thread_t *local_targets[16];
+    thread_t **targets = local_targets;
+    process_thread_lock(process);
+    uint32_t capacity = process->thread_count;
+    process_thread_unlock(process);
+    if (capacity > sizeof(local_targets) / sizeof(local_targets[0])) {
+        targets = kmalloc((size_t)capacity * sizeof(*targets), 0U);
+    }
+    uint32_t count = 0U;
+    process_thread_lock(process);
+    for (list_head_t *node = process->threads.next; node != &process->threads; node = node->next) {
+        thread_t *candidate = list_entry(node, thread_t, process_node);
+        if (candidate == exclude || atomic_load_explicit(&candidate->state, memory_order_acquire) == THREAD_DEAD) continue;
+        __atomic_fetch_or(&candidate->signal_pending, 1ULL << (OS_SIGKILL - 1U), __ATOMIC_RELEASE);
+        if (targets != 0) {
+            object_get(candidate);
+            targets[count++] = candidate;
+        }
+    }
+    process_thread_unlock(process);
+    if (targets == 0) {
+        process_terminate_threads_fallback(process, exclude, status);
+    } else {
+        for (uint32_t index = 0U; index < count; ++index) {
+            (void)thread_terminate(targets[index], status);
+            object_put(targets[index]);
+        }
+        if (targets != local_targets) kfree(targets);
+    }
+}
+
+kstatus_t process_terminate_pid(process_t *caller, uint64_t pid, uint64_t create_time_ns) {
+    if (caller == 0 || pid <= 1U || pid == caller->pid) return K_EPERM;
+    process_t *process = process_monitor_find(pid);
+    if (process == 0) return K_ENOENT;
+    process_thread_lock(process);
+    bool allowed = process_monitor_terminable(process, create_time_ns);
+    process_thread_unlock(process);
+    if (!allowed) { object_put(process); return K_EPERM; }
+    if (process_begin_exit(process, -(int64_t)OS_SIGKILL, OS_SIGKILL)) {
+        process_terminate_siblings(process, 0, -(int64_t)OS_SIGKILL);
+    }
+    object_put(process);
+    return K_OK;
+}
+
+kstatus_t process_terminate_tid(process_t *caller, uint64_t pid, uint64_t tid, uint64_t create_time_ns) {
+    if (caller == 0 || pid <= 1U || pid == caller->pid || tid == 0U) return K_EPERM;
+    process_t *process = process_monitor_find(pid);
+    if (process == 0) return K_ENOENT;
+    thread_t *target = 0;
+    process_thread_lock(process);
+    bool allowed = process_monitor_terminable(process, create_time_ns);
+    if (allowed) {
+        thread_t *candidate = process_monitor_thread_locked(process, tid);
+        if (candidate != 0) {
+            object_get(candidate);
+            __atomic_fetch_or(&candidate->flags, THREAD_FLAG_TERMINATE_REQUEST, __ATOMIC_RELEASE);
+            target = candidate;
+        }
+    }
+    process_thread_unlock(process);
+    if (target != 0) {
+        /* Running threads leave only at a safe user boundary, never by
+         * reclaiming an arbitrary live kernel continuation. */
+        (void)thread_terminate(target, -(int64_t)OS_SIGKILL);
+        object_put(target);
+    }
+    object_put(process);
+    return !allowed ? K_EPERM : target == 0 ? K_ENOENT : K_OK;
 }
 
 static uint64_t read_tsc(void) {
@@ -407,19 +733,16 @@ kstatus_t process_register_teardown_callback(
     process_global_initialize();
     process_teardown_lock();
     for (uint32_t index = 0U;
-         index < PROCESS_TEARDOWN_CALLBACK_MAX; ++index) {
+         index < g_process_teardown_count; ++index) {
         if (g_process_teardown_callbacks[index] == callback) {
             process_teardown_unlock();
             return K_OK;
         }
     }
-    for (uint32_t index = 0U;
-         index < PROCESS_TEARDOWN_CALLBACK_MAX; ++index) {
-        if (g_process_teardown_callbacks[index] == 0) {
-            g_process_teardown_callbacks[index] = callback;
-            process_teardown_unlock();
-            return K_OK;
-        }
+    if (g_process_teardown_count < PROCESS_TEARDOWN_CALLBACK_MAX) {
+        g_process_teardown_callbacks[g_process_teardown_count++] = callback;
+        process_teardown_unlock();
+        return K_OK;
     }
     process_teardown_unlock();
     return K_ENOSPC;
@@ -427,10 +750,21 @@ kstatus_t process_register_teardown_callback(
 
 void process_initialize_object(object_header_t *header, object_type_id_t type,
                                const object_ops_t *ops) {
-    refcount_init(&header->refs, 1U);
-    header->type = type;
-    header->flags = 0;
-    header->ops = ops;
+    object_header_init(header, type, ops);
+}
+
+static kstatus_t process_create_vm(process_t *parent, vm_space_t **out) {
+    if (parent == 0) return vm_space_create(out);
+    /* Exit can detach the parent's VM while the child is being allocated.
+     * Pin its snapshot under the owner lock, never clone/put under that lock. */
+    process_thread_lock(parent);
+    vm_space_t *source = parent->vm;
+    if (source != 0) vm_space_get(source);
+    process_thread_unlock(parent);
+    if (source == 0) return K_EINVAL;
+    kstatus_t status = vm_space_clone_cow(source, out);
+    vm_space_put(source);
+    return status;
 }
 
 kstatus_t process_create_named(process_t *parent, const char *name,
@@ -443,9 +777,9 @@ kstatus_t process_create_named(process_t *parent, const char *name,
                               &g_process_ops);
     process->pid = process_allocate_task_id();
     atomic_init(&process->state, PROCESS_NEW);
-    if (parent != 0) {
-        process->flags = parent->flags & PROCESS_FLAG_INIT_CPU_PINNED;
-    }
+    /* CPU pinning is only for the bootstrap process itself.  Inheriting it
+     * pins every descendant (including multithreaded applications) to the
+     * bootstrap CPU and defeats SMP scheduling. */
     atomic_init(&process->parent_lock.state, 0U);
     atomic_init(&process->children_lock.state, 0U);
     wait_queue_init(&process->child_waitq);
@@ -465,9 +799,29 @@ kstatus_t process_create_named(process_t *parent, const char *name,
     else if (parent != 0) process_copy_name(process, parent);
     else process_set_name(process, "system");
     process->create_time_ns = read_tsc();
+    process->personality = parent != 0 ? parent->personality :
+                          OS_PROCESS_PERSONALITY_NATIVE;
+    process->linux_loader_pending = false;
+    process->linux_root[0] = '/';
+    process->linux_root[1] = '\0';
+    process->linux_cwd[0] = '/';
+    process->linux_cwd[1] = '\0';
+    process->linux_exe[0] = '\0';
+    process->linux_brk_base = 0U;
+    process->linux_brk = 0U;
+    if (parent != 0) {
+        __builtin_memcpy(process->linux_root, parent->linux_root,
+                         sizeof(process->linux_root));
+        __builtin_memcpy(process->linux_cwd, parent->linux_cwd,
+                         sizeof(process->linux_cwd));
+        __builtin_memcpy(process->linux_exe, parent->linux_exe,
+                         sizeof(process->linux_exe));
+        process->linux_brk_base = parent->linux_brk_base;
+        process->linux_brk = parent->linux_brk;
+    }
+    linux_fd_table_init(&process->linux_fds);
 
-    kstatus_t status = parent != 0 ? vm_space_clone_cow(parent->vm, &process->vm) :
-                                    vm_space_create(&process->vm);
+    kstatus_t status = process_create_vm(parent, &process->vm);
     if (status != K_OK) {
         kfree(process);
         return status;
@@ -475,6 +829,7 @@ kstatus_t process_create_named(process_t *parent, const char *name,
     status = handle_table_init(&process->handles);
     if (status != K_OK) {
         vm_space_put(process->vm);
+        linux_fd_table_destroy(&process->linux_fds);
         kfree(process);
         return status;
     }
@@ -489,6 +844,7 @@ kstatus_t process_create_named(process_t *parent, const char *name,
             process_detach_from_parent(process);
             handle_table_destroy(&process->handles);
             vm_space_put(process->vm);
+            linux_fd_table_destroy(&process->linux_fds);
             kfree(process);
             return status;
         }
@@ -500,6 +856,7 @@ kstatus_t process_create_named(process_t *parent, const char *name,
             process_detach_from_parent(process);
             handle_table_destroy(&process->handles);
             vm_space_put(process->vm);
+            linux_fd_table_destroy(&process->linux_fds);
             kfree(process);
             return K_EBUSY;
         }
@@ -513,6 +870,7 @@ kstatus_t process_create_named(process_t *parent, const char *name,
         if (root_job != 0) object_put(root_job);
         if (status != K_OK) {
             handle_table_destroy(&process->handles);
+            linux_fd_table_destroy(&process->linux_fds);
             vm_space_put(process->vm);
             kfree(process);
             return status;
@@ -521,6 +879,7 @@ kstatus_t process_create_named(process_t *parent, const char *name,
     atomic_store_explicit(&process->state, PROCESS_RUNNING, memory_order_release);
     process_registry_lock();
     object_get(process);
+    process_registry_invalidate_cursors_locked();
     list_add_tail(&g_process_registry, &process->global_node);
     process->global_registered = true;
     process_registry_unlock();
@@ -572,6 +931,12 @@ kstatus_t process_fork(process_t *parent, process_t **out) {
     }
     handle_table_destroy(&child->handles);
     child->handles = cloned;
+    status = linux_fd_table_clone(&parent->linux_fds, &child->linux_fds);
+    if (status != K_OK) {
+        (void)process_abort(child);
+        object_put(child);
+        return status;
+    }
     spinlock_lock(&parent->signal_lock);
     spinlock_lock(&child->signal_lock);
     for (uint32_t signal = 0U; signal <= OS_SIGNAL_COUNT; ++signal) {
@@ -660,13 +1025,21 @@ kstatus_t process_wait_child(process_t *parent, int64_t pid, uint32_t options,
 
 void process_release_runtime_resources(process_t *process) {
     if (process == 0) return;
+    /* This bit is a monotonic ownership claim, not a completion barrier.
+     * Repeated reapers need no write to an already-claimed cache line. */
+    if ((__atomic_load_n(&process->flags, __ATOMIC_ACQUIRE) &
+         PROCESS_FLAG_RESOURCES_RELEASED) != 0U) return;
     uint32_t old_flags = __atomic_fetch_or(&process->flags,
                                            PROCESS_FLAG_RESOURCES_RELEASED,
                                            __ATOMIC_ACQ_REL);
     if ((old_flags & PROCESS_FLAG_RESOURCES_RELEASED) != 0) return;
     handle_table_destroy(&process->handles);
+    file_lock_release_owner(process->pid);
+    linux_fd_table_destroy(&process->linux_fds);
+    process_thread_lock(process);
     vm_space_t *space = process->vm;
     process->vm = 0;
+    process_thread_unlock(process);
     if (space != 0) vm_space_put(space);
 }
 
@@ -678,10 +1051,13 @@ static bool process_destruction_self_test_round(void) {
     handle_t child_handle = 0;
     void *lookup = 0;
     bool success = false;
-    if (process_create(0, &parent) != K_OK ||
-        thread_create_user(parent, 0x400000ULL, 0x800000ULL, 0, &thread) != K_OK ||
+    if (process_create(0, &parent) != K_OK) goto cleanup;
+    /* Child processes must not inherit the bootstrap-only CPU restriction. */
+    parent->flags |= PROCESS_FLAG_INIT_CPU_PINNED;
+    if (thread_create_user(parent, 0x400000ULL, 0x800000ULL, 0, &thread) != K_OK ||
         parent->thread_count != 1U || thread->process != parent ||
          process_create(parent, &child) != K_OK || child->parent != parent ||
+         (child->flags & PROCESS_FLAG_INIT_CPU_PINNED) != 0U ||
          parent->pid == child->pid || parent->pid == thread->tid ||
          child->pid == thread->tid ||
          handle_create(&parent->handles, child, 1U, &child_handle) != K_OK ||
@@ -722,6 +1098,33 @@ cleanup:
 }
 
 bool process_core_self_test(void) {
+    process_t exit_probe = {0};
+    spinlock_init(&exit_probe.thread_lock);
+    atomic_init(&exit_probe.state, PROCESS_RUNNING);
+    exit_probe.thread_count = 1U;
+    if (!process_begin_exit(&exit_probe, -9, 9U) ||
+        process_begin_exit(&exit_probe, -15, 15U) ||
+        atomic_load_explicit(&exit_probe.state, memory_order_acquire) !=
+            PROCESS_EXITING ||
+        exit_probe.exit_code != -9 || exit_probe.exit_signal != 9U) {
+        return false;
+    }
+
+    /* Exercise the real registry/resource path: no thread reaper will ever
+     * visit a newly-created empty process after its termination. */
+    process_t *empty = 0;
+    if (process_create(0, &empty) != K_OK) return false;
+    bool empty_exited = process_begin_exit(empty, -9, 9U) &&
+        !process_begin_exit(empty, -15, 15U) &&
+        atomic_load_explicit(&empty->state, memory_order_acquire) == PROCESS_DEAD &&
+        empty->exit_code == -9 && empty->exit_signal == 9U &&
+        empty->vm == 0 && !empty->global_registered &&
+        (empty->flags & PROCESS_FLAG_RESOURCES_RELEASED) != 0U &&
+        object_is_signaled(empty);
+    if (!empty_exited) (void)process_abort(empty);
+    object_put(empty);
+    if (!empty_exited) return false;
+
     /* 多轮验证进程、线程、句柄的销毁以及引用计数不会累积泄漏。 */
     for (uint32_t round = 0; round < 32U; ++round) {
         if (!process_destruction_self_test_round()) return false;

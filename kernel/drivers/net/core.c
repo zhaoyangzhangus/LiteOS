@@ -18,6 +18,7 @@ bool e1000_intel_hardware_present(void) {
 #include <kernel/pci.h>
 #include <kernel/telemetry.h>
 #include <kernel/socket.h>
+#include <kernel/sched.h>
 
 #define E1000_MMIO_VA (X86_64_MMIO_BASE + 0x10000000ULL)
 #define E1000_BUFFER_SIZE 2048U
@@ -61,6 +62,7 @@ bool e1000_intel_hardware_present(void) {
 static e1000_state_t g_e1000;
 static uint32_t g_e1000_error;
 static atomic_bool g_e1000_poll_queued;
+static atomic_bool g_e1000_poll_retry;
 static atomic_uint g_e1000_lifecycle_lock;
 /* 鍙湁鑷瀹屾垚鍚庯紝杩愯鏃朵腑鏂?鍏煎宸ヤ綔椤规墠鍙互璁块棶鎺ユ敹闃熷垪銆?*/
 static bool g_e1000_runtime_ready;
@@ -70,12 +72,19 @@ void e1000_record_error(uint32_t error) {
 }
 
 static bool e1000_lifecycle_try_lock(void) {
-    return atomic_exchange_explicit(&g_e1000_lifecycle_lock, 1U,
-                                    memory_order_acquire) == 0U;
+    /* Do not let the deferred worker displace a local lifecycle owner and
+     * repeatedly retry RX while that owner cannot release the device. IRQs
+     * may still try the lock, but failure never waits and restores nesting. */
+    sched_preempt_disable();
+    if (atomic_exchange_explicit(&g_e1000_lifecycle_lock, 1U,
+                                 memory_order_acquire) == 0U) return true;
+    sched_preempt_enable();
+    return false;
 }
 
 static void e1000_lifecycle_unlock(void) {
     atomic_store_explicit(&g_e1000_lifecycle_lock, 0U, memory_order_release);
+    sched_preempt_enable();
 }
 
 static void e1000_zero(void *memory, size_t size) {
@@ -122,7 +131,6 @@ void e1000_state_prepare(e1000_state_t *state, const pci_device_t *pci,
                          net_backend_t backend) {
     if (state == 0) return;
     e1000_zero(state, sizeof(*state));
-    atomic_init(&state->poll_lock.state, 0U);
     e1000_initialize_software_queues(state);
     net_arp_cache_init(&state->arp_cache);
     net_ipv6_neighbor_cache_init(&state->ndp_cache);
@@ -467,6 +475,7 @@ e1000_state_t *e1000_controller_state(void) {
 void e1000_self_test_begin(void) {
     g_e1000_runtime_ready = false;
     atomic_init(&g_e1000_poll_queued, false);
+    atomic_init(&g_e1000_poll_retry, false);
     g_e1000_error = 0U;
 }
 
@@ -521,13 +530,8 @@ kstatus_t e1000_send_frame(const void *frame, size_t length) {
         e1000_lifecycle_unlock();
         return K_ENOENT;
     }
-    if (atomic_exchange_explicit(&g_e1000.poll_lock.state, 1U,
-                                 memory_order_acquire) != 0U) {
-        e1000_lifecycle_unlock();
-        return K_EBUSY;
-    }
+    /* Lifecycle ownership already serializes TX, RX and device reset. */
     sent = net_device_send(&g_e1000.device, frame, length) == K_OK;
-    atomic_store_explicit(&g_e1000.poll_lock.state, 0U, memory_order_release);
     e1000_lifecycle_unlock();
     return sent ? K_OK : K_EIO;
 }
@@ -678,14 +682,18 @@ bool e1000_link_up(void) {
         e1000_lifecycle_unlock();
         return false;
     }
-    if (g_e1000.backend == NET_BACKEND_RTL8126) {
-        bool link_up = rtl8126_link_up_state(&g_e1000);
-        e1000_lifecycle_unlock();
-        return link_up;
-    }
-    g_e1000.link_up = (e1000_read(&g_e1000, E1000_REG_STATUS) & E1000_STATUS_LU) != 0U;
+    /* Keep lifecycle ownership (reset may unmap these registers), but a
+     * read-only link query must not pin this CPU across a slow MMIO exit.
+     * Drop only the nesting level acquired by try_lock; outer guards remain.
+     * Deferred RX contention records a retry instead of immediately spinning
+     * on the preempted lifecycle owner. */
+    sched_preempt_enable();
+    bool link_up = g_e1000.backend == NET_BACKEND_RTL8126 ?
+        rtl8126_link_up_state(&g_e1000) :
+        (e1000_read(&g_e1000, E1000_REG_STATUS) & E1000_STATUS_LU) != 0U;
+    sched_preempt_disable();
+    g_e1000.link_up = link_up;
     g_e1000.device.link_up = g_e1000.link_up;
-    bool link_up = g_e1000.link_up;
     e1000_lifecycle_unlock();
     return link_up;
 }
@@ -698,12 +706,7 @@ bool e1000_poll(void) {
         e1000_lifecycle_unlock();
         return false;
     }
-    /* Deferred context 璋冪敤锛涙姠涓嶅埌閿佹椂鐩存帴寤跺悗鏈疆銆?*/
-    if (atomic_exchange_explicit(&g_e1000.poll_lock.state, 1U,
-                                 memory_order_acquire) != 0U) {
-        e1000_lifecycle_unlock();
-        return false;
-    }
+    /* Lifecycle ownership is the sole TX/RX exclusion boundary. */
     start_tsc = telemetry_timestamp();
     if (g_e1000.backend == NET_BACKEND_RTL8126) {
         g_e1000.link_up = rtl8126_link_up_state(&g_e1000);
@@ -712,7 +715,6 @@ bool e1000_poll(void) {
     }
     g_e1000.device.link_up = g_e1000.link_up;
     if (!g_e1000.link_up) {
-        atomic_store_explicit(&g_e1000.poll_lock.state, 0U, memory_order_release);
         e1000_lifecycle_unlock();
         (void)telemetry_record_latency(TELEMETRY_CATEGORY_NETWORK_BATCH,
                                        g_e1000.pci != 0 ?
@@ -723,7 +725,6 @@ bool e1000_poll(void) {
     received = g_e1000.backend == NET_BACKEND_RTL8126 ?
                rtl8126_poll_receive_state(&g_e1000) :
                e1000_poll_receive(&g_e1000);
-    atomic_store_explicit(&g_e1000.poll_lock.state, 0U, memory_order_release);
     e1000_lifecycle_unlock();
     (void)telemetry_record_latency(TELEMETRY_CATEGORY_NETWORK_BATCH,
                                    g_e1000.pci != 0 ?
@@ -750,15 +751,55 @@ bool e1000_schedule_deferred_poll(void) {
                                                  memory_order_acquire)) return false;
     if (!deferred_try_schedule(e1000_deferred_poll, 0)) {
         atomic_store_explicit(&g_e1000_poll_queued, false, memory_order_release);
+        /* The ISR has already cleared the interrupt cause. Preserve the
+         * request when the shared queue is full; another IRQ is not assured. */
+        atomic_store_explicit(&g_e1000_poll_retry, true, memory_order_release);
         return false;
     }
     return true;
+}
+
+void e1000_retry_deferred_poll(void) {
+    if (atomic_exchange_explicit(&g_e1000_poll_retry, false,
+                                 memory_order_acq_rel)) {
+        (void)e1000_schedule_deferred_poll();
+    }
 }
 
 void e1000_deferred_poll(void *argument) {
     (void)argument;
     (void)e1000_poll();
     atomic_store_explicit(&g_e1000_poll_queued, false, memory_order_release);
+
+    /* An RX interrupt can arrive while this work item is running.  Its
+     * attempt to queue another item then sees g_e1000_poll_queued set and is
+     * coalesced.  If the packet arrived just after the RX loop went empty,
+     * the interrupt has already been acknowledged and no further interrupt
+     * is guaranteed.  Close that gap after clearing the queued bit. */
+    if (!e1000_lifecycle_try_lock()) {
+        /* A preemptible link query can own the device on this CPU. Do not
+         * recursively requeue RX ahead of that owner; the manager tick retries
+         * this acknowledged request even if no new interrupt arrives. */
+        atomic_store_explicit(&g_e1000_poll_retry, true, memory_order_release);
+        return;
+    }
+    bool pending = false;
+    if (g_e1000.initialized && g_e1000_runtime_ready &&
+        g_e1000.backend == NET_BACKEND_E1000 && g_e1000.rx_ring != 0) {
+        dma_sync_for_cpu(&g_e1000.rx_ring_dma);
+        pending = (g_e1000.rx_ring[g_e1000.rx_clean].status &
+                   E1000_RX_STATUS_DD) != 0U;
+    } else if (g_e1000.initialized && g_e1000_runtime_ready &&
+               g_e1000.backend == NET_BACKEND_RTL8126 &&
+               g_e1000.rtl_rx_ring != 0) {
+        dma_sync_for_cpu(&g_e1000.rtl_rx_ring_dma);
+        /* RTL uses inverted ownership: a cleared OWN bit belongs to us.
+         * Check the next descriptor, not slot zero, including ring wrap. */
+        pending = (g_e1000.rtl_rx_ring[g_e1000.rtl_rx_next].options1 &
+                   (1U << 31)) == 0U;
+    }
+    e1000_lifecycle_unlock();
+    if (pending) (void)e1000_schedule_deferred_poll();
 }
 
 uint32_t e1000_last_error(void) {

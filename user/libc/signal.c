@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <signal.h>
 
@@ -91,9 +91,13 @@ int sigaction(int signal, const struct sigaction *action,
         replacement.restorer = (uint64_t)(uintptr_t)(
             action->sa_restorer != 0 ? action->sa_restorer :
             __libc_signal_restorer);
-        replacement.flags = (uint32_t)action->sa_flags;
+        uint32_t public_flags = (uint32_t)action->sa_flags;
+        if ((public_flags & SA_RESETHAND) != 0U)
+            replacement.flags |= OS_SIG_FLAG_RESETHAND;
+        if ((public_flags & SA_NODEFER) != 0U)
+            replacement.flags |= OS_SIG_FLAG_NODEFER;
     }
-    status = liteos_syscall6(OS_SYS_SIGNAL_ACTION, (uint64_t)signal,
+    status = __libc_native_syscall6(OS_SYS_SIGNAL_ACTION, (uint64_t)signal,
                              (uint64_t)(uintptr_t)(action != 0 ? &replacement : 0),
                              (uint64_t)(uintptr_t)(old_action != 0 ? &previous : 0),
                              0U, 0U, 0U);
@@ -101,7 +105,12 @@ int sigaction(int signal, const struct sigaction *action,
     if (old_action != 0) {
         old_action->sa_handler = (sighandler_t)(uintptr_t)previous.handler;
         old_action->sa_mask = previous.mask;
-        old_action->sa_flags = (int)previous.flags;
+        uint32_t public_flags = 0U;
+        if ((previous.flags & OS_SIG_FLAG_RESETHAND) != 0U)
+            public_flags |= SA_RESETHAND;
+        if ((previous.flags & OS_SIG_FLAG_NODEFER) != 0U)
+            public_flags |= SA_NODEFER;
+        old_action->sa_flags = (int)public_flags;
         old_action->sa_restorer = (void (*)(void))(uintptr_t)previous.restorer;
     }
     return 0;
@@ -117,7 +126,7 @@ sighandler_t signal(int signal_number, sighandler_t handler) {
 }
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *old_set) {
-    int64_t status = liteos_syscall6(
+    int64_t status = __libc_native_syscall6(
         OS_SYS_SIGNAL_MASK, (uint64_t)(uint32_t)how,
         (uint64_t)(uintptr_t)set, (uint64_t)(uintptr_t)old_set,
         0U, 0U, 0U);
@@ -131,7 +140,7 @@ int kill(pid_t pid, int signal_number) {
         errno = EINVAL;
         return -1;
     }
-    status = liteos_syscall6(OS_SYS_SIGNAL_SEND, (uint64_t)(int64_t)pid,
+    status = __libc_native_syscall6(OS_SYS_SIGNAL_SEND, (uint64_t)(int64_t)pid,
                              (uint64_t)(uint32_t)signal_number,
                              0U, 0U, 0U, 0U);
     return status < 0 ? __libc_status_result(status) : 0;

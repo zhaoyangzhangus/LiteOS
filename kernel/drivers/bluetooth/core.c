@@ -1,6 +1,7 @@
 #include <kernel/bluetooth.h>
 #include <kernel/input.h>
 #include <kernel/kmem.h>
+#include <kernel/sched.h>
 
 typedef struct bt_attribute {
     uint16_t handle;
@@ -26,14 +27,13 @@ struct bt_controller {
 #define BT_HCI_MAX_EVENT_PARAMS       255U
 
 static void bt_lock(bt_controller_t *controller) {
-    while (atomic_exchange_explicit(&controller->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    sched_preempt_disable();
+    spinlock_lock(&controller->lock);
 }
 
 static void bt_unlock(bt_controller_t *controller) {
-    atomic_store_explicit(&controller->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&controller->lock);
+    sched_preempt_enable();
 }
 
 static bool bt_contains_key(const uint8_t *keys, uint8_t key) {
@@ -53,7 +53,7 @@ kstatus_t bt_controller_create(bt_transport_send_fn send, void *context,
     if (send == 0) return K_EINVAL;
     controller = (bt_controller_t *)kzalloc(sizeof(*controller), 0);
     if (controller == 0) return K_ENOMEM;
-    atomic_init(&controller->lock.state, 0U);
+    spinlock_init(&controller->lock);
     controller->send = send;
     controller->context = context;
     controller->state = BT_CONTROLLER_OFFLINE;

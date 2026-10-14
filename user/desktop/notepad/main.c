@@ -1,25 +1,25 @@
 #include <stdint.h>
 #include <stdbool.h>
-#if LITEOS_REALTEST
+#if OS_REALTEST
 #include <stdio.h>
 #endif
 
 #include <uapi/all.h>
 
-#include "../../runtime/liteos_text.h"
-#include "../../client_chrome.h"
+#include "../../runtime/text.h"
+#include "../../runtime/caption.h"
+#include "../../runtime/message_box.h"
 
 #define NOTEPAD_TEXT_CAPACITY 8192U
+#define NOTEPAD_CONTENT_TOP 0U
 #define NOTEPAD_MAP_BASE      0x08000000ULL
 #define NOTEPAD_EVENT_WAIT OS_WAIT_INFINITE
 #define NOTEPAD_FILE_PATH     "/notes.txt"
 #define NOTEPAD_UNDO_DEPTH    8U
 #define NOTEPAD_PATH_CAPACITY 256U
-#define NOTEPAD_CONTENT_BACKGROUND 0x00F7F8FAU
-#define NOTEPAD_CONTENT_TEXT       0x00353B43U
-#define NOTEPAD_CURSOR             0x005B86D6U
-#define NOTEPAD_STATUS_BACKGROUND  0x00E9EDF1U
-#define NOTEPAD_STATUS_TEXT        0x00545D66U
+#define NOTEPAD_CONTENT_BACKGROUND OS_THEME_SURFACE
+#define NOTEPAD_CONTENT_TEXT       OS_THEME_TEXT
+#define NOTEPAD_CURSOR             OS_THEME_ACCENT
 
 typedef struct notepad_window {
     os_handle_t handle;
@@ -35,22 +35,31 @@ typedef struct notepad_snapshot {
     size_t cursor;
 } notepad_snapshot_t;
 
+typedef struct notepad_history {
+    notepad_snapshot_t snapshots[NOTEPAD_UNDO_DEPTH];
+    uint32_t count;
+    uint32_t next;
+} notepad_history_t;
+
 static char g_file_path[NOTEPAD_PATH_CAPACITY] = NOTEPAD_FILE_PATH;
 static notepad_window_t g_window = {OS_INVALID_HANDLE, 0U, 0U, 0U, 0};
 static char g_text[NOTEPAD_TEXT_CAPACITY];
+static char g_load_text[NOTEPAD_TEXT_CAPACITY];
 static size_t g_text_length;
 static size_t g_cursor;
+static size_t g_selection_anchor = SIZE_MAX;
+static bool g_mouse_selecting;
 static uint32_t g_scroll_line;
 static bool g_follow_cursor = true;
 static bool g_shift;
 static bool g_ctrl;
 static bool g_dirty;
-static char g_status[128] =
-    "CTRL+S SAVE  CTRL+Z UNDO  CTRL+/- FONT  CTRL+Q EXIT";
-static notepad_snapshot_t g_undo[NOTEPAD_UNDO_DEPTH];
-static notepad_snapshot_t g_redo[NOTEPAD_UNDO_DEPTH];
-static uint32_t g_undo_count;
-static uint32_t g_redo_count;
+static ui_message_box_t g_message;
+enum notepad_pending { NOTEPAD_PENDING_NONE, NOTEPAD_PENDING_CLOSE,
+                      NOTEPAD_PENDING_NEW, NOTEPAD_PENDING_RELOAD };
+static enum notepad_pending g_pending;
+static notepad_history_t g_undo;
+static notepad_history_t g_redo;
 static char g_saved_text[NOTEPAD_TEXT_CAPACITY];
 static size_t g_saved_length;
 static uint32_t *g_target;
@@ -113,23 +122,17 @@ static void notepad_damage_rect(uint32_t x, uint32_t y,
 }
 
 static void notepad_damage_editor(void) {
-    uint32_t top = USER_CLIENT_CHROME_HEIGHT;
-    uint32_t bottom = g_window.height > 32U ? g_window.height - 32U : top;
+    uint32_t top = NOTEPAD_CONTENT_TOP;
+    uint32_t bottom = g_window.height;
     if (bottom > top) notepad_damage_rect(0U, top, g_window.width,
                                           bottom - top);
 }
 
 static void notepad_damage_title(void) {
-    notepad_damage_rect(0U, 0U, g_window.width,
-                        USER_CLIENT_CHROME_HEIGHT);
+    notepad_damage_all();
 }
 
-static void notepad_damage_status(void) {
-    uint32_t y = g_window.height > 32U ? g_window.height - 32U : 0U;
-    notepad_damage_rect(0U, y, g_window.width, g_window.height - y);
-}
-
-/* MinGW 在标准 main 入口前会发出 __main；LiteOS 用户程序不链接 CRT。 */
+/* MinGW 在标准 main 入口前会发出 __main；System 用户程序不链接 CRT。 */
 void __main(void) {
 }
 
@@ -159,14 +162,9 @@ __attribute__((noreturn)) static void notepad_exit(uint64_t status) {
     for (;;) __asm__ volatile ("pause");
 }
 
-static void copy_text(char *destination, uint32_t capacity, const char *source) {
-    uint32_t index = 0U;
-    if (destination == 0 || source == 0 || capacity == 0U) return;
-    while (index + 1U < capacity && source[index] != '\0') {
-        destination[index] = source[index];
-        ++index;
-    }
-    destination[index] = '\0';
+static bool text_equals(const char *a, const char *b) {
+    while (*a && *a == *b) { ++a; ++b; }
+    return *a == *b;
 }
 
 static bool set_file_path(const char *argument) {
@@ -198,7 +196,14 @@ static bool set_file_path(const char *argument) {
 }
 
 static void set_status(const char *text) {
-    copy_text(g_status, sizeof(g_status), text);
+    /* Routine editing is silent; explicit results and errors are dialogs. */
+    if (!text || text_equals(text, "UNDO") || text_equals(text, "REDO") ||
+        text_equals(text, "NOTHING TO UNDO") || text_equals(text, "NOTHING TO REDO") ||
+        text_equals(text, "NEW DOCUMENT - CTRL+S TO SAVE") ||
+        text_equals(text, "CTRL+S SAVE  CTRL+Z UNDO  CTRL+/- FONT  CTRL+Q EXIT")) return;
+    ui_message_show(&g_message, "Notepad", text, OS_MESSAGE_OK);
+    g_mouse_selecting = false;
+    notepad_damage_all();
 }
 
 static void snapshot_capture(notepad_snapshot_t *snapshot) {
@@ -212,6 +217,8 @@ static void snapshot_capture(notepad_snapshot_t *snapshot) {
 
 static void snapshot_restore(const notepad_snapshot_t *snapshot) {
     if (snapshot == 0 || snapshot->length >= NOTEPAD_TEXT_CAPACITY) return;
+    g_selection_anchor = SIZE_MAX;
+    g_mouse_selecting = false;
     g_text_length = snapshot->length;
     g_cursor = snapshot->cursor <= g_text_length ? snapshot->cursor : g_text_length;
     for (size_t index = 0U; index <= g_text_length; ++index) {
@@ -219,35 +226,31 @@ static void snapshot_restore(const notepad_snapshot_t *snapshot) {
     }
 }
 
-static void snapshot_copy(notepad_snapshot_t *destination,
-                          const notepad_snapshot_t *source) {
-    if (destination == 0 || source == 0) return;
-    destination->length = source->length;
-    destination->cursor = source->cursor;
-    for (size_t index = 0U; index < NOTEPAD_TEXT_CAPACITY; ++index) {
-        destination->text[index] = source->text[index];
-    }
+static void push_snapshot(notepad_history_t *history) {
+    if (history == 0) return;
+    snapshot_capture(&history->snapshots[history->next]);
+    history->next = (history->next + 1U) % NOTEPAD_UNDO_DEPTH;
+    if (history->count < NOTEPAD_UNDO_DEPTH) ++history->count;
 }
 
-static void push_snapshot(notepad_snapshot_t *stack, uint32_t *count) {
-    uint32_t limit;
-    if (stack == 0 || count == 0) return;
-    limit = *count < NOTEPAD_UNDO_DEPTH ? *count : NOTEPAD_UNDO_DEPTH - 1U;
-    for (uint32_t index = limit; index != 0U; --index) {
-        snapshot_copy(&stack[index], &stack[index - 1U]);
-    }
-    if (*count < NOTEPAD_UNDO_DEPTH) ++*count;
-    snapshot_capture(&stack[0]);
+static bool pop_snapshot(notepad_history_t *history) {
+    if (history == 0 || history->count == 0U) return false;
+    history->next = (history->next + NOTEPAD_UNDO_DEPTH - 1U) % NOTEPAD_UNDO_DEPTH;
+    snapshot_restore(&history->snapshots[history->next]);
+    --history->count;
+    return true;
 }
 
 static void history_reset(void) {
-    g_undo_count = 0U;
-    g_redo_count = 0U;
+    g_selection_anchor = SIZE_MAX;
+    g_mouse_selecting = false;
+    g_undo.count = g_undo.next = 0U;
+    g_redo.count = g_redo.next = 0U;
 }
 
 static void begin_edit(void) {
-    push_snapshot(g_undo, &g_undo_count);
-    g_redo_count = 0U;
+    push_snapshot(&g_undo);
+    g_redo.count = g_redo.next = 0U;
 }
 
 static void update_dirty(void) {
@@ -273,31 +276,23 @@ static void mark_saved(void) {
 }
 
 static void undo_document(void) {
-    if (g_undo_count == 0U) {
+    if (g_undo.count == 0U) {
         set_status("NOTHING TO UNDO");
         return;
     }
-    push_snapshot(g_redo, &g_redo_count);
-    snapshot_restore(&g_undo[0]);
-    for (uint32_t index = 1U; index < g_undo_count; ++index) {
-        snapshot_copy(&g_undo[index - 1U], &g_undo[index]);
-    }
-    --g_undo_count;
+    push_snapshot(&g_redo);
+    (void)pop_snapshot(&g_undo);
     update_dirty();
     set_status("UNDO");
 }
 
 static void redo_document(void) {
-    if (g_redo_count == 0U) {
+    if (g_redo.count == 0U) {
         set_status("NOTHING TO REDO");
         return;
     }
-    push_snapshot(g_undo, &g_undo_count);
-    snapshot_restore(&g_redo[0]);
-    for (uint32_t index = 1U; index < g_redo_count; ++index) {
-        snapshot_copy(&g_redo[index - 1U], &g_redo[index]);
-    }
-    --g_redo_count;
+    push_snapshot(&g_undo);
+    (void)pop_snapshot(&g_redo);
     update_dirty();
     set_status("REDO");
 }
@@ -314,15 +309,23 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
     }
 }
 
-static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
-    liteos_text_draw(g_target, g_target_width, g_target_width, g_target_height,
+static void draw_character(uint32_t x, uint32_t y, char character, uint32_t color) {
+    char text[2] = {character, '\0'};
+    ui_text_draw(g_target, g_target_width, g_target_width, g_target_height,
                      (int32_t)x, (int32_t)y, text, color);
 }
 
-static void draw_character(uint32_t x, uint32_t y, char character, uint32_t color) {
-    char text[2] = {character, '\0'};
-    liteos_text_draw(g_target, g_target_width, g_target_width, g_target_height,
-                     (int32_t)x, (int32_t)y, text, color);
+static uint32_t editor_columns(uint32_t width, uint32_t cell_width) {
+    uint32_t columns = width > 20U && cell_width != 0U ?
+                       (width - 20U) / cell_width : 0U;
+    return columns != 0U ? columns : 1U;
+}
+
+static uint32_t editor_visible_lines(uint32_t height, uint32_t caption_height,
+                                     uint32_t status_height, uint32_t cell_height) {
+    if (cell_height == 0U || height <= caption_height ||
+        height - caption_height <= status_height) return 0U;
+    return (height - caption_height - status_height) / cell_height;
 }
 
 static void advance_position(char character, uint32_t columns,
@@ -368,11 +371,8 @@ static size_t offset_at_position(uint32_t columns, uint32_t wanted_line,
     return g_text_length;
 }
 
-static void ensure_cursor_visible(uint32_t columns, uint32_t visible_lines) {
-    uint32_t line = 0U;
-    uint32_t column = 0U;
-    cursor_position(columns, &line, &column);
-    (void)column;
+static void ensure_cursor_visible(uint32_t line, uint32_t visible_lines) {
+    if (visible_lines == 0U) return;
     if (line < g_scroll_line) g_scroll_line = line;
     if (visible_lines != 0U && line >= g_scroll_line + visible_lines) {
         g_scroll_line = line - visible_lines + 1U;
@@ -380,48 +380,49 @@ static void ensure_cursor_visible(uint32_t columns, uint32_t visible_lines) {
 }
 
 static void draw_editor(void) {
-    const uint32_t text_top = USER_CLIENT_CHROME_HEIGHT;
-    const uint32_t status_height = 32U;
-    uint32_t columns = g_target_width > 20U ?
-        (g_target_width - 20U) / LITEOS_TEXT_WIDTH : 1U;
-    uint32_t visible_lines = g_target_height > text_top + status_height ?
-        (g_target_height - text_top - status_height) / LITEOS_TEXT_HEIGHT : 1U;
+    const uint32_t text_top = NOTEPAD_CONTENT_TOP;
+    const uint32_t status_height = 0U;
+    const uint32_t cell_width = OS_TEXT_WIDTH;
+    const uint32_t cell_height = OS_TEXT_HEIGHT;
+    uint32_t columns = editor_columns(g_target_width, cell_width);
+    uint32_t visible_lines = editor_visible_lines(g_target_height, text_top,
+                                                  status_height, cell_height);
     uint32_t line = 0U;
     uint32_t column = 0U;
-    uint32_t cursor_line;
-    uint32_t cursor_column;
-    if (g_follow_cursor) ensure_cursor_visible(columns, visible_lines);
-    cursor_position(columns, &cursor_line, &cursor_column);
+    uint32_t cursor_line = 0U;
+    uint32_t cursor_column = 0U;
+    if (visible_lines != 0U) {
+        cursor_position(columns, &cursor_line, &cursor_column);
+        if (g_follow_cursor) ensure_cursor_visible(cursor_line, visible_lines);
+    }
     fill_rect(0U, 0U, g_target_width, g_target_height,
               NOTEPAD_CONTENT_BACKGROUND);
-    fill_rect(0U, 0U, g_target_width, USER_CLIENT_CHROME_HEIGHT,
-              USER_CLIENT_CHROME_BACKGROUND);
-    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
-              USER_CLIENT_CHROME_SEPARATOR);
-    user_client_chrome_app_icon(g_target, g_target_width,
-                                g_target_width, g_target_height,
-                                16U, USER_CLIENT_CHROME_TITLE_Y,
-                                USER_CLIENT_CHROME_ICON_NOTE);
-    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "NOTEPAD",
-              USER_CLIENT_CHROME_TEXT);
-    draw_text(160U, USER_CLIENT_CHROME_TITLE_Y, g_dirty ? "*" : " ",
-              USER_CLIENT_CHROME_TEXT);
-    draw_text(178U, USER_CLIENT_CHROME_TITLE_Y, g_file_path,
-              USER_CLIENT_CHROME_TEXT);
-    for (size_t index = 0U; index < g_text_length; ++index) {
+    const size_t selection_start = g_selection_anchor < g_cursor ? g_selection_anchor : g_cursor;
+    const size_t selection_end = g_selection_anchor > g_cursor ? g_selection_anchor : g_cursor;
+    for (size_t index = 0U; visible_lines != 0U && index < g_text_length; ++index) {
+        if (line >= g_scroll_line && line - g_scroll_line >= visible_lines) break;
         char character = g_text[index];
+        if (g_selection_anchor != SIZE_MAX && index >= selection_start &&
+            index < selection_end && line >= g_scroll_line &&
+            line < g_scroll_line + visible_lines) {
+            uint32_t cells = character == '\t' ? 4U - (column & 3U) : 1U;
+            if (cells > columns - column) cells = columns - column;
+            fill_rect(10U + column * cell_width,
+                text_top + (line - g_scroll_line) * cell_height,
+                cells * cell_width, cell_height, OS_THEME_SELECTED);
+        }
         if (character != '\n' && character != '\t' && line >= g_scroll_line &&
             line < g_scroll_line + visible_lines) {
-            draw_character(10U + column * LITEOS_TEXT_WIDTH,
-                           text_top + (line - g_scroll_line) * LITEOS_TEXT_HEIGHT,
+            draw_character(10U + column * cell_width,
+                           text_top + (line - g_scroll_line) * cell_height,
                            character, NOTEPAD_CONTENT_TEXT);
         }
         if (character == '\t' && line >= g_scroll_line &&
             line < g_scroll_line + visible_lines) {
             uint32_t spaces = 4U - (column & 3U);
             for (uint32_t space = 0U; space < spaces && column + space < columns; ++space) {
-                draw_character(10U + (column + space) * LITEOS_TEXT_WIDTH,
-                               text_top + (line - g_scroll_line) * LITEOS_TEXT_HEIGHT,
+                draw_character(10U + (column + space) * cell_width,
+                               text_top + (line - g_scroll_line) * cell_height,
                                ' ', NOTEPAD_CONTENT_TEXT);
             }
         }
@@ -429,21 +430,12 @@ static void draw_editor(void) {
     }
     if (cursor_line >= g_scroll_line && cursor_line < g_scroll_line + visible_lines &&
         cursor_column < columns) {
-        fill_rect(10U + cursor_column * LITEOS_TEXT_WIDTH,
-                  text_top + (cursor_line - g_scroll_line) * LITEOS_TEXT_HEIGHT,
-                  2U, LITEOS_TEXT_HEIGHT, NOTEPAD_CURSOR);
+        fill_rect(10U + cursor_column * cell_width,
+                  text_top + (cursor_line - g_scroll_line) * cell_height,
+                  2U, cell_height, NOTEPAD_CURSOR);
     }
-    fill_rect(0U, g_target_height - status_height, g_target_width,
-              status_height, NOTEPAD_STATUS_BACKGROUND);
-    draw_text(10U, g_target_height - 28U, g_status, NOTEPAD_STATUS_TEXT);
-    user_client_chrome_close(g_target, g_target_width,
-                             g_target_width, g_target_height,
-                             USER_CLIENT_CHROME_HEIGHT,
-                             USER_CLIENT_CHROME_CLOSE_BG,
-                             USER_CLIENT_CHROME_CLOSE_FG);
-    user_client_chrome_frame(g_target, g_target_width,
-                             g_target_width, g_target_height,
-                             USER_CLIENT_CHROME_HEIGHT);
+    ui_message_draw(&g_message, g_target, g_target_width,
+                         g_target_width, g_target_height);
 }
 
 static bool create_window(void) {
@@ -467,7 +459,7 @@ static bool create_window(void) {
     request.height = height;
     request.flags = OS_WINDOW_VISIBLE |
                     OS_WINDOW_RESIZABLE |
-                    OS_WINDOW_CLIENT_DECORATIONS;
+                    OS_WINDOW_STANDARD_CAPTION_CONTROLS;
     request.background = NOTEPAD_CONTENT_BACKGROUND;
     request.title[0] = 'N'; request.title[1] = 'O'; request.title[2] = 'T';
     request.title[3] = 'E'; request.title[4] = 'P'; request.title[5] = 'A';
@@ -485,6 +477,13 @@ static bool create_window(void) {
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    request.flags = OS_WINDOW_CAPTION_HEIGHT(user_caption_height());
+    os_window_title_t title = {0};
+    title.hdr.size = sizeof(title);
+    title.hdr.version = OS_SYSCALL_ABI_VERSION;
+    title.identifier = g_window.identifier;
+    user_caption_format_title(title.title, g_file_path, g_dirty);
+    (void)notepad_syscall_one(OS_SYS_WINDOW_TITLE, (uint64_t)&title);
     if (!g_damage_full && g_damage_count == 0U) return;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
@@ -520,23 +519,18 @@ static bool load_document(void) {
     os_handle_t handle = OS_INVALID_HANDLE;
     uint64_t total = 0U;
     bool success = true;
-    if (notepad_syscall_four(OS_SYS_FILE_OPEN, (uint64_t)g_file_path,
-                             OS_FILE_OPEN_READ, 0U,
-                             (uint64_t)&handle) < 0 || handle == OS_INVALID_HANDLE) {
-        g_text[0] = '\0';
-        g_text_length = 0U;
-        g_cursor = 0U;
-        history_reset();
-        mark_saved();
-        set_status("NEW DOCUMENT - CTRL+S TO SAVE");
+    int64_t opened = notepad_syscall_four(OS_SYS_FILE_OPEN, (uint64_t)g_file_path,
+                                         OS_FILE_OPEN_READ, 0U, (uint64_t)&handle);
+    if (opened < 0 || handle == OS_INVALID_HANDLE) {
+        if (opened != -2 || g_text_length != 0U || g_dirty)
+            set_status("LOAD FAILED: FILE CANNOT BE OPENED");
         return false;
     }
     while (total + 1U < NOTEPAD_TEXT_CAPACITY) {
         uint64_t bytes = 0U;
         uint64_t capacity = NOTEPAD_TEXT_CAPACITY - 1U - total;
-        if (capacity > 256U) capacity = 256U;
         int64_t status = notepad_syscall_four(OS_SYS_FILE_READ, handle,
-                                              (uint64_t)(g_text + total), capacity,
+                                              (uint64_t)(g_load_text + total), capacity,
                                               (uint64_t)&bytes);
         if (status < 0 || bytes > capacity) {
             success = false;
@@ -544,19 +538,25 @@ static bool load_document(void) {
             break;
         }
         total += bytes;
-        if (bytes == 0U || bytes < capacity) break;
+        if (bytes == 0U) break;
     }
+    if (success && total + 1U == NOTEPAD_TEXT_CAPACITY) {
+        char extra;
+        uint64_t bytes = 0U;
+        if (notepad_syscall_four(OS_SYS_FILE_READ, handle, (uint64_t)&extra,
+                                 1U, (uint64_t)&bytes) < 0 || bytes != 0U) {
+            success = false;
+            set_status("LOAD FAILED: DOCUMENT EXCEEDS EDITOR CAPACITY");
+        }
+    }
+    (void)notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
+    if (!success) return false;
+    for (size_t i = 0U; i < total; ++i) g_text[i] = g_load_text[i];
     g_text_length = (size_t)total;
     g_cursor = g_text_length;
     g_scroll_line = 0U;
     g_follow_cursor = true;
     g_text[g_text_length] = '\0';
-    (void)notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
-    if (!success) {
-        g_text[0] = '\0';
-        g_text_length = 0U;
-        g_cursor = 0U;
-    }
     history_reset();
     mark_saved();
     if (success) {
@@ -565,43 +565,114 @@ static bool load_document(void) {
     return success;
 }
 
-static void save_document(void) {
+static bool remove_temporary_document(const char *path) {
+    os_file_path_op_t request = {0};
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.path = (uint64_t)(uintptr_t)path;
+    int64_t status = notepad_syscall_one(OS_SYS_FILE_REMOVE, (uint64_t)(uintptr_t)&request);
+    return status == 0 || status == -2;
+}
+
+static bool save_document(void) {
     os_handle_t handle = OS_INVALID_HANDLE;
     uint64_t total = 0U;
-    if (notepad_syscall_four(OS_SYS_FILE_OPEN, (uint64_t)g_file_path,
-                             OS_FILE_OPEN_READ | OS_FILE_OPEN_WRITE |
-                             OS_FILE_OPEN_CREATE | OS_FILE_OPEN_TRUNCATE, 0U,
-                             (uint64_t)&handle) < 0 || handle == OS_INVALID_HANDLE) {
-        set_status("SAVE FAILED: FILE IS NOT WRITABLE");
-        return;
+    static uint32_t sequence;
+    static const char suffix[] = ".np-save-00000000.tmp";
+    static const char hex[] = "0123456789abcdef";
+    char temporary[NOTEPAD_PATH_CAPACITY];
+    size_t length = 0U, directory = 0U;
+    while (length < NOTEPAD_PATH_CAPACITY && g_file_path[length] != '\0') {
+        if (g_file_path[length] == '/') directory = length + 1U;
+        ++length;
+    }
+    if (length == 0U || length == NOTEPAD_PATH_CAPACITY ||
+        g_file_path[0] != '/' || g_file_path[length - 1U] == '/' ||
+        directory + sizeof(suffix) > sizeof(temporary)) {
+        set_status("SAVE FAILED: INVALID OR LONG PATH");
+        return false;
+    }
+    for (size_t i = 0U; i < directory; ++i) temporary[i] = g_file_path[i];
+    for (size_t i = 0U; i < sizeof(suffix); ++i) temporary[directory + i] = suffix[i];
+    for (uint32_t attempt = 0U; attempt < 32U; ++attempt) {
+        uint32_t value = ++sequence;
+        for (uint32_t digit = 0U; digit < 8U; ++digit)
+            temporary[directory + 9U + digit] = hex[(value >> (28U - digit * 4U)) & 15U];
+        bool same_path = length == directory + sizeof(suffix) - 1U;
+        for (size_t i = 0U; same_path && i < length; ++i)
+            same_path = temporary[i] == g_file_path[i];
+        if (same_path) continue;
+        handle = OS_INVALID_HANDLE;
+        int64_t status = notepad_syscall_four(OS_SYS_FILE_OPEN, (uint64_t)(uintptr_t)temporary,
+            OS_FILE_OPEN_WRITE | OS_FILE_OPEN_CREATE | OS_FILE_OPEN_EXCLUSIVE,
+            0U, (uint64_t)(uintptr_t)&handle);
+        if (status == -17) {
+            handle = OS_INVALID_HANDLE;
+            continue; /* A different editor owns this name. */
+        }
+        if (status < 0 || handle == OS_INVALID_HANDLE) {
+            set_status("SAVE FAILED: CANNOT CREATE TEMPORARY FILE");
+            return false;
+        }
+        break;
+    }
+    if (handle == OS_INVALID_HANDLE) {
+        set_status("SAVE FAILED: TEMPORARY NAMES ARE BUSY");
+        return false;
     }
     while (total < g_text_length) {
         uint64_t bytes = 0U;
         uint64_t capacity = g_text_length - total;
-        if (capacity > 256U) capacity = 256U;
         int64_t status = notepad_syscall_four(OS_SYS_FILE_WRITE, handle,
                                               (uint64_t)(g_text + total), capacity,
                                               (uint64_t)&bytes);
         if (status < 0 || bytes == 0U || bytes > capacity) {
             set_status("SAVE FAILED");
-            (void)notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
-            return;
+            goto failed;
         }
         total += bytes;
     }
     if (notepad_syscall_one(OS_SYS_FILE_FSYNC, handle) < 0) {
         set_status("SAVE FAILED: FLUSH ERROR");
-        (void)notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
-        return;
+        goto failed;
     }
-    (void)notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
+    int64_t closed = notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
+    handle = OS_INVALID_HANDLE;
+    if (closed < 0) {
+        set_status("SAVE FAILED: CLOSE ERROR");
+        goto failed;
+    }
+    os_file_rename_t renamed = {0};
+    renamed.hdr.size = sizeof(renamed);
+    renamed.hdr.version = OS_SYSCALL_ABI_VERSION;
+    renamed.old_path = (uint64_t)(uintptr_t)temporary;
+    renamed.new_path = (uint64_t)(uintptr_t)g_file_path;
+    if (notepad_syscall_one(OS_SYS_FILE_RENAME, (uint64_t)(uintptr_t)&renamed) < 0) {
+        set_status("SAVE FAILED: REPLACE ERROR");
+        goto failed;
+    }
     mark_saved();
-    set_status("SAVED");
+    return true;
+failed:
+    if (handle != OS_INVALID_HANDLE) (void)notepad_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
+    if (!remove_temporary_document(temporary))
+        set_status("SAVE FAILED: TEMPORARY FILE CLEANUP FAILED");
+    return false;
+}
+
+static void request_action(enum notepad_pending action) {
+    if (g_dirty) {
+        g_pending = action;
+        g_mouse_selecting = false;
+        ui_message_show(&g_message, "Unsaved changes",
+            "Save changes before continuing?", OS_MESSAGE_SAVE_DISCARD_CANCEL);
+        notepad_damage_all();
+    } else if (action == NOTEPAD_PENDING_CLOSE) notepad_exit(0U);
 }
 
 static void new_document(void) {
     if (g_dirty) {
-        set_status("UNSAVED CHANGES - CTRL+S FIRST");
+        request_action(NOTEPAD_PENDING_NEW);
         return;
     }
     if (g_text_length != 0U) begin_edit();
@@ -609,6 +680,7 @@ static void new_document(void) {
     g_text_length = 0U;
     g_cursor = 0U;
     g_scroll_line = 0U;
+    g_selection_anchor = SIZE_MAX;
     g_follow_cursor = true;
     g_dirty = true;
     set_status("NEW DOCUMENT - CTRL+S TO SAVE");
@@ -616,7 +688,7 @@ static void new_document(void) {
 
 static void reload_document(void) {
     if (g_dirty) {
-        set_status("UNSAVED CHANGES - CTRL+S FIRST");
+        request_action(NOTEPAD_PENDING_RELOAD);
         return;
     }
     if (load_document()) set_status("RELOADED");
@@ -649,12 +721,53 @@ static char key_to_ascii(uint32_t code, bool shift) {
     return '\0';
 }
 
+static bool has_selection(void) {
+    return g_selection_anchor != SIZE_MAX && g_selection_anchor != g_cursor;
+}
+
+static void complete_message(enum ui_message_result result) {
+    enum notepad_pending action = g_pending;
+    g_pending = NOTEPAD_PENDING_NONE;
+    if (result == OS_MESSAGE_CANCEL || action == NOTEPAD_PENDING_NONE) return;
+    if (result == OS_MESSAGE_SAVE && !save_document()) return;
+    if (action == NOTEPAD_PENDING_CLOSE) notepad_exit(0U);
+    if (action == NOTEPAD_PENDING_NEW) {
+        /* The confirmation has authorized replacing the unsaved document. */
+        g_dirty = false;
+        new_document();
+    } else if (action == NOTEPAD_PENDING_RELOAD) {
+        if (load_document()) set_status("RELOADED");
+    }
+}
+
+static void reflow_editor(void) {
+    /* Start from the first row and then reveal the caret. This also removes
+     * a scroll offset inherited from a viewport smaller than the document. */
+    g_scroll_line = 0U;
+    g_follow_cursor = true;
+    notepad_damage_all();
+}
+
+/* Caller records one undo snapshot for the whole replacement. */
+static void erase_selection(void) {
+    if (!has_selection()) { g_selection_anchor = SIZE_MAX; return; }
+    size_t first = g_selection_anchor < g_cursor ? g_selection_anchor : g_cursor;
+    size_t last = g_selection_anchor > g_cursor ? g_selection_anchor : g_cursor;
+    for (size_t index = last; index <= g_text_length; ++index)
+        g_text[first + index - last] = g_text[index];
+    g_text_length -= last - first;
+    g_cursor = first;
+    g_selection_anchor = SIZE_MAX;
+    g_dirty = true;
+}
+
 static void insert_character(char character) {
-    if (g_text_length + 1U >= NOTEPAD_TEXT_CAPACITY) {
+    if (!has_selection() && g_text_length + 1U >= NOTEPAD_TEXT_CAPACITY) {
         set_status("DOCUMENT IS FULL");
         return;
     }
     begin_edit();
+    erase_selection();
     for (size_t index = g_text_length + 1U; index > g_cursor; --index) {
         g_text[index] = g_text[index - 1U];
     }
@@ -665,6 +778,8 @@ static void insert_character(char character) {
 }
 
 static void backspace(void) {
+    if (has_selection()) { begin_edit(); erase_selection(); return; }
+    g_selection_anchor = SIZE_MAX;
     if (g_cursor == 0U) return;
     begin_edit();
     for (size_t index = g_cursor; index <= g_text_length; ++index) {
@@ -676,6 +791,8 @@ static void backspace(void) {
 }
 
 static void delete_character(void) {
+    if (has_selection()) { begin_edit(); erase_selection(); return; }
+    g_selection_anchor = SIZE_MAX;
     if (g_cursor >= g_text_length) return;
     begin_edit();
     for (size_t index = g_cursor; index < g_text_length; ++index) {
@@ -686,8 +803,7 @@ static void delete_character(void) {
 }
 
 static void move_vertical_by(int32_t direction, uint32_t distance) {
-    uint32_t columns = g_window.width > 20U ?
-        (g_window.width - 20U) / LITEOS_TEXT_WIDTH : 1U;
+    uint32_t columns = editor_columns(g_window.width, OS_TEXT_WIDTH);
     uint32_t line = 0U;
     uint32_t column = 0U;
     cursor_position(columns, &line, &column);
@@ -706,12 +822,10 @@ static void move_vertical(int32_t direction) {
 }
 
 static void scroll_editor(int32_t direction) {
-    uint32_t columns = g_window.width > 20U ?
-        (g_window.width - 20U) / LITEOS_TEXT_WIDTH : 1U;
-    uint32_t visible_lines =
-        g_window.height > USER_CLIENT_CHROME_HEIGHT + 32U ?
-        (g_window.height - USER_CLIENT_CHROME_HEIGHT - 32U) /
-        LITEOS_TEXT_HEIGHT : 1U;
+    uint32_t columns = editor_columns(g_window.width, OS_TEXT_WIDTH);
+    uint32_t visible_lines = editor_visible_lines(g_window.height, NOTEPAD_CONTENT_TOP,
+                                                  0U, OS_TEXT_HEIGHT);
+    if (visible_lines == 0U || direction == 0) return;
     uint32_t line = 0U;
     uint32_t column = 0U;
     uint32_t total_lines;
@@ -722,7 +836,7 @@ static void scroll_editor(int32_t direction) {
     total_lines = line == UINT32_MAX ? UINT32_MAX : line + 1U;
     maximum = total_lines > visible_lines ? total_lines - visible_lines : 0U;
     if (direction < 0) {
-        uint32_t distance = (uint32_t)(-direction);
+        uint32_t distance = 0U - (uint32_t)direction;
         g_scroll_line = distance > g_scroll_line ? 0U : g_scroll_line - distance;
     } else if ((uint32_t)direction > maximum -
                (g_scroll_line < maximum ? g_scroll_line : maximum)) {
@@ -735,9 +849,8 @@ static void scroll_editor(int32_t direction) {
 }
 
 static void page_editor(int32_t direction) {
-    uint32_t page = g_window.height > USER_CLIENT_CHROME_HEIGHT + 32U ?
-        (g_window.height - USER_CLIENT_CHROME_HEIGHT - 32U) /
-        LITEOS_TEXT_HEIGHT : 1U;
+    uint32_t page = editor_visible_lines(g_window.height, NOTEPAD_CONTENT_TOP,
+                                         0U, OS_TEXT_HEIGHT);
     if (page > 1000000000U) page = 1000000000U;
     scroll_editor(direction < 0 ? -(int32_t)page : (int32_t)page);
 }
@@ -765,16 +878,24 @@ static bool handle_key(const os_window_event_t *event) {
     if (input->value == OS_INPUT_VALUE_RELEASE) return false;
     dirty_before = g_dirty;
     g_follow_cursor = true;
+    bool navigation = input->code >= 0x4AU && input->code <= 0x52U && input->code != 0x4CU;
+    if (navigation) {
+        if (g_shift && g_selection_anchor == SIZE_MAX) g_selection_anchor = g_cursor;
+        else if (!g_shift) g_selection_anchor = SIZE_MAX;
+    }
     if (g_ctrl && input->code == 0x2EU) {
-        (void)liteos_text_adjust(1);
-        notepad_damage_all();
+        (void)ui_text_adjust(1);
+        reflow_editor();
     } else if (g_ctrl && input->code == 0x2DU) {
-        (void)liteos_text_adjust(-1);
-        notepad_damage_all();
+        (void)ui_text_adjust(-1);
+        reflow_editor();
+    } else if (g_ctrl && key_matches(input, 0x04U, 'A')) {
+        g_selection_anchor = 0U;
+        g_cursor = g_text_length;
     } else if (g_ctrl && key_matches(input, 0x16U, 'S')) {
-        save_document();
+        if (save_document()) set_status("SAVED");
     } else if (g_ctrl && key_matches(input, 0x14U, 'Q')) {
-        notepad_exit(0U);
+        request_action(NOTEPAD_PENDING_CLOSE);
     } else if (g_ctrl && key_matches(input, 0x1DU, 'Z')) {
         undo_document();
     } else if (g_ctrl && key_matches(input, 0x1CU, 'Y')) {
@@ -818,8 +939,55 @@ static bool handle_key(const os_window_event_t *event) {
     notepad_damage_editor();
     if (g_ctrl || g_dirty != dirty_before) {
         notepad_damage_title();
-        notepad_damage_status();
     }
+    render();
+    return true;
+}
+
+static size_t editor_mouse_offset(int32_t x, int32_t y) {
+    uint32_t cell_width = OS_TEXT_WIDTH;
+    uint32_t cell_height = OS_TEXT_HEIGHT;
+    uint32_t columns = editor_columns(g_window.width, cell_width);
+    int32_t top = (int32_t)NOTEPAD_CONTENT_TOP;
+    uint32_t visible_lines = editor_visible_lines(g_window.height, (uint32_t)top,
+                                                  0U, cell_height);
+    if (visible_lines == 0U) return g_cursor;
+    int32_t bottom = top + (int32_t)(visible_lines * cell_height);
+    if (y < top) y = top;
+    if (y >= bottom) y = bottom > top ? bottom - 1 : top;
+    uint32_t line = g_scroll_line + (uint32_t)(y - top) / cell_height;
+    uint32_t column = x > 10 ? ((uint32_t)(x - 10) + cell_width / 2U) / cell_width : 0U;
+    if (column >= columns) column = columns - 1U;
+    return offset_at_position(columns, line, column);
+}
+
+static bool handle_editor_mouse(const os_window_event_t *event) {
+    const os_input_event_t *input = &event->input;
+    if (input->type == OS_INPUT_EVENT_BUTTON && input->code == OS_INPUT_BUTTON_LEFT) {
+        if (input->value == OS_INPUT_VALUE_RELEASE) {
+            if (!g_mouse_selecting) return false;
+            g_cursor = editor_mouse_offset(event->pointer_x, event->pointer_y);
+            g_mouse_selecting = false;
+        } else if (input->value == OS_INPUT_VALUE_PRESS &&
+                   editor_visible_lines(g_window.height, NOTEPAD_CONTENT_TOP,
+                                        0U, OS_TEXT_HEIGHT) != 0U &&
+                   event->pointer_y >= (int32_t)NOTEPAD_CONTENT_TOP &&
+                   (int64_t)event->pointer_y < (int64_t)g_window.height) {
+            if (!g_shift || g_selection_anchor == SIZE_MAX)
+                g_selection_anchor = g_shift ? g_cursor : editor_mouse_offset(event->pointer_x, event->pointer_y);
+            g_cursor = editor_mouse_offset(event->pointer_x, event->pointer_y);
+            g_mouse_selecting = true;
+        } else return false;
+    } else if (input->type == OS_INPUT_EVENT_RELATIVE && g_mouse_selecting &&
+               (input->code == OS_INPUT_REL_X || input->code == OS_INPUT_REL_Y)) {
+        if (event->pointer_y < (int32_t)NOTEPAD_CONTENT_TOP) scroll_editor(-1);
+        else if ((int64_t)event->pointer_y >= (int64_t)g_window.height) scroll_editor(1);
+        size_t next = editor_mouse_offset(event->pointer_x, event->pointer_y);
+        if (next == g_cursor) return true;
+        g_cursor = next;
+    } else return false;
+    g_follow_cursor = false;
+    notepad_damage_editor();
     render();
     return true;
 }
@@ -829,25 +997,34 @@ static bool handle_event(const os_window_event_t *event) {
     uint64_t pixels;
 
     if (event == 0) return false;
+    if (event->type == OS_WINDOW_EVENT_MINIMIZED) {
+        g_mouse_selecting = false;
+        return true;
+    }
 
-    /* V2.3 cooperative close */
-    if (event->type ==
-        OS_WINDOW_EVENT_CLOSE_REQUEST) {
-
-        /*
-         * Do not silently discard an edited document.
-         *
-         * A real modal confirmation dialog can replace this later.
-         */
-        if (g_dirty) {
-            set_status(
-                "UNSAVED CHANGES - CTRL+S SAVE OR CTRL+Q EXIT");
-            notepad_damage_status();
-            render();
-            return true;
+    if (g_message.active && (event->type == OS_WINDOW_EVENT_INPUT ||
+                            event->type == OS_WINDOW_EVENT_CLOSE_REQUEST)) {
+        /* Modifier releases must still reach the owner, even while modal. */
+        if (event->type == OS_WINDOW_EVENT_INPUT && event->input.type == OS_INPUT_EVENT_KEY) {
+            uint32_t code = event->input.code;
+            if (code == 0xE0U || code == 0xE4U) g_ctrl = event->input.value != OS_INPUT_VALUE_RELEASE;
+            if (code == 0xE1U || code == 0xE5U) g_shift = event->input.value != OS_INPUT_VALUE_RELEASE;
         }
-
-        notepad_exit(0U);
+        uint32_t focus = g_message.focus;
+        int32_t pressed = g_message.pressed;
+        enum ui_message_result result = ui_message_event(&g_message,
+            g_window.width, g_window.height, event);
+        if (result == OS_MESSAGE_NONE && focus == g_message.focus &&
+            pressed == g_message.pressed) return true;
+        if (result != OS_MESSAGE_NONE) complete_message(result);
+        notepad_damage_all();
+        render();
+        return true;
+    }
+    if (event->type == OS_WINDOW_EVENT_CLOSE_REQUEST) {
+        request_action(NOTEPAD_PENDING_CLOSE);
+        render();
+        return true;
     }
 
     if (event->type == OS_WINDOW_EVENT_RESIZE) {
@@ -856,34 +1033,21 @@ static bool handle_event(const os_window_event_t *event) {
         if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return false;
         g_window.width = event->resize.width;
         g_window.height = event->resize.height;
-        g_follow_cursor = true;
-        notepad_damage_all();
+        g_mouse_selecting = false;
+        g_message.pressed = -1;
+        reflow_editor();
         render();
         return true;
     }
     if (event->type != OS_WINDOW_EVENT_INPUT) return false;
 
     input = &event->input;
-    if (input->type == OS_INPUT_EVENT_BUTTON &&
-        input->code == OS_INPUT_BUTTON_LEFT &&
-        input->value == OS_INPUT_VALUE_PRESS &&
-        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
-                                     g_window.width,
-                                     USER_CLIENT_CHROME_HEIGHT)) {
-        if (g_dirty) {
-            set_status(
-                "UNSAVED CHANGES - CTRL+S SAVE OR CTRL+Q EXIT");
-            notepad_damage_status();
-            render();
-            return true;
-        }
-        notepad_exit(0U);
-    }
+    if (handle_editor_mouse(event)) return true;
     if (input->type == OS_INPUT_EVENT_RELATIVE &&
         input->code == OS_INPUT_REL_WHEEL && input->value != 0) {
         if (g_ctrl) {
-            (void)liteos_text_adjust(input->value > 0 ? 1 : -1);
-            notepad_damage_all();
+            (void)ui_text_adjust(input->value > 0 ? 1 : -1);
+            reflow_editor();
             render();
             return true;
         }
@@ -896,7 +1060,7 @@ static bool handle_event(const os_window_event_t *event) {
 }
 
 int main(int argc, char **argv) {
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE)) {
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE)) {
         notepad_exit(1U);
     }
     if (argc > 1 && (argv == 0 || argv[1] == 0 || !set_file_path(argv[1]))) {
@@ -905,9 +1069,9 @@ int main(int argc, char **argv) {
     if (!create_window()) notepad_exit(1U);
     (void)load_document();
     render();
-#if LITEOS_REALTEST
-    (void)fprintf(stderr, "LITEOS_NOTEPAD_READY SIZE=%u\n",
-                  liteos_text_size());
+#if OS_REALTEST
+    (void)fprintf(stderr, "OS_NOTEPAD_READY SIZE=%u\n",
+                  ui_text_size());
 #endif
     for (;;) {
         os_window_event_read_t request = {0};

@@ -89,7 +89,7 @@ static EFI_STATUS apply_relocations(UINT8 *image, UINT64 image_size,
     return EFI_SUCCESS;
 }
 
-EFI_STATUS pe_load(EFI_BOOT_SERVICES *bs, const UINT8 *file, UINTN file_size, LITEOS_PE_IMAGE *out) {
+EFI_STATUS pe_load(EFI_BOOT_SERVICES *bs, const UINT8 *file, UINTN file_size, OS_PE_IMAGE *out) {
     if (bs == 0 || file == 0 || out == 0 || file_size < sizeof(IMAGE_DOS_HEADER)) return EFI_INVALID_PARAMETER;
     const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)file;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || !range_ok(dos->e_lfanew, 4 + sizeof(IMAGE_FILE_HEADER), file_size)) {

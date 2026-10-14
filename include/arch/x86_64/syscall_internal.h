@@ -24,17 +24,17 @@ _Static_assert(__builtin_offsetof(syscall_cpu_local_t, CpuIndex) == 48U,
 _Static_assert(__builtin_offsetof(syscall_cpu_local_t, UserEntries) == 64U,
                "syscall cpu-local UserEntries offset");
 
-extern syscall_cpu_local_t liteos_syscall_cpu_local;
-extern void liteos_syscall_entry(void);
-extern void liteos_arch_enter_user(uint64_t instruction_pointer,
+extern syscall_cpu_local_t syscall_cpu_local;
+extern void syscall_entry(void);
+extern void arch_enter_user(uint64_t instruction_pointer,
                                    uint64_t stack_pointer);
 
-bool liteos_syscall_init(uint64_t kernel_stack_top);
+bool syscall_init(uint64_t kernel_stack_top);
 void x86_syscall_set_kernel_stack(uint64_t kernel_stack_top);
-int64_t liteos_syscall_dispatch(arch_trap_frame_t *frame);
+int64_t syscall_dispatch(arch_trap_frame_t *frame);
 int64_t syscall_deliver_pending_signal(arch_trap_frame_t *frame,
                                        int64_t status);
-uint32_t liteos_syscall_thread_create_stage(void);
+uint32_t syscall_thread_create_stage(void);
 int x86_syscall_return_mode(arch_trap_frame_t *frame);
 uint32_t x86_syscall_return_progress(uint32_t cpu_index);
 uint64_t x86_syscall_return_number(uint32_t cpu_index);

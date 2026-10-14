@@ -1,6 +1,6 @@
 #pragma once
-#ifndef LITEOS_KERNEL_TELEMETRY_H
-#define LITEOS_KERNEL_TELEMETRY_H
+#ifndef OS_KERNEL_TELEMETRY_H
+#define OS_KERNEL_TELEMETRY_H
 
 #include "base.h"
 

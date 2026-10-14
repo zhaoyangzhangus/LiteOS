@@ -125,10 +125,12 @@ static kstatus_t nvme_prepare_request_dma(device_t *device,
     uint64_t lba;
     uint64_t sectors;
     uint64_t page_offset = 0U;
+    uint64_t page_capacity = PAGE_SIZE;
+    uint32_t page_count = 1U;
     enum dma_direction direction;
     enum dma_device_access access;
     dma_mapping_t *mapping;
-    page_t *pages[1];
+    page_t *pages[2] = {0};
     kstatus_t status;
 
     if (device == 0 || request == 0 || command == 0 || mapping_out == 0 ||
@@ -147,9 +149,16 @@ static kstatus_t nvme_prepare_request_dma(device_t *device,
         if (bio->io != request || bio->vec_count != 1U || bio->vecs == 0 ||
             (bio->op != BIO_OP_READ && bio->op != BIO_OP_WRITE)) return K_EINVAL;
         bio_vector = &bio->vecs[0];
-        if (bio_vector->page == 0 || bio_vector->length == 0U ||
-            bio_vector->offset >= PAGE_SIZE ||
-            bio_vector->length > PAGE_SIZE - bio_vector->offset ||
+        if (bio_vector->page == 0) return K_EINVAL;
+        if ((bio_vector->page->flags & PAGE_COMPOUND_HEAD) != 0U) {
+            page_capacity = (uint64_t)PAGE_SIZE <<
+                            bio_vector->page->order;
+        }
+        if ((bio_vector->page->flags & PAGE_FREE) != 0U ||
+            (bio_vector->page->flags & PAGE_COMPOUND_TAIL) != 0U ||
+            bio_vector->length == 0U ||
+            bio_vector->offset >= page_capacity ||
+            bio_vector->length > page_capacity - bio_vector->offset ||
             (bio_vector->length & 511U) != 0U) return K_EINVAL;
         bytes = bio_vector->length;
         lba = bio->lba;
@@ -181,10 +190,23 @@ static kstatus_t nvme_prepare_request_dma(device_t *device,
     if (sectors == 0U || sectors > 0x10000ULL || lba > UINT64_MAX - sectors) {
         return K_EINVAL;
     }
-    pages[0] = page;
+    page_count = (uint32_t)((page_offset + bytes + PAGE_SIZE - 1U) /
+                            PAGE_SIZE);
+    if (page_count == 0U || page_count > 2U) return K_EINVAL;
+    uint64_t page_physical = page_to_phys(page).value;
+    if (page_physical == UINT64_MAX ||
+        page_physical > UINT64_MAX - (uint64_t)(page_count - 1U) * PAGE_SIZE) {
+        return K_EACCES;
+    }
+    for (uint32_t index = 0U; index < page_count; ++index) {
+        pages[index] = phys_to_page(paddr_make(
+            page_physical + (uint64_t)index * PAGE_SIZE));
+        if (pages[index] == 0 ||
+            (pages[index]->flags & PAGE_FREE) != 0U) return K_EACCES;
+    }
     mapping = (dma_mapping_t *)kzalloc(sizeof(*mapping), 0);
     if (mapping == 0) return K_ENOMEM;
-    status = dma_map_pages(device, pages, 1U, direction, mapping);
+    status = dma_map_pages(device, pages, page_count, direction, mapping);
     if (status != K_OK) {
         kfree(mapping);
         return status;
@@ -192,6 +214,7 @@ static kstatus_t nvme_prepare_request_dma(device_t *device,
     iova_t address = iova_make(mapping->segments[0].addr.value + page_offset);
     access = request->opcode == IO_READ ? DMA_DEVICE_WRITE : DMA_DEVICE_READ;
     if (mapping->segment_count != 1U ||
+        mapping->segments[0].length < page_offset + bytes ||
         dma_validate_access(device, address, bytes, access) != K_OK) {
         status = nvme_release_transient_dma(mapping, 0);
         return status == K_OK ? K_EACCES : K_EIO;
@@ -199,6 +222,14 @@ static kstatus_t nvme_prepare_request_dma(device_t *device,
     dma_sync_for_device(mapping);
     command->opcode_flags = request->opcode == IO_READ ? NVME_IO_READ : NVME_IO_WRITE;
     command->prp1 = address.value;
+    command->prp2 = 0U;
+    if (page_offset + bytes > PAGE_SIZE) {
+        if (page_count != 2U) {
+            status = nvme_release_transient_dma(mapping, 0);
+            return status == K_OK ? K_EINVAL : K_EIO;
+        }
+        command->prp2 = mapping->segments[0].addr.value + PAGE_SIZE;
+    }
     command->cdw10 = (uint32_t)lba;
     command->cdw11 = (uint32_t)(lba >> 32);
     command->cdw12 = (uint32_t)(sectors - 1U);

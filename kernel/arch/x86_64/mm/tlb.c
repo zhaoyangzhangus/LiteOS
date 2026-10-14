@@ -6,6 +6,7 @@
 #include <kernel/mm.h>
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
+#include <kernel/console.h>
 
 /*
  * 当前实现串行化 shootdown 请求。这样页表写入者可以严格执行：发布 PTE 变更、
@@ -19,6 +20,76 @@ static atomic_bool g_tlb_waiting[MAX_CPUS];
 static vaddr_t g_tlb_address;
 static paddr_t g_tlb_root;
 static uint16_t g_tlb_pcid;
+static bool g_tlb_full_root;
+
+/* Keep rare shootdown failures visible even in normal boots where routine
+ * COM1 tracing is disabled.  Chrome turns MADV_DONTNEED failures into a hard
+ * allocator CHECK, so the target CPU and address are needed to diagnose them. */
+static void tlb_failure_putc(char value) {
+    for (uint32_t attempt = 0U; attempt < 100000U; ++attempt) {
+        uint8_t status;
+        __asm__ volatile ("inb %w1, %0" : "=a"(status) : "d"(0x3FDU));
+        if ((status & 0x20U) != 0U) break;
+        __asm__ volatile ("pause");
+    }
+    __asm__ volatile ("outb %0, %w1" : : "a"((uint8_t)value), "d"(0x3F8U));
+}
+
+static void tlb_failure_text(const char *text) {
+    if (text == 0) return;
+    while (*text != '\0') tlb_failure_putc(*text++);
+}
+
+static void tlb_failure_hex(uint64_t value) {
+    static const char digits[] = "0123456789abcdef";
+    tlb_failure_text("0x");
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        tlb_failure_putc(digits[(value >> (uint32_t)shift) & 0xFU]);
+    }
+}
+
+static void tlb_failure_report(const char *reason, uint32_t owner,
+                               uint32_t target, uint32_t apic_id,
+                               uint64_t generation, uint64_t acknowledgement,
+                               paddr_t root, vaddr_t address) {
+    tlb_failure_text("OS_TLB_");
+    tlb_failure_text(reason);
+    tlb_failure_text(" owner=");
+    tlb_failure_hex(owner);
+    tlb_failure_text(" target=");
+    tlb_failure_hex(target);
+    tlb_failure_text(" apic=");
+    tlb_failure_hex(apic_id);
+    tlb_failure_text(" gen=");
+    tlb_failure_hex(generation);
+    tlb_failure_text(" ack=");
+    tlb_failure_hex(acknowledgement);
+    tlb_failure_text(" root=");
+    tlb_failure_hex(root.value);
+    tlb_failure_text(" va=");
+    tlb_failure_hex((uint64_t)address);
+    uint32_t state = UINT32_MAX, runnable = 0;
+    uint64_t tid = 0, waits = 0;
+    uint32_t lock = 0, lock_owner = UINT32_MAX, lock_waiter = UINT32_MAX;
+    if (sched_debug_cpu(target, &state, &tid, &runnable)) {
+        tlb_failure_text(" target_tid=");
+        tlb_failure_hex(tid);
+        tlb_failure_text(" target_state=");
+        tlb_failure_hex(state);
+        tlb_failure_text(" runnable=");
+        tlb_failure_hex(runnable);
+    }
+    x86_page_table_debug_state(&lock, &lock_owner, &lock_waiter, &waits);
+    tlb_failure_text(" pt_lock=");
+    tlb_failure_hex(lock);
+    tlb_failure_text(" pt_owner=");
+    tlb_failure_hex(lock_owner);
+    tlb_failure_text(" pt_waiter=");
+    tlb_failure_hex(lock_waiter);
+    tlb_failure_text(" pt_waits=");
+    tlb_failure_hex(waits);
+    tlb_failure_text("\r\n");
+}
 
 typedef struct {
     uint64_t pcid;
@@ -99,10 +170,24 @@ static void invalidate_target_page(paddr_t root, uint16_t pcid, vaddr_t address)
     invalidate_local_page(address);
 }
 
+static void invalidate_target_root(paddr_t root, uint16_t pcid) {
+    if (x86_current_root_table().value == root.value) {
+        uint64_t cr3;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+        cr3 &= ~(1ULL << 63); /* Do not request PCID no-flush. */
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    } else if (x86_boot_cpu_features.pcid && x86_boot_cpu_features.invpcid) {
+        invpcid_descriptor_t descriptor = {(uint64_t)pcid, 0U};
+        __asm__ volatile ("invpcid %0, %1" : : "m"(descriptor), "r"(1ULL)
+                          : "memory");
+    }
+    /* Without PCID, switching back to an inactive root flushes its entries. */
+}
+
 static bool send_tlb_ipi_with_retry(uint32_t apic_id) {
     /* ICR 可能正被本地 APIC 的定时器/其它 IPI 占用，短暂失败时重试。 */
     for (uint32_t attempt = 0; attempt < 8U; ++attempt) {
-        if (liteos_lapic_send_fixed(apic_id, X86_TLB_IPI_VECTOR)) return true;
+        if (lapic_send_fixed(apic_id, X86_TLB_IPI_VECTOR)) return true;
         for (uint32_t pause = 0; pause < 256U; ++pause) {
             __asm__ volatile ("pause");
         }
@@ -202,16 +287,17 @@ void x86_tlb_ipi_interrupt(void) {
                                                memory_order_acquire);
     vaddr_t address = g_tlb_address;
     paddr_t root = g_tlb_root;
-    invalidate_target_page(root, g_tlb_pcid, address);
+    if (g_tlb_full_root) invalidate_target_root(root, g_tlb_pcid);
+    else invalidate_target_page(root, g_tlb_pcid, address);
     uint32_t cpu_index = x86_current_cpu_index();
     if (generation != 0 && cpu_index < MAX_CPUS) {
         atomic_store_explicit(&g_tlb_acknowledgement[cpu_index], generation,
                               memory_order_release);
     }
-    liteos_lapic_end_of_interrupt();
+    lapic_end_of_interrupt();
 }
 
-bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
+static bool tlb_shootdown(paddr_t root, vaddr_t virtual_address, bool full_root) {
     if (root.value == 0 || !x86_is_canonical((uint64_t)virtual_address)) return false;
 
     /*
@@ -235,8 +321,10 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
     g_tlb_root = root;
     g_tlb_address = virtual_address;
     g_tlb_pcid = root_pcid(root);
+    g_tlb_full_root = full_root;
     atomic_store_explicit(&g_tlb_generation, generation, memory_order_release);
-    invalidate_target_page(root, g_tlb_pcid, virtual_address);
+    if (full_root) invalidate_target_root(root, g_tlb_pcid);
+    else invalidate_target_page(root, g_tlb_pcid, virtual_address);
 
     const x86_acpi_platform_t *platform = x86_acpi_platform();
     if (platform != 0) {
@@ -256,6 +344,9 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
             if (user_address && !sched_cpu_uses_root(cpu_index, root)) continue;
             targets[cpu_index] = true;
             if (!send_tlb_ipi_with_retry(platform->cpus[cpu_index].apic_id)) {
+                tlb_failure_report("SEND_FAIL", current_cpu, cpu_index,
+                                   platform->cpus[cpu_index].apic_id,
+                                   generation, 0U, root, virtual_address);
                 tlb_finish_shootdown(current_cpu, interrupt_flags);
                 return false;
             }
@@ -269,6 +360,12 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
             while (atomic_load_explicit(&g_tlb_acknowledgement[cpu_index],
                                         memory_order_acquire) != generation) {
                 if ((int64_t)(x86_read_tsc() - deadline) >= 0) {
+                    tlb_failure_report(
+                        "ACK_TIMEOUT", current_cpu, cpu_index,
+                        platform->cpus[cpu_index].apic_id, generation,
+                        atomic_load_explicit(
+                            &g_tlb_acknowledgement[cpu_index],
+                            memory_order_relaxed), root, virtual_address);
                     tlb_finish_shootdown(current_cpu, interrupt_flags);
                     return false;
                 }
@@ -278,6 +375,14 @@ bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
     }
     tlb_finish_shootdown(current_cpu, interrupt_flags);
     return true;
+}
+
+bool x86_tlb_shootdown_page(paddr_t root, vaddr_t virtual_address) {
+    return tlb_shootdown(root, virtual_address, false);
+}
+
+bool x86_tlb_shootdown_root(paddr_t root) {
+    return tlb_shootdown(root, 0U, true);
 }
 
 bool x86_tlb_shootdown_self_test(void) {

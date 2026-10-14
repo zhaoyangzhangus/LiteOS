@@ -53,7 +53,7 @@ for cpu in "${cpus[@]}"; do
         exit 2
     fi
 
-    if [[ "${LITEOS_VERBOSE:-0}" == "1" ]]; then
+    if [[ "${OS_VERBOSE:-0}" == "1" ]]; then
         echo "QEMU matrix: running ${cpu} CPU(s), accel=${actual_accel}"
     fi
     BUILD="$build_dir" ./run-qemu.sh \
@@ -70,6 +70,6 @@ for cpu in "${cpus[@]}"; do
         "$build_dir/qemu-serial-${cpu}.log"
 done
 
-if [[ "${LITEOS_VERBOSE:-0}" == "1" ]]; then
+if [[ "${OS_VERBOSE:-0}" == "1" ]]; then
     echo "QEMU matrix: all CPU counts passed"
 fi

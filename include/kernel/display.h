@@ -75,6 +75,11 @@ kstatus_t display_core_register_scanout_backend(
 
 bool display_core_has_native_scanout(uint32_t output);
 
+/* Submit one full-frame CPU-WB buffer through the registered native backend
+ * and wait for its release fence.  This is the boot-time hand-off test used
+ * to separate native flip/event delivery from the later compositor wiring. */
+bool display_core_native_self_test(void);
+
 /*
  * Kernel compositor fast path.
  *

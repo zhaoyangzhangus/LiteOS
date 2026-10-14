@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$buildName = if ($Build) { $Build } elseif ($env:LITEOS_BUILD) { $env:LITEOS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
+$buildName = if ($Build) { $Build } elseif ($env:OS_BUILD) { $env:OS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
 if ([IO.Path]::IsPathRooted($buildName) -or $buildName -match '(^|[\\/])\.\.(?:[\\/]|$)') {
     throw "Build directory must be relative to the project: $buildName"
 }

@@ -17,7 +17,7 @@
  */
 #include <openssl/opensslconf.h>
 
-#if !defined(OPENSSL_SYS_UEFI) && !defined(OPENSSL_SYS_LITEOS)
+#if !defined(OPENSSL_SYS_UEFI) && !defined(OPENSSL_SYS_FREESTANDING)
 #include "crypto/bn_conf.h"
 #endif
 

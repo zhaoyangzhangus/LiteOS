@@ -6,6 +6,7 @@
 #include "rbtree.h"
 #include "spinlock.h"
 #include "fat32.h"
+#include "wait.h"
 
 struct page;
 struct vm_file_ops;
@@ -26,6 +27,8 @@ typedef struct vnode {
 
     rwlock_t lock;
     void *page_cache;
+    wait_queue_t record_lock_waitq;
+    atomic_uint record_lock_sequence;
 } vnode_t;
 
 typedef struct file {
@@ -42,6 +45,8 @@ kstatus_t vfs_open(const char __user *path, uint32_t flags, uint32_t mode, file_
 kstatus_t vfs_read(file_t *file, void __user *buf, size_t len, uint64_t *bytes);
 kstatus_t vfs_write(file_t *file, const void __user *buf, size_t len, uint64_t *bytes);
 kstatus_t vfs_fsync(file_t *file);
+/* Flush cached file data and all mounted FAT volumes before power control. */
+kstatus_t vfs_sync_all(void);
 void vfs_close(file_t *file);
 #include <uapi/file.h>
 
@@ -82,13 +87,27 @@ kstatus_t vfs_register_backend_file_ex(const char *path, uint64_t size, uint32_t
                                        vfs_backend_fsync_t fsync,
                                        vfs_backend_truncate_t truncate,
                                        void *context);
-kstatus_t vfs_mount_fat32(const char *prefix, LITEOS_FAT32 *filesystem);
+kstatus_t vfs_mount_fat32(const char *prefix, OS_FAT32 *filesystem);
 kstatus_t vfs_unmount_fat32(void);
 kstatus_t vfs_create_kernel(const char *path, uint32_t mode, bool directory);
 kstatus_t vfs_mkdir_kernel(const char *path, uint32_t mode);
+kstatus_t vfs_symlink_kernel(const char *target, const char *path);
+kstatus_t vfs_readlink_kernel(const char *path, char *buffer, size_t capacity,
+                             size_t *bytes);
+kstatus_t vfs_resolve_path_kernel(const char *path, bool follow_final,
+                                bool allow_missing_leaf, char output[256]);
 kstatus_t vfs_remove_kernel(const char *path);
+kstatus_t vfs_remove_typed_kernel(const char *path, int directory);
+kstatus_t vfs_directory_path_kernel(file_t *file, char *path, size_t capacity);
 kstatus_t vfs_open_kernel(const char *path, uint32_t flags, uint32_t mode,
                           file_t **out);
+kstatus_t vfs_enumerate_file(file_t *file, uint32_t index,
+                             os_file_info_t *out);
+/* Copies a bounded batch from one namespace enumeration. Count is zero on
+ * failure; returned records are private copies, not registry pointers. */
+kstatus_t vfs_enumerate_file_batch(file_t *file, uint32_t index,
+                                   os_file_info_t *out, uint32_t capacity,
+                                   uint32_t *count);
 kstatus_t vfs_stat_kernel(const char *path, os_file_info_t *out);
 kstatus_t vfs_file_stat(file_t *file, os_file_info_t *out);
 kstatus_t vfs_rename_kernel(const char *old_path, const char *new_path);
@@ -97,6 +116,8 @@ kstatus_t vfs_enumerate_kernel(const char *path, uint32_t index,
 kstatus_t vfs_stat(const char __user *path, os_file_info_t *out);
 kstatus_t vfs_enumerate(const char __user *path, uint32_t index,
                         os_file_info_t *out);
+kstatus_t vfs_rename(const char __user *old_path,
+                     const char __user *new_path);
 kstatus_t vfs_file_page_get(vnode_t *vnode, uint64_t page_index,
                             struct page **out);
 void vfs_file_page_mark_dirty(vnode_t *vnode, uint64_t page_index);
@@ -104,6 +125,9 @@ kstatus_t vfs_page_cache_sync(vnode_t *vnode, uint64_t first_page,
                               uint64_t page_count);
 const struct vm_file_ops *vfs_vm_file_ops(void);
 kstatus_t vfs_read_kernel(file_t *file, void *buf, size_t len, uint64_t *bytes);
+/* Executable loading shares the coherent file pages used by mmap. */
+kstatus_t vfs_read_cached_kernel(file_t *file, void *buf, size_t len,
+                                 uint64_t *bytes);
 kstatus_t vfs_write_kernel(file_t *file, const void *buf, size_t len,
                            uint64_t *bytes);
 kstatus_t vfs_seek(file_t *file, int64_t offset, uint32_t whence,

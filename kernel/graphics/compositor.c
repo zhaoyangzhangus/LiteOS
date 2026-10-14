@@ -1,8 +1,137 @@
 #include <kernel/sched.h>
+#include <kernel/console.h>
+#include <kernel/display.h>
+#include <kernel/gpu.h>
 #include <kernel/qemu_stdvga.h>
+#include <kernel/realtest.h>
 #include "internal.h"
 
 /* REFACTOR_P7A_COMPOSITOR_OWNER: frame orchestration. */
+
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
+#endif
+
+#if OS_REALTEST
+static uint64_t compositor_display_probe_hash(
+    const volatile uint32_t *pixels,
+    uint32_t stride,
+    uint32_t x,
+    uint32_t y,
+    uint32_t width,
+    uint32_t height) {
+    uint64_t hash = 1469598103934665603ULL;
+
+    if (pixels == 0 || stride == 0U || width == 0U || height == 0U) {
+        return 0U;
+    }
+
+    for (uint32_t row = 0U; row < height; ++row) {
+        for (uint32_t column = 0U; column < width; ++column) {
+            uint32_t pixel = pixels[(uint64_t)(y + row) * stride +
+                                    x + column];
+            for (uint32_t byte = 0U; byte < sizeof(pixel); ++byte) {
+                hash ^= (uint8_t)(pixel >> (byte * 8U));
+                hash *= 1099511628211ULL;
+            }
+        }
+    }
+    return hash;
+}
+
+static void compositor_report_display_probe(void) {
+    static bool reported;
+    const compositor_window_view_t *view = 0;
+    uint32_t surface_x;
+    uint32_t surface_y;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    const volatile uint32_t *scene;
+    const volatile uint32_t *scanout;
+    volatile uint32_t *probe_pixel;
+    uint64_t scene_hash;
+    uint64_t scanout_hash;
+    uint32_t center_offset;
+    uint32_t probe_saved;
+    uint32_t probe_observed;
+    Rect damage0 = { 0U, 0U, 0U, 0U };
+
+    if (reported || g_window_server.composite_framebuffer == 0 ||
+        g_window_server.framebuffer == 0) {
+        return;
+    }
+
+    for (uint32_t index = 0U;
+         index < g_compositor_snapshot.window_count;
+         ++index) {
+        const compositor_window_view_t *candidate =
+            &g_compositor_snapshot.windows[index];
+        if (candidate->width == 800U && candidate->height == 600U &&
+            candidate->x >= 0 && candidate->y >= 0 &&
+            window_client_decorations(candidate->flags)) {
+            view = candidate;
+            break;
+        }
+    }
+    if (view == 0) return;
+
+    surface_x = (uint32_t)view->x + window_client_offset_x(view->flags);
+    surface_y = (uint32_t)view->y + window_client_offset_y(view->flags);
+    width = view->width;
+    height = view->height;
+    stride = g_window_server.display_stride;
+    if (surface_x > g_window_server.display_width ||
+        surface_y > g_window_server.display_height ||
+        width > g_window_server.display_width - surface_x ||
+        height > g_window_server.display_height - surface_y ||
+        stride < g_window_server.display_width) {
+        return;
+    }
+
+    scene = g_window_server.composite_framebuffer +
+            (uint64_t)surface_y * stride + surface_x;
+    scanout = g_window_server.framebuffer +
+              (uint64_t)surface_y * stride + surface_x;
+    scene_hash = compositor_display_probe_hash(scene, stride, 0U, 0U,
+                                                width, height);
+    scanout_hash = compositor_display_probe_hash(scanout, stride, 0U, 0U,
+                                                  width, height);
+    center_offset = (height / 2U) * stride + width / 2U;
+    probe_pixel = (volatile uint32_t *)(uintptr_t)(scanout + center_offset);
+    probe_saved = *probe_pixel;
+    compositor_copy_wc_scanline(
+        probe_pixel,
+        (const uint32_t *)(uintptr_t)(scene + center_offset),
+        1U);
+    __asm__ volatile ("sfence" : : : "memory");
+    probe_observed = *probe_pixel;
+    *probe_pixel = probe_saved;
+    __asm__ volatile ("sfence" : : : "memory");
+    if (g_compositor_snapshot.damage_count != 0U) {
+        damage0 = g_compositor_snapshot.damage_rects[0];
+    }
+    reported = true;
+    kernel_serial_printf_serial_only(
+        "OS_DISPLAY_SURFACE_PROBE x=%u y=%u width=%u height=%u "
+        "scene_hash=%llx scanout_hash=%llx scene0=%x scanout0=%x "
+        "scene_center=%x scanout_center=%x damage_count=%u "
+        "d0=%u,%u,%u,%u plan=%u/%u copy_probe=%x\r\n",
+        surface_x, surface_y, width, height,
+        (unsigned long long)scene_hash,
+        (unsigned long long)scanout_hash,
+        (unsigned)scene[0],
+        (unsigned)scanout[0],
+        (unsigned)scene[center_offset],
+        (unsigned)scanout[center_offset],
+        g_compositor_snapshot.damage_count,
+        damage0.x0, damage0.y0, damage0.x1, damage0.y1,
+        g_compositor_render_plan_valid ? 1U : 0U,
+        g_compositor_render_plan_count,
+        probe_observed);
+}
+#endif
+
 /* Linux Xcursor/Adwaita top_left_arrow, 24x24, hotspot (3,1).
  * The source is an ARGB cursor surface; it is composited pixel by pixel
  * with the same source-over rule as a Linux software cursor. */
@@ -27,9 +156,158 @@
 
 
 
+static uint32_t compositor_native_cursor_blend(uint32_t background,
+                                               uint32_t cursor) {
+    uint32_t alpha = cursor >> 24U;
+    uint32_t color = cursor & 0x00FFFFFFU;
+    uint32_t inverse;
+
+    if (alpha == 0U) return background;
+    if (alpha >= 255U) return color;
+
+    inverse = 255U - alpha;
+    return (((((background >> 16U) & 0xFFU) * inverse +
+              ((color >> 16U) & 0xFFU) * alpha + 127U) / 255U) << 16U) |
+           (((((background >> 8U) & 0xFFU) * inverse +
+              ((color >> 8U) & 0xFFU) * alpha + 127U) / 255U) << 8U) |
+           ((((background & 0xFFU) * inverse +
+              (color & 0xFFU) * alpha + 127U) / 255U));
+}
+
+
+/*
+ * Native scanout consumes an allocation, while the retained compositor scene
+ * is deliberately an ordinary WB buffer.  Snapshot the scene into a fresh
+ * allocation before submitting it.  This is intentionally a correctness
+ * boundary: the compositor may start rendering the next retained frame as
+ * soon as this function returns, but the native KAPI may still be copying the
+ * submitted source on its deferred worker.
+ */
+static kstatus_t compositor_submit_native_snapshot(void) {
+    gpu_allocation_t *buffer = 0;
+    gpu_fence_t *fence = 0;
+    const uint32_t *scene;
+    uint32_t width = g_window_server.display_width;
+    uint32_t height = g_window_server.display_height;
+    uint32_t stride = g_window_server.display_stride;
+    uint64_t row_bytes;
+    uint64_t frame_bytes;
+    void *mapped = 0;
+    kstatus_t status;
+    static bool accepted_reported;
+
+    if (!display_core_has_native_scanout(0U) ||
+        g_window_server.composite_framebuffer == 0 ||
+        g_window_server.composite_framebuffer ==
+            g_window_server.framebuffer ||
+        width == 0U || height == 0U || stride < width) {
+        return K_EINVAL;
+    }
+
+    row_bytes = (uint64_t)stride * sizeof(uint32_t);
+    if (row_bytes == 0U ||
+        (uint64_t)height > UINT64_MAX / row_bytes) {
+        return K_EOVERFLOW;
+    }
+    frame_bytes = row_bytes * height;
+
+    status = gpu_allocation_create(frame_bytes, &buffer);
+    if (status != K_OK || buffer == 0) {
+        return status == K_OK ? K_ENOMEM : status;
+    }
+
+    status = gpu_fence_create(&fence);
+    if (status != K_OK || fence == 0) {
+        object_put(buffer);
+        return status == K_OK ? K_ENOMEM : status;
+    }
+
+    status = gpu_allocation_cpu_map(buffer, 0U, frame_bytes, &mapped);
+    if (status != K_OK || mapped == 0) {
+        object_put(fence);
+        object_put(buffer);
+        return status == K_OK ? K_EIO : status;
+    }
+
+    scene = (const uint32_t *)(uintptr_t)g_window_server.composite_framebuffer;
+    for (uint32_t row = 0U; row < height; ++row) {
+        __builtin_memcpy(
+            (uint8_t *)mapped + (uint64_t)row * row_bytes,
+            scene + (uint64_t)row * stride,
+            (size_t)row_bytes);
+    }
+
+    /* The retained scene is cursor-free.  Native scanout has no direct GOP
+     * cursor overlay, so fold the snapshot's cursor into this private copy. */
+    {
+        int64_t origin_x =
+            (int64_t)g_compositor_snapshot.pointer_x -
+            window_cursor_hotspot_x(g_compositor_snapshot.cursor_shape);
+        int64_t origin_y =
+            (int64_t)g_compositor_snapshot.pointer_y -
+            window_cursor_hotspot_y(g_compositor_snapshot.cursor_shape);
+        int64_t left = origin_x < 0 ? 0 : origin_x;
+        int64_t top = origin_y < 0 ? 0 : origin_y;
+        int64_t right = origin_x + WINDOW_CURSOR_WIDTH;
+        int64_t bottom = origin_y + WINDOW_CURSOR_HEIGHT;
+        uint32_t *frame = (uint32_t *)mapped;
+
+        if (right > (int64_t)width) right = width;
+        if (bottom > (int64_t)height) bottom = height;
+        if (left < right && top < bottom) {
+            for (int64_t y = top; y < bottom; ++y) {
+                for (int64_t x = left; x < right; ++x) {
+                    uint32_t cursor_x = (uint32_t)(x - origin_x);
+                    uint32_t cursor_y = (uint32_t)(y - origin_y);
+                    uint64_t offset = (uint64_t)y * stride + (uint64_t)x;
+                    frame[offset] = compositor_native_cursor_blend(
+                        frame[offset],
+                        window_cursor_pixel(g_compositor_snapshot.cursor_shape,
+                                            cursor_x, cursor_y));
+                }
+            }
+        }
+    }
+
+    gpu_allocation_cpu_unmap(buffer, mapped, frame_bytes);
+    mapped = 0;
+
+    status = display_commit_submit(
+        0U, buffer, 0U, row_bytes, width, height, 1U,
+        0, 0U, fence, 1U);
+    if (status != K_OK) {
+        object_put(fence);
+        object_put(buffer);
+        return status;
+    }
+
+    /* The submitted snapshot contains the current pointer.  No direct GOP
+     * cursor state is changed on this path; the next native frame is always a
+     * complete scene snapshot. */
+    g_window_server.presented_pointer_x =
+        g_compositor_snapshot.pointer_x;
+    g_window_server.presented_pointer_y =
+        g_compositor_snapshot.pointer_y;
+    g_window_server.presented_pointer_valid = true;
+    g_window_server.presented_cursor_shape = g_compositor_snapshot.cursor_shape;
+
+    if (!accepted_reported) {
+        accepted_reported = true;
+        realtest_checkpoint(
+            "OS_NVKMS_NATIVE_COMPOSITOR_ACCEPTED");
+    }
+
+    object_put(fence);
+    object_put(buffer);
+    return K_OK;
+}
+
+
 void compositor_commit_snapshot(void) {
     bool commit_as_move_transaction;
     bool allow_yield;
+    bool qemu_single_page;
+    kstatus_t native_status;
 
     if (g_window_server.framebuffer == 0 ||
         g_window_server.composite_framebuffer == 0 ||
@@ -39,15 +317,33 @@ void compositor_commit_snapshot(void) {
         return;
     }
 
-    /*
-     * Native hidden-VRAM publication replaces the GOP visible copy entirely.
-     * The final Y_OFFSET write is the only operation that exposes this frame.
-     */
-    if (qemu_stdvga_flip_available() &&
+    /* Native scanout owns the complete frame.  Do not publish the same scene
+     * through the firmware GOP mapping, which is not the active GB205 target. */
+    if (display_core_has_native_scanout(0U)) {
+        native_status = compositor_submit_native_snapshot();
+        if (native_status == K_EBUSY) {
+            /* The core permits one in-flight commit.  Preserve this generation
+             * for a later compositor pass once the previous flip retires. */
+            window_lock();
+            window_mark_dirty_locked();
+            window_unlock();
+            window_server_notify_worker();
+        }
+        return;
+    }
+
+    if (qemu_stdvga_page_flip_active() &&
         compositor_commit_qemu_stdvga()) {
         compositor_present_mark_scanout_flipped();
         return;
     }
+
+    /* The fixed QEMU page has no atomic scanout boundary.  Every writer on
+     * this path must go through compositor_publication_rect(), which preserves
+     * the software cursor in scanlines intersecting its rectangle. */
+    qemu_single_page =
+        qemu_stdvga_flip_available() &&
+        !qemu_stdvga_page_flip_active();
 
     commit_as_move_transaction =
         g_compositor_snapshot.dragging_identifier != 0U;
@@ -55,7 +351,9 @@ void compositor_commit_snapshot(void) {
     /* Keep cursor-sized and other tiny updates atomic (there is no useful
      * scheduling point in a 24x24 copy), but make a large ordinary client
      * repaint preemptible in bounded row chunks.  A drag/move is always kept
-     * atomic until a real page-flip path exists. */
+     * atomic until a real page-flip path exists. Fixed-page QEMU is safe at
+     * these row boundaries too: publication preserves the visible cursor in
+     * each intersecting scanline, and composing pins the immutable scene. */
     allow_yield = !commit_as_move_transaction &&
                   compositor_publication_damage_pixels() >
                   WINDOW_COMPOSITOR_ATOMIC_PIXELS;
@@ -72,6 +370,7 @@ void compositor_commit_snapshot(void) {
      */
     if (WINDOW_COMPOSITOR_PARALLEL_ORDINARY != 0U &&
         !commit_as_move_transaction &&
+        !qemu_single_page &&
         g_compositor_snapshot.damage_count == 1U) {
 
         const Rect *ordinary =
@@ -98,7 +397,8 @@ void compositor_commit_snapshot(void) {
      * so it cannot expose the stale-gap corruption caused by the old bounding
      * box copy. */
     if (WINDOW_COMPOSITOR_PARALLEL_DRAG != 0U &&
-        commit_as_move_transaction) {
+        commit_as_move_transaction &&
+        !qemu_single_page) {
         uint32_t left = g_window_server.display_width;
         uint32_t top = g_window_server.display_height;
         uint32_t right = 0U;
@@ -379,12 +679,15 @@ bool compositor_snapshot_begin_locked(void) {
 
     snapshot->focused_identifier =
         g_window_server.focused_identifier;
+    snapshot->title_pressed_identifier = g_window_server.title_pressed_identifier;
+    snapshot->title_pressed_button = g_window_server.title_pressed_button;
 
     snapshot->pointer_x =
         g_window_server.pointer_x;
 
     snapshot->pointer_y =
         g_window_server.pointer_y;
+    snapshot->cursor_shape = window_input_cursor_shape_locked();
 
     snapshot->desktop_hovered_app =
         g_window_server.desktop_hovered_app;
@@ -496,8 +799,10 @@ bool compositor_snapshot_begin_locked(void) {
         view->background = window->background;
         view->buffer_size = window->buffer_size;
         view->owner_address = window->owner_address;
+        view->present_sequence = window->present_sequence;
         view->resize_pending = window->resize_pending;
-        view->maximized = window->maximized;
+        view->maximized = window->maximized || window->fullscreen;
+        window_surface_snapshot_capture_locked(view);
 
         for (uint32_t title_index = 0U;
              title_index < sizeof(view->title);
@@ -585,9 +890,6 @@ void compositor_snapshot_plan(void) {
             snapshot);
     }
 
-    /* P7B: materialize touch/full/opaque masks before render planning. */
-    (void)compositor_tile_metadata_build(snapshot);
-
     first_window_index =
         compositor_snapshot_occlusion_floor(
             snapshot);
@@ -611,6 +913,7 @@ void compositor_snapshot_plan(void) {
 
         if (!keep) {
             if (view->reference != 0) {
+                window_surface_snapshot_release(view);
                 object_put(view->reference);
                 view->reference = 0;
             }
@@ -632,6 +935,12 @@ void compositor_snapshot_plan(void) {
 
     snapshot->window_count =
         write_index;
+
+    /* Tile masks encode indices into this array. Build only after pruning
+     * and compaction, or an exposed lower window can be mistaken for the
+     * moved top window and its old pixels will never be restored. This also
+     * avoids computing masks for windows discarded by the occlusion floor. */
+    (void)compositor_tile_metadata_build(snapshot);
 
     /*
      * Adaptive: the builder immediately returns for simple frames.
@@ -739,20 +1048,33 @@ void compositor_render_snapshot(void) {
     } else {
         compositor_present_reset_scanout_state();
         compositor_commit_snapshot();
+#if OS_REALTEST
+        if (!display_core_has_native_scanout(0U)) {
+            compositor_report_display_probe();
+        }
+#endif
 
         /*
-         * Do not restore/reblend 24x24 cursor pixels after every unrelated
-         * client update.  A coordinate change still presents immediately;
-         * force only when this scene transaction actually overwrote the
-         * currently visible cursor rectangle.
+         * Active QEMU page flip already received a complete cursor-inclusive
+         * hidden page.  Fixed-page QEMU publication preserves the currently
+         * visible cursor inside each intersecting scanline, so only a real
+         * pointer move (or an uninitialized cursor) needs the direct overlay.
          */
-        compositor_present_cursor_direct(
-            compositor_present_scanout_flipped() ||
-            compositor_snapshot_overwrites_presented_cursor());
+        if (!display_core_has_native_scanout(0U) &&
+            !compositor_present_scanout_flipped()) {
+            bool qemu_single_page =
+                qemu_stdvga_flip_available() &&
+                !qemu_stdvga_page_flip_active();
+
+            compositor_present_cursor_direct(
+                qemu_single_page ? false :
+                compositor_snapshot_overwrites_presented_cursor());
+        }
     }
 }
 
 void compositor_snapshot_finish(void) {
+    bool present_ack_changed[WINDOW_SERVER_MAX_WINDOWS] = { false };
     /*
      * This snapshot has finished scene rendering and publication.
      *
@@ -795,6 +1117,15 @@ void compositor_snapshot_finish(void) {
 
         reference->compositor_presented_valid =
             true;
+
+        present_ack_changed[index] =
+            atomic_load_explicit(&reference->compositor_presented_sequence,
+                                 memory_order_relaxed) !=
+            view->present_sequence;
+        atomic_store_explicit(
+            &reference->compositor_presented_sequence,
+            view->present_sequence,
+            memory_order_release);
     }
 
     /*
@@ -809,6 +1140,28 @@ void compositor_snapshot_finish(void) {
     window_unlock();
 
     /*
+     * Do not take a window event-queue lock while holding window_lock.
+     * A client blocked in window_event_read() evaluates its predicate while
+     * holding that queue lock and then needs window_lock, so waking here would
+     * invert the order and deadlock exactly when a new window is opened.
+     * Snapshot references remain held until the cleanup loop below, keeping
+     * each event queue alive for this unlocked wake-up pass.
+     */
+    for (uint32_t index = 0U;
+         index < g_compositor_snapshot.window_count;
+         ++index) {
+        compositor_window_view_t *view =
+            &g_compositor_snapshot.windows[index];
+
+        /* Cursor/other-window frames must not wake this window's event and
+         * epoll subscribers when its PRESENT fence has not changed. Input
+         * and close notifications retain their independent wake paths. */
+        if (view->reference != 0 && present_ack_changed[index]) {
+            (void)wake_all(&view->reference->event_waitq);
+        }
+    }
+
+    /*
      * Release the unlocked compositor's lifetime references only after the
      * committed-geometry bookkeeping above.  object_put() remains outside
      * window_lock so destruction cannot lengthen the scene critical section.
@@ -821,6 +1174,7 @@ void compositor_snapshot_finish(void) {
             &g_compositor_snapshot.windows[index];
 
         if (view->reference != 0) {
+            window_surface_snapshot_release(view);
             object_put(view->reference);
             view->reference = 0;
         }

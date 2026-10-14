@@ -71,8 +71,8 @@ void kernel_perf_emit_scope_at(const char *name, uint64_t start_tsc,
     uint64_t end_tsc;
     if (name == 0) return;
     end_tsc = telemetry_timestamp();
-    liteos_serial_printf_serial_only(
-        "LITEOS_BENCH name=%s cycles=%llu loc=%s:%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_BENCH name=%s cycles=%llu loc=%s:%u\r\n",
         name, (unsigned long long)(end_tsc - start_tsc),
         file != 0 ? file : "<unknown>", line);
 }
@@ -84,8 +84,8 @@ void kernel_perf_emit_scope(const char *name, uint64_t start_tsc) {
 void kernel_perf_emit_value_at(const char *name, uint64_t value,
                               const char *file, uint32_t line) {
     if (name == 0) return;
-    liteos_serial_printf_serial_only(
-        "LITEOS_BENCH_VALUE name=%s value=%llu loc=%s:%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_BENCH_VALUE name=%s value=%llu loc=%s:%u\r\n",
         name, (unsigned long long)value,
         file != 0 ? file : "<unknown>", line);
 }
@@ -97,8 +97,8 @@ void kernel_perf_emit_value(const char *name, uint64_t value) {
 void kernel_perf_emit_report_at(const kernel_perf_report_t *report,
                                const char *file, uint32_t line) {
     if (report == 0) return;
-    liteos_serial_printf_serial_only(
-        "LITEOS_PERF_KMALLOC_OK SAMPLES=%llu MIN=%llu MEDIAN=%llu "
+    kernel_serial_printf_serial_only(
+        "OS_PERF_KMALLOC_OK SAMPLES=%llu MIN=%llu MEDIAN=%llu "
         "P95=%llu AVG=%llu MAX=%llu HITS=%llu REFILLS=%llu "
         "loc=%s:%u\r\n",
         (unsigned long long)report->samples,

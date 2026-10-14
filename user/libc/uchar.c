@@ -1,7 +1,7 @@
 #include <uchar.h>
 
 #include <errno.h>
-#include <liteos/utf8.h>
+#include <libc/utf8.h>
 
 #define UTF16_HIGH_SURROGATE_MIN 0xd800U
 #define UTF16_HIGH_SURROGATE_MAX 0xdbffU

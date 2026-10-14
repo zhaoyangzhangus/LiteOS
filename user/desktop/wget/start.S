@@ -4,7 +4,7 @@
 .extern __libc_thread_init
 
 /*
- * LiteOS exec supplies a SysV-style initial process stack:
+ * System exec supplies a SysV-style initial process stack:
  *   [rsp+0] = argc
  *   [rsp+8] = argv[0]
  *

@@ -3,26 +3,29 @@
 
 #include <uapi/all.h>
 
-#include "../../client_chrome.h"
-#include "../../runtime/liteos_text.h"
+#include <uapi/window_theme.h>
+#include "../../runtime/caption.h"
+#include "../../runtime/paint.h"
+#include "../../runtime/text.h"
 
 #define TASKMGR_MAP_BASE       0x0E000000ULL
-#define TASKMGR_EVENT_WAIT OS_WAIT_INFINITE
+#define TASKMGR_REFRESH_NS 1000000000ULL
 #define TASKMGR_MAX_PROCESSES   256U
 #define TASKMGR_MAX_THREADS     512U
 #define TASKMGR_MAX_ENTRIES     (TASKMGR_MAX_PROCESSES + TASKMGR_MAX_THREADS)
-#define TASKMGR_ROW_HEIGHT      34U
-#define TASKMGR_TABLE_TOP       116U
-#define TASKMGR_STATUS_HEIGHT   32U
+#define TASKMGR_ROW_HEIGHT      (ui_text_line_height() + 14U)
+#define TASKMGR_BUTTON_HEIGHT   (ui_text_line_height() + 12U)
+#define TASKMGR_TABLE_TOP       TASKMGR_ROW_HEIGHT
+#define TASKMGR_STATUS_HEIGHT   (ui_text_line_height() + 16U)
 #define TASKMGR_STATUS_CAP      96U
 
-#define TASKMGR_BACKGROUND      0x00F4F6F8U
-#define TASKMGR_HEADER          0x00FAFAFAU
-#define TASKMGR_TABLE_HEADER    0x00E9EDF1U
-#define TASKMGR_TEXT            0x00353B43U
-#define TASKMGR_MUTED           0x006A747CU
-#define TASKMGR_ACCENT          0x005B86D6U
-#define TASKMGR_SELECTED        0x00DCEBFAU
+#define TASKMGR_BACKGROUND      OS_THEME_SURFACE
+#define TASKMGR_HEADER          OS_THEME_HEADER
+#define TASKMGR_TABLE_HEADER    OS_THEME_TOOLBAR
+#define TASKMGR_TEXT            OS_THEME_TEXT
+#define TASKMGR_MUTED           OS_THEME_MUTED
+#define TASKMGR_ACCENT          OS_THEME_ACCENT
+#define TASKMGR_SELECTED        OS_THEME_SELECTED
 
 typedef struct taskmgr_window {
     os_handle_t handle;
@@ -39,6 +42,9 @@ typedef struct taskmgr_entry {
     uint32_t state;
     uint32_t cpu;
     uint32_t thread_count;
+    bool expanded;
+    bool cpu_sample_valid;
+    os_task_info_t resources;
     char name[OS_PROCESS_NAME_MAX];
 } taskmgr_entry_t;
 
@@ -52,6 +58,17 @@ static uint32_t g_selected_entry;
 static bool g_selection_valid;
 static bool g_entries_truncated;
 static bool g_ctrl;
+static taskmgr_entry_t g_previous[TASKMGR_MAX_ENTRIES];
+static uint32_t g_previous_count;
+static uint64_t g_sample_time;
+static uint64_t g_next_refresh;
+static uint64_t g_confirm_pid;
+static uint64_t g_confirm_created;
+static uint64_t g_confirm_tid;
+static bool g_menu_open;
+static uint32_t g_menu_x, g_menu_y;
+static int32_t g_menu_hover = -1;
+static void dismiss_menu(void);
 static char g_status[TASKMGR_STATUS_CAP] =
     "R REFRESH  CTRL +/- FONT  ESC CLOSE";
 
@@ -132,6 +149,81 @@ static void set_status(const char *text) {
     copy_text(g_status, sizeof(g_status), text);
 }
 
+static uint64_t monotonic_ns(void) {
+    os_timespec_t time = {0};
+    if (taskmgr_syscall6(OS_SYS_CLOCK_GET, OS_CLOCK_MONOTONIC,
+            (uint64_t)(uintptr_t)&time, 0U, 0U, 0U, 0U) < 0) return 0U;
+    return (uint64_t)time.seconds * 1000000000ULL + (uint64_t)time.nanoseconds;
+}
+
+static void sample_resources(taskmgr_entry_t *entry, uint64_t now) {
+    entry->resources = (os_task_info_t){0};
+    entry->resources.hdr.size = sizeof(entry->resources);
+    entry->resources.hdr.version = OS_SYSCALL_ABI_VERSION;
+    entry->resources.pid = entry->thread ? entry->parent_id : entry->id;
+    entry->resources.tid = entry->thread ? entry->id : 0U;
+    entry->cpu = 0U;
+    entry->cpu_sample_valid = false;
+    entry->expanded = false;
+    if (taskmgr_syscall_one(OS_SYS_TASK_QUERY,
+            (uint64_t)(uintptr_t)&entry->resources) < 0) {
+        entry->resources.flags = OS_TASK_PROTECTED;
+        return;
+    }
+    for (uint32_t i = 0; i < g_previous_count; ++i) {
+        const taskmgr_entry_t *old = &g_previous[i];
+        if (old->id != entry->id || old->thread != entry->thread ||
+            old->parent_id != entry->parent_id ||
+            old->resources.create_time_ns != entry->resources.create_time_ns) continue;
+        entry->expanded = old->expanded;
+        if (now > g_sample_time && entry->resources.runtime_ns >= old->resources.runtime_ns) {
+            uint64_t elapsed = now - g_sample_time;
+            uint32_t cpus = entry->resources.cpu_count;
+            if (!cpus) cpus = 1U;
+            uint64_t delta = entry->resources.runtime_ns - old->resources.runtime_ns;
+            /* Three fractional digits keep low but real CPU usage visible. */
+            uint64_t thousandths = delta <= UINT64_MAX / 100000U ?
+                delta * 100000U / elapsed / cpus : delta / elapsed * 100000U / cpus;
+            entry->cpu = thousandths > 100000U ? 100000U : (uint32_t)thousandths;
+            entry->cpu_sample_valid = true;
+        }
+        break;
+    }
+}
+
+static bool entry_visible(uint32_t index) {
+    if (!g_entries[index].thread) return true;
+    for (uint32_t i = 0; i < g_entry_count; ++i)
+        if (!g_entries[i].thread && g_entries[i].id == g_entries[index].parent_id)
+            return g_entries[i].expanded;
+    return false;
+}
+
+static uint32_t visible_entry(uint32_t row) {
+    /* Process enumeration order is stable; threads live directly under their process. */
+    for (uint32_t i = 0; i < g_entry_count; ++i) {
+        if (g_entries[i].thread) continue;
+        if (row-- == 0U) return i;
+        if (!g_entries[i].expanded) continue;
+        for (uint32_t j = 0; j < g_entry_count; ++j)
+            if (g_entries[j].thread && g_entries[j].parent_id == g_entries[i].id)
+                if (row-- == 0U) return j;
+    }
+    return g_entry_count;
+}
+
+static uint32_t entry_row(uint32_t index) {
+    for (uint32_t row = 0; row < g_entry_count; ++row)
+        if (visible_entry(row) == index) return row;
+    return 0U;
+}
+
+static uint32_t visible_count(void) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < g_entry_count; ++i) if (entry_visible(i)) ++count;
+    return count;
+}
+
 static const char *process_state_text(uint32_t state) {
     if (state == OS_PROCESS_NEW) return "NEW";
     if (state == OS_PROCESS_RUNNING) return "RUNNING";
@@ -155,6 +247,12 @@ static void refresh_processes(void) {
         g_selected_entry < g_entry_count && g_entries[g_selected_entry].thread;
     uint64_t selected_id = g_selection_valid && g_selected_entry < g_entry_count ?
                            g_entries[g_selected_entry].id : 0U;
+    uint64_t selected_created = g_selection_valid && g_selected_entry < g_entry_count ?
+        g_entries[g_selected_entry].resources.create_time_ns : 0U;
+    g_previous_count = g_entry_count;
+    for (uint32_t i = 0; i < g_entry_count; ++i) g_previous[i] = g_entries[i];
+    uint64_t now = monotonic_ns();
+    g_next_refresh = now + TASKMGR_REFRESH_NS;
     g_entry_count = 0U;
     g_entries_truncated = false;
     for (uint32_t index = 0U; index <= TASKMGR_MAX_PROCESSES; ++index) {
@@ -184,6 +282,7 @@ static void refresh_processes(void) {
         entry->cpu = 0U;
         entry->thread_count = request.info.thread_count;
         copy_text(entry->name, sizeof(entry->name), request.info.name);
+        sample_resources(entry, now);
     }
     for (uint32_t index = 0U; index <= TASKMGR_MAX_THREADS; ++index) {
         os_thread_enumerate_t request = {0};
@@ -212,21 +311,30 @@ static void refresh_processes(void) {
         entry->cpu = request.info.current_cpu;
         entry->thread_count = 0U;
         copy_text(entry->name, sizeof(entry->name), request.info.name);
+        sample_resources(entry, now);
     }
-    g_first_row = 0U;
+    g_sample_time = now;
+    g_next_refresh = now + TASKMGR_REFRESH_NS;
     g_selection_valid = g_entry_count != 0U;
     g_selected_entry = 0U;
+    bool restored = false;
     if (selected_id != 0U) {
         for (uint32_t index = 0U; index < g_entry_count; ++index) {
             if (g_entries[index].id == selected_id &&
-                g_entries[index].thread == selected_thread) {
+                g_entries[index].thread == selected_thread &&
+                g_entries[index].resources.create_time_ns == selected_created &&
+                entry_visible(index)) {
                 g_selected_entry = index;
+                restored = true;
                 break;
             }
         }
     }
-    set_status(g_entries_truncated ? "LIST LIMIT  R REFRESH  CTRL +/- FONT" :
-                                    "R REFRESH  CTRL +/- FONT  ESC CLOSE");
+    if (selected_id != 0U && !restored) dismiss_menu();
+    uint32_t count = visible_count();
+    if (g_first_row >= count) g_first_row = count ? count - 1U : 0U;
+    if (!g_confirm_pid) set_status(g_entries_truncated ? "LIST LIMIT  AUTO REFRESH 1s" :
+        "AUTO REFRESH 1s  |  CPU: MACHINE %  |  MEMORY: RESIDENT MiB");
 }
 
 static void fill_rect(uint32_t x, uint32_t y, uint32_t width,
@@ -242,9 +350,13 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width,
 }
 
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
-    liteos_text_draw(g_window.pixels, g_window.width,
+    uint32_t right = g_window.width > 12U ? g_window.width - 12U : 0U;
+    if (x == g_window.width * 36U / 100U) right = g_window.width * 48U / 100U - 12U;
+    else if (x == g_window.width * 48U / 100U) right = g_window.width * 67U / 100U - 12U;
+    else if (x == g_window.width * 67U / 100U) right = g_window.width * 81U / 100U - 12U;
+    ui_text_draw_clipped(g_window.pixels, g_window.width,
                      g_window.width, g_window.height,
-                     (int32_t)x, (int32_t)y, text, color);
+                     (int32_t)x, (int32_t)y, right, text, color);
 }
 
 static void draw_number(uint32_t x, uint32_t y, uint64_t value, uint32_t color) {
@@ -253,12 +365,51 @@ static void draw_number(uint32_t x, uint32_t y, uint64_t value, uint32_t color) 
     draw_text(x, y, text, color);
 }
 
-static void draw_button(uint32_t x, uint32_t y, uint32_t width,
-                        const char *text) {
-    user_client_chrome_round_rect(g_window.pixels, g_window.width,
-                                  g_window.width, g_window.height,
-                                  x, y, width, 30U, TASKMGR_ACCENT);
-    draw_text(x + 12U, y + 4U, text, 0x00FFFFFFU);
+static uint32_t menu_width(void) {
+    uint32_t width = ui_text_measure("Confirm end process") + 32U;
+    return width < g_window.width ? width : g_window.width;
+}
+
+static uint32_t menu_rows(void) {
+    return g_selected_entry < g_entry_count && g_entries[g_selected_entry].thread ? 2U : 1U;
+}
+
+static int32_t menu_hit(int32_t x, int32_t y) {
+    if (!g_menu_open || x < (int32_t)g_menu_x || y < (int32_t)g_menu_y ||
+        (uint32_t)x - g_menu_x >= menu_width() ||
+        (uint32_t)y - g_menu_y >= menu_rows() * TASKMGR_ROW_HEIGHT) return -1;
+    return ((uint32_t)y - g_menu_y) / TASKMGR_ROW_HEIGHT;
+}
+
+static void dismiss_menu(void) {
+    g_menu_open = false;
+    g_menu_hover = -1;
+    g_confirm_pid = 0U;
+    g_confirm_tid = 0U;
+}
+
+static void draw_context_menu(void) {
+    if (!g_menu_open || g_selected_entry >= g_entry_count) return;
+    uint32_t width = menu_width();
+    uint32_t height = menu_rows() * TASKMGR_ROW_HEIGHT;
+    if (g_menu_x > g_window.width - width) g_menu_x = g_window.width - width;
+    if (height > g_window.height) height = g_window.height;
+    if (g_menu_y > g_window.height - height) g_menu_y = g_window.height - height;
+    user_paint_round_rect(g_window.pixels, g_window.width,
+        g_window.width, g_window.height, g_menu_x, g_menu_y, width, height, OS_THEME_BORDER);
+    for (uint32_t row = 0; row < menu_rows(); ++row) {
+        bool thread_only = g_entries[g_selected_entry].thread && row == 0U;
+        bool confirm = g_confirm_pid != 0U && ((g_confirm_tid != 0U) == thread_only);
+        uint32_t y = g_menu_y + row * TASKMGR_ROW_HEIGHT;
+        fill_rect(g_menu_x + 1U, y + 1U, width - 2U, TASKMGR_ROW_HEIGHT - 2U,
+            g_menu_hover == (int32_t)row ? OS_THEME_SELECTED : OS_THEME_SURFACE);
+        ui_text_draw_clipped(g_window.pixels, g_window.width, g_window.width,
+            g_window.height, (int32_t)g_menu_x + 12, (int32_t)y + 6,
+            g_menu_x + width - 12U,
+            thread_only ? (confirm ? "Confirm end thread" : "End thread") :
+                (confirm ? "Confirm end process" : "End process"),
+            g_entries[g_selected_entry].resources.flags & OS_TASK_PROTECTED ? TASKMGR_MUTED : 0x00B3261EU);
+    }
 }
 
 static uint32_t visible_rows(void) {
@@ -271,9 +422,10 @@ static uint32_t visible_rows(void) {
 static void ensure_selection_visible(void) {
     uint32_t rows = visible_rows();
     if (!g_selection_valid || rows == 0U) return;
-    if (g_selected_entry < g_first_row) g_first_row = g_selected_entry;
-    if (g_selected_entry >= g_first_row + rows) {
-        g_first_row = g_selected_entry - rows + 1U;
+    uint32_t selected_row = entry_row(g_selected_entry);
+    if (selected_row < g_first_row) g_first_row = selected_row;
+    if (selected_row >= g_first_row + rows) {
+        g_first_row = selected_row - rows + 1U;
     }
     if (g_first_row > g_entry_count) g_first_row = g_entry_count;
 }
@@ -287,10 +439,11 @@ static void select_delta(int32_t delta) {
         ensure_selection_visible();
         return;
     }
-    next = (int64_t)g_selected_entry + delta;
+    next = (int64_t)entry_row(g_selected_entry) + delta;
     if (next < 0) next = 0;
-    if (next >= (int64_t)g_entry_count) next = (int64_t)g_entry_count - 1;
-    g_selected_entry = (uint32_t)next;
+    if (next >= (int64_t)visible_count()) next = (int64_t)visible_count() - 1;
+    g_selected_entry = visible_entry((uint32_t)next);
+    dismiss_menu();
     ensure_selection_visible();
 }
 
@@ -299,64 +452,70 @@ static void draw_row(uint32_t row, uint32_t y) {
     bool running = entry->thread ? entry->state == OS_THREAD_RUNNING :
                                    entry->state == OS_PROCESS_RUNNING;
     uint32_t color = row == g_selected_entry && g_selection_valid ?
-                     TASKMGR_SELECTED : 0x00FFFFFFU;
+                     TASKMGR_SELECTED : (entry_row(row) & 1U ? TASKMGR_BACKGROUND : 0x00FFFFFFU);
     fill_rect(0U, y, g_window.width, TASKMGR_ROW_HEIGHT, color);
-    draw_text(16U, y + 5U, entry->thread ? "THREAD" : "PROCESS", TASKMGR_MUTED);
-    draw_number(112U, y + 5U, entry->id, TASKMGR_TEXT);
-    draw_number(214U, y + 5U, entry->parent_id, TASKMGR_MUTED);
-    draw_text(316U, y + 5U, entry->name, TASKMGR_TEXT);
-    draw_text(650U, y + 5U,
+    draw_text(16U, y + 6U, entry->thread ? "" : (entry->expanded ? "v" : ">"), TASKMGR_MUTED);
+    ui_text_draw_rect(g_window.pixels, g_window.width, g_window.width, g_window.height,
+        entry->thread ? 64 : 44, (int32_t)y + 6, 0, y,
+        g_window.width * 36U / 100U - 12U, y + TASKMGR_ROW_HEIGHT,
+        entry->name, TASKMGR_TEXT);
+    draw_number(g_window.width * 36U / 100U, y + 6U, entry->id, TASKMGR_MUTED);
+    draw_text(g_window.width * 48U / 100U, y + 6U,
                entry->thread ? thread_state_text(entry->state) :
                                 process_state_text(entry->state),
                running ? 0x002A7A43U : TASKMGR_MUTED);
-    if (entry->thread) draw_number(790U, y + 5U, entry->cpu, TASKMGR_TEXT);
-    else draw_text(790U, y + 5U, "-", TASKMGR_MUTED);
-    if (entry->thread) draw_text(870U, y + 5U, "-", TASKMGR_MUTED);
-    else draw_number(870U, y + 5U, entry->thread_count, TASKMGR_TEXT);
+    char value[32] = {0};
+    append_u64(value, sizeof(value), entry->cpu / 1000U);
+    append_text(value, sizeof(value), ".");
+    uint32_t fractional = entry->cpu % 1000U;
+    if (fractional < 100U) append_text(value, sizeof(value), "0");
+    if (fractional < 10U) append_text(value, sizeof(value), "0");
+    append_u64(value, sizeof(value), fractional);
+    append_text(value, sizeof(value), "%");
+    draw_text(g_window.width * 67U / 100U, y + 6U,
+        entry->cpu_sample_valid ? value : "-", TASKMGR_TEXT);
+    if (entry->thread) draw_text(g_window.width * 81U / 100U, y + 6U, "-", TASKMGR_MUTED);
+    else {
+        value[0] = '\0';
+        uint64_t kib = entry->resources.rss_bytes / 1024U;
+        append_u64(value, sizeof(value), kib / 1024U);
+        append_text(value, sizeof(value), ".");
+        append_u64(value, sizeof(value), (kib % 1024U) * 10U / 1024U);
+        draw_text(g_window.width * 81U / 100U, y + 6U, value, TASKMGR_TEXT);
+    }
 }
 
 static void render(void) {
     uint32_t rows = visible_rows();
     fill_rect(0U, 0U, g_window.width, g_window.height, TASKMGR_BACKGROUND);
-    fill_rect(0U, 0U, g_window.width, USER_CLIENT_CHROME_HEIGHT, TASKMGR_HEADER);
-    user_client_chrome_app_icon(g_window.pixels, g_window.width,
-                                g_window.width, g_window.height,
-                                16U, USER_CLIENT_CHROME_TITLE_Y,
-                                USER_CLIENT_CHROME_ICON_TASKS);
-    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "TASK MANAGER", TASKMGR_TEXT);
-    draw_button(20U, 57U, 112U, "REFRESH");
-    draw_text(154U, 63U, "R / F5", TASKMGR_MUTED);
 
-    fill_rect(0U, 98U, g_window.width, 18U, TASKMGR_TABLE_HEADER);
-    draw_text(16U, 98U, "TYPE", TASKMGR_MUTED);
-    draw_text(112U, 98U, "ID", TASKMGR_MUTED);
-    draw_text(214U, 98U, "PARENT/PID", TASKMGR_MUTED);
-    draw_text(316U, 98U, "NAME", TASKMGR_MUTED);
-    draw_text(650U, 98U, "STATE", TASKMGR_MUTED);
-    draw_text(790U, 98U, "CPU", TASKMGR_MUTED);
-    draw_text(870U, 98U, "THREADS", TASKMGR_MUTED);
+    uint32_t header_y = TASKMGR_TABLE_TOP - TASKMGR_ROW_HEIGHT;
+    fill_rect(0U, header_y, g_window.width, TASKMGR_ROW_HEIGHT, TASKMGR_TABLE_HEADER);
+    draw_text(44U, header_y + 6U, "Name", TASKMGR_MUTED);
+    draw_text(g_window.width * 36U / 100U, header_y + 6U, "ID", TASKMGR_MUTED);
+    draw_text(g_window.width * 48U / 100U, header_y + 6U, "State", TASKMGR_MUTED);
+    draw_text(g_window.width * 67U / 100U, header_y + 6U, "CPU", TASKMGR_MUTED);
+    draw_text(g_window.width * 81U / 100U, header_y + 6U, "MiB", TASKMGR_MUTED);
 
     for (uint32_t visible = 0U; visible < rows; ++visible) {
-        uint32_t row = g_first_row + visible;
+        uint32_t row = visible_entry(g_first_row + visible);
         if (row >= g_entry_count) break;
         draw_row(row, TASKMGR_TABLE_TOP + visible * TASKMGR_ROW_HEIGHT);
     }
-    fill_rect(0U, g_window.height - TASKMGR_STATUS_HEIGHT,
+    uint32_t status_top = g_window.height > TASKMGR_STATUS_HEIGHT ?
+        g_window.height - TASKMGR_STATUS_HEIGHT : 0U;
+    fill_rect(0U, status_top,
               g_window.width, TASKMGR_STATUS_HEIGHT, TASKMGR_TABLE_HEADER);
-    draw_text(16U, g_window.height - 27U, g_status, TASKMGR_TEXT);
-    user_client_chrome_close(g_window.pixels, g_window.width,
-                             g_window.width, g_window.height,
-                             USER_CLIENT_CHROME_HEIGHT,
-                             USER_CLIENT_CHROME_CLOSE_BG,
-                             USER_CLIENT_CHROME_CLOSE_FG);
-    user_client_chrome_frame(g_window.pixels, g_window.width,
-                             g_window.width, g_window.height,
-                             USER_CLIENT_CHROME_HEIGHT);
+    ui_text_draw_clipped(g_window.pixels, g_window.width, g_window.width,
+        g_window.height, 16, (int32_t)status_top + 8,
+        g_window.width > 16U ? g_window.width - 16U : 0U, g_status, TASKMGR_MUTED);
+    draw_context_menu();
 
     os_window_update_t update = {0};
     update.hdr.size = sizeof(update);
     update.hdr.version = OS_SYSCALL_ABI_VERSION;
     update.identifier = g_window.identifier;
+    update.flags = OS_WINDOW_CAPTION_HEIGHT(user_caption_height());
     update.width = g_window.width;
     update.height = g_window.height;
     (void)taskmgr_syscall_one(OS_SYS_WINDOW_UPDATE,
@@ -386,7 +545,7 @@ static bool create_window(void) {
     request.width = width;
     request.height = height;
     request.flags = OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE |
-                    OS_WINDOW_CLIENT_DECORATIONS;
+                    OS_WINDOW_STANDARD_CAPTION_CONTROLS;
     request.background = TASKMGR_BACKGROUND;
     request.title[0] = 'T'; request.title[1] = 'A'; request.title[2] = 'S';
     request.title[3] = 'K'; request.title[4] = ' '; request.title[5] = 'M';
@@ -408,6 +567,42 @@ static bool key_is(const os_input_event_t *input, uint32_t hid, char ascii) {
     return input != 0 && (input->code == hid || input->code == (uint32_t)ascii);
 }
 
+static void end_selected_process(bool thread_only) {
+    if (!g_selection_valid || g_selected_entry >= g_entry_count) return;
+    taskmgr_entry_t *entry = &g_entries[g_selected_entry];
+    uint64_t pid = entry->thread ? entry->parent_id : entry->id;
+    uint64_t tid = thread_only && entry->thread ? entry->id : 0U;
+    if (entry->resources.flags & OS_TASK_PROTECTED) {
+        g_confirm_pid = 0U;
+        set_status("SYSTEM PROCESS: CANNOT END");
+        return;
+    }
+    if (g_confirm_pid != pid || g_confirm_tid != tid || g_confirm_created != entry->resources.create_time_ns) {
+        g_confirm_pid = pid;
+        g_confirm_tid = tid;
+        g_confirm_created = entry->resources.create_time_ns;
+        set_status(thread_only ? "Click Confirm end thread to terminate only this thread" :
+            "Click Confirm end process to terminate the whole process");
+        return;
+    }
+    os_process_terminate_t request = {0};
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.pid = pid;
+    request.create_time_ns = g_confirm_created;
+    int64_t status;
+    if (tid != 0U) {
+        os_thread_terminate_t thread = {0};
+        thread.hdr = request.hdr;
+        thread.hdr.size = sizeof(thread);
+        thread.pid = pid; thread.tid = tid; thread.create_time_ns = g_confirm_created;
+        status = taskmgr_syscall_one(OS_SYS_THREAD_TERMINATE, (uint64_t)(uintptr_t)&thread);
+    } else status = taskmgr_syscall_one(OS_SYS_PROCESS_TERMINATE, (uint64_t)(uintptr_t)&request);
+    dismiss_menu();
+    refresh_processes();
+    set_status(status == 0 ? "Termination requested" : "Cannot end this process");
+}
+
 static void handle_event(const os_window_event_t *event) {
     const os_input_event_t *input;
     if (event == 0) return;
@@ -418,6 +613,7 @@ static void handle_event(const os_window_event_t *event) {
                 event->resize.buffer_size) return;
         g_window.width = event->resize.width;
         g_window.height = event->resize.height;
+        dismiss_menu();
         ensure_selection_visible();
         render();
         return;
@@ -429,28 +625,40 @@ static void handle_event(const os_window_event_t *event) {
         g_ctrl = input->value != OS_INPUT_VALUE_RELEASE;
         return;
     }
+    if (input->type == OS_INPUT_EVENT_RELATIVE &&
+        (input->code == OS_INPUT_REL_X || input->code == OS_INPUT_REL_Y) && g_menu_open) {
+        int32_t hover = menu_hit(event->pointer_x, event->pointer_y);
+        if (hover != g_menu_hover) { g_menu_hover = hover; render(); }
+        return;
+    }
     if (input->type == OS_INPUT_EVENT_BUTTON &&
-        input->code == OS_INPUT_BUTTON_LEFT &&
+        (input->code == OS_INPUT_BUTTON_LEFT || input->code == OS_INPUT_BUTTON_RIGHT) &&
         input->value == OS_INPUT_VALUE_PRESS) {
-        if (user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
-                                         g_window.width,
-                                         USER_CLIENT_CHROME_HEIGHT)) {
-            taskmgr_exit(0U);
-        }
-        if (event->pointer_y >= 57 && event->pointer_y < 87 &&
-            event->pointer_x >= 20 && event->pointer_x < 132) {
-            refresh_processes();
+        if (g_menu_open && input->code == OS_INPUT_BUTTON_LEFT) {
+            int32_t row = menu_hit(event->pointer_x, event->pointer_y);
+            if (row >= 0) {
+                end_selected_process(g_entries[g_selected_entry].thread && row == 0);
+                render();
+                return;
+            }
+            dismiss_menu();
             render();
-            return;
         }
         uint32_t rows = visible_rows();
         if (event->pointer_y >= (int32_t)TASKMGR_TABLE_TOP &&
             event->pointer_y < (int32_t)(TASKMGR_TABLE_TOP + rows * TASKMGR_ROW_HEIGHT)) {
-            uint32_t row = g_first_row +
-                ((uint32_t)event->pointer_y - TASKMGR_TABLE_TOP) / TASKMGR_ROW_HEIGHT;
+            uint32_t row = visible_entry(g_first_row +
+                ((uint32_t)event->pointer_y - TASKMGR_TABLE_TOP) / TASKMGR_ROW_HEIGHT);
             if (row < g_entry_count) {
                 g_selected_entry = row;
                 g_selection_valid = true;
+                dismiss_menu();
+                if (input->code == OS_INPUT_BUTTON_RIGHT) {
+                    g_menu_open = true;
+                    g_menu_x = event->pointer_x > 0 ? (uint32_t)event->pointer_x : 0U;
+                    g_menu_y = event->pointer_y > 0 ? (uint32_t)event->pointer_y : 0U;
+                } else if (!g_entries[row].thread && event->pointer_x >= 0 && event->pointer_x < 44)
+                    g_entries[row].expanded = !g_entries[row].expanded;
                 render();
             }
         }
@@ -459,7 +667,7 @@ static void handle_event(const os_window_event_t *event) {
     if (input->type == OS_INPUT_EVENT_RELATIVE &&
         input->code == OS_INPUT_REL_WHEEL && input->value != 0) {
         if (g_ctrl) {
-            (void)liteos_text_adjust(input->value > 0 ? 1 : -1);
+            (void)ui_text_adjust(input->value > 0 ? 1 : -1);
             render();
             return;
         }
@@ -468,11 +676,12 @@ static void handle_event(const os_window_event_t *event) {
         return;
     }
     if (input->type != OS_INPUT_EVENT_KEY || input->value == OS_INPUT_VALUE_RELEASE) return;
+    if (key_is(input, 0x29U, 27) && g_menu_open) { dismiss_menu(); render(); return; }
     if (key_is(input, 0x29U, 27) || key_is(input, 0x14U, 'q')) taskmgr_exit(0U);
     if (g_ctrl && input->code == 0x2EU) {
-        (void)liteos_text_adjust(1);
+        (void)ui_text_adjust(1);
     } else if (g_ctrl && input->code == 0x2DU) {
-        (void)liteos_text_adjust(-1);
+        (void)ui_text_adjust(-1);
     } else if (key_is(input, 0x15U, 'r') || input->code == 0x3EU) {
         refresh_processes();
     } else if (input->code == 0x52U) {
@@ -490,7 +699,7 @@ static void handle_event(const os_window_event_t *event) {
 }
 
 int main(void) {
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE) ||
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE) ||
         !create_window()) return 1;
     refresh_processes();
     render();
@@ -499,7 +708,13 @@ int main(void) {
         request.hdr.size = sizeof(request);
         request.hdr.version = OS_SYSCALL_ABI_VERSION;
         request.identifier = g_window.identifier;
-        request.timeout_ns = TASKMGR_EVENT_WAIT;
+        uint64_t now = monotonic_ns();
+        if (now >= g_next_refresh) {
+            refresh_processes();
+            render();
+            now = monotonic_ns();
+        }
+        request.timeout_ns = now < g_next_refresh ? g_next_refresh - now : 0U;
         int64_t status = taskmgr_syscall_one(OS_SYS_WINDOW_EVENT_READ,
                                              (uint64_t)(uintptr_t)&request);
         if (status == 0) handle_event(&request.event);

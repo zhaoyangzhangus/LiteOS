@@ -20,30 +20,21 @@ function Read-Objdump([string[]]$Arguments) {
     return (& $Objdump @Arguments | Out-String)
 }
 
-$loaderHeaders = Read-Objdump @('-p', $Loader)
-$libraryHeaders = Read-Objdump @('-p', $Library)
-$testHeaders = Read-Objdump @('-p', $Test)
-$testInterpreter = Read-Objdump @('-s', '-j', '.interp', $Test)
+$python = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $python) { $python = Get-Command python -ErrorAction Stop }
+& $python.Source (Join-Path $PSScriptRoot 'verify-elf-runtime.py') $Loader $Library $Test 'libsystemc.so.1'
+if ($LASTEXITCODE -ne 0) { throw 'libc: invalid ELF runtime identity' }
 $librarySymbols = Read-Objdump @('-T', $Library)
 $testRelocations = Read-Objdump @('-R', $Test)
 
-if ($loaderHeaders -match 'NEEDED' -or $libraryHeaders -match 'NEEDED') {
-    throw 'libc: loader or libc has an external dependency'
-}
-if ($testHeaders -notmatch 'INTERP' -or
-    $testInterpreter -notmatch '2f6c6962' -or
-    $testInterpreter -notmatch '6c697465' -or
-    $testInterpreter -notmatch '6f732e73' -or
-    $testInterpreter -notmatch '6f2e3100') {
-    throw 'libc: test image has no LiteOS interpreter'
-}
-if ($testHeaders -notmatch 'NEEDED' -or $testHeaders -notmatch 'libliteosc\.so\.1') {
-    throw 'libc: test image has no libc dependency'
-}
 if ($librarySymbols -match '\*UND\*') {
     throw 'libc: shared library has unresolved dynamic symbols'
 }
 foreach ($symbol in @(
+        '__libc_native_syscall6', '__libc_linux_syscall6',
+        '__system_free', '__system_realloc', '__system_malloc_usable_size',
+        '_Z7readdirP8libc_dir', '_Z8closedirP8libc_dir',
+        '_Z6setjmpP14libc_jmp_state', '_Z7longjmpP14libc_jmp_statei',
         'memcpy', 'memmove', 'memset', 'strlen', 'strcpy', 'memmem', 'mempcpy',
         'memccpy', 'strchrnul',
         'ffs', 'strtok_r',
@@ -97,7 +88,9 @@ foreach ($symbol in @(
         '__mulsc3', '__muldc3', '__mulxc3', '__divsc3', '__divdc3', '__divxc3',
         'mbrtoc16', 'c16rtomb', 'mbrtoc32', 'c32rtomb', 'thrd_create', 'thrd_join',
         'mtx_init', 'mtx_lock', 'cnd_wait', 'call_once', 'tss_create')) {
-    if ($librarySymbols -notmatch [regex]::Escape($symbol)) {
+    if (-not ($librarySymbols -split '\r?\n' | Where-Object {
+        $_ -notmatch '\*UND\*' -and $_ -match ('\s' + [regex]::Escape($symbol) + '\s*$')
+    })) {
         throw "libc: missing exported symbol: $symbol"
     }
 }

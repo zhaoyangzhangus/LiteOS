@@ -15,11 +15,11 @@
 #include <kernel/vm.h>
 #include <kernel/wait.h>
 
-static BOOLEAN scheduler_fail_at(const liteos_init_scheduler_hooks_t *hooks,
+static BOOLEAN scheduler_fail_at(const kernel_init_scheduler_hooks_t *hooks,
                                  const CHAR8 *message, const char *file,
                                  uint32_t line) {
-    liteos_debug_stage_fail_at(LITEOS_DEBUG_PHASE_SCHEDULER,
-                               LITEOS_DEBUG_STEP_FAIL, K_EIO, file, line);
+    kernel_debug_stage_fail_at(OS_DEBUG_PHASE_SCHEDULER,
+                               OS_DEBUG_STEP_FAIL, K_EIO, file, line);
     hooks->write(message);
     hooks->halt();
     return 0;
@@ -320,17 +320,17 @@ static BOOLEAN canonical_scheduler_self_test(void) {
     benchmark_start = telemetry_timestamp();
     if (!sched_enqueue_bootstrap(&thread)) return 0;
     kernel_perf_emit_scope("scheduler.enqueue", benchmark_start);
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_ENQUEUE_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_ENQUEUE_OK");
     benchmark_start = telemetry_timestamp();
     schedule();
     kernel_perf_emit_scope("scheduler.schedule", benchmark_start);
     if (atomic_load_explicit(&thread.state, memory_order_relaxed) != THREAD_RUNNING) return 0;
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_SCHEDULE_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_SCHEDULE_OK");
     benchmark_start = telemetry_timestamp();
     sched_block_current();
     kernel_perf_emit_scope("scheduler.block", benchmark_start);
     if (atomic_load_explicit(&thread.state, memory_order_relaxed) != THREAD_BLOCKED) return 0;
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_BLOCK_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_BLOCK_OK");
 
     benchmark_start = telemetry_timestamp();
     sched_wake(&thread);
@@ -339,11 +339,11 @@ static BOOLEAN canonical_scheduler_self_test(void) {
     schedule();
     kernel_perf_emit_scope("scheduler.wake_to_running", benchmark_start);
     if (atomic_load_explicit(&thread.state, memory_order_relaxed) != THREAD_RUNNING) return 0;
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_WAKE_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_WAKE_OK");
     /* Do not let the bootstrap fixture affect the fair-tree count below. */
     sched_block_current();
     if (atomic_load_explicit(&thread.state, memory_order_relaxed) != THREAD_BLOCKED) return 0;
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_REBLOCK_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_REBLOCK_OK");
 
     /* 瓒呰繃鏃ф暟缁勪笂闄愶紝骞朵互浜掔礌姝ラ暱涔卞簭鍒犻櫎锛岃鐩栫孩榛戞爲鍒犻櫎淇璺緞銆?*/
     for (UINT32 i = 0; i < 300U; ++i) {
@@ -362,10 +362,10 @@ static BOOLEAN canonical_scheduler_self_test(void) {
         list_init(&fair_threads[i].sched.rt_node);
         sched_enqueue_bootstrap(&fair_threads[i]);
     }
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_BULK_ENQUEUE_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_BULK_ENQUEUE_OK");
     if (sched_runnable_count() != 300U || !sched_validate_current_cpu()) return 0;
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_VALIDATE_OK");
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_REMOVE_BEGIN");
+    realtest_checkpoint("SCHED_CORE_STAGE_VALIDATE_OK");
+    realtest_checkpoint("SCHED_CORE_STAGE_REMOVE_BEGIN");
     for (UINT32 i = 0; i < 300U; ++i) {
         UINT32 index = (i * 73U) % 300U;
         benchmark_start = telemetry_timestamp();
@@ -373,10 +373,10 @@ static BOOLEAN canonical_scheduler_self_test(void) {
         if (i == 0U) kernel_perf_emit_scope("scheduler.dequeue", benchmark_start);
         if ((i & 15U) == 0 && !sched_validate_current_cpu()) return 0;
         if ((i & 63U) == 63U) {
-            liteos_realtest_checkpoint("SCHED_CORE_STAGE_REMOVE_PROGRESS");
+            realtest_checkpoint("SCHED_CORE_STAGE_REMOVE_PROGRESS");
         }
     }
-    liteos_realtest_checkpoint("SCHED_CORE_STAGE_REMOVE_DONE");
+    realtest_checkpoint("SCHED_CORE_STAGE_REMOVE_DONE");
     return sched_runnable_count() == 0 && sched_validate_current_cpu();
 }
 
@@ -418,8 +418,27 @@ static BOOLEAN canonical_object_handle_self_test(void) {
         handle_close(&table, handle) != K_OK ||
         handle_lookup(&table, handle, 0U, &lookup) != K_ENOENT) return 0;
     object_put(lookup);
-    object_put(&object);
+    /* Exercise close-on-exec across a chunk boundary in the real kernel. */
+    handle_t exec_handles[300];
+    for (uint32_t index = 0U; index < 300U; ++index) {
+        if (handle_create_with_flags(&table, &object, 0x3U,
+                                    (index & 1U) ? HANDLE_FLAG_CLOEXEC : 0U,
+                                    &exec_handles[index]) != K_OK) return 0;
+    }
+    if (handle_table_close_on_exec(&table) != K_OK ||
+        handle_table_close_on_exec(&table) != K_OK) return 0;
+    for (uint32_t index = 0U; index < 300U; ++index) {
+        lookup = 0;
+        kstatus_t status = handle_lookup(&table, exec_handles[index], 0x1U, &lookup);
+        if ((index & 1U) != 0U) {
+            if (status != K_ENOENT || lookup != 0) return 0;
+        } else {
+            if (status != K_OK || lookup != &object) return 0;
+            object_put(lookup);
+        }
+    }
     handle_table_destroy(&table);
+    object_put(&object);
     wait_queue_init(&queue);
     return g_canonical_object_destroyed &&
            wait_on_queue(&queue, canonical_true_predicate, &condition, 1000U) == K_OK;
@@ -428,11 +447,17 @@ static BOOLEAN canonical_object_handle_self_test(void) {
 static BOOLEAN canonical_vm_self_test(void) {
     vm_space_t *parent = 0;
     vm_space_t *child = 0;
+    vm_space_t *sparse_space = 0;
     vm_object_t *object = 0;
     vm_object_t *shared_object = 0;
+    vm_object_t *sparse_object = 0;
+    vm_object_t *index_object = 0;
     vaddr_t address = 0x0000000040000000ULL;
     vaddr_t shared_parent_address = 0x0000000050000000ULL;
     vaddr_t shared_child_address = 0x0000000060000000ULL;
+    vaddr_t sparse_address = 0x0000200000000000ULL;
+    const uint64_t sparse_size = 1ULL << 40;
+    const uint32_t index_test_pages = 257U;
     paddr_t parent_physical = paddr_make(0);
     paddr_t child_physical = paddr_make(0);
     paddr_t shared_parent_physical = paddr_make(0);
@@ -527,191 +552,248 @@ static BOOLEAN canonical_vm_self_test(void) {
     if (shared_bytes == 0 || shared_child_bytes == 0) goto cleanup;
     shared_bytes[0] = 0xC3U;
     if (shared_child_bytes[0] != 0xC3U) goto cleanup;
+
+    /* Regression: Chrome/PartitionAlloc reserves terabyte-scale sparse
+     * regions and changes their protection before faulting any pages in. */
+    if (vm_space_create(&sparse_space) != K_OK ||
+        vm_object_create_anon(sparse_size, &sparse_object) != K_OK ||
+        vm_map_object(sparse_space, sparse_object, &sparse_address,
+                      0, sparse_size,
+                      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_USER,
+                      VM_MAP_PRIVATE | VM_MAP_FIXED) != K_OK ||
+        x86_page_range_has_present_pages(
+            sparse_space->root_table, sparse_address,
+            sparse_address + sparse_size) ||
+        vm_protect(sparse_space, sparse_address, sparse_size,
+                   VM_PROT_READ | VM_PROT_USER) != K_OK ||
+        vm_unmap(sparse_space, sparse_address, sparse_size) != K_OK) {
+        goto cleanup;
+    }
+
+    /* Randomized sparse page access exercises anon-page index insertion and
+     * hits through the shared backing API. */
+    if (vm_object_create_shared(PAGE_SIZE * index_test_pages,
+                                &index_object) != K_OK) {
+        goto cleanup;
+    }
+    for (uint32_t iteration = 0; iteration < index_test_pages; ++iteration) {
+        uint64_t page_index = ((uint64_t)iteration * 73U) % index_test_pages;
+        uint8_t *bytes = 0;
+        if (vm_object_shared_page_direct(index_object,
+                                         page_index * PAGE_SIZE,
+                                         true, &bytes) != K_OK ||
+            bytes == 0) {
+            goto cleanup;
+        }
+        bytes[0] = (uint8_t)page_index;
+        bytes[1] = (uint8_t)(page_index >> 8U);
+    }
+    if (vm_object_populated_pages(index_object) != index_test_pages) {
+        goto cleanup;
+    }
+    for (uint32_t iteration = 0; iteration < index_test_pages; ++iteration) {
+        uint64_t page_index = ((uint64_t)iteration * 73U) % index_test_pages;
+        uint8_t *bytes = 0;
+        if (vm_object_shared_page_direct(index_object,
+                                         page_index * PAGE_SIZE,
+                                         true, &bytes) != K_OK ||
+            bytes == 0 || bytes[0] != (uint8_t)page_index ||
+            bytes[1] != (uint8_t)(page_index >> 8U)) {
+            goto cleanup;
+        }
+    }
     success = 1;
 
 cleanup:
+    if (sparse_space != 0) vm_space_put(sparse_space);
     if (child != 0) vm_space_put(child);
     if (parent != 0) vm_space_put(parent);
     if (object != 0) vm_object_put(object);
     if (shared_object != 0) vm_object_put(shared_object);
+    if (sparse_object != 0) vm_object_put(sparse_object);
+    if (index_object != 0) vm_object_put(index_object);
     return success;
 }
 
-BOOLEAN liteos_init_scheduler(const LITEOS_BOOT_INFO *boot_info,
-                              const liteos_init_scheduler_hooks_t *hooks) {
+BOOLEAN kernel_init_scheduler(const OS_BOOT_INFO *boot_info,
+                              const kernel_init_scheduler_hooks_t *hooks) {
     uint64_t benchmark_start;
     if (boot_info == 0 || hooks == 0 || hooks->write == 0 ||
         hooks->write_u32 == 0 || hooks->halt == 0) return 0;
 
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_ENTER, 0U);
-    liteos_realtest_mark("SMP_CALL_BEGIN");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_ENTER, 0U);
+    realtest_mark("SMP_CALL_BEGIN");
     if (!x86_smp_start_aps(boot_info) ||
         x86_smp_started_count() != x86_smp_discovered_count()) {
-        return scheduler_fail(hooks, "LITEOS_SMP_START_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SMP_START_FAIL\r\n");
     }
-    liteos_realtest_mark("SMP_CALL_OK");
-    liteos_realtest_mark("SMP_REPORT_BEGIN");
-    hooks->write("LITEOS_SMP_STARTED_COUNT=");
+    realtest_mark("SMP_CALL_OK");
+    realtest_mark("SMP_REPORT_BEGIN");
+    hooks->write("OS_SMP_STARTED_COUNT=");
     hooks->write_u32(x86_smp_started_count());
-    hooks->write("\r\nLITEOS_SMP_TRAMPOLINE_OK\r\n");
-    liteos_realtest_mark("SMP_REPORT_OK");
-    liteos_realtest_mark("SCHED_INIT_BEGIN");
+    hooks->write("\r\nOS_SMP_TRAMPOLINE_OK\r\n");
+    realtest_mark("SMP_REPORT_OK");
+    realtest_mark("SCHED_INIT_BEGIN");
     sched_init();
-    liteos_realtest_mark("SCHED_INIT_OK");
-    liteos_realtest_mark("SMP_RELEASE_BEGIN");
+    realtest_mark("SCHED_INIT_OK");
+    realtest_mark("SMP_RELEASE_BEGIN");
     if (!x86_smp_release_aps()) {
-        return scheduler_fail(hooks, "LITEOS_SMP_RELEASE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SMP_RELEASE_FAIL\r\n");
     }
-    liteos_realtest_mark("SMP_RELEASE_OK");
-    liteos_realtest_mark("SMP_POST_RELEASE_REPORT_BEGIN");
-    hooks->write("LITEOS_SMP_CPU_LOCAL_OK\r\n");
-    liteos_realtest_mark("SMP_POST_RELEASE_REPORT_OK");
-    liteos_realtest_mark("SMP_IPI_TEST_BEGIN");
+    realtest_mark("SMP_RELEASE_OK");
+    realtest_mark("SMP_POST_RELEASE_REPORT_BEGIN");
+    hooks->write("OS_SMP_CPU_LOCAL_OK\r\n");
+    realtest_mark("SMP_POST_RELEASE_REPORT_OK");
+    realtest_mark("SMP_IPI_TEST_BEGIN");
     if (!x86_smp_ipi_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SMP_IPI_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SMP_IPI_FAIL\r\n");
     }
-    liteos_realtest_mark("SMP_IPI_TEST_OK");
-    hooks->write("LITEOS_SMP_IPI_OK\r\n");
-    liteos_realtest_mark("SMP_TLB_TEST_BEGIN");
+    realtest_mark("SMP_IPI_TEST_OK");
+    hooks->write("OS_SMP_IPI_OK\r\n");
+    realtest_mark("SMP_TLB_TEST_BEGIN");
     benchmark_start = telemetry_timestamp();
     bool tlb_test_ok = x86_tlb_shootdown_self_test();
     kernel_perf_emit_scope("mm.tlb_shootdown", benchmark_start);
     if (!tlb_test_ok) {
-        return scheduler_fail(hooks, "LITEOS_TLB_SHOOTDOWN_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_TLB_SHOOTDOWN_FAIL\r\n");
     }
-    liteos_realtest_checkpoint("SMP_TLB_TEST_OK");
-    hooks->write("LITEOS_TLB_SHOOTDOWN_OK\r\n");
-    liteos_realtest_checkpoint("SCHED_SPEC4_READY_BEGIN");
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_4);
-    liteos_realtest_checkpoint("SCHED_SPEC4_READY_OK");
-    liteos_realtest_checkpoint("SCHED_SPEC5_ENTER_BEGIN");
-    liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_5);
-    liteos_realtest_checkpoint("SCHED_SPEC5_ENTER_OK");
-    liteos_realtest_checkpoint("SCHED_CORE_TEST_BEGIN");
+    realtest_checkpoint("SMP_TLB_TEST_OK");
+    hooks->write("OS_TLB_SHOOTDOWN_OK\r\n");
+    realtest_checkpoint("SCHED_SPEC4_READY_BEGIN");
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_4);
+    realtest_checkpoint("SCHED_SPEC4_READY_OK");
+    realtest_checkpoint("SCHED_SPEC5_ENTER_BEGIN");
+    kernel_debug_stage_enter(OS_DEBUG_PHASE_SPEC_5);
+    realtest_checkpoint("SCHED_SPEC5_ENTER_OK");
+    realtest_checkpoint("SCHED_CORE_TEST_BEGIN");
     benchmark_start = telemetry_timestamp();
     if (!canonical_scheduler_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_CORE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_CORE_FAIL\r\n");
     }
-    liteos_realtest_checkpoint("SCHED_CORE_TEST_OK");
-    liteos_realtest_checkpoint("SCHED_CORE_BENCH_BEGIN");
+    realtest_checkpoint("SCHED_CORE_TEST_OK");
+    realtest_checkpoint("SCHED_CORE_BENCH_BEGIN");
     kernel_perf_emit_scope("scheduler.core", benchmark_start);
     if (!scheduler_benchmark_queue_paths()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_BENCH_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_BENCH_FAIL\r\n");
     }
     if (!scheduler_benchmark_schedule_paths()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_PATH_BENCH_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_PATH_BENCH_FAIL\r\n");
     }
     if (!scheduler_benchmark_local_wake()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_WAKE_BENCH_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_WAKE_BENCH_FAIL\r\n");
     }
-    hooks->write("LITEOS_SCHED_BENCH_OK\r\n");
-    liteos_realtest_checkpoint("SCHED_CORE_BENCH_OK");
-    liteos_realtest_checkpoint("SCHED_CORE_REPORT_BEGIN");
-    hooks->write("LITEOS_SCHED_CORE_OK\r\n");
-    liteos_realtest_checkpoint("SCHED_CORE_REPORT_OK");
+    hooks->write("OS_SCHED_BENCH_OK\r\n");
+    realtest_checkpoint("SCHED_CORE_BENCH_OK");
+    realtest_checkpoint("SCHED_CORE_REPORT_BEGIN");
+    hooks->write("OS_SCHED_CORE_OK\r\n");
+    realtest_checkpoint("SCHED_CORE_REPORT_OK");
     benchmark_start = telemetry_timestamp();
     if (!sched_accounting_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_ACCOUNTING_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_ACCOUNTING_FAIL\r\n");
     }
     kernel_perf_emit_scope("scheduler.accounting", benchmark_start);
-    hooks->write("LITEOS_SCHED_ACCOUNTING_OK\r\n");
+    hooks->write("OS_SCHED_ACCOUNTING_OK\r\n");
     if (!sched_fair_policy_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_FAIR_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_FAIR_FAIL\r\n");
     }
-    hooks->write("LITEOS_SCHED_FAIR_OK\r\n");
+    hooks->write("OS_SCHED_FAIR_OK\r\n");
     if (!sched_rt_policy_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_RT_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_RT_FAIL\r\n");
     }
-    hooks->write("LITEOS_SCHED_RT_OK\r\n");
+    hooks->write("OS_SCHED_RT_OK\r\n");
     benchmark_start = telemetry_timestamp();
     if (!sched_balance_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_BALANCE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_BALANCE_FAIL\r\n");
     }
     kernel_perf_emit_scope("scheduler.balance", benchmark_start);
-    hooks->write("LITEOS_SCHED_BALANCE_OK\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_PROGRESS, 3U);
+    hooks->write("OS_SCHED_BALANCE_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_PROGRESS, 3U);
     if (!sched_state_transition_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_STATE_TRANSITION_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_STATE_TRANSITION_FAIL\r\n");
     }
-    hooks->write("LITEOS_SCHED_STATE_TRANSITION_OK\r\n");
+    hooks->write("OS_SCHED_STATE_TRANSITION_OK\r\n");
+    if (!sched_remote_remove_ack_self_test()) {
+        return scheduler_fail(hooks, "OS_SCHED_REMOTE_REMOVE_FAIL\r\n");
+    }
+    hooks->write("OS_SCHED_REMOTE_REMOVE_OK\r\n");
     if (!sched_remote_wake_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_SCHED_REMOTE_WAKE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SCHED_REMOTE_WAKE_FAIL\r\n");
     }
-    hooks->write("LITEOS_SCHED_REMOTE_WAKE_OK\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_PROGRESS, 4U);
+    hooks->write("OS_SCHED_REMOTE_WAKE_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_PROGRESS, 4U);
     if (!sched_context_switch_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_CONTEXT_SWITCH_TEST_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_CONTEXT_SWITCH_TEST_FAIL\r\n");
     }
-    hooks->write("LITEOS_CONTEXT_SWITCH_OK\r\n");
+    hooks->write("OS_CONTEXT_SWITCH_OK\r\n");
     /* Idle CPUs poll pending wakeups before HLT to close the lost-IPI window. */
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_PROGRESS, 6U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_SCHEDULER,
-                       LITEOS_DEBUG_STEP_READY, 1U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_PROGRESS, 2U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_PROGRESS, 5U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_PROGRESS, 6U);
+    kernel_debug_stage(OS_DEBUG_PHASE_SCHEDULER,
+                       OS_DEBUG_STEP_READY, 1U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_PROGRESS, 2U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_PROGRESS, 5U);
     if (!kmutex_pi_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_MUTEX_PI_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_MUTEX_PI_FAIL\r\n");
     }
-    hooks->write("LITEOS_MUTEX_PI_OK\r\n");
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_5);
-    liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_6);
-    liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_8);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_ENTER, 0U);
+    hooks->write("OS_MUTEX_PI_OK\r\n");
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_5);
+    kernel_debug_stage_enter(OS_DEBUG_PHASE_SPEC_6);
+    kernel_debug_stage_enter(OS_DEBUG_PHASE_SPEC_8);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_ENTER, 0U);
     if (!canonical_object_handle_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_OBJECT_CORE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_OBJECT_CORE_FAIL\r\n");
     }
-    hooks->write("LITEOS_OBJECT_CORE_OK\r\n");
+    hooks->write("OS_OBJECT_CORE_OK\r\n");
     benchmark_start = telemetry_timestamp();
     if (!canonical_vm_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_VM_CORE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_VM_CORE_FAIL\r\n");
     }
     kernel_perf_emit_scope("mm.vm", benchmark_start);
-    hooks->write("LITEOS_VM_CORE_OK\r\nLITEOS_VM_SHARED_OK\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 7U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 1U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 2U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 3U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 4U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 5U);
+    hooks->write("OS_VM_CORE_OK\r\nOS_VM_SHARED_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 7U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 1U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 2U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 3U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 4U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 5U);
     /* Page-fault entry now hands CR2/error data to the MM policy owner. */
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_6,
-                       LITEOS_DEBUG_STEP_PROGRESS, 6U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_2,
-                       LITEOS_DEBUG_STEP_READY, 1U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_6,
+                       OS_DEBUG_STEP_PROGRESS, 6U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_2,
+                       OS_DEBUG_STEP_READY, 1U);
     benchmark_start = telemetry_timestamp();
     if (!process_core_self_test()) {
-        return scheduler_fail(hooks, "LITEOS_PROCESS_CORE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_PROCESS_CORE_FAIL\r\n");
     }
     kernel_perf_emit_scope("process.core", benchmark_start);
-    hooks->write("LITEOS_PROCESS_CORE_OK\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_5,
-                       LITEOS_DEBUG_STEP_PROGRESS, 3U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_5,
-                       LITEOS_DEBUG_STEP_PROGRESS, 4U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_5,
-                       LITEOS_DEBUG_STEP_PROGRESS, 5U);
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_6);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_3,
-                       LITEOS_DEBUG_STEP_PROGRESS, 6U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_4,
-                       LITEOS_DEBUG_STEP_PROGRESS, 1U);
-    liteos_realtest_checkpoint("SMP_AP_TIMER_ENABLE_BEGIN");
+    hooks->write("OS_PROCESS_CORE_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_5,
+                       OS_DEBUG_STEP_PROGRESS, 3U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_5,
+                       OS_DEBUG_STEP_PROGRESS, 4U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_5,
+                       OS_DEBUG_STEP_PROGRESS, 5U);
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_6);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_3,
+                       OS_DEBUG_STEP_PROGRESS, 6U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_4,
+                       OS_DEBUG_STEP_PROGRESS, 1U);
+    realtest_checkpoint("SMP_AP_TIMER_ENABLE_BEGIN");
     if (!x86_smp_enable_ap_timers()) {
-        return scheduler_fail(hooks, "LITEOS_SMP_TIMER_ENABLE_FAIL\r\n");
+        return scheduler_fail(hooks, "OS_SMP_TIMER_ENABLE_FAIL\r\n");
     }
-    liteos_realtest_mark("SMP_AP_TIMER_ENABLE_OK");
+    realtest_mark("SMP_AP_TIMER_ENABLE_OK");
     return 1;
 }

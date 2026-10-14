@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-/* LiteOS signal ABI: one bit per signal number, signals 1..64. */
+/* System signal ABI: one bit per signal number, signals 1..64. */
 #define OS_SIGNAL_COUNT 64U
 #define OS_SIGNAL_MASK_ALL UINT64_MAX
 

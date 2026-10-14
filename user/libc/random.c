@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -25,7 +25,7 @@ static bool random_rdrand64(uint64_t *value) {
     return success != 0U;
 }
 
-/* OpenSSL's LiteOS seed hook. Keep the source fail-closed when hardware
+/* OpenSSL's System seed hook. Keep the source fail-closed when hardware
  * randomness is unavailable instead of pretending that TSC jitter is entropy. */
 int getentropy(void *buffer, size_t length) {
     uint8_t *output = (uint8_t *)buffer;
@@ -39,7 +39,7 @@ int getentropy(void *buffer, size_t length) {
         return -1;
     }
 
-    int64_t status = liteos_syscall6(OS_SYS_RANDOM_GET,
+    int64_t status = __libc_native_syscall6(OS_SYS_RANDOM_GET,
                                      (uint64_t)(uintptr_t)buffer, length,
                                      0U, 0U, 0U, 0U);
     if (status == (int64_t)length) return 0;

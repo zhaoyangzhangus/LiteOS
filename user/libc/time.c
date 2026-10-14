@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <limits.h>
 #include <sys/time.h>
@@ -7,6 +7,8 @@
 #define SECONDS_PER_MINUTE 60LL
 #define SECONDS_PER_HOUR   (60LL * SECONDS_PER_MINUTE)
 #define SECONDS_PER_DAY    (24LL * SECONDS_PER_HOUR)
+
+char *tzname[2] = {"UTC", "UTC"};
 
 static int64_t floor_divide(int64_t value, int64_t divisor) {
     int64_t quotient = value / divisor;
@@ -104,11 +106,13 @@ struct tm *gmtime_r(const time_t *value, struct tm *result) {
     result->tm_wday = (int)positive_modulo(days + 4, 7);
     result->tm_yday = (int)(days - days_from_civil(year, 1U, 1U));
     result->tm_isdst = 0;
+    result->tm_gmtoff = 0;
+    result->tm_zone = tzname[0];
     return result;
 }
 
 struct tm *localtime_r(const time_t *value, struct tm *result) {
-    /* LiteOS currently has no timezone database; local time is UTC. */
+    /* System currently has no timezone database; local time is UTC. */
     return gmtime_r(value, result);
 }
 
@@ -154,6 +158,10 @@ int timespec_get(struct timespec *value, int base) {
         return 0;
     }
     return clock_gettime(CLOCK_REALTIME, value) == 0 ? base : 0;
+}
+
+void tzset(void) {
+    /* System currently exposes UTC only and has no timezone database. */
 }
 
 __attribute__((target("sse"))) double difftime(time_t end, time_t start) {
@@ -446,6 +454,20 @@ int settimeofday(const struct timeval *value, const struct timezone *zone) {
     converted.tv_sec = value->tv_sec;
     converted.tv_nsec = value->tv_usec * 1000L;
     return clock_settime(CLOCK_REALTIME, &converted);
+}
+
+int utimes(const char *path, const struct timeval times[2]) {
+    (void)path;
+    (void)times;
+    errno = ENOSYS;
+    return -1;
+}
+
+int futimes(int descriptor, const struct timeval times[2]) {
+    (void)descriptor;
+    (void)times;
+    errno = ENOSYS;
+    return -1;
 }
 
 int clock_nanosleep(clockid_t clock_id, int flags,

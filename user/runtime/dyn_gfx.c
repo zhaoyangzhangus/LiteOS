@@ -7,7 +7,7 @@
 #include <uapi/window.h>
 
 #include "blend2d_demo.h"
-#include "liteos_gfx.h"
+#include "graphics.h"
 
 #define DYNAMIC_GFX_MAP_BASE 0x07000000ULL
 #define DYNAMIC_GFX_MIN_WIDTH 320U
@@ -67,7 +67,7 @@ static bool create_window(const os_display_info_t *display,
     window->y = (int32_t)((display->height - height) / 2U);
     window->width = width;
     window->height = height;
-    window->flags = OS_WINDOW_VISIBLE | OS_WINDOW_CLIENT_DECORATIONS;
+    window->flags = OS_WINDOW_VISIBLE | OS_WINDOW_STANDARD_CAPTION_CONTROLS;
     window->background = 0x00121C2EU;
     window->title[0] = 'D';
     window->title[1] = 'Y';
@@ -98,28 +98,27 @@ static void draw_demo(uint32_t *pixels, uint32_t width, uint32_t height) {
     uint32_t panel_y = height / 8U;
     uint32_t panel_width = width - panel_x * 2U;
     uint32_t panel_height = height - panel_y * 2U;
-    liteos_gfx_gradient_rect(pixels, width, width, height, 0, 0, width, height,
+    gfx_gradient_rect(pixels, width, width, height, 0, 0, width, height,
                              0x00101A30U, 0x003C1F62U);
-    liteos_gfx_fill_rect(pixels, width, width, height,
+    gfx_fill_rect(pixels, width, width, height,
                          (int32_t)panel_x, (int32_t)panel_y,
                          panel_width, panel_height, 0x001C2945U);
-    liteos_gfx_gradient_rect(pixels, width, width, height,
+    gfx_gradient_rect(pixels, width, width, height,
                              (int32_t)panel_x + 4, (int32_t)panel_y + 4,
                              panel_width - 8U, panel_height / 2U,
                              0x002A6A92U, 0x00163B68U);
-    liteos_gfx_fill_rect(pixels, width, width, height,
+    gfx_fill_rect(pixels, width, width, height,
                          (int32_t)panel_x + panel_width / 8U,
                          (int32_t)panel_y + panel_height * 3U / 5U,
                          panel_width * 3U / 5U, 18U, 0x005DE0C0U);
-    liteos_gfx_fill_rect(pixels, width, width, height,
+    gfx_fill_rect(pixels, width, width, height,
                          (int32_t)panel_x + panel_width / 8U,
                          (int32_t)panel_y + panel_height * 3U / 5U + 30,
                          panel_width * 2U / 5U, 10U, 0x00E5B567U);
-    liteos_gfx_fill_rect(pixels, width, width, height,
+    gfx_fill_rect(pixels, width, width, height,
                          (int32_t)panel_x + panel_width * 5U / 8U,
                          (int32_t)panel_y + panel_height * 3U / 5U,
                          panel_width / 8U, 40U, 0x00F16D7AU);
-    liteos_gfx_frame(pixels, width, width, height, 4U, 0x007DD6FFU);
 }
 
 static bool publish_window(uint32_t identifier, uint32_t width, uint32_t height) {
@@ -136,7 +135,7 @@ static bool render_window(os_window_create_t *window, uint32_t font_size) {
     if (window == 0 || window->address == 0U) return false;
     draw_demo((uint32_t *)(uintptr_t)window->address,
               window->width, window->height);
-    if (!liteos_blend2d_draw_demo((uint32_t *)(uintptr_t)window->address,
+    if (!blend2d_draw_demo((uint32_t *)(uintptr_t)window->address,
                                   window->width, window->width,
                                   window->height, font_size)) return false;
     return publish_window(window->identifier, window->width, window->height);
@@ -146,11 +145,11 @@ static bool change_font_size(uint32_t *font_size, int32_t direction) {
     uint32_t next;
     if (font_size == 0) return false;
     if (direction > 0) {
-        next = *font_size >= LITEOS_BLEND2D_FONT_MAX - LITEOS_BLEND2D_FONT_STEP ?
-               LITEOS_BLEND2D_FONT_MAX : *font_size + LITEOS_BLEND2D_FONT_STEP;
+        next = *font_size >= OS_BLEND2D_FONT_MAX - OS_BLEND2D_FONT_STEP ?
+               OS_BLEND2D_FONT_MAX : *font_size + OS_BLEND2D_FONT_STEP;
     } else {
-        next = *font_size <= LITEOS_BLEND2D_FONT_MIN + LITEOS_BLEND2D_FONT_STEP ?
-               LITEOS_BLEND2D_FONT_MIN : *font_size - LITEOS_BLEND2D_FONT_STEP;
+        next = *font_size <= OS_BLEND2D_FONT_MIN + OS_BLEND2D_FONT_STEP ?
+               OS_BLEND2D_FONT_MIN : *font_size - OS_BLEND2D_FONT_STEP;
     }
     if (next == *font_size) return false;
     *font_size = next;
@@ -186,7 +185,7 @@ int64_t dyn_gfx_main(uint64_t argc, char **argv) {
     os_display_info_t display = {0};
     os_window_create_t window = {0};
     os_window_event_read_t event = {0};
-    uint32_t font_size = LITEOS_BLEND2D_FONT_DEFAULT;
+    uint32_t font_size = OS_BLEND2D_FONT_DEFAULT;
     bool shift = false;
     bool runtime_ready = false;
     bool window_ready = false;
@@ -209,7 +208,7 @@ int64_t dyn_gfx_main(uint64_t argc, char **argv) {
         goto cleanup;
     }
     result = 0;
-    dyn_gfx_debug("LITEOS_BLEND2D_VISIBLE_OK\r\n");
+    dyn_gfx_debug("OS_BLEND2D_VISIBLE_OK\r\n");
     for (;;) {
         event = (os_window_event_read_t){0};
         event.hdr.size = sizeof(event);
@@ -224,11 +223,11 @@ int64_t dyn_gfx_main(uint64_t argc, char **argv) {
                 result = 1;
                 break;
             }
-            dyn_gfx_debug(font_size == LITEOS_BLEND2D_FONT_MAX ?
-                          "LITEOS_BLEND2D_FONT_MAX\r\n" :
-                          font_size == LITEOS_BLEND2D_FONT_MIN ?
-                          "LITEOS_BLEND2D_FONT_MIN\r\n" :
-                          "LITEOS_BLEND2D_FONT_ZOOM\r\n");
+            dyn_gfx_debug(font_size == OS_BLEND2D_FONT_MAX ?
+                          "OS_BLEND2D_FONT_MAX\r\n" :
+                          font_size == OS_BLEND2D_FONT_MIN ?
+                          "OS_BLEND2D_FONT_MIN\r\n" :
+                          "OS_BLEND2D_FONT_ZOOM\r\n");
         }
     }
 

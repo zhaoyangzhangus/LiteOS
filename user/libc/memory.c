@@ -1,19 +1,63 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
-void *memcpy(void *destination, const void *source, size_t length) {
+#include <uapi/memory.h>
+
+int __libc_query_memory_info(os_memory_info_t *info) {
+    int64_t status;
+    if (info == 0) return -1;
+    info->hdr.size = sizeof(*info);
+    info->hdr.version = OS_SYSCALL_ABI_VERSION;
+    status = __libc_native_syscall6(OS_SYS_MEMORY_INFO,
+                             (uint64_t)(uintptr_t)info,
+                             0U, 0U, 0U, 0U, 0U);
+    return status < 0 ? __libc_status_result(status) : 0;
+}
+
+/* This helper also accepts forward-safe overlap for memmove. Do not rely on
+ * compiler builtin memcpy assumptions when the ranges overlap. */
+static void *libc_copy_forward(void *destination, const void *source, size_t length) {
     uint8_t *out = (uint8_t *)destination;
     const uint8_t *in = (const uint8_t *)source;
+#if defined(__x86_64__)
+    if (length >= 64U) {
+        size_t words = length / sizeof(uint64_t);
+        /* No AVX/ERMS feature requirement or alignment/guard-page overread.
+         * Leave DF clear, including across asynchronous signal delivery. */
+        __asm__ volatile("cld; rep movsq"
+                         : "+D"(out), "+S"(in), "+c"(words)
+                         : : "memory", "cc");
+        length %= sizeof(uint64_t);
+    }
+#endif
     while (length-- != 0U) *out++ = *in++;
     return destination;
+}
+
+void *memcpy(void *destination, const void *source, size_t length) {
+    return libc_copy_forward(destination, source, length);
 }
 
 void *memmove(void *destination, const void *source, size_t length) {
     uint8_t *out = (uint8_t *)destination;
     const uint8_t *in = (const uint8_t *)source;
     if (out == in || length == 0U) return destination;
-    if (out < in || out >= in + length) {
-        while (length-- != 0U) *out++ = *in++;
+    if ((uintptr_t)out < (uintptr_t)in ||
+        (uintptr_t)out - (uintptr_t)in >= length) {
+        return libc_copy_forward(destination, source, length);
     } else {
+#if defined(__x86_64__)
+        /* Backward integer loads/stores preserve overlap even one byte
+         * apart, without setting DF or requiring aligned uint64_t access. */
+        typedef struct { uint64_t value; }
+            __attribute__((packed, may_alias)) unaligned_word_t;
+        if (length >= 64U) {
+            while (length >= sizeof(uint64_t)) {
+                length -= sizeof(uint64_t);
+                uint64_t value = ((const unaligned_word_t *)(in + length))->value;
+                ((unaligned_word_t *)(out + length))->value = value;
+            }
+        }
+#endif
         out += length;
         in += length;
         while (length-- != 0U) *--out = *--in;

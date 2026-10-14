@@ -1,5 +1,7 @@
 #include <arch/x86_64/cpu.h>
 #include <kernel/spinlock.h>
+#include <kernel/sched.h>
+#include <kernel/string.h>
 #include <kernel/telemetry.h>
 
 static struct {
@@ -9,12 +11,23 @@ static struct {
     uint64_t next_sequence;
 } g_telemetry;
 
+static void telemetry_lock(void) {
+    sched_preempt_disable();
+    spinlock_lock(&g_telemetry.lock);
+}
+
+static void telemetry_unlock(void) {
+    spinlock_unlock(&g_telemetry.lock);
+    sched_preempt_enable();
+}
+
 bool telemetry_init(void) {
+    if (atomic_load_explicit(&g_telemetry.init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_telemetry.init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_telemetry.lock.state, 0U);
+        spinlock_init(&g_telemetry.lock);
         for (uint32_t i = 0; i < TELEMETRY_RING_CAPACITY; ++i) {
             g_telemetry.records[i] = (telemetry_record_t){0};
         }
@@ -36,12 +49,9 @@ kstatus_t telemetry_record(uint32_t category, uint64_t object_id,
                            uint64_t value0, uint64_t value1) {
     telemetry_record_t *record;
     if (category == 0U || !telemetry_init()) return K_EINVAL;
-    while (atomic_exchange_explicit(&g_telemetry.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    telemetry_lock();
     if (g_telemetry.next_sequence == UINT64_MAX) {
-        atomic_store_explicit(&g_telemetry.lock.state, 0U, memory_order_release);
+        telemetry_unlock();
         return K_EIO;
     }
     uint64_t sequence = ++g_telemetry.next_sequence;
@@ -52,8 +62,9 @@ kstatus_t telemetry_record(uint32_t category, uint64_t object_id,
     record->object_id = object_id;
     record->value0 = value0;
     record->value1 = value1;
-    __atomic_store_n(&record->sequence, sequence, __ATOMIC_RELEASE);
-    atomic_store_explicit(&g_telemetry.lock.state, 0U, memory_order_release);
+    /* All ring readers use telemetry_lock; unlock publishes the record. */
+    record->sequence = sequence;
+    telemetry_unlock();
     return K_OK;
 }
 
@@ -71,28 +82,32 @@ size_t telemetry_snapshot(uint64_t after_sequence, telemetry_record_t *records,
                           size_t capacity, uint64_t *next_sequence) {
     size_t count = 0U;
     if (!telemetry_init() || records == 0 || capacity == 0U) return 0U;
-    while (atomic_exchange_explicit(&g_telemetry.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    telemetry_lock();
     uint64_t newest = g_telemetry.next_sequence;
     if (after_sequence == UINT64_MAX) {
         if (next_sequence != 0) *next_sequence = newest;
-        atomic_store_explicit(&g_telemetry.lock.state, 0U, memory_order_release);
+        telemetry_unlock();
         return 0U;
     }
     uint64_t first = newest >= TELEMETRY_RING_CAPACITY ?
                      newest - TELEMETRY_RING_CAPACITY + 1U : 1U;
     if (after_sequence + 1U > first) first = after_sequence + 1U;
-    for (uint64_t sequence = first;
-         sequence <= newest && count < capacity; ++sequence) {
-        telemetry_record_t record = g_telemetry.records[
-            (size_t)((sequence - 1U) % TELEMETRY_RING_CAPACITY)];
-        if (__atomic_load_n(&record.sequence, __ATOMIC_ACQUIRE) != sequence) continue;
-        records[count++] = record;
+    if (first <= newest) {
+        /* Writers commit consecutive records under this same lock. The live
+         * sequence interval therefore occupies at most two contiguous spans. */
+        count = (size_t)(newest - first + 1U);
+        if (count > capacity) count = capacity;
+        size_t index = (size_t)((first - 1U) % TELEMETRY_RING_CAPACITY);
+        size_t first_count = TELEMETRY_RING_CAPACITY - index;
+        if (first_count > count) first_count = count;
+        memcpy(records, &g_telemetry.records[index], first_count * sizeof(*records));
+        if (count > first_count) {
+            memcpy(records + first_count, g_telemetry.records,
+                   (count - first_count) * sizeof(*records));
+        }
     }
     if (next_sequence != 0) *next_sequence = newest;
-    atomic_store_explicit(&g_telemetry.lock.state, 0U, memory_order_release);
+    telemetry_unlock();
     return count;
 }
 

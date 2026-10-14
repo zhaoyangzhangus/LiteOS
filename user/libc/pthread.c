@@ -1,12 +1,25 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <limits.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <time.h>
 
+#include <uapi/linux_abi.h>
+
 #define PTHREAD_DEFAULT_STACK_SIZE (64U * 1024U)
 #define PTHREAD_PAGE_SIZE 4096U
+#define LIBC_TLS_HEADER_WORDS 6U
+#define LIBC_TLS_MAGIC 0x4C4954454F53544CULL
+#define LIBC_MUTEXATTR_TYPE_MASK 0x3U
+#define LIBC_MUTEXATTR_PSHARED_BIT 0x4U
+#define LIBC_CONDATTR_CLOCK_MASK 0xFFU
+#define LIBC_CONDATTR_PSHARED_BIT 0x100U
+
+_Static_assert(sizeof(pthread_mutexattr_t) == sizeof(uint32_t),
+               "pthread_mutexattr_t must match glibc x86-64 ABI");
+_Static_assert(sizeof(pthread_condattr_t) == sizeof(uint32_t),
+               "pthread_condattr_t must match glibc x86-64 ABI");
 
 typedef struct pthread_start_context {
     pthread_t thread;
@@ -15,7 +28,7 @@ typedef struct pthread_start_context {
     int error_number;
 } pthread_start_context_t;
 
-struct liteos_pthread {
+struct libc_pthread {
     os_handle_t handle;
     void *stack_address;
     size_t stack_size;
@@ -27,11 +40,17 @@ struct liteos_pthread {
     bool listed;
     bool cleanup;
     bool handle_ready;
-    struct liteos_pthread *detached_next;
+    struct libc_pthread *detached_next;
     pthread_start_context_t *context;
+    void *tls_mapping;
+    size_t tls_mapping_size;
+    uint64_t tls_fs_base;
+    char name[16];
     void *specific[PTHREAD_KEYS_MAX];
     uint32_t specific_generation[PTHREAD_KEYS_MAX];
 };
+
+static void pthread_release_tls(pthread_t thread);
 
 /* Keep pthread_mutex_t's historical one-word ABI.  Recursive ownership is
  * process-local metadata keyed by the public mutex address. */
@@ -44,6 +63,15 @@ typedef struct pthread_mutex_metadata {
     struct pthread_mutex_metadata *next;
 } pthread_mutex_metadata_t;
 
+#define MUTEX_METADATA_BUCKET_COUNT 1024U
+#define LIBC_LOCK_STATE_FREE 0U
+#define LIBC_LOCK_STATE_LOCKED 1U
+#define LIBC_LOCK_STATE_CONTENDED 2U
+/* Preserve the one-word ABI and static zero initializer. Only ownership-
+ * tracking mutexes need the side table; normal mutexes must never serialize
+ * behind its allocator or an unrelated recursive lock. */
+#define LIBC_MUTEX_METADATA_BIT 0x80000000U
+
 static volatile uint64_t g_key_bitmap;
 static void (*g_key_destructors[PTHREAD_KEYS_MAX])(void *);
 static uint32_t g_key_generation[PTHREAD_KEYS_MAX];
@@ -51,11 +79,29 @@ static volatile uint32_t g_key_lock;
 static void *g_main_specific[PTHREAD_KEYS_MAX];
 static uint32_t g_main_specific_generation[PTHREAD_KEYS_MAX];
 static pthread_start_context_t g_main_context;
-static struct liteos_pthread g_main_thread;
+static struct libc_pthread g_main_thread;
 static volatile uint32_t g_detached_lock;
 static pthread_t g_detached_threads;
 static volatile uint32_t g_mutex_metadata_lock;
-static pthread_mutex_metadata_t *g_mutex_metadata;
+static pthread_mutex_metadata_t *
+    g_mutex_metadata_buckets[MUTEX_METADATA_BUCKET_COUNT];
+
+static void pthread_startup_debug_mark(const char *text, size_t length) {
+    (void)__libc_linux_syscall6(OS_SYS_DEBUG_WRITE,
+                                (uint64_t)(uintptr_t)text, length,
+                                0U, 0U, 0U, 0U);
+}
+
+#define PTHREAD_ATFORK_MAX 64U
+typedef struct pthread_atfork_entry {
+    void (*prepare)(void);
+    void (*parent)(void);
+    void (*child)(void);
+} pthread_atfork_entry_t;
+
+static pthread_atfork_entry_t g_atfork_entries[PTHREAD_ATFORK_MAX];
+static unsigned int g_atfork_count;
+static volatile uint32_t g_atfork_lock;
 
 static void detached_lock(void) {
     while (__atomic_exchange_n(&g_detached_lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
@@ -65,6 +111,28 @@ static void detached_lock(void) {
 
 static void detached_unlock(void) {
     __atomic_store_n(&g_detached_lock, 0U, __ATOMIC_RELEASE);
+}
+
+static void atfork_lock(void) {
+    while (__atomic_exchange_n(&g_atfork_lock, 1U, __ATOMIC_ACQUIRE) != 0U) {
+        __asm__ volatile("pause");
+    }
+}
+
+static void atfork_unlock(void) {
+    __atomic_store_n(&g_atfork_lock, 0U, __ATOMIC_RELEASE);
+}
+
+static unsigned int atfork_snapshot(pthread_atfork_entry_t *entries) {
+    unsigned int count;
+    atfork_lock();
+    count = g_atfork_count;
+    if (count != 0U) {
+        memcpy(entries, g_atfork_entries,
+               count * sizeof(pthread_atfork_entry_t));
+    }
+    atfork_unlock();
+    return count;
 }
 
 static void thread_lifecycle_lock(pthread_t thread) {
@@ -133,12 +201,13 @@ static void detached_reap(void) {
         detached_unlock();
         if (candidate == 0) return;
 
-        status = liteos_syscall6(OS_SYS_WAIT_ONE, candidate->handle, 0U,
+        status = __libc_native_syscall6(OS_SYS_WAIT_ONE, candidate->handle, 0U,
                                  (uint64_t)(uintptr_t)&wait_result,
                                  0U, 0U, 0U);
         if (status >= 0) {
-            (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, candidate->handle,
+            (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, candidate->handle,
                                   0U, 0U, 0U, 0U, 0U);
+            pthread_release_tls(candidate);
             free(candidate->context);
             free(candidate);
             continue;
@@ -162,11 +231,55 @@ void __libc_reap_detached_threads(void) {
 }
 
 int __libc_thread_init(void) {
+    uint64_t fs_base = 0U;
+    pthread_startup_debug_mark("OS_LIBC_THREAD_INIT_ENTER\n",
+                               sizeof("OS_LIBC_THREAD_INIT_ENTER\n") - 1U);
     g_main_context.thread = &g_main_thread;
     g_main_thread.context = &g_main_context;
-    int64_t status = liteos_syscall6(
-        OS_SYS_THREAD_CONTEXT, OS_THREAD_CONTEXT_SET_FS,
-        (uint64_t)(uintptr_t)&g_main_context, 0U, 0U, 0U, 0U);
+    /* The dynamic linker switches to the Linux syscall ABI immediately before
+     * entering the CRT entry point.  Use arch_prctl for that first TLS setup;
+     * native THREAD_CONTEXT would otherwise be interpreted as a Linux syscall.
+     */
+    int64_t probe = __libc_linux_syscall6(OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U,
+                                          0U, 0U);
+    if (probe == -38LL) {
+        pthread_startup_debug_mark("OS_LIBC_THREAD_PROBE_LINUX\n",
+                                   sizeof("OS_LIBC_THREAD_PROBE_LINUX\n") - 1U);
+        int64_t get_status = __libc_linux_syscall6(
+            LINUX_SYS_ARCH_PRCTL, LINUX_ARCH_GET_FS,
+            (uint64_t)(uintptr_t)&fs_base, 0U, 0U, 0U, 0U);
+        if (get_status < 0) {
+            pthread_startup_debug_mark("OS_LIBC_THREAD_GETFS_FAIL\n",
+                                       sizeof("OS_LIBC_THREAD_GETFS_FAIL\n") - 1U);
+            return -1;
+        }
+        if (fs_base != 0U) {
+            pthread_startup_debug_mark("OS_LIBC_THREAD_GETFS_OK\n",
+                                       sizeof("OS_LIBC_THREAD_GETFS_OK\n") - 1U);
+            uint64_t *tcb = (uint64_t *)(uintptr_t)fs_base;
+            /* fs:0 is the TLS self pointer required by Chromium's
+             * local-exec TLS ABI; keep pthread_t in the private slot at
+             * fs:32. */
+            tcb[0] = fs_base;
+            tcb[4] = (uint64_t)(uintptr_t)&g_main_thread;
+            return 0;
+        }
+        pthread_startup_debug_mark("OS_LIBC_THREAD_GETFS_ZERO\n",
+                                   sizeof("OS_LIBC_THREAD_GETFS_ZERO\n") - 1U);
+    }
+    if (probe != -38LL) {
+        pthread_startup_debug_mark("OS_LIBC_THREAD_PROBE_NATIVE\n",
+                                   sizeof("OS_LIBC_THREAD_PROBE_NATIVE\n") - 1U);
+    }
+    int64_t status = probe == -38LL ?
+        __libc_linux_syscall6(LINUX_SYS_ARCH_PRCTL, LINUX_ARCH_SET_FS,
+                              (uint64_t)(uintptr_t)&g_main_thread, 0U, 0U, 0U, 0U) :
+        __libc_native_syscall6(OS_SYS_THREAD_CONTEXT, OS_THREAD_CONTEXT_SET_FS,
+        (uint64_t)(uintptr_t)&g_main_thread, 0U, 0U, 0U, 0U);
+    pthread_startup_debug_mark(status < 0 ? "OS_LIBC_THREAD_SETFS_FAIL\n" :
+                                      "OS_LIBC_THREAD_SETFS_OK\n",
+                               status < 0 ? sizeof("OS_LIBC_THREAD_SETFS_FAIL\n") - 1U :
+                                             sizeof("OS_LIBC_THREAD_SETFS_OK\n") - 1U);
     return status < 0 ? -1 : 0;
 }
 
@@ -194,15 +307,43 @@ static int pthread_status_error(int64_t status) {
     return error;
 }
 
+static bool pthread_linux_personality(void) {
+    return __libc_linux_personality();
+}
+
+static uint64_t linux_futex_timeout_pointer(uint64_t timeout_ns,
+                                            struct timespec *timeout) {
+    if (timeout_ns == OS_WAIT_INFINITE || timeout == 0) return 0U;
+    timeout->tv_sec = (time_t)(timeout_ns / 1000000000ULL);
+    timeout->tv_nsec = (long)(timeout_ns % 1000000000ULL);
+    return (uint64_t)(uintptr_t)timeout;
+}
+
 static int futex_wait(volatile uint32_t *address, uint32_t expected,
                       uint64_t timeout_ns) {
-    return pthread_status_error(liteos_syscall6(
+    if (pthread_linux_personality()) {
+        struct timespec timeout;
+        uint64_t timeout_pointer = linux_futex_timeout_pointer(
+            timeout_ns, &timeout);
+        return pthread_status_error(__libc_linux_syscall6(
+            LINUX_SYS_FUTEX, (uint64_t)(uintptr_t)address,
+            LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG, expected,
+            timeout_pointer, 0U, 0U));
+    }
+    return pthread_status_error(__libc_native_syscall6(
         OS_SYS_FUTEX_WAIT, (uint64_t)(uintptr_t)address, expected,
         timeout_ns, 0U, 0U, 0U));
 }
 
 static int futex_wake(volatile uint32_t *address, uint32_t count) {
-    int64_t status = liteos_syscall6(OS_SYS_FUTEX_WAKE,
+    if (pthread_linux_personality()) {
+        int64_t status = __libc_linux_syscall6(
+            LINUX_SYS_FUTEX, (uint64_t)(uintptr_t)address,
+            LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG, count,
+            0U, 0U, 0U);
+        return status < 0 ? pthread_status_error(status) : 0;
+    }
+    int64_t status = __libc_native_syscall6(OS_SYS_FUTEX_WAKE,
                                      (uint64_t)(uintptr_t)address, count,
                                      0U, 0U, 0U, 0U);
     return status < 0 ? pthread_status_error(status) : 0;
@@ -237,11 +378,12 @@ static void run_key_destructors(pthread_t thread) {
              * without the lock so destructors may use key APIs. */
             key_lock();
             if (key_is_valid_locked(key) &&
-                generations[key] == g_key_generation[key] &&
-                values[key] != 0) {
-                value = values[key];
-                values[key] = 0;
-                generations[key] = 0;
+                __atomic_load_n(&generations[key], __ATOMIC_ACQUIRE) ==
+                    __atomic_load_n(&g_key_generation[key], __ATOMIC_ACQUIRE) &&
+                __atomic_load_n(&values[key], __ATOMIC_RELAXED) != 0) {
+                value = __atomic_load_n(&values[key], __ATOMIC_RELAXED);
+                __atomic_store_n(&values[key], 0, __ATOMIC_RELAXED);
+                __atomic_store_n(&generations[key], 0U, __ATOMIC_RELEASE);
                 destructor = g_key_destructors[key];
             }
             key_unlock();
@@ -260,14 +402,104 @@ static size_t page_round(size_t size) {
            ~(size_t)(PTHREAD_PAGE_SIZE - 1U);
 }
 
+static bool pthread_tls_metadata(uint64_t fs_base, uint64_t *tls_size,
+                                 uint64_t *template_base,
+                                 uint64_t *tls_alignment) {
+    const uint64_t maximum = 1ULL << 20U;
+    uint64_t *tcb;
+    if (fs_base == 0U || fs_base > UINTPTR_MAX -
+        LIBC_TLS_HEADER_WORDS * sizeof(uint64_t) ||
+        tls_size == 0 || template_base == 0 || tls_alignment == 0) {
+        return false;
+    }
+    tcb = (uint64_t *)(uintptr_t)fs_base;
+    if (tcb[3] != LIBC_TLS_MAGIC || tcb[1] == 0U || tcb[1] > maximum ||
+        tcb[2] == 0U || tcb[5] == 0U || tcb[5] > maximum ||
+        (tcb[5] & (tcb[5] - 1U)) != 0U) return false;
+    *tls_size = tcb[1];
+    *template_base = tcb[2];
+    *tls_alignment = tcb[5];
+    return true;
+}
+
+static bool pthread_prepare_tls(pthread_t thread) {
+    uint64_t fs_base = 0U;
+    uint64_t tls_size = 0U;
+    uint64_t template_base = 0U;
+    uint64_t tls_alignment = 0U;
+    uint64_t aligned_tls_size;
+    uint64_t tls_mapping_offset;
+    size_t mapping_size;
+    size_t required_size;
+    void *mapping;
+    uint64_t child_tls_base;
+    uint64_t child_fs;
+    int64_t status = __libc_linux_syscall6(
+        LINUX_SYS_ARCH_PRCTL, LINUX_ARCH_GET_FS,
+        (uint64_t)(uintptr_t)&fs_base, 0U, 0U, 0U, 0U);
+    if (status < 0) return false;
+    if (!pthread_tls_metadata(fs_base, &tls_size, &template_base,
+                             &tls_alignment)) return true;
+    if (tls_size > UINT64_MAX - (tls_alignment - 1U)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    aligned_tls_size = (tls_size + tls_alignment - 1U) &
+                       ~(tls_alignment - 1U);
+    if (aligned_tls_size > SIZE_MAX - (tls_alignment - 1U) ||
+        aligned_tls_size + tls_alignment - 1U > SIZE_MAX -
+            LIBC_TLS_HEADER_WORDS * sizeof(uint64_t)) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    tls_mapping_offset = tls_alignment - 1U;
+    required_size = (size_t)aligned_tls_size + (size_t)tls_mapping_offset +
+                    LIBC_TLS_HEADER_WORDS * sizeof(uint64_t);
+    mapping_size = page_round(required_size);
+    if (mapping_size == 0U) {
+        errno = EOVERFLOW;
+        return false;
+    }
+    mapping = mmap(0, mapping_size, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapping == MAP_FAILED) return false;
+    child_tls_base = ((uint64_t)(uintptr_t)mapping + tls_mapping_offset) &
+                     ~(tls_alignment - 1U);
+    memcpy((void *)(uintptr_t)child_tls_base,
+           (const void *)(uintptr_t)template_base, (size_t)tls_size);
+    child_fs = child_tls_base + aligned_tls_size;
+    {
+        uint64_t *tcb = (uint64_t *)(uintptr_t)child_fs;
+        tcb[0] = child_fs;
+        tcb[1] = tls_size;
+        tcb[2] = template_base;
+        tcb[3] = LIBC_TLS_MAGIC;
+        tcb[4] = (uint64_t)(uintptr_t)thread;
+        tcb[5] = tls_alignment;
+    }
+    thread->tls_mapping = mapping;
+    thread->tls_mapping_size = mapping_size;
+    thread->tls_fs_base = child_fs;
+    return true;
+}
+
+static void pthread_release_tls(pthread_t thread) {
+    if (thread == 0 || thread->tls_mapping == 0 ||
+        thread->tls_mapping_size == 0U) return;
+    (void)munmap(thread->tls_mapping, thread->tls_mapping_size);
+    thread->tls_mapping = 0;
+    thread->tls_mapping_size = 0U;
+    thread->tls_fs_base = 0U;
+}
+
 static int absolute_timeout(const struct timespec *absolute,
-                            uint64_t *timeout_ns) {
+                            clockid_t clock_id, uint64_t *timeout_ns) {
     struct timespec now;
     uint64_t seconds;
     uint64_t nanoseconds;
     if (absolute == 0 || timeout_ns == 0 || absolute->tv_nsec < 0 ||
         absolute->tv_nsec >= 1000000000L) return EINVAL;
-    if (clock_gettime(CLOCK_REALTIME, &now) < 0) return errno;
+    if (clock_gettime(clock_id, &now) < 0) return errno;
     if (absolute->tv_sec < now.tv_sec ||
         (absolute->tv_sec == now.tv_sec &&
          absolute->tv_nsec <= now.tv_nsec)) {
@@ -370,20 +602,61 @@ int pthread_attr_getdetachstate(const pthread_attr_t *attribute, int *state) {
 }
 
 static void mutex_metadata_lock(void) {
-    while (__atomic_exchange_n(&g_mutex_metadata_lock, 1U,
-                               __ATOMIC_ACQUIRE) != 0U) {
-        __asm__ volatile("pause");
+    bool contended = false;
+    for (;;) {
+        uint32_t expected = LIBC_LOCK_STATE_FREE;
+        uint32_t desired = contended ? LIBC_LOCK_STATE_CONTENDED :
+                                       LIBC_LOCK_STATE_LOCKED;
+        if (__atomic_compare_exchange_n(&g_mutex_metadata_lock, &expected,
+                                        desired,
+                                        false, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            return;
+        }
+
+        /* State 2 means the owner must wake one sleeper when it releases the
+         * lock. Keep that state when a woken waiter takes ownership so a
+         * chain of sleepers cannot be stranded behind an uncontended unlock. */
+        if (expected == LIBC_LOCK_STATE_LOCKED) {
+            expected = LIBC_LOCK_STATE_LOCKED;
+            if (!__atomic_compare_exchange_n(
+                    &g_mutex_metadata_lock, &expected,
+                    LIBC_LOCK_STATE_CONTENDED, false, __ATOMIC_ACQ_REL,
+                    __ATOMIC_RELAXED)) {
+                contended = true;
+                continue;
+            }
+        } else if (expected != LIBC_LOCK_STATE_CONTENDED) {
+            contended = true;
+            continue;
+        }
+        contended = true;
+        (void)futex_wait(&g_mutex_metadata_lock,
+                         LIBC_LOCK_STATE_CONTENDED, OS_WAIT_INFINITE);
     }
 }
 
 static void mutex_metadata_unlock(void) {
-    __atomic_store_n(&g_mutex_metadata_lock, 0U, __ATOMIC_RELEASE);
+    uint32_t previous_state = __atomic_exchange_n(
+        &g_mutex_metadata_lock, LIBC_LOCK_STATE_FREE, __ATOMIC_RELEASE);
+    if (previous_state == LIBC_LOCK_STATE_CONTENDED) {
+        (void)futex_wake(&g_mutex_metadata_lock, 1U);
+    }
+}
+
+static uint32_t mutex_metadata_bucket_index(const pthread_mutex_t *mutex) {
+    uintptr_t value = (uintptr_t)mutex >> 3U;
+    value ^= value >> 13U;
+    value ^= value >> 23U;
+    return (uint32_t)value & (MUTEX_METADATA_BUCKET_COUNT - 1U);
 }
 
 /* The caller must hold g_mutex_metadata_lock. */
 static pthread_mutex_metadata_t *mutex_metadata_find_locked(
     pthread_mutex_t *mutex) {
-    for (pthread_mutex_metadata_t *entry = g_mutex_metadata; entry != 0;
+    uint32_t bucket = mutex_metadata_bucket_index(mutex);
+    for (pthread_mutex_metadata_t *entry = g_mutex_metadata_buckets[bucket];
+         entry != 0;
          entry = entry->next) {
         if (entry->mutex == mutex) return entry;
     }
@@ -393,7 +666,8 @@ static pthread_mutex_metadata_t *mutex_metadata_find_locked(
 /* The caller must hold g_mutex_metadata_lock. */
 static pthread_mutex_metadata_t *mutex_metadata_remove_locked(
     pthread_mutex_t *mutex) {
-    pthread_mutex_metadata_t **link = &g_mutex_metadata;
+    uint32_t bucket = mutex_metadata_bucket_index(mutex);
+    pthread_mutex_metadata_t **link = &g_mutex_metadata_buckets[bucket];
     while (*link != 0) {
         pthread_mutex_metadata_t *entry = *link;
         if (entry->mutex == mutex) {
@@ -408,8 +682,7 @@ static pthread_mutex_metadata_t *mutex_metadata_remove_locked(
 
 int pthread_mutexattr_init(pthread_mutexattr_t *attribute) {
     if (attribute == 0) return pthread_invalid();
-    attribute->type = PTHREAD_MUTEX_NORMAL;
-    attribute->process_shared = PTHREAD_PROCESS_PRIVATE;
+    attribute->value = 0U;
     return 0;
 }
 
@@ -421,13 +694,14 @@ int pthread_mutexattr_settype(pthread_mutexattr_t *attribute, int type) {
     if (attribute == 0) return pthread_invalid();
     if (type != PTHREAD_MUTEX_NORMAL && type != PTHREAD_MUTEX_RECURSIVE &&
         type != PTHREAD_MUTEX_ERRORCHECK) return EINVAL;
-    attribute->type = type;
+    attribute->value = (attribute->value & ~LIBC_MUTEXATTR_TYPE_MASK) |
+                       ((uint32_t)type & LIBC_MUTEXATTR_TYPE_MASK);
     return 0;
 }
 
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *attribute, int *type) {
     if (attribute == 0 || type == 0) return pthread_invalid();
-    *type = attribute->type;
+    *type = (int)(attribute->value & LIBC_MUTEXATTR_TYPE_MASK);
     return 0;
 }
 
@@ -436,39 +710,52 @@ int pthread_mutexattr_setpshared(pthread_mutexattr_t *attribute, int shared) {
     if (shared != PTHREAD_PROCESS_PRIVATE && shared != PTHREAD_PROCESS_SHARED) {
         return EINVAL;
     }
-    attribute->process_shared = shared;
+    attribute->value = (attribute->value & ~LIBC_MUTEXATTR_PSHARED_BIT) |
+        (shared == PTHREAD_PROCESS_SHARED ? LIBC_MUTEXATTR_PSHARED_BIT : 0U);
     return 0;
 }
 
 int pthread_mutexattr_getpshared(const pthread_mutexattr_t *attribute,
                                  int *shared) {
     if (attribute == 0 || shared == 0) return pthread_invalid();
-    *shared = attribute->process_shared;
+    *shared = (attribute->value & LIBC_MUTEXATTR_PSHARED_BIT) != 0U ?
+              PTHREAD_PROCESS_SHARED : PTHREAD_PROCESS_PRIVATE;
     return 0;
+}
+
+int pthread_mutexattr_setprotocol(pthread_mutexattr_t *attribute,
+                                  int protocol) {
+    if (attribute == 0) return pthread_invalid();
+    if (protocol != 0 && protocol != PTHREAD_PRIO_INHERIT) return EINVAL;
+    /* The current System futex/mutex ABI has no priority-inheritance state. */
+    return protocol == PTHREAD_PRIO_INHERIT ? ENOTSUP : 0;
 }
 
 int pthread_mutex_init(pthread_mutex_t *mutex,
                        const pthread_mutexattr_t *attribute) {
     pthread_mutex_metadata_t *entry;
     pthread_mutex_metadata_t *removed = 0;
-    int type = attribute == 0 ? PTHREAD_MUTEX_NORMAL : attribute->type;
+    uint32_t attribute_value = attribute == 0 ? 0U : attribute->value;
+    int type = (int)(attribute_value & LIBC_MUTEXATTR_TYPE_MASK);
+    int process_shared = (attribute_value & LIBC_MUTEXATTR_PSHARED_BIT) != 0U ?
+                         PTHREAD_PROCESS_SHARED : PTHREAD_PROCESS_PRIVATE;
     if (mutex == 0 ||
-        (attribute != 0 && attribute->process_shared != PTHREAD_PROCESS_PRIVATE &&
-         attribute->process_shared != PTHREAD_PROCESS_SHARED) ||
         (type != PTHREAD_MUTEX_NORMAL && type != PTHREAD_MUTEX_RECURSIVE &&
          type != PTHREAD_MUTEX_ERRORCHECK)) {
         return pthread_invalid();
     }
-    if (attribute != 0 && attribute->process_shared == PTHREAD_PROCESS_SHARED &&
+    if (process_shared == PTHREAD_PROCESS_SHARED &&
         type != PTHREAD_MUTEX_NORMAL) return ENOTSUP;
 
     /* Metadata is private to this libc image, so the public mutex layout stays
-     * compatible with the original one-word state and static initializer. */
+     * compatible with the original one-word state and static initializer.
+     *
+     * pthread_mutex_init() receives storage whose previous bytes are not part
+     * of the new mutex.  In particular, Chromium embeds this opaque object in
+     * a C++ class without zero-initializing it first.  Do not interpret the
+     * incoming state word as a live lock and return EBUSY; initialization must
+     * replace it below. */
     mutex_metadata_lock();
-    if (__atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE) != 0U) {
-        mutex_metadata_unlock();
-        return EBUSY;
-    }
     entry = mutex_metadata_find_locked(mutex);
     if (type == PTHREAD_MUTEX_RECURSIVE || type == PTHREAD_MUTEX_ERRORCHECK) {
         if (entry == 0) {
@@ -478,8 +765,9 @@ int pthread_mutex_init(pthread_mutex_t *mutex,
                 return ENOMEM;
             }
             entry->mutex = mutex;
-            entry->next = g_mutex_metadata;
-            g_mutex_metadata = entry;
+            uint32_t bucket = mutex_metadata_bucket_index(mutex);
+            entry->next = g_mutex_metadata_buckets[bucket];
+            g_mutex_metadata_buckets[bucket] = entry;
         }
         entry->type = type;
         entry->owner = 0;
@@ -488,7 +776,9 @@ int pthread_mutex_init(pthread_mutex_t *mutex,
     } else if (entry != 0) {
         removed = mutex_metadata_remove_locked(mutex);
     }
-    __atomic_store_n(&mutex->state, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&mutex->state,
+        (type == PTHREAD_MUTEX_RECURSIVE || type == PTHREAD_MUTEX_ERRORCHECK) ?
+            LIBC_MUTEX_METADATA_BIT : LIBC_LOCK_STATE_FREE, __ATOMIC_RELEASE);
     mutex_metadata_unlock();
     free(removed);
     return 0;
@@ -498,7 +788,8 @@ int pthread_mutex_destroy(pthread_mutex_t *mutex) {
     pthread_mutex_metadata_t *removed;
     if (mutex == 0) return pthread_invalid();
     mutex_metadata_lock();
-    if (__atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE) != 0U) {
+    if ((__atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE) &
+         ~LIBC_MUTEX_METADATA_BIT) != LIBC_LOCK_STATE_FREE) {
         mutex_metadata_unlock();
         return EBUSY;
     }
@@ -508,12 +799,21 @@ int pthread_mutex_destroy(pthread_mutex_t *mutex) {
     return 0;
 }
 
-static int mutex_try_acquire(pthread_mutex_t *mutex, bool try_only) {
+static int mutex_try_acquire(pthread_mutex_t *mutex, bool try_only,
+                             uint32_t acquired_state) {
     pthread_mutex_metadata_t *entry;
     pthread_t self = 0;
-    uint32_t expected = 0U;
+    uint32_t expected;
     int result;
 
+    if ((__atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE) &
+         LIBC_MUTEX_METADATA_BIT) == 0U) {
+        expected = LIBC_LOCK_STATE_FREE;
+        return __atomic_compare_exchange_n(&mutex->state, &expected,
+            acquired_state, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED) ?
+                0 : EBUSY;
+    }
+    expected = LIBC_MUTEX_METADATA_BIT;
     mutex_metadata_lock();
     entry = mutex_metadata_find_locked(mutex);
     if (entry != 0 &&
@@ -533,8 +833,10 @@ static int mutex_try_acquire(pthread_mutex_t *mutex, bool try_only) {
             return result;
         }
     }
-    if (!__atomic_compare_exchange_n(&mutex->state, &expected, 1U, false,
-                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+    if (!__atomic_compare_exchange_n(&mutex->state, &expected,
+                                     acquired_state | LIBC_MUTEX_METADATA_BIT,
+                                     false, __ATOMIC_ACQUIRE,
+                                     __ATOMIC_RELAXED)) {
         mutex_metadata_unlock();
         return EBUSY;
     }
@@ -549,14 +851,40 @@ static int mutex_try_acquire(pthread_mutex_t *mutex, bool try_only) {
     return 0;
 }
 
+static int mutex_wait_contended(pthread_mutex_t *mutex, uint64_t timeout_ns) {
+    for (;;) {
+        uint32_t state = __atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE);
+        uint32_t metadata = state & LIBC_MUTEX_METADATA_BIT;
+        uint32_t lock_state = state & ~LIBC_MUTEX_METADATA_BIT;
+        if (lock_state == LIBC_LOCK_STATE_FREE) return EAGAIN;
+        if (lock_state == LIBC_LOCK_STATE_LOCKED) {
+            uint32_t expected = state;
+            if (!__atomic_compare_exchange_n(
+                    &mutex->state, &expected,
+                    metadata | LIBC_LOCK_STATE_CONTENDED,
+                    false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                continue;
+            }
+        } else if (lock_state != LIBC_LOCK_STATE_CONTENDED) {
+            return EINVAL;
+        }
+        return futex_wait(&mutex->state, metadata | LIBC_LOCK_STATE_CONTENDED,
+                          timeout_ns);
+    }
+}
+
 static int mutex_lock_until(pthread_mutex_t *mutex, uint64_t timeout_ns,
                             bool timed) {
+    bool contended = false;
     for (;;) {
-        int error = mutex_try_acquire(mutex, false);
+        int error = mutex_try_acquire(
+            mutex, false, contended ? LIBC_LOCK_STATE_CONTENDED :
+                                      LIBC_LOCK_STATE_LOCKED);
         if (error == 0 || error == EAGAIN) return error;
         if (error != EBUSY) return error;
-        error = futex_wait(&mutex->state, 1U,
-                           timed ? timeout_ns : OS_WAIT_INFINITE);
+        error = mutex_wait_contended(
+            mutex, timed ? timeout_ns : OS_WAIT_INFINITE);
+        contended = true;
         if (error == EAGAIN) continue;
         if (error != 0) return error;
     }
@@ -568,23 +896,27 @@ int pthread_mutex_lock(pthread_mutex_t *mutex) {
 
 int pthread_mutex_trylock(pthread_mutex_t *mutex) {
     if (mutex == 0) return pthread_invalid();
-    return mutex_try_acquire(mutex, true);
+    return mutex_try_acquire(mutex, true, LIBC_LOCK_STATE_LOCKED);
 }
 
 int pthread_mutex_timedlock(pthread_mutex_t *mutex,
                             const struct timespec *abstime) {
     uint64_t timeout_ns;
+    bool contended = false;
     int error;
     if (mutex == 0) return pthread_invalid();
-    error = absolute_timeout(abstime, &timeout_ns);
+    error = absolute_timeout(abstime, CLOCK_REALTIME, &timeout_ns);
     if (error != 0) return error;
     for (;;) {
-        error = mutex_try_acquire(mutex, false);
+        error = mutex_try_acquire(
+            mutex, false, contended ? LIBC_LOCK_STATE_CONTENDED :
+                                      LIBC_LOCK_STATE_LOCKED);
         if (error == 0 || error == EAGAIN) return error;
         if (error != EBUSY) return error;
-        error = futex_wait(&mutex->state, 1U, timeout_ns);
+        error = mutex_wait_contended(mutex, timeout_ns);
+        contended = true;
         if (error == EAGAIN) {
-            error = absolute_timeout(abstime, &timeout_ns);
+            error = absolute_timeout(abstime, CLOCK_REALTIME, &timeout_ns);
             if (error != 0) return error;
             continue;
         }
@@ -595,8 +927,17 @@ int pthread_mutex_timedlock(pthread_mutex_t *mutex,
 int pthread_mutex_unlock(pthread_mutex_t *mutex) {
     pthread_mutex_metadata_t *entry;
     pthread_t self;
+    uint32_t previous_state;
     if (mutex == 0) return pthread_invalid();
 
+    if ((__atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE) &
+         LIBC_MUTEX_METADATA_BIT) == 0U) {
+        previous_state = __atomic_exchange_n(
+            &mutex->state, LIBC_LOCK_STATE_FREE, __ATOMIC_RELEASE);
+        if (previous_state == LIBC_LOCK_STATE_FREE) return EPERM;
+        return previous_state == LIBC_LOCK_STATE_CONTENDED ?
+            futex_wake(&mutex->state, 1U) : 0;
+    }
     mutex_metadata_lock();
     entry = mutex_metadata_find_locked(mutex);
     if (entry != 0 &&
@@ -615,21 +956,25 @@ int pthread_mutex_unlock(pthread_mutex_t *mutex) {
         entry->owner = 0;
         entry->depth = 0U;
         entry->owner_valid = false;
-        __atomic_store_n(&mutex->state, 0U, __ATOMIC_RELEASE);
+        previous_state = __atomic_exchange_n(
+            &mutex->state, LIBC_MUTEX_METADATA_BIT, __ATOMIC_RELEASE);
         mutex_metadata_unlock();
-        return futex_wake(&mutex->state, 1U);
+        return previous_state == (LIBC_MUTEX_METADATA_BIT | LIBC_LOCK_STATE_CONTENDED) ?
+            futex_wake(&mutex->state, 1U) : 0;
     }
     mutex_metadata_unlock();
-    if (__atomic_exchange_n(&mutex->state, 0U, __ATOMIC_RELEASE) == 0U) {
+    previous_state = __atomic_exchange_n(
+        &mutex->state, LIBC_LOCK_STATE_FREE, __ATOMIC_RELEASE);
+    if (previous_state == LIBC_LOCK_STATE_FREE) {
         return EPERM;
     }
-    return futex_wake(&mutex->state, 1U);
+    return previous_state == LIBC_LOCK_STATE_CONTENDED ?
+        futex_wake(&mutex->state, 1U) : 0;
 }
 
 int pthread_condattr_init(pthread_condattr_t *attribute) {
     if (attribute == 0) return pthread_invalid();
-    attribute->clock_id = CLOCK_REALTIME;
-    attribute->process_shared = PTHREAD_PROCESS_PRIVATE;
+    attribute->value = (uint32_t)CLOCK_REALTIME;
     return 0;
 }
 
@@ -639,15 +984,16 @@ int pthread_condattr_destroy(pthread_condattr_t *attribute) {
 
 int pthread_condattr_setclock(pthread_condattr_t *attribute, clockid_t clock_id) {
     if (attribute == 0) return pthread_invalid();
-    if (clock_id != CLOCK_REALTIME) return ENOTSUP;
-    attribute->clock_id = clock_id;
+    if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) return EINVAL;
+    attribute->value = (attribute->value & ~LIBC_CONDATTR_CLOCK_MASK) |
+                       ((uint32_t)clock_id & LIBC_CONDATTR_CLOCK_MASK);
     return 0;
 }
 
 int pthread_condattr_getclock(const pthread_condattr_t *attribute,
                               clockid_t *clock_id) {
     if (attribute == 0 || clock_id == 0) return pthread_invalid();
-    *clock_id = attribute->clock_id;
+    *clock_id = (clockid_t)(attribute->value & LIBC_CONDATTR_CLOCK_MASK);
     return 0;
 }
 
@@ -656,25 +1002,33 @@ int pthread_condattr_setpshared(pthread_condattr_t *attribute, int shared) {
     if (shared != PTHREAD_PROCESS_PRIVATE && shared != PTHREAD_PROCESS_SHARED) {
         return EINVAL;
     }
-    attribute->process_shared = shared;
+    attribute->value = (attribute->value & ~LIBC_CONDATTR_PSHARED_BIT) |
+        (shared == PTHREAD_PROCESS_SHARED ? LIBC_CONDATTR_PSHARED_BIT : 0U);
     return 0;
 }
 
 int pthread_condattr_getpshared(const pthread_condattr_t *attribute,
                                 int *shared) {
     if (attribute == 0 || shared == 0) return pthread_invalid();
-    *shared = attribute->process_shared;
+    *shared = (attribute->value & LIBC_CONDATTR_PSHARED_BIT) != 0U ?
+              PTHREAD_PROCESS_SHARED : PTHREAD_PROCESS_PRIVATE;
     return 0;
 }
 
 int pthread_cond_init(pthread_cond_t *condition,
                       const pthread_condattr_t *attribute) {
-    if (condition == 0 || (attribute != 0 &&
-        attribute->process_shared != PTHREAD_PROCESS_PRIVATE &&
-        attribute->process_shared != PTHREAD_PROCESS_SHARED)) {
+    uint32_t attribute_value = attribute == 0 ?
+        (uint32_t)CLOCK_REALTIME : attribute->value;
+    uint32_t clock_id = attribute_value & LIBC_CONDATTR_CLOCK_MASK;
+    if (condition == 0 ||
+        (attribute_value & ~(LIBC_CONDATTR_CLOCK_MASK |
+                             LIBC_CONDATTR_PSHARED_BIT)) != 0U ||
+        (clock_id != (uint32_t)CLOCK_REALTIME &&
+         clock_id != (uint32_t)CLOCK_MONOTONIC)) {
         return pthread_invalid();
     }
     __atomic_store_n(&condition->sequence, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&condition->clock_id, clock_id, __ATOMIC_RELAXED);
     return 0;
 }
 
@@ -693,6 +1047,10 @@ static int mutex_release_for_condition(pthread_mutex_t *mutex,
 
     if (depth == 0) return pthread_invalid();
     *depth = 1U;
+    if ((__atomic_load_n(&mutex->state, __ATOMIC_ACQUIRE) &
+         LIBC_MUTEX_METADATA_BIT) == 0U) {
+        return pthread_mutex_unlock(mutex);
+    }
     mutex_metadata_lock();
     entry = mutex_metadata_find_locked(mutex);
     if (entry != 0 &&
@@ -707,14 +1065,18 @@ static int mutex_release_for_condition(pthread_mutex_t *mutex,
         entry->owner = 0;
         entry->depth = 0U;
         entry->owner_valid = false;
-        __atomic_store_n(&mutex->state, 0U, __ATOMIC_RELEASE);
+        state = __atomic_exchange_n(&mutex->state, LIBC_MUTEX_METADATA_BIT,
+                                    __ATOMIC_RELEASE);
         mutex_metadata_unlock();
-        return futex_wake(&mutex->state, 1U);
+        return state == (LIBC_MUTEX_METADATA_BIT | LIBC_LOCK_STATE_CONTENDED) ?
+            futex_wake(&mutex->state, 1U) : 0;
     }
-    state = __atomic_exchange_n(&mutex->state, 0U, __ATOMIC_RELEASE);
+    state = __atomic_exchange_n(&mutex->state, LIBC_LOCK_STATE_FREE,
+                                __ATOMIC_RELEASE);
     mutex_metadata_unlock();
-    if (state == 0U) return EPERM;
-    return futex_wake(&mutex->state, 1U);
+    if (state == LIBC_LOCK_STATE_FREE) return EPERM;
+    return state == LIBC_LOCK_STATE_CONTENDED ?
+        futex_wake(&mutex->state, 1U) : 0;
 }
 
 static int mutex_restore_after_condition(pthread_mutex_t *mutex,
@@ -753,7 +1115,11 @@ int pthread_cond_timedwait(pthread_cond_t *condition, pthread_mutex_t *mutex,
     uint64_t timeout_ns;
     int error;
     if (condition == 0 || mutex == 0) return pthread_invalid();
-    error = absolute_timeout(abstime, &timeout_ns);
+    uint32_t clock_id = __atomic_load_n(&condition->clock_id,
+                                        __ATOMIC_ACQUIRE);
+    if (clock_id != (uint32_t)CLOCK_REALTIME &&
+        clock_id != (uint32_t)CLOCK_MONOTONIC) return EINVAL;
+    error = absolute_timeout(abstime, (clockid_t)clock_id, &timeout_ns);
     if (error != 0) return error;
     return condition_wait(condition, mutex, timeout_ns);
 }
@@ -796,9 +1162,10 @@ int pthread_key_create(pthread_key_t *key, void (*destructor)(void *)) {
     for (pthread_key_t index = 0U; index < PTHREAD_KEYS_MAX; ++index) {
         uint64_t bit = 1ULL << index;
         if ((__atomic_load_n(&g_key_bitmap, __ATOMIC_RELAXED) & bit) == 0U) {
-            uint32_t generation = g_key_generation[index] + 1U;
+            uint32_t generation =
+                __atomic_load_n(&g_key_generation[index], __ATOMIC_RELAXED) + 1U;
             if (generation == 0U) generation = 1U;
-            g_key_generation[index] = generation;
+            __atomic_store_n(&g_key_generation[index], generation, __ATOMIC_RELEASE);
             g_key_destructors[index] = destructor;
             __atomic_fetch_or(&g_key_bitmap, bit, __ATOMIC_RELEASE);
             *key = index;
@@ -821,12 +1188,29 @@ int pthread_key_delete(pthread_key_t key) {
     /* The initial thread normally uses g_main_thread.specific.  Clear both
      * representations so a key can be deleted and reused without exposing
      * the previous value. */
-    g_main_specific[key] = 0;
-    g_main_specific_generation[key] = 0;
-    g_main_thread.specific[key] = 0;
-    g_main_thread.specific_generation[key] = 0;
+    __atomic_store_n(&g_main_specific[key], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_main_specific_generation[key], 0U, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_main_thread.specific[key], 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_main_thread.specific_generation[key], 0U, __ATOMIC_RELEASE);
     key_unlock();
     return 0;
+}
+
+/* Key allocation/deletion is serialized, but values belong to the calling
+ * thread. Do not serialize every allocator TLS access across all CPUs. A
+ * generation check on both sides of the slot access rejects deleted/reused
+ * keys; atomic metadata access also makes concurrent deletion well-defined. */
+static bool key_generation_snapshot(pthread_key_t key, uint32_t *generation) {
+    if (key >= PTHREAD_KEYS_MAX ||
+        ((__atomic_load_n(&g_key_bitmap, __ATOMIC_ACQUIRE) >> key) & 1U) == 0U)
+        return false;
+    *generation = __atomic_load_n(&g_key_generation[key], __ATOMIC_ACQUIRE);
+    return true;
+}
+
+static bool key_generation_matches(pthread_key_t key, uint32_t generation) {
+    uint32_t current;
+    return key_generation_snapshot(key, &current) && current == generation;
 }
 
 void *pthread_getspecific(pthread_key_t key) {
@@ -834,36 +1218,32 @@ void *pthread_getspecific(pthread_key_t key) {
     void **values;
     uint32_t *generations;
     void *value = 0;
+    uint32_t generation;
+    if (!key_generation_snapshot(key, &generation)) return 0;
     thread = pthread_self();
     values = thread == 0 ? g_main_specific : thread->specific;
     generations = thread == 0 ? g_main_specific_generation :
                                 thread->specific_generation;
-    key_lock();
-    if (key_is_valid_locked(key) &&
-        generations[key] == g_key_generation[key]) {
-        value = values[key];
+    if (__atomic_load_n(&generations[key], __ATOMIC_ACQUIRE) == generation) {
+        value = __atomic_load_n(&values[key], __ATOMIC_RELAXED);
     }
-    key_unlock();
-    return value;
+    return key_generation_matches(key, generation) ? value : 0;
 }
 
 int pthread_setspecific(pthread_key_t key, const void *value) {
     pthread_t thread;
     void **values;
     uint32_t *generations;
+    uint32_t generation;
+    if (!key_generation_snapshot(key, &generation)) return EINVAL;
     thread = pthread_self();
     values = thread == 0 ? g_main_specific : thread->specific;
     generations = thread == 0 ? g_main_specific_generation :
                                 thread->specific_generation;
-    key_lock();
-    if (!key_is_valid_locked(key)) {
-        key_unlock();
-        return EINVAL;
-    }
-    values[key] = (void *)value;
-    generations[key] = value == 0 ? 0U : g_key_generation[key];
-    key_unlock();
-    return 0;
+    __atomic_store_n(&values[key], (void *)value, __ATOMIC_RELAXED);
+    __atomic_store_n(&generations[key], value == 0 ? 0U : generation,
+                     __ATOMIC_RELEASE);
+    return key_generation_matches(key, generation) ? 0 : EINVAL;
 }
 
 int pthread_rwlockattr_init(pthread_rwlockattr_t *attribute) {
@@ -1091,6 +1471,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attribute,
     os_thread_stack_t stack_arguments;
     os_handle_t handle = OS_INVALID_HANDLE;
     int64_t status;
+    bool linux_personality;
 
     detached_reap();
     if (thread == 0 || start_routine == 0) return pthread_invalid();
@@ -1136,7 +1517,11 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attribute,
         if (attribute->stack_address == 0) (void)munmap(mapping_base, mapping_size);
         return EOVERFLOW;
     }
-    stack_top = ((uintptr_t)stack + stack_extent) & ~(uintptr_t)0x0fU;
+    /* A newly scheduled entry has no CALL-pushed return address.  Start it
+     * at 8 mod 16 so the first C function observes the SysV ABI entry
+     * alignment (the exec entry point itself remains 16-byte aligned). */
+    stack_top = (((uintptr_t)stack + stack_extent) & ~(uintptr_t)0x0fU) -
+                sizeof(uint64_t);
     if (stack_top <= (uintptr_t)stack) {
         if (attribute->stack_address == 0) (void)munmap(mapping_base, mapping_size);
         return EINVAL;
@@ -1166,12 +1551,22 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attribute,
     context->start_routine = start_routine;
     context->argument = argument;
     context->error_number = 0;
+    linux_personality = pthread_linux_personality();
+    if (linux_personality && !pthread_prepare_tls(record)) {
+        int error = errno != 0 ? errno : EIO;
+        pthread_release_tls(record);
+        free(context);
+        free(record);
+        if (attribute->stack_address == 0) (void)munmap(mapping_base, mapping_size);
+        return error;
+    }
     memset(&arguments, 0, sizeof(arguments));
     arguments.hdr.size = sizeof(arguments);
     arguments.hdr.version = OS_SYSCALL_ABI_VERSION;
     arguments.entry = (uint64_t)(uintptr_t)pthread_thread_start;
     arguments.stack_top = (uint64_t)stack_top;
-    arguments.fs_base = (uint64_t)(uintptr_t)context;
+    arguments.fs_base = record->tls_fs_base != 0U ? record->tls_fs_base :
+                        (uint64_t)(uintptr_t)record;
     arguments.argument = (uint64_t)(uintptr_t)context;
     memset(&stack_arguments, 0, sizeof(stack_arguments));
     if (record->owns_stack) {
@@ -1181,7 +1576,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attribute,
         stack_arguments.size = (uint64_t)mapping_size;
         stack_arguments.flags = OS_THREAD_STACK_OWNED;
     }
-    status = liteos_syscall6(OS_SYS_THREAD_CREATE, OS_INVALID_HANDLE,
+    status = __libc_native_syscall6(OS_SYS_THREAD_CREATE, OS_INVALID_HANDLE,
                              (uint64_t)(uintptr_t)&arguments,
                              (uint64_t)(uintptr_t)&handle,
                              record->owns_stack ?
@@ -1189,6 +1584,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attribute,
                              0U, 0U);
     if (status < 0) {
         int error = pthread_status_error(status);
+        pthread_release_tls(record);
         free(context);
         free(record);
         if (attribute->stack_address == 0) (void)munmap(mapping_base, mapping_size);
@@ -1220,7 +1616,7 @@ int pthread_join(pthread_t thread, void **result) {
     thread->joined = true;
     thread_lifecycle_unlock(thread);
 
-    status = liteos_syscall6(OS_SYS_WAIT_ONE, thread->handle,
+    status = __libc_native_syscall6(OS_SYS_WAIT_ONE, thread->handle,
                              OS_WAIT_INFINITE,
                              (uint64_t)(uintptr_t)&wait_result,
                              0U, 0U, 0U);
@@ -1232,9 +1628,10 @@ int pthread_join(pthread_t thread, void **result) {
         return error;
     }
     if (result != 0) *result = (void *)(uintptr_t)wait_result.value;
-    (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, thread->handle,
+    (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, thread->handle,
                           0U, 0U, 0U, 0U, 0U);
     /* Owned stacks are reclaimed by the kernel after the context switch. */
+    pthread_release_tls(thread);
     free(thread->context);
     free(thread);
     detached_reap();
@@ -1274,18 +1671,138 @@ void pthread_exit(void *result) {
          */
         __atomic_store_n(&thread->exited, true, __ATOMIC_RELEASE);
     }
-    (void)liteos_syscall6(OS_SYS_THREAD_EXIT,
+    (void)__libc_native_syscall6(OS_SYS_THREAD_EXIT,
                           (uint64_t)(uintptr_t)result,
                           0U, 0U, 0U, 0U, 0U);
     for (;;) __asm__ volatile("pause");
 }
 
 pthread_t pthread_self(void) {
+    uint64_t marker = 0U;
     pthread_t thread = 0;
-    __asm__ volatile("movq %%fs:0, %0" : "=r"(thread));
+    int64_t fs_status;
+    __asm__ volatile("movq %%fs:24, %0" : "=r"(marker));
+    if (marker == LIBC_TLS_MAGIC) {
+        __asm__ volatile("movq %%fs:32, %0" : "=r"(thread));
     return thread;
+}
+    fs_status = __libc_native_syscall6(OS_SYS_THREAD_CONTEXT,
+                                OS_THREAD_CONTEXT_GET_FS,
+                                0U, 0U, 0U, 0U, 0U);
+    return fs_status <= 0 ? 0 : (pthread_t)(uintptr_t)fs_status;
 }
 
 int pthread_equal(pthread_t left, pthread_t right) {
     return left == right;
+}
+
+int pthread_kill(pthread_t thread, int signal_number) {
+    if (thread == 0 || signal_number < 0 ||
+        signal_number > (int)OS_SIGNAL_COUNT) {
+        return EINVAL;
+    }
+    return pthread_status_error(__libc_native_syscall6(
+        OS_SYS_THREAD_SIGNAL, thread->handle, (uint64_t)(uint32_t)signal_number,
+        0U, 0U, 0U, 0U));
+}
+
+int pthread_setname_np(pthread_t thread, const char *name) {
+    size_t length;
+    if (thread == 0 || name == 0) return EINVAL;
+    length = strlen(name);
+    if (length >= sizeof(thread->name)) return ERANGE;
+    memcpy(thread->name, name, length + 1U);
+    return 0;
+}
+
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *attribute) {
+    if (thread == 0 || attribute == 0) return pthread_invalid();
+    if (pthread_attr_init(attribute) != 0) return pthread_invalid();
+    if (thread == &g_main_thread) {
+        /* Keep this in sync with the initial stack mapping in exec.c. */
+        attribute->stack_address = (void *)(uintptr_t)
+            OS_LINUX_USER_STACK_BASE;
+        attribute->stack_size = (size_t)OS_LINUX_USER_STACK_SIZE;
+    } else {
+        attribute->stack_address = thread->stack_address;
+        attribute->stack_size = thread->stack_size;
+    }
+    return 0;
+}
+
+int pthread_getname_np(pthread_t thread, char *name, size_t length) {
+    if (thread == 0 || name == 0 || length == 0U) return ERANGE;
+    if (thread->name[0] == '\0') {
+        name[0] = '\0';
+        return 0;
+    }
+    if (strlen(thread->name) + 1U > length) return ERANGE;
+    memcpy(name, thread->name, strlen(thread->name) + 1U);
+    return 0;
+}
+
+int pthread_getschedparam(pthread_t thread, int *policy,
+                          struct sched_param *parameter) {
+    if (thread == 0 || policy == 0 || parameter == 0) return EINVAL;
+    *policy = SCHED_OTHER;
+    parameter->sched_priority = 0;
+    return 0;
+}
+
+int pthread_setschedparam(pthread_t thread, int policy,
+                          const struct sched_param *parameter) {
+    if (thread == 0 || parameter == 0) return EINVAL;
+    if (policy != SCHED_OTHER || parameter->sched_priority != 0) {
+        return ENOTSUP;
+    }
+    return 0;
+}
+
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *old_set) {
+    int result = sigprocmask(how, set, old_set);
+    return result == 0 ? 0 : errno;
+}
+
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+                   void (*child)(void)) {
+    if (prepare == 0 && parent == 0 && child == 0) return EINVAL;
+    atfork_lock();
+    if (g_atfork_count >= PTHREAD_ATFORK_MAX) {
+        atfork_unlock();
+        return ENOMEM;
+    }
+    g_atfork_entries[g_atfork_count].prepare = prepare;
+    g_atfork_entries[g_atfork_count].parent = parent;
+    g_atfork_entries[g_atfork_count].child = child;
+    ++g_atfork_count;
+    atfork_unlock();
+    return 0;
+}
+
+void __libc_atfork_prepare(void) {
+    pthread_atfork_entry_t entries[PTHREAD_ATFORK_MAX];
+    unsigned int count = atfork_snapshot(entries);
+    while (count != 0U) {
+        void (*prepare)(void) = entries[count - 1U].prepare;
+        if (prepare != 0) prepare();
+        --count;
+    }
+}
+
+void __libc_atfork_parent(void) {
+    pthread_atfork_entry_t entries[PTHREAD_ATFORK_MAX];
+    unsigned int count = atfork_snapshot(entries);
+    for (unsigned int index = 0U; index < count; ++index) {
+        void (*parent)(void) = entries[index].parent;
+        if (parent != 0) parent();
+    }
+}
+
+void __libc_atfork_child(void) {
+    pthread_atfork_entry_t entries[PTHREAD_ATFORK_MAX];
+    unsigned int count = atfork_snapshot(entries);
+    for (unsigned int index = 0U; index < count; ++index) {
+        void (*child)(void) = entries[index].child;
+        if (child != 0) child();
+    }
 }

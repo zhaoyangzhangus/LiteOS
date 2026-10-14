@@ -8,8 +8,8 @@ typedef struct {
     uintptr_t fixup;
 } uaccess_fixup_t;
 
-extern const uaccess_fixup_t liteos_uaccess_table_start[];
-extern const uaccess_fixup_t liteos_uaccess_table_end[];
+extern const uaccess_fixup_t arch_uaccess_table_start[];
+extern const uaccess_fixup_t arch_uaccess_table_end[];
 extern kstatus_t x86_copy_from_user_raw(void *destination, const void *source, size_t size);
 extern kstatus_t x86_copy_to_user_raw(void *destination, const void *source, size_t size);
 extern kstatus_t x86_get_user_u32_raw(uint32_t *value, const uint32_t *source);
@@ -54,8 +54,8 @@ kstatus_t put_user_u32(uint32_t __user *destination, uint32_t value) {
 
 bool x86_uaccess_fixup(arch_trap_frame_t *frame) {
     if (frame == 0 || frame->vector != 14U) return false;
-    for (const uaccess_fixup_t *entry = liteos_uaccess_table_start;
-         entry < liteos_uaccess_table_end; ++entry) {
+    for (const uaccess_fixup_t *entry = arch_uaccess_table_start;
+         entry < arch_uaccess_table_end; ++entry) {
         if (frame->rip == entry->fault) {
             frame->rip = entry->fixup;
             return true;
@@ -66,8 +66,8 @@ bool x86_uaccess_fixup(arch_trap_frame_t *frame) {
 
 bool x86_uaccess_fault_site(const arch_trap_frame_t *frame) {
     if (frame == 0 || frame->vector != 14U) return false;
-    for (const uaccess_fixup_t *entry = liteos_uaccess_table_start;
-         entry < liteos_uaccess_table_end; ++entry) {
+    for (const uaccess_fixup_t *entry = arch_uaccess_table_start;
+         entry < arch_uaccess_table_end; ++entry) {
         if (frame->rip == entry->fault) return true;
     }
     return false;

@@ -1,5 +1,5 @@
-#ifndef LITEOS_KERNEL_PACKAGE_H
-#define LITEOS_KERNEL_PACKAGE_H
+#ifndef OS_KERNEL_PACKAGE_H
+#define OS_KERNEL_PACKAGE_H
 
 #include <kernel/base.h>
 #include <kernel/spinlock.h>

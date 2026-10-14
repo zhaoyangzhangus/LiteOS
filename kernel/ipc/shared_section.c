@@ -23,10 +23,8 @@ kstatus_t shared_section_create(uint64_t size, shared_section_t **out) {
         (size & (PAGE_SIZE - 1ULL)) != 0U) return K_EINVAL;
     shared_section_t *section = (shared_section_t *)kzalloc(sizeof(*section), 0);
     if (section == 0) return K_ENOMEM;
-    refcount_init(&section->object.refs, 1U);
-    section->object.type = KOBJECT_TYPE_SHARED_SECTION;
-    section->object.flags = 0U;
-    section->object.ops = &g_shared_section_ops;
+    object_header_init(&section->object, KOBJECT_TYPE_SHARED_SECTION,
+                       &g_shared_section_ops);
     section->size = size;
     kstatus_t status = vm_object_create_shared((size_t)size, &section->vm_object);
     if (status != K_OK) {

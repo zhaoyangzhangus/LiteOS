@@ -78,7 +78,9 @@ static inline void rb_tree_rotate_right(rb_root_t *root, rb_node_t *node) {
 }
 
 /* The caller links node below parent and marks it red before calling this. */
-static inline void rb_tree_insert_rebalance(rb_root_t *root, rb_node_t *node) {
+static inline void rb_tree_insert_rebalance_augmented(
+    rb_root_t *root, rb_node_t *node,
+    void (*rotate)(rb_node_t *old_root, rb_node_t *new_root)) {
     rb_node_t *parent;
     while ((parent = rb_tree_parent(node)) != 0 &&
            rb_tree_color(parent) == RB_TREE_RED) {
@@ -94,12 +96,14 @@ static inline void rb_tree_insert_rebalance(rb_root_t *root, rb_node_t *node) {
                 if (node == parent->right) {
                     node = parent;
                     rb_tree_rotate_left(root, node);
+                    if (rotate != 0) rotate(node, rb_tree_parent(node));
                     parent = rb_tree_parent(node);
                     grand = rb_tree_parent(parent);
                 }
                 rb_tree_set_color(parent, RB_TREE_BLACK);
                 rb_tree_set_color(grand, RB_TREE_RED);
                 rb_tree_rotate_right(root, grand);
+                if (rotate != 0) rotate(grand, rb_tree_parent(grand));
             }
         } else {
             rb_node_t *uncle = grand->left;
@@ -112,16 +116,22 @@ static inline void rb_tree_insert_rebalance(rb_root_t *root, rb_node_t *node) {
                 if (node == parent->left) {
                     node = parent;
                     rb_tree_rotate_right(root, node);
+                    if (rotate != 0) rotate(node, rb_tree_parent(node));
                     parent = rb_tree_parent(node);
                     grand = rb_tree_parent(parent);
                 }
                 rb_tree_set_color(parent, RB_TREE_BLACK);
                 rb_tree_set_color(grand, RB_TREE_RED);
                 rb_tree_rotate_left(root, grand);
+                if (rotate != 0) rotate(grand, rb_tree_parent(grand));
             }
         }
     }
     rb_tree_set_color(root->root, RB_TREE_BLACK);
+}
+
+static inline void rb_tree_insert_rebalance(rb_root_t *root, rb_node_t *node) {
+    rb_tree_insert_rebalance_augmented(root, node, 0);
 }
 
 static inline rb_node_t *rb_tree_first(const rb_root_t *root) {
@@ -154,8 +164,9 @@ static inline void rb_tree_transplant(rb_root_t *root, rb_node_t *old_node,
     rb_tree_set_parent(new_node, parent);
 }
 
-static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
-                                            rb_node_t *parent) {
+static inline void rb_tree_erase_rebalance_augmented(
+    rb_root_t *root, rb_node_t *node, rb_node_t *parent,
+    void (*rotate)(rb_node_t *old_root, rb_node_t *new_root)) {
     while (node != root->root && rb_tree_color(node) == RB_TREE_BLACK) {
         if (parent == 0) break;
         if (node == parent->left) {
@@ -164,6 +175,7 @@ static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
                 rb_tree_set_color(sibling, RB_TREE_BLACK);
                 rb_tree_set_color(parent, RB_TREE_RED);
                 rb_tree_rotate_left(root, parent);
+                if (rotate != 0) rotate(parent, rb_tree_parent(parent));
                 sibling = parent->right;
             }
             if (sibling == 0) {
@@ -181,12 +193,14 @@ static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
                     rb_tree_set_color(sibling->left, RB_TREE_BLACK);
                     rb_tree_set_color(sibling, RB_TREE_RED);
                     rb_tree_rotate_right(root, sibling);
+                    if (rotate != 0) rotate(sibling, rb_tree_parent(sibling));
                     sibling = parent->right;
                 }
                 rb_tree_set_color(sibling, rb_tree_color(parent));
                 rb_tree_set_color(parent, RB_TREE_BLACK);
                 rb_tree_set_color(sibling->right, RB_TREE_BLACK);
                 rb_tree_rotate_left(root, parent);
+                if (rotate != 0) rotate(parent, rb_tree_parent(parent));
                 node = root->root;
                 parent = 0;
             }
@@ -196,6 +210,7 @@ static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
                 rb_tree_set_color(sibling, RB_TREE_BLACK);
                 rb_tree_set_color(parent, RB_TREE_RED);
                 rb_tree_rotate_right(root, parent);
+                if (rotate != 0) rotate(parent, rb_tree_parent(parent));
                 sibling = parent->left;
             }
             if (sibling == 0) {
@@ -213,12 +228,14 @@ static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
                     rb_tree_set_color(sibling->right, RB_TREE_BLACK);
                     rb_tree_set_color(sibling, RB_TREE_RED);
                     rb_tree_rotate_left(root, sibling);
+                    if (rotate != 0) rotate(sibling, rb_tree_parent(sibling));
                     sibling = parent->left;
                 }
                 rb_tree_set_color(sibling, rb_tree_color(parent));
                 rb_tree_set_color(parent, RB_TREE_BLACK);
                 rb_tree_set_color(sibling->left, RB_TREE_BLACK);
                 rb_tree_rotate_right(root, parent);
+                if (rotate != 0) rotate(parent, rb_tree_parent(parent));
                 node = root->root;
                 parent = 0;
             }
@@ -227,7 +244,14 @@ static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
     rb_tree_set_color(node, RB_TREE_BLACK);
 }
 
-static inline void rb_tree_erase(rb_root_t *root, rb_node_t *node) {
+static inline void rb_tree_erase_rebalance(rb_root_t *root, rb_node_t *node,
+                                           rb_node_t *parent) {
+    rb_tree_erase_rebalance_augmented(root, node, parent, 0);
+}
+
+static inline void rb_tree_erase_augmented(
+    rb_root_t *root, rb_node_t *node, void (*propagate)(rb_node_t *node),
+    void (*rotate)(rb_node_t *old_root, rb_node_t *new_root)) {
     rb_node_t *moved = node;
     unsigned moved_color = rb_tree_color(moved);
     rb_node_t *child;
@@ -260,8 +284,15 @@ static inline void rb_tree_erase(rb_root_t *root, rb_node_t *node) {
         rb_tree_set_parent(moved->left, moved);
         rb_tree_set_color(moved, rb_tree_color(node));
     }
+    /* The successor's old parent now leads through its new position to the
+     * root. Repair that path before balancing consumes child summaries. */
+    if (propagate != 0 && child_parent != 0) propagate(child_parent);
     if (moved_color == RB_TREE_BLACK) {
-        rb_tree_erase_rebalance(root, child, child_parent);
+        rb_tree_erase_rebalance_augmented(root, child, child_parent, rotate);
     }
     rb_tree_node_init(node);
+}
+
+static inline void rb_tree_erase(rb_root_t *root, rb_node_t *node) {
+    rb_tree_erase_augmented(root, node, 0, 0);
 }

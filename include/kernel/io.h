@@ -18,6 +18,8 @@ enum io_request_state {
     IOREQ_COMPLETING,
     IOREQ_COMPLETED,
     IOREQ_CANCELLED,
+    /* Exclusive, non-cancellable setup; retain existing state numbers. */
+    IOREQ_PREPARING,
 };
 
 enum io_opcode {
@@ -52,8 +54,6 @@ typedef struct io_request {
     uint64_t submit_tsc;
     /* io_submit 持有的设备对象引用和 inflight 计数标记。 */
     uint32_t device_ref_held;
-    /* 设备卸载者持有的引用在终态发布前释放，保护栈请求不被复用。 */
-    atomic_uint terminal_holds;
 
     kstatus_t status;
     uint64_t bytes_done;
@@ -96,7 +96,7 @@ kstatus_t io_request_set_completion_port(io_request_t *req,
                                          struct completion_port *port,
                                          uint64_t user_key);
 
-/* 将异步用户请求登记到 request id 表；返回时转移 req 的初始引用。 */
+/* 成功登记后表持有独立引用；调用者始终保留原引用，失败不转移引用。 */
 kstatus_t io_request_register_user(io_request_t *req);
 /* 返回一个临时引用；完成或取消后找不到已从表中摘除的请求。 */
 kstatus_t io_request_lookup_user(struct process *process, uint64_t request_id,
@@ -112,4 +112,7 @@ void io_request_init(io_request_t *req, uint32_t opcode, struct device *device,
 /* 设备移除与用户取消共享同一 CAS 状态机，但保留各自的完成错误码。 */
 kstatus_t io_cancel_with_status(io_request_t *req, kstatus_t status);
 /* 将一个观察者引用交给完成者，在终态发布前释放。 */
-void io_request_hold_until_terminal(io_request_t *req);
+/* Claim while holding the device-list lock; finish only a successful claim,
+ * outside the lock. The claim transfers the existing execution ownership. */
+bool io_request_claim_device_cancel(io_request_t *req);
+void io_request_finish_device_cancel(io_request_t *req, kstatus_t status);

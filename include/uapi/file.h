@@ -27,6 +27,7 @@ enum os_file_type {
     OS_FILE_TYPE_REGULAR = 1U,
     OS_FILE_TYPE_DIRECTORY = 2U,
     OS_FILE_TYPE_FIFO = 3U,
+    OS_FILE_TYPE_SYMLINK = 4U,
 };
 
 typedef struct os_file_info {

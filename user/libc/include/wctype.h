@@ -18,6 +18,9 @@ typedef unsigned int wctrans_t;
 #define WCTYPE_UPPER 11U
 #define WCTYPE_XDIGIT 12U
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int iswalnum(wint_t value);
 int iswalpha(wint_t value);
 int iswblank(wint_t value);
@@ -36,3 +39,6 @@ wctype_t wctype(const char *name);
 int iswctype(wint_t value, wctype_t type);
 wctrans_t wctrans(const char *name);
 wint_t towctrans(wint_t value, wctrans_t transform);
+#ifdef __cplusplus
+}
+#endif

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <liteos/libc.h>
+#include <libc/libc.h>
 
 #define BUFSIZ 4096U
 #define FOPEN_MAX 32
@@ -18,6 +18,9 @@
 
 typedef off_t fpos_t;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int sprintf(char *buffer, const char *format, ...);
 int vsprintf(char *buffer, const char *format, va_list arguments);
 int vasprintf(char **buffer, const char *format, va_list arguments);
@@ -32,6 +35,7 @@ int vsscanf(const char *text, const char *format, va_list arguments);
 int sscanf(const char *text, const char *format, ...);
 int fwide(FILE *stream, int mode);
 wint_t fgetwc(FILE *stream);
+wint_t ungetwc(wint_t value, FILE *stream);
 wint_t fputwc(wchar_t value, FILE *stream);
 wchar_t *fgetws(wchar_t *buffer, int capacity, FILE *stream);
 int fputws(const wchar_t *text, FILE *stream);
@@ -43,6 +47,12 @@ int fseek(FILE *stream, long offset, int whence);
 long ftell(FILE *stream);
 int fseeko(FILE *stream, off_t offset, int whence);
 off_t ftello(FILE *stream);
+#ifndef fseeko64
+#define fseeko64 fseeko
+#endif
+#ifndef ftello64
+#define ftello64 ftello
+#endif
 void rewind(FILE *stream);
 int fgetpos(FILE *stream, fpos_t *position);
 int fsetpos(FILE *stream, const fpos_t *position);
@@ -50,6 +60,10 @@ int feof(FILE *stream);
 int ferror(FILE *stream);
 void clearerr(FILE *stream);
 int ungetc(int value, FILE *stream);
+int (getc)(FILE *stream);
+int (getchar)(void);
+int (putc)(int value, FILE *stream);
+int (putchar)(int value);
 int fileno(FILE *stream);
 int setvbuf(FILE *stream, char *buffer, int mode, size_t size);
 void setbuf(FILE *stream, char *buffer);
@@ -73,3 +87,6 @@ size_t fread_unlocked(void *buffer, size_t size, size_t count, FILE *stream);
 size_t fwrite_unlocked(const void *buffer, size_t size, size_t count,
                        FILE *stream);
 int fflush_unlocked(FILE *stream);
+#ifdef __cplusplus
+}
+#endif

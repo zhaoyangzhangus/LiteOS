@@ -18,7 +18,7 @@ $outputDirectory = Join-Path (Join-Path $projectRoot $Build) "real-hardware\$Run
 $resultPath = Join-Path $outputDirectory 'realtest.result'
 $outputLog = Join-Path $outputDirectory 'realtest.log'
 $firmwareStatePath = Join-Path $outputDirectory 'firmware-state.txt'
-$runOnceName = "LiteOSRealTest_$($RunId.Replace('-', '_'))"
+$runOnceName = "SystemRealTest_$($RunId.Replace('-', '_'))"
 $taskName = $runOnceName
 $collectionComplete = $false
 
@@ -27,7 +27,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
-public static class LiteOsFirmwareEnvironment {
+public static class SystemFirmwareEnvironment {
     [StructLayout(LayoutKind.Sequential)]
     public struct Luid { public UInt32 LowPart; public Int32 HighPart; }
     [StructLayout(LayoutKind.Sequential)]
@@ -74,8 +74,8 @@ function Write-Result([string]$status, [string]$detail) {
 
 function Read-FirmwareState {
     $buffer = New-Object byte[] 8192
-    if (-not [LiteOsFirmwareEnvironment]::EnableFirmwarePrivilege()) { return '' }
-    $size = [LiteOsFirmwareEnvironment]::GetFirmwareEnvironmentVariable(
+    if (-not [SystemFirmwareEnvironment]::EnableFirmwarePrivilege()) { return '' }
+    $size = [SystemFirmwareEnvironment]::GetFirmwareEnvironmentVariable(
         'LiteOSRealTestState', $firmwareGuid, $buffer, [uint32]$buffer.Length)
     if ($size -eq 0) { return '' }
     return [Text.Encoding]::ASCII.GetString($buffer, 0, [int]$size).Trim([char]0,
@@ -84,30 +84,30 @@ function Read-FirmwareState {
 
 function Write-FirmwareFallbackLog([string]$reason, [string]$state) {
     $lines = @(
-        'LITEOS_HOST_FIRMWARE_LOG',
+        'OS_HOST_FIRMWARE_LOG',
         "reason=$reason"
     )
     if ($state) { $lines += $state }
-    else { $lines += 'LITEOS_REALTEST_NO_FIRMWARE_STATE' }
+    else { $lines += 'OS_REALTEST_NO_FIRMWARE_STATE' }
     Set-Content -LiteralPath $outputLog -Value $lines -Encoding UTF8
 }
 
 function Append-FirmwareStateIfNeeded([string]$path, [string]$log,
                                       [string]$state) {
-    if (-not $state -or $log -match 'LITEOS_REALTEST_PASS|LITEOS_REALTEST_FAIL' -or
-        $log -match 'LITEOS_HOST_FIRMWARE_STATE') {
+    if (-not $state -or $log -match 'OS_REALTEST_PASS|OS_REALTEST_FAIL' -or
+        $log -match 'OS_HOST_FIRMWARE_STATE') {
         return
     }
     Add-Content -LiteralPath $path -Value @(
         '',
-        'LITEOS_HOST_FIRMWARE_STATE',
+        'OS_HOST_FIRMWARE_STATE',
         $state
     ) -Encoding UTF8
 }
 
 function Test-TerminalFirmwareFailure([string]$state) {
     if (-not $state) { return $false }
-    return $state -match '(?m)^(?:LITEOS_REALTEST_FAIL|FAILURE_ROOT_PROBE|ROOT_PROBE_FAIL|ROOT_USB_(?:ATTACH|VOLUME)_FAIL)\s*$'
+    return $state -match '(?m)^(?:OS_REALTEST_FAIL|FAILURE_ROOT_PROBE|ROOT_PROBE_FAIL|ROOT_USB_(?:ATTACH|VOLUME)_FAIL)\s*$'
 }
 
 function Get-UserRunOncePath {
@@ -139,7 +139,7 @@ try {
             if ($accessPath) { $roots += [string]$accessPath }
         }
         foreach ($root in ($roots | Select-Object -Unique)) {
-            $candidate = Join-Path $root 'EFI\LITEOS\realtest.log'
+            $candidate = Join-Path $root 'EFI\OS\realtest.log'
             if (-not (Test-Path -LiteralPath $candidate)) {
                 $candidate = Join-Path $root 'realtest.log'
             }
@@ -152,7 +152,7 @@ try {
     }
     if ($null -eq $volume) {
         Write-FirmwareFallbackLog 'volume-unavailable' $firmwareState
-        if ($firmwareState -match 'LITEOS_REALTEST_PASS') {
+        if ($firmwareState -match 'OS_REALTEST_PASS') {
             Write-Result 'pass-firmware-only' 'No volume was mounted; saved the terminal firmware state.'
             $collectionComplete = $true
             exit 0
@@ -162,13 +162,13 @@ try {
             $collectionComplete = $true
             exit 1
         }
-        Write-Result 'missing-volume' "The LiteOS volume was not available after Windows logon. firmware=$firmwareState"
+        Write-Result 'missing-volume' "The System volume was not available after Windows logon. firmware=$firmwareState"
         exit 1
     }
 
     if ($null -eq $sourceLog) {
         Write-FirmwareFallbackLog 'log-unavailable' $firmwareState
-        if ($firmwareState -match 'LITEOS_REALTEST_PASS') {
+        if ($firmwareState -match 'OS_REALTEST_PASS') {
             Write-Result 'pass-firmware-only' 'The volume had no file log; saved the terminal firmware state.'
             $collectionComplete = $true
             exit 0
@@ -186,12 +186,12 @@ try {
     $log = Get-Content -LiteralPath $outputLog -Raw
     Append-FirmwareStateIfNeeded $outputLog $log $firmwareState
     $log = Get-Content -LiteralPath $outputLog -Raw
-    if ($log -match 'LITEOS_REALTEST_FAIL') {
+    if ($log -match 'OS_REALTEST_FAIL') {
         Write-Result 'guest-failure' "Copied failure log from $sourceLog."
         $collectionComplete = $true
         exit 1
     }
-    if ($log -match 'LITEOS_REALTEST_PASS') {
+    if ($log -match 'OS_REALTEST_PASS') {
         Write-Result 'pass' "Copied $sourceLog from volume $($volume.UniqueId)."
         $collectionComplete = $true
         exit 0

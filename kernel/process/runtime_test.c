@@ -21,12 +21,12 @@
 
 /* REFACTOR_P5_USER_RUNTIME_TEST_OWNER: locatable user runtime self-test. */
 
-#ifndef LITEOS_DEBUG_SERIAL
-#define LITEOS_DEBUG_SERIAL 0
+#ifndef OS_DEBUG_SERIAL
+#define OS_DEBUG_SERIAL 0
 #endif
 
-#ifndef LITEOS_REALTEST
-#define LITEOS_REALTEST 0
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
 #endif
 
 #define USER_RUNTIME_COW_SYNC_ADDRESS     0x0000000067000000ULL
@@ -36,15 +36,17 @@
 #define USER_RUNTIME_WAIT_RACE_GO_OFFSET    0x1F5U
 #define USER_RUNTIME_WAIT_RACE_ACK_OFFSET   0x1F6U
 #define USER_RUNTIME_WAIT_RACE_PASS_OFFSET  0x1F3U
+#define USER_RUNTIME_EXEC_PIN_ACK_OFFSET     0x1F7U
+#define USER_RUNTIME_EXEC_PIN_EXEC_ACK_OFFSET 0x1F8U
 #define USER_RUNTIME_REAP_TIMEOUT_NS        5000000000ULL
 #define USER_RUNTIME_TEST_TIMEOUT_NS        (180ULL * 1000000000ULL)
 
-extern const uint8_t liteos_user_runtime_blob_start[];
-extern const uint8_t liteos_user_runtime_blob_end[];
-extern const uint8_t liteos_user_runtime_child[];
-extern const uint8_t liteos_user_runtime_timer_helper[];
-extern const uint8_t liteos_user_runtime_vm_worker[];
-extern const uint8_t liteos_user_runtime_uaccess_worker[];
+extern const uint8_t user_runtime_blob_start[];
+extern const uint8_t user_runtime_blob_end[];
+extern const uint8_t user_runtime_child[];
+extern const uint8_t user_runtime_timer_helper[];
+extern const uint8_t user_runtime_vm_worker[];
+extern const uint8_t user_runtime_uaccess_worker[];
 
 static uint32_t g_user_runtime_stage;
 static uint64_t g_user_runtime_result;
@@ -73,6 +75,11 @@ static uint32_t g_user_runtime_process_thread_lock;
 static uint32_t g_user_runtime_vm_live;
 static uint32_t g_user_runtime_exec_stage;
 static uint32_t g_user_runtime_exec_status;
+static volatile uint32_t g_user_runtime_exec_pin_stage;
+static volatile uint32_t g_user_runtime_exec_pin_flags;
+static volatile uint64_t g_user_runtime_exec_pin_affinity;
+static volatile uint32_t g_user_runtime_exec_pin_checked;
+static volatile uint32_t g_user_runtime_exec_pin_passed;
 static uint32_t g_user_runtime_main_state;
 static uint32_t g_user_runtime_main_cpu;
 static uint32_t g_user_runtime_main_flags;
@@ -170,27 +177,27 @@ static void runtime_snapshot_wait_child(
 
 static void runtime_log_wait_child(const runtime_wait_child_snapshot_t *snapshot) {
     if (snapshot == 0) return;
-    liteos_serial_write("LITEOS_RUNTIME_WAIT_CHILD_PRESENT=");
-    liteos_serial_write_u32(snapshot->present ? 1U : 0U);
+    kernel_serial_write("OS_RUNTIME_WAIT_CHILD_PRESENT=");
+    kernel_serial_write_u32(snapshot->present ? 1U : 0U);
     if (snapshot->present) {
-        liteos_serial_write(" PID=");
-        liteos_serial_write_u32((uint32_t)snapshot->pid);
-        liteos_serial_write(" PROCESS_STATE=");
-        liteos_serial_write_u32(snapshot->process_state);
-        liteos_serial_write(" THREADS=");
-        liteos_serial_write_u32(snapshot->thread_count);
-        liteos_serial_write(" TID=");
-        liteos_serial_write_u32((uint32_t)snapshot->tid);
-        liteos_serial_write(" THREAD_STATE=");
-        liteos_serial_write_u32(snapshot->thread_state);
-        liteos_serial_write(" CPU=");
-        liteos_serial_write_u32(snapshot->thread_cpu);
-        liteos_serial_write(" THREAD_FLAGS=");
-        liteos_serial_write_u32(snapshot->thread_flags);
-        liteos_serial_write(" SCHED_FLAGS=");
-        liteos_serial_write_u32(snapshot->sched_flags);
+        kernel_serial_write(" PID=");
+        kernel_serial_write_u32((uint32_t)snapshot->pid);
+        kernel_serial_write(" PROCESS_STATE=");
+        kernel_serial_write_u32(snapshot->process_state);
+        kernel_serial_write(" THREADS=");
+        kernel_serial_write_u32(snapshot->thread_count);
+        kernel_serial_write(" TID=");
+        kernel_serial_write_u32((uint32_t)snapshot->tid);
+        kernel_serial_write(" THREAD_STATE=");
+        kernel_serial_write_u32(snapshot->thread_state);
+        kernel_serial_write(" CPU=");
+        kernel_serial_write_u32(snapshot->thread_cpu);
+        kernel_serial_write(" THREAD_FLAGS=");
+        kernel_serial_write_u32(snapshot->thread_flags);
+        kernel_serial_write(" SCHED_FLAGS=");
+        kernel_serial_write_u32(snapshot->sched_flags);
     }
-    liteos_serial_write("\r\n");
+    kernel_serial_write("\r\n");
 }
 
 /* A dead user thread releases its VM on the CPU that owned its stack.  The
@@ -250,12 +257,12 @@ bool user_elf_runtime_self_test(void) {
     code_program->virtual_address = 0x400000ULL;
     code_program->memory_size = 2U * PAGE_SIZE;
     code_program->alignment = PAGE_SIZE;
-    size_t code_size = (size_t)(liteos_user_runtime_blob_end -
-                                liteos_user_runtime_blob_start);
+    size_t code_size = (size_t)(user_runtime_blob_end -
+                                user_runtime_blob_start);
     if (code_size == 0 || code_size > 2U * PAGE_SIZE) return false;
     code_program->file_size = code_size;
     for (size_t i = 0; i < code_size; ++i) {
-        image[0x1000U + i] = liteos_user_runtime_blob_start[i];
+        image[0x1000U + i] = user_runtime_blob_start[i];
     }
 
     elf64_program_header_t *data_program = &programs[1];
@@ -286,7 +293,7 @@ bool user_elf_runtime_self_test(void) {
     thread_arguments->hdr.size = sizeof(*thread_arguments);
     thread_arguments->hdr.version = OS_SYSCALL_ABI_VERSION;
     thread_arguments->entry = 0x400000ULL +
-        (uint64_t)(liteos_user_runtime_child - liteos_user_runtime_blob_start);
+        (uint64_t)(user_runtime_child - user_runtime_blob_start);
     thread_arguments->argument = 0x1234U;
 
     os_thread_create_t *timer_arguments =
@@ -294,10 +301,10 @@ bool user_elf_runtime_self_test(void) {
     timer_arguments->hdr.size = sizeof(*timer_arguments);
     timer_arguments->hdr.version = OS_SYSCALL_ABI_VERSION;
     timer_arguments->entry = 0x400000ULL +
-        (uint64_t)(liteos_user_runtime_timer_helper - liteos_user_runtime_blob_start);
+        (uint64_t)(user_runtime_timer_helper - user_runtime_blob_start);
     timer_arguments->argument = 0x5678U;
     *(uint64_t *)(void *)(image + 0x3000U + 0xF0U) = 0x400000ULL +
-        (uint64_t)(liteos_user_runtime_vm_worker - liteos_user_runtime_blob_start);
+        (uint64_t)(user_runtime_vm_worker - user_runtime_blob_start);
     static const char boot_path[] = "/sbin/gshell";
     for (size_t i = 0; i < sizeof(boot_path); ++i) {
         image[0x3000U + 0x100U + i] = (uint8_t)boot_path[i];
@@ -320,10 +327,13 @@ bool user_elf_runtime_self_test(void) {
     user_elf_image_info_t info;
     vaddr_t stack_pointer = 0;
     paddr_t kernel_root = x86_current_root_table();
-    uint64_t timer_ticks_before = liteos_lapic_tick_count();
+    uint64_t timer_ticks_before = lapic_tick_count();
     paddr_t marker_physical;
     bool success = false;
-    liteos_debug_trace_set(false);
+    bool exec_pin_test_armed = false;
+    bool exec_pin_exec_requested = false;
+    bool exec_pin_test_checked = false;
+    debug_trace_set(false);
     g_user_runtime_stage = 0;
     g_user_runtime_result = 0;
     g_user_runtime_cow_pass = 0;
@@ -345,6 +355,11 @@ bool user_elf_runtime_self_test(void) {
     g_user_runtime_cpu_current_tid = 0;
     g_user_runtime_exec_stage = 0;
     g_user_runtime_exec_status = 0;
+    g_user_runtime_exec_pin_stage = 0;
+    g_user_runtime_exec_pin_flags = UINT32_MAX;
+    g_user_runtime_exec_pin_affinity = 0;
+    g_user_runtime_exec_pin_checked = 0;
+    g_user_runtime_exec_pin_passed = 0;
     g_user_runtime_main_state = UINT32_MAX;
     g_user_runtime_main_cpu = UINT32_MAX;
     g_user_runtime_main_flags = 0;
@@ -406,7 +421,7 @@ bool user_elf_runtime_self_test(void) {
         remote_mask.bits[remote_cpu >> 6] = 1ULL << (remote_cpu & 63U);
         if (sched_set_affinity(thread, &remote_mask) != K_OK) goto cleanup;
     }
-    liteos_debug_trace_set(true);
+    debug_trace_set(true);
     if (thread_start(thread) != K_OK) goto cleanup;
     runtime_space = process->vm;
     vm_space_get(runtime_space);
@@ -422,7 +437,7 @@ bool user_elf_runtime_self_test(void) {
      * itself.  The realtest also executes the 4.4 MB NASM image twice, so it
      * gets the same bounded budget even when COM1 mirroring is disabled.
      */
-#if LITEOS_DEBUG_SERIAL || LITEOS_REALTEST
+#if OS_DEBUG_SERIAL || OS_REALTEST
     /* The first Blend2D pipeline is JIT-compiled inside the bounded test. */
     uint64_t runtime_budget =
         x86_timeout_ns_to_tsc(USER_RUNTIME_TEST_TIMEOUT_NS);
@@ -431,7 +446,7 @@ bool user_elf_runtime_self_test(void) {
 #endif
     runtime_deadline = runtime_budget > UINT64_MAX - runtime_deadline ?
                        UINT64_MAX : runtime_deadline + runtime_budget;
-#if LITEOS_DEBUG_SERIAL
+#if OS_DEBUG_SERIAL
     uint8_t runtime_progress = 0xFFU;
 #endif
     for (;;) {
@@ -439,15 +454,69 @@ bool user_elf_runtime_self_test(void) {
         __asm__ volatile ("sti" : : : "memory");
         schedule();
         sched_finish_switch();
-#if LITEOS_DEBUG_SERIAL
+        if (!exec_pin_test_armed && runtime_page_table_available() &&
+            x86_translate_page(runtime_space->root_table, 0x00402000ULL,
+                               &marker_physical, 0) == K_OK) {
+            uint8_t *progress_page =
+                (uint8_t *)phys_to_direct(marker_physical);
+            if (progress_page != 0 && progress_page[0xA8U] == 17U) {
+                __atomic_fetch_or(&process->flags,
+                                  PROCESS_FLAG_INIT_CPU_PINNED,
+                                  __ATOMIC_ACQ_REL);
+                __atomic_store_n(
+                    &progress_page[USER_RUNTIME_EXEC_PIN_ACK_OFFSET], 1U,
+                    __ATOMIC_RELEASE);
+                exec_pin_test_armed = true;
+            }
+        }
+        if (exec_pin_test_armed && !exec_pin_exec_requested &&
+            runtime_page_table_available() &&
+            x86_translate_page(runtime_space->root_table, 0x00402000ULL,
+                               &marker_physical, 0) == K_OK) {
+            uint8_t *progress_page =
+                (uint8_t *)phys_to_direct(marker_physical);
+            if (progress_page != 0 && progress_page[0xA8U] == 18U) {
+                process_exec_debug_reset();
+                __atomic_store_n(
+                    &progress_page[USER_RUNTIME_EXEC_PIN_EXEC_ACK_OFFSET],
+                    1U, __ATOMIC_RELEASE);
+                exec_pin_exec_requested = true;
+            }
+        }
+        if (exec_pin_test_armed && !exec_pin_test_checked) {
+            uint32_t exec_stage = process_exec_debug_stage();
+            if (exec_pin_exec_requested && exec_stage == 12U &&
+                process_exec_debug_status() == K_OK) {
+                uint32_t flags =
+                    __atomic_load_n(&process->flags, __ATOMIC_ACQUIRE);
+                uint64_t affinity = thread->affinity.bits[0];
+                bool all_online_cpus_allowed = true;
+                for (uint32_t cpu = 0; cpu < x86_smp_discovered_count(); ++cpu) {
+                    if (x86_smp_cpu_online(cpu) &&
+                        (thread->affinity.bits[cpu >> 6U] &
+                         (1ULL << (cpu & 63U))) == 0U) {
+                        all_online_cpus_allowed = false;
+                    }
+                }
+                g_user_runtime_exec_pin_stage = exec_stage;
+                g_user_runtime_exec_pin_flags = flags;
+                g_user_runtime_exec_pin_affinity = affinity;
+                g_user_runtime_exec_pin_passed =
+                    (flags & PROCESS_FLAG_INIT_CPU_PINNED) == 0U &&
+                    all_online_cpus_allowed ? 1U : 0U;
+                g_user_runtime_exec_pin_checked = 1U;
+                exec_pin_test_checked = true;
+            }
+        }
+#if OS_DEBUG_SERIAL
         if (runtime_page_table_available() &&
             x86_translate_page(runtime_space->root_table, 0x00402000ULL,
                                &marker_physical, 0) == K_OK) {
             uint8_t *progress_page = (uint8_t *)phys_to_direct(marker_physical);
             if (progress_page != 0 && progress_page[0xA8U] != runtime_progress) {
                 runtime_progress = progress_page[0xA8U];
-                liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                                         LITEOS_DEBUG_STEP_USER_MARK,
+                debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                                         OS_DEBUG_STEP_USER_MARK,
                                          runtime_progress);
             }
         }
@@ -689,7 +758,7 @@ bool user_elf_runtime_self_test(void) {
 
     bool thread_dead = atomic_load_explicit(&thread->state, memory_order_acquire) == THREAD_DEAD;
     bool process_dead = atomic_load_explicit(&process->state, memory_order_acquire) == PROCESS_DEAD;
-    bool tick_seen = liteos_lapic_tick_count() > timer_ticks_before;
+    bool tick_seen = lapic_tick_count() > timer_ticks_before;
     bool kernel_thread_current = current != 0 && current->process == 0;
     bool kernel_root_current = x86_current_root_table().value == kernel_root.value;
     /*
@@ -702,10 +771,18 @@ bool user_elf_runtime_self_test(void) {
     bool exec_exit_completed =
         g_user_runtime_exec_stage == 14U &&
         g_user_runtime_exec_status == K_OK;
+    bool exec_pin_test_passed = exec_pin_test_armed &&
+        exec_pin_exec_requested && exec_pin_test_checked &&
+        g_user_runtime_exec_pin_passed == 1U;
+    if (exec_pin_test_armed && !exec_pin_test_passed) {
+        g_user_runtime_stage = 19U;
+        g_user_runtime_result |= 0x400U;
+    }
     success = cleanup_complete && thread_dead && thread->exit_code == 0 &&
               process->thread_count == 0 &&
               process_dead && process->exit_code == 0 && process->vm == 0 &&
-              (marker == 0xA5U || exec_exit_completed) && tick_seen &&
+              (marker == 0xA5U || exec_exit_completed) &&
+              exec_pin_test_passed && tick_seen &&
               kernel_thread_current &&
               kernel_root_current;
     if (!success && g_user_runtime_result == 0U) {
@@ -724,7 +801,7 @@ bool user_elf_runtime_self_test(void) {
     }
 
 cleanup:
-    liteos_debug_trace_set(false);
+    debug_trace_set(false);
     if (runtime_space != 0) vm_space_put(runtime_space);
     if (thread != 0) {
         (void)thread_terminate(thread, K_ECANCELED);

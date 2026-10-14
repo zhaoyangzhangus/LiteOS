@@ -18,11 +18,11 @@ bool compositor_snapshot_overwrites_presented_cursor(void) {
 
     cursor_left =
         (int64_t)g_window_server.presented_pointer_x -
-        WINDOW_CURSOR_HOTSPOT_X;
+        window_cursor_hotspot_x(g_window_server.presented_cursor_shape);
 
     cursor_top =
         (int64_t)g_window_server.presented_pointer_y -
-        WINDOW_CURSOR_HOTSPOT_Y;
+        window_cursor_hotspot_y(g_window_server.presented_cursor_shape);
 
     cursor_right =
         cursor_left + WINDOW_CURSOR_WIDTH;
@@ -255,11 +255,11 @@ void compositor_cursor_locked(void) {
 
     origin_x =
         (int64_t)g_compositor_snapshot.pointer_x -
-        WINDOW_CURSOR_HOTSPOT_X;
+        window_cursor_hotspot_x(g_compositor_snapshot.cursor_shape);
 
     origin_y =
         (int64_t)g_compositor_snapshot.pointer_y -
-        WINDOW_CURSOR_HOTSPOT_Y;
+        window_cursor_hotspot_y(g_compositor_snapshot.cursor_shape);
 
     cursor_clip_left = origin_x;
     cursor_clip_top = origin_y;
@@ -335,11 +335,6 @@ void compositor_cursor_locked(void) {
                 g_window_server.display_stride +
             (uint32_t)cursor_clip_left;
 
-        const uint32_t *source =
-            &g_linux_cursor_argb[
-                source_row * WINDOW_CURSOR_WIDTH +
-                source_column];
-
         uint32_t pixels =
             (uint32_t)(cursor_clip_right - cursor_clip_left);
 
@@ -347,7 +342,8 @@ void compositor_cursor_locked(void) {
              column < pixels;
              ++column) {
 
-            uint32_t pixel = source[column];
+            uint32_t pixel = window_cursor_pixel(g_compositor_snapshot.cursor_shape,
+                                                 source_column + column, source_row);
             uint32_t alpha = pixel >> 24;
 
             if (alpha == 0U) {

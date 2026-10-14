@@ -398,9 +398,9 @@ bool xhci_controller_handoff_legacy(xhci_state_t *state,
             }
             uint32_t after = xhci_controller_read32(state, offset);
             if ((after & XHCI_LEGACY_BIOS_OWNED) != 0U) {
-                liteos_serial_write("LITEOS_XHCI_LEGACY_HANDOFF_TIMEOUT BIOS=");
-                liteos_serial_write_u32(after);
-                liteos_serial_write("\r\n");
+                kernel_serial_write("OS_XHCI_LEGACY_HANDOFF_TIMEOUT BIOS=");
+                kernel_serial_write_u32(after);
+                kernel_serial_write("\r\n");
                 (void)xhci_controller_write32(
                     state, offset,
                     (after | XHCI_LEGACY_OS_OWNED) &

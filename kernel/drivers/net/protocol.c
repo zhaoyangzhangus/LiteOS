@@ -1,5 +1,6 @@
 /* REFACTOR_P8_E1000_PROTOCOL_OWNER */
 
+#include <kernel/console.h>
 #include <kernel/net_core.h>
 #include <kernel/socket.h>
 
@@ -9,6 +10,10 @@
 #define E1000_IPV6_TCP_MSS       1440U
 #define E1000_IPV4_UDP_PAYLOAD   1472U
 #define E1000_IPV6_UDP_PAYLOAD   1452U
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_debug_tcp_output_logs;
+#endif
 
 static void e1000_protocol_copy(void *destination, const void *source, size_t size) {
     uint8_t *out = (uint8_t *)destination;
@@ -137,12 +142,31 @@ kstatus_t e1000_tcp_ipv4_output(
             net_device_send(&state->device, arp_frame, arp_length) != K_OK) {
             return K_EIO;
         }
+#if OS_DEBUG_SERIAL
+        if (g_debug_tcp_output_logs < 32U) {
+            kernel_serial_printf_serial_only(
+                "OS_TCP_OUTPUT arp-miss src=%x:%u dst=%x:%u next=%x\r\n",
+                source_address, source_port, destination_address,
+                destination_port, neighbor_address);
+            ++g_debug_tcp_output_logs;
+        }
+#endif
         return K_EAGAIN;
     }
-    return e1000_send_tcp_ipv4_segments(
+    kstatus_t status = e1000_send_tcp_ipv4_segments(
         state, destination_mac, source_address, destination_address,
         source_port, destination_port, sequence, acknowledgement, flags,
         window, payload, payload_length);
+#if OS_DEBUG_SERIAL
+    if (g_debug_tcp_output_logs < 32U) {
+        kernel_serial_printf_serial_only(
+            "OS_TCP_OUTPUT arp-hit src=%x:%u dst=%x:%u status=%d\r\n",
+            source_address, source_port, destination_address, destination_port,
+            status);
+        ++g_debug_tcp_output_logs;
+    }
+#endif
+    return status;
 }
 
 kstatus_t e1000_udp_ipv4_output(

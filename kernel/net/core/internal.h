@@ -1,9 +1,10 @@
 #pragma once
 
+#include <kernel/string.h>
+
 /* REFACTOR_P8_NET_INTERNAL: shared private byte-zeroing primitive. */
 static inline void net_zero(void *destination, size_t length) {
-    uint8_t *bytes = (uint8_t *)destination;
-    while (length-- != 0U) *bytes++ = 0U;
+    memset(destination, 0, length);
 }
 
 static inline bool net_mac_equal(const uint8_t left[6],

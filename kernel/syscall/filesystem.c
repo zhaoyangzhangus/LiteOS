@@ -224,7 +224,7 @@ int64_t syscall_file_rename(uint64_t arguments_pointer, uint64_t unused1,
     if (status != K_OK) return status;
     if (!versioned_header_valid(&arguments.hdr, sizeof(arguments)) ||
         arguments.old_path == 0U || arguments.new_path == 0U) return K_EINVAL;
-    return vfs_rename_kernel(
+    return vfs_rename(
         (const char __user *)(uintptr_t)arguments.old_path,
         (const char __user *)(uintptr_t)arguments.new_path);
 }

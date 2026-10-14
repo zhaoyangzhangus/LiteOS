@@ -3,7 +3,6 @@
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
 #include <kernel/bitmap.h>
-#include <arch/x86_64/paging.h>
 
 #define VMALLOC_MANAGED_SIZE  (1ULL << 30)
 #define VMALLOC_PAGE_COUNT    (VMALLOC_MANAGED_SIZE / PAGE_SIZE)
@@ -13,28 +12,34 @@
 typedef struct {
     bool used;
     bool owns_pages;
+    bool cleanup_pending;
     uint32_t bitmap_start;
     uint32_t total_pages;
     uint32_t data_pages;
-    size_t requested_size;
     vaddr_t address;
     paddr_t root_table;
 } vmalloc_area_t;
+
+_Static_assert(sizeof(vmalloc_area_t) == 32U, "compact vmalloc area record");
 
 static uint64_t g_vmalloc_bitmap[VMALLOC_BITMAP_WORDS];
 static vmalloc_area_t g_vmalloc_areas[VMALLOC_MAX_AREAS];
 static spinlock_t g_vmalloc_lock;
 static atomic_uint g_vmalloc_init_state;
 static volatile uint32_t g_vmalloc_failure;
+static uint32_t g_vmalloc_pending_cleanup;
+static uint32_t g_vmalloc_next_free_area;
+static uint32_t g_vmalloc_area_limit; /* one past the last used record */
 
 static uint64_t vmalloc_lock_irqsave(void) {
     uint64_t flags;
     __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
     sched_preempt_disable();
     bool enabled_delivery = false;
+    unsigned expected = 0U;
     for (;;) {
-        if (atomic_exchange_explicit(&g_vmalloc_lock.state, 1U,
-                                     memory_order_acquire) == 0U) {
+        if (atomic_compare_exchange_strong_explicit(&g_vmalloc_lock.state,
+                &expected, 1U, memory_order_acquire, memory_order_relaxed)) {
             if (enabled_delivery) {
                 if ((flags & (1ULL << 9)) == 0) {
                     __asm__ volatile ("cli" : : : "memory");
@@ -50,7 +55,11 @@ static uint64_t vmalloc_lock_irqsave(void) {
             enabled_delivery = true;
         }
         /* 禁止本地调度但保持 IF，确保等待期间仍可接收 TLB IPI。 */
-        __asm__ volatile ("pause");
+        do {
+            __asm__ volatile ("pause");
+        } while (atomic_load_explicit(&g_vmalloc_lock.state,
+                                      memory_order_relaxed) != 0U);
+        expected = 0U;
     }
 }
 
@@ -65,11 +74,14 @@ static void vmalloc_unlock_irqrestore(uint64_t flags) {
 }
 
 static void vmalloc_initialize(void) {
+    if (atomic_load_explicit(&g_vmalloc_init_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_vmalloc_init_state, &expected, 1U,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) {
         atomic_init(&g_vmalloc_lock.state, 0U);
+        g_vmalloc_next_free_area = 0U;
+        g_vmalloc_area_limit = 0U;
         for (uint32_t i = 0; i < VMALLOC_BITMAP_WORDS; ++i) g_vmalloc_bitmap[i] = 0;
         for (uint32_t i = 0; i < VMALLOC_MAX_AREAS; ++i) g_vmalloc_areas[i].used = false;
         atomic_store_explicit(&g_vmalloc_init_state, 2U, memory_order_release);
@@ -81,55 +93,145 @@ static void vmalloc_initialize(void) {
 }
 
 static bool find_virtual_run(uint32_t count, uint32_t *start_out) {
+    if (count == 0U || count > VMALLOC_PAGE_COUNT) return false;
     uint32_t run_start = 0;
     uint32_t run_length = 0;
-    for (uint32_t page = 0; page < VMALLOC_PAGE_COUNT; ++page) {
-        if (!bitmap_test_bit(g_vmalloc_bitmap, page)) {
-            if (run_length == 0) run_start = page;
-            if (++run_length == count) {
+    for (uint32_t word = 0; word < VMALLOC_BITMAP_WORDS; ++word) {
+        uint64_t used = g_vmalloc_bitmap[word];
+        uint32_t base = word * 64U;
+        if (used == UINT64_MAX) {
+            run_length = 0;
+            continue;
+        }
+        if (used == 0U) {
+            if (run_length == 0U) run_start = base;
+            run_length += 64U;
+            if (run_length >= count) {
                 *start_out = run_start;
                 return true;
             }
-        } else {
-            run_length = 0;
+            continue;
+        }
+        /* Skip whole occupied/free spans. Never shift by 64 or call ctz on
+         * zero; retain a free suffix for runs crossing word boundaries. */
+        for (uint32_t bit = 0; bit < 64U;) {
+            uint64_t suffix = used >> bit;
+            uint32_t remaining = 64U - bit;
+            if ((suffix & 1U) != 0U) {
+                bit += ~suffix == 0U ? remaining :
+                    (uint32_t)__builtin_ctzll(~suffix);
+                run_length = 0;
+            } else {
+                uint32_t free_pages = suffix == 0U ? remaining :
+                    (uint32_t)__builtin_ctzll(suffix);
+                if (run_length == 0U) run_start = base + bit;
+                run_length += free_pages;
+                if (run_length >= count) {
+                    *start_out = run_start;
+                    return true;
+                }
+                bit += free_pages;
+            }
         }
     }
     return false;
+}
+
+/* Caller holds g_vmalloc_lock. Keep the reservation until every PTE has been
+ * removed with acknowledged TLB invalidation; retries see ENOENT for pages
+ * already retired, so owned physical pages are never freed twice. */
+static bool vmalloc_release_area_locked(vmalloc_area_t *area) {
+    uint32_t remaining = 0U;
+    for (uint32_t i = 0; i < area->data_pages; ++i) {
+        paddr_t physical;
+        kstatus_t status = x86_unmap_page(area->root_table,
+            area->address + (vaddr_t)i * PAGE_SIZE, &physical);
+        if (status == K_OK) {
+            /* Borrowed mappings retire PTEs, not physical ownership. */
+            if (area->owns_pages) {
+                page_t *page = phys_to_page(physical);
+                if (page != 0) page_free(page);
+            }
+        } else if (status != K_ENOENT) {
+            remaining = i + 1U;
+            g_vmalloc_failure = 0x400U | (uint32_t)(-status);
+        }
+    }
+    if (remaining != 0U) {
+        /* Only the failed prefix can still contain live PTEs. Keep the
+         * full bitmap reservation, but do not retry its retired suffix. */
+        area->data_pages = remaining;
+        if (!area->cleanup_pending) ++g_vmalloc_pending_cleanup;
+        area->cleanup_pending = true;
+        return false;
+    }
+    if (area->cleanup_pending) --g_vmalloc_pending_cleanup;
+    bitmap_set_range(g_vmalloc_bitmap, area->bitmap_start, area->total_pages, false);
+    area->used = false;
+    uint32_t area_index = (uint32_t)(area - g_vmalloc_areas);
+    if (area_index < g_vmalloc_next_free_area) g_vmalloc_next_free_area = area_index;
+    if (area_index + 1U == g_vmalloc_area_limit) {
+        while (g_vmalloc_area_limit != 0U &&
+               !g_vmalloc_areas[g_vmalloc_area_limit - 1U].used)
+            --g_vmalloc_area_limit;
+    }
+    area->owns_pages = false;
+    area->cleanup_pending = false;
+    area->root_table = paddr_make(0);
+    return true;
+}
+
+static vmalloc_area_t *vmalloc_reserve_area_locked(uint32_t pages,
+                                                  bool owns) {
+    if (g_vmalloc_pending_cleanup != 0U) {
+        for (uint32_t i = 0; i < g_vmalloc_area_limit; ++i) {
+            if (g_vmalloc_areas[i].cleanup_pending) {
+                (void)vmalloc_release_area_locked(&g_vmalloc_areas[i]);
+                if (g_vmalloc_pending_cleanup == 0U) break;
+            }
+        }
+    }
+    vmalloc_area_t *area = 0;
+    for (uint32_t i = g_vmalloc_next_free_area; i < VMALLOC_MAX_AREAS; ++i) {
+        if (!g_vmalloc_areas[i].used) {
+            area = &g_vmalloc_areas[i];
+            g_vmalloc_next_free_area = i;
+            break;
+        }
+    }
+    uint32_t start, total = pages + 2U;
+    if (area == 0 || !find_virtual_run(total, &start)) {
+        g_vmalloc_failure = 1U;
+        return 0;
+    }
+    bitmap_set_range(g_vmalloc_bitmap, start, total, true);
+    area->used = true;
+    g_vmalloc_next_free_area = (uint32_t)(area - g_vmalloc_areas) + 1U;
+    if (g_vmalloc_next_free_area > g_vmalloc_area_limit)
+        g_vmalloc_area_limit = g_vmalloc_next_free_area;
+    area->owns_pages = owns;
+    area->cleanup_pending = false;
+    area->bitmap_start = start;
+    area->total_pages = total;
+    area->data_pages = pages;
+    area->address = (vaddr_t)(X86_64_VMALLOC_BASE + ((uint64_t)start + 1ULL) * PAGE_SIZE);
+    area->root_table = x86_current_root_table();
+    return area;
 }
 
 void *vmalloc(size_t size) {
     if (size == 0 || size > VMALLOC_MANAGED_SIZE - 2U * PAGE_SIZE) return 0;
     if (size > UINT64_MAX - (PAGE_SIZE - 1ULL)) return 0;
     uint32_t data_pages = (uint32_t)((size + PAGE_SIZE - 1ULL) >> PAGE_SHIFT);
-    uint32_t total_pages = data_pages + 2U; /* 两端各保留一个未映射保护页。 */
     vmalloc_initialize();
     uint64_t irq_flags = vmalloc_lock_irqsave();
 
-    vmalloc_area_t *area = 0;
-    for (uint32_t i = 0; i < VMALLOC_MAX_AREAS; ++i) {
-        if (!g_vmalloc_areas[i].used) {
-            area = &g_vmalloc_areas[i];
-            break;
-        }
-    }
-    uint32_t bitmap_start;
-    if (area == 0 || !find_virtual_run(total_pages, &bitmap_start)) {
-        g_vmalloc_failure = 1U;
+    vmalloc_area_t *area = vmalloc_reserve_area_locked(data_pages, true);
+    if (area == 0) {
         vmalloc_unlock_irqrestore(irq_flags);
         return 0;
     }
-    bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, true);
-    area->used = true;
-    area->owns_pages = true;
-    area->bitmap_start = bitmap_start;
-    area->total_pages = total_pages;
-    area->data_pages = data_pages;
-    area->requested_size = size;
-    area->address = (vaddr_t)(X86_64_VMALLOC_BASE +
-                    ((uint64_t)bitmap_start + 1ULL) * PAGE_SIZE);
-
-    paddr_t root = x86_current_root_table();
-    area->root_table = root;
+    paddr_t root = area->root_table;
     uint32_t mapped = 0;
     while (mapped < data_pages) {
         page_t *page = page_alloc(0, PAGE_ALLOC_ZERO);
@@ -150,18 +252,8 @@ void *vmalloc(size_t size) {
         ++mapped;
     }
     if (mapped != data_pages) {
-        while (mapped-- != 0) {
-            paddr_t physical;
-            if (x86_unmap_page(root, area->address + (vaddr_t)mapped * PAGE_SIZE,
-                               &physical) == K_OK) {
-                page_t *page = phys_to_page(physical);
-                if (page != 0) page_free(page);
-            }
-        }
-        bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, false);
-        area->used = false;
-        area->owns_pages = false;
-        area->root_table = paddr_make(0);
+        area->data_pages = mapped;
+        (void)vmalloc_release_area_locked(area);
         vmalloc_unlock_irqrestore(irq_flags);
         return 0;
     }
@@ -179,7 +271,7 @@ void vfree(void *pointer) {
     vmalloc_initialize();
     uint64_t irq_flags = vmalloc_lock_irqsave();
     vmalloc_area_t *area = 0;
-    for (uint32_t i = 0; i < VMALLOC_MAX_AREAS; ++i) {
+    for (uint32_t i = 0; i < g_vmalloc_area_limit; ++i) {
         if (g_vmalloc_areas[i].used &&
             g_vmalloc_areas[i].address == (vaddr_t)(uintptr_t)pointer) {
             area = &g_vmalloc_areas[i];
@@ -190,32 +282,7 @@ void vfree(void *pointer) {
         vmalloc_unlock_irqrestore(irq_flags);
         return;
     }
-    /* 回收可能发生在不同 CPU/CR3，必须使用分配时记录的页表根。 */
-    paddr_t root = area->root_table;
-    bool complete = true;
-    for (uint32_t i = 0; i < area->data_pages; ++i) {
-        paddr_t physical;
-        kstatus_t status = x86_unmap_page(root,
-                                           area->address + (vaddr_t)i * PAGE_SIZE,
-                                           &physical);
-        if (status == K_OK) {
-            page_t *page = phys_to_page(physical);
-            if (area->owns_pages && page != 0) page_free(page);
-        } else if (status != K_ENOENT) {
-            /* shootdown 失败时 x86_unmap_page 会恢复 PTE，地址仍然必须保留。 */
-            complete = false;
-            g_vmalloc_failure = 0x400U | (uint32_t)(-status);
-        }
-    }
-    if (!complete) {
-        vmalloc_unlock_irqrestore(irq_flags);
-        return;
-    }
-    bitmap_set_range(g_vmalloc_bitmap, area->bitmap_start, area->total_pages,
-                     false);
-    area->used = false;
-    area->owns_pages = false;
-    area->root_table = paddr_make(0);
+    (void)vmalloc_release_area_locked(area);
     vmalloc_unlock_irqrestore(irq_flags);
 }
 
@@ -234,31 +301,11 @@ kstatus_t vmalloc_map_pages(page_t *const *pages, uint32_t page_count,
 
     vmalloc_initialize();
     uint64_t irq_flags = vmalloc_lock_irqsave();
-    vmalloc_area_t *area = 0;
-    for (uint32_t index = 0U; index < VMALLOC_MAX_AREAS; ++index) {
-        if (!g_vmalloc_areas[index].used) {
-            area = &g_vmalloc_areas[index];
-            break;
-        }
-    }
-    uint32_t bitmap_start;
-    uint32_t total_pages = page_count + 2U;
-    if (area == 0 || !find_virtual_run(total_pages, &bitmap_start)) {
-        g_vmalloc_failure = 1U;
+    vmalloc_area_t *area = vmalloc_reserve_area_locked(page_count, false);
+    if (area == 0) {
         vmalloc_unlock_irqrestore(irq_flags);
         return K_ENOMEM;
     }
-
-    bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, true);
-    area->used = true;
-    area->owns_pages = false;
-    area->bitmap_start = bitmap_start;
-    area->total_pages = total_pages;
-    area->data_pages = page_count;
-    area->requested_size = (size_t)page_count * PAGE_SIZE;
-    area->address = (vaddr_t)(X86_64_VMALLOC_BASE +
-                    ((uint64_t)bitmap_start + 1ULL) * PAGE_SIZE);
-    area->root_table = x86_current_root_table();
 
     uint32_t mapped = 0U;
     kstatus_t status = K_OK;
@@ -273,18 +320,8 @@ kstatus_t vmalloc_map_pages(page_t *const *pages, uint32_t page_count,
         ++mapped;
     }
     if (mapped != page_count) {
-        while (mapped != 0U) {
-            --mapped;
-            paddr_t ignored;
-            (void)x86_unmap_page(
-                area->root_table,
-                area->address + (vaddr_t)mapped * PAGE_SIZE,
-                &ignored);
-        }
-        bitmap_set_range(g_vmalloc_bitmap, bitmap_start, total_pages, false);
-        area->used = false;
-        area->owns_pages = false;
-        area->root_table = paddr_make(0);
+        area->data_pages = mapped;
+        (void)vmalloc_release_area_locked(area);
         vmalloc_unlock_irqrestore(irq_flags);
         return status == K_OK ? K_EIO : status;
     }

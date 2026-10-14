@@ -48,14 +48,14 @@ static int emit_font(FILE *output, FT_Face face) {
         baseline += (CELL_HEIGHT - ascender - descender) / 2;
     }
 
-    fputs("#ifndef LITEOS_CONSOLE_FONT_A8_H\n"
-          "#define LITEOS_CONSOLE_FONT_A8_H\n\n"
+    fputs("#ifndef OS_CONSOLE_FONT_A8_H\n"
+          "#define OS_CONSOLE_FONT_A8_H\n\n"
           "#include <stdint.h>\n\n"
-          "#define LITEOS_CONSOLE_FONT_WIDTH 12U\n"
-          "#define LITEOS_CONSOLE_FONT_HEIGHT 24U\n"
-          "#define LITEOS_CONSOLE_FONT_FIRST 0x20U\n"
-          "#define LITEOS_CONSOLE_FONT_LAST 0x7EU\n\n"
-          "static const uint8_t g_liteos_console_font_a8[95][288] = {\n",
+          "#define OS_CONSOLE_FONT_WIDTH 12U\n"
+          "#define OS_CONSOLE_FONT_HEIGHT 24U\n"
+          "#define OS_CONSOLE_FONT_FIRST 0x20U\n"
+          "#define OS_CONSOLE_FONT_LAST 0x7EU\n\n"
+          "static const uint8_t g_console_font_a8[95][288] = {\n",
           output);
 
     for (unsigned int character = FIRST_CHAR; character <= LAST_CHAR;
@@ -100,12 +100,12 @@ static int emit_font(FILE *output, FT_Face face) {
         fprintf(output, "    }%s\n", character == LAST_CHAR ? "" : ",");
     }
     fputs("};\n\nstatic inline const uint8_t *\n"
-          "liteos_console_font_glyph(uint8_t character) {\n"
+          "kernel_console_font_glyph(uint8_t character) {\n"
           "    uint32_t code = character;\n"
-          "    if (code < LITEOS_CONSOLE_FONT_FIRST ||\n"
-          "        code > LITEOS_CONSOLE_FONT_LAST) code = '?';\n"
-          "    return g_liteos_console_font_a8[code -\n"
-          "        LITEOS_CONSOLE_FONT_FIRST];\n}\n\n#endif\n", output);
+          "    if (code < OS_CONSOLE_FONT_FIRST ||\n"
+          "        code > OS_CONSOLE_FONT_LAST) code = '?';\n"
+          "    return g_console_font_a8[code -\n"
+          "        OS_CONSOLE_FONT_FIRST];\n}\n\n#endif\n", output);
     return ferror(output) != 0 ? 1 : 0;
 }
 

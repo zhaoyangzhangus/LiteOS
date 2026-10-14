@@ -62,7 +62,7 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
                  * which deliberately exercise detach/attach lifetime. */
                 keep_controller =
                     true;
-                liteos_realtest_mark("XHCI_STABLE_SLOT_RETAINED");
+                realtest_mark("XHCI_STABLE_SLOT_RETAINED");
             }
         }
 
@@ -93,8 +93,8 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
                 xhci_set_error(76U);
             }
 
-            liteos_serial_write(
-                "LITEOS_XHCI_EVENT_DRAIN_FAIL\r\n");
+            kernel_serial_write(
+                "OS_XHCI_EVENT_DRAIN_FAIL\r\n");
 
             success = false;
             keep_controller = false;
@@ -108,10 +108,10 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
              * Hub hotplug path remains disabled for this controller. */
             if(xhci_usb_mass_storage_configured())
             {
-                liteos_realtest_mark(
+                realtest_mark(
                     "XHCI_HUB_RUNTIME_OPTIONAL_FAIL_WITH_MSC");
-                liteos_serial_write(
-                    "LITEOS_XHCI_HUB_RUNTIME_OPTIONAL_FAIL\r\n");
+                kernel_serial_write(
+                    "OS_XHCI_HUB_RUNTIME_OPTIONAL_FAIL\r\n");
                 xhci_clear_error();
             }
             else
@@ -121,8 +121,8 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
                     xhci_set_error(76U);
                 }
 
-                liteos_serial_write(
-                    "LITEOS_XHCI_HUB_RUNTIME_FAIL\r\n");
+                kernel_serial_write(
+                    "OS_XHCI_HUB_RUNTIME_FAIL\r\n");
 
                 success = false;
                 keep_controller = false;
@@ -135,23 +135,23 @@ static bool xhci_hardware_self_test_one(const pci_device_t *pci) {
     if (success && !xhci_core_bind_msix(xhci_controller_state())) {
             uint32_t irq_error = xhci_last_error();
             uint32_t irq_stage = xhci_msix_failure_stage();
-            liteos_realtest_mark_number("XHCI_PRIMARY_MSIX_ERROR",
+            realtest_mark_number("XHCI_PRIMARY_MSIX_ERROR",
                                         irq_error);
-            liteos_realtest_mark_number("XHCI_PRIMARY_MSIX_STAGE",
+            realtest_mark_number("XHCI_PRIMARY_MSIX_STAGE",
                                         irq_stage);
-            liteos_serial_write("LITEOS_XHCI_MSIX_FAIL_STAGE=");
-            liteos_serial_write_u32(irq_stage);
-            liteos_serial_write("\r\n");
+            kernel_serial_write("OS_XHCI_MSIX_FAIL_STAGE=");
+            kernel_serial_write_u32(irq_stage);
+            kernel_serial_write("\r\n");
             success = false;
             keep_controller = false;
             xhci_runtime_set_ready(false);
-            liteos_realtest_mark_number("XHCI_PRIMARY_IRQ_MODE", 0U);
-            liteos_serial_write("LITEOS_XHCI_IRQ_UNAVAILABLE\r\n");
+            realtest_mark_number("XHCI_PRIMARY_IRQ_MODE", 0U);
+            kernel_serial_write("OS_XHCI_IRQ_UNAVAILABLE\r\n");
         } else if(success) {
-            liteos_realtest_mark_number("XHCI_PRIMARY_IRQ_MODE", 1U);
-            liteos_serial_write("LITEOS_XHCI_MSIX_OK\r\n");
-            liteos_serial_write(
-                "LITEOS_XHCI_HUB_RUNTIME_OK\r\n");
+            realtest_mark_number("XHCI_PRIMARY_IRQ_MODE", 1U);
+            kernel_serial_write("OS_XHCI_MSIX_OK\r\n");
+            kernel_serial_write(
+                "OS_XHCI_HUB_RUNTIME_OK\r\n");
 
             /* Count only post-MSI-X runtime HID completions. */
             xhci_hid_runtime_reset_completion_counters();
@@ -182,53 +182,53 @@ static bool xhci_start_auxiliary_hid(const pci_device_t *pci) {
     if (state == 0 || pci == 0 || state->initialized) return false;
     xhci_hid_controller_set_active(false);
     xhci_clear_error();
-    liteos_realtest_mark_number("XHCI_AUX_DEVICE", pci->device_id);
-    liteos_realtest_mark_number("XHCI_AUX_BUS", pci->bus);
-    liteos_realtest_mark_number("XHCI_AUX_PCI_STATUS", pci->status);
-    liteos_realtest_mark_number("XHCI_AUX_PCI_COMMAND", pci->command);
-    liteos_realtest_mark_number("XHCI_AUX_MSI_CAP", pci->msi_capability);
-    liteos_realtest_mark_number("XHCI_AUX_MSIX_CAP", pci->msix_capability);
-    liteos_realtest_mark_number("XHCI_AUX_MSIX_ENTRIES",
+    realtest_mark_number("XHCI_AUX_DEVICE", pci->device_id);
+    realtest_mark_number("XHCI_AUX_BUS", pci->bus);
+    realtest_mark_number("XHCI_AUX_PCI_STATUS", pci->status);
+    realtest_mark_number("XHCI_AUX_PCI_COMMAND", pci->command);
+    realtest_mark_number("XHCI_AUX_MSI_CAP", pci->msi_capability);
+    realtest_mark_number("XHCI_AUX_MSIX_CAP", pci->msix_capability);
+    realtest_mark_number("XHCI_AUX_MSIX_ENTRIES",
                                 pci->msix_table_size);
-    liteos_realtest_mark_number("XHCI_AUX_MSIX_BAR", pci->msix_table_bar);
-    liteos_realtest_mark_number("XHCI_AUX_MSIX_OFFSET",
+    realtest_mark_number("XHCI_AUX_MSIX_BAR", pci->msix_table_bar);
+    realtest_mark_number("XHCI_AUX_MSIX_OFFSET",
                                 pci->msix_table_offset);
     if (pci->msix_table_bar < PCI_MAX_BARS) {
-        liteos_realtest_mark_number("XHCI_AUX_MSIX_BAR_FLAGS",
+        realtest_mark_number("XHCI_AUX_MSIX_BAR_FLAGS",
                                     pci->bars[pci->msix_table_bar].flags);
-        liteos_realtest_mark_number("XHCI_AUX_MSIX_BAR_LENGTH_LO",
+        realtest_mark_number("XHCI_AUX_MSIX_BAR_LENGTH_LO",
                                     (uint32_t)pci->bars[pci->msix_table_bar].length);
     }
     if (!xhci_core_initialize(state, pci)) {
-        liteos_realtest_mark_number("XHCI_AUX_INIT_ERROR", xhci_last_error());
-        liteos_serial_write("LITEOS_XHCI_AUX_HID_FAIL\r\n");
+        realtest_mark_number("XHCI_AUX_INIT_ERROR", xhci_last_error());
+        kernel_serial_write("OS_XHCI_AUX_HID_FAIL\r\n");
         return false;
     }
     if (!xhci_probe_hid_controller(state)) {
-        liteos_realtest_mark_number("XHCI_AUX_PROBE_ERROR", xhci_last_error());
-        liteos_serial_write("LITEOS_XHCI_AUX_HID_FAIL\r\n");
+        realtest_mark_number("XHCI_AUX_PROBE_ERROR", xhci_last_error());
+        kernel_serial_write("OS_XHCI_AUX_HID_FAIL\r\n");
         (void)xhci_core_destroy(state);
         return false;
     }
     if (!xhci_core_bind_msix(state)) {
         uint32_t irq_stage = xhci_msix_failure_stage();
-        liteos_realtest_mark_number("XHCI_AUX_MSIX_ERROR", xhci_last_error());
-        liteos_realtest_mark_number("XHCI_AUX_MSIX_STAGE",
+        realtest_mark_number("XHCI_AUX_MSIX_ERROR", xhci_last_error());
+        realtest_mark_number("XHCI_AUX_MSIX_STAGE",
                                     irq_stage);
         /* Enumeration and endpoint setup are not enough for runtime HID:
          * without an interrupt route there is no event-driven completion
          * path, so release this controller and leave a failure marker. */
         xhci_hid_controller_set_active(false);
-        liteos_realtest_mark_number("XHCI_AUX_HID_IRQ_MODE", 0U);
-        liteos_realtest_mark("XHCI_AUX_HID_IRQ_UNAVAILABLE");
-        liteos_serial_write("LITEOS_XHCI_AUX_HID_IRQ_UNAVAILABLE\r\n");
+        realtest_mark_number("XHCI_AUX_HID_IRQ_MODE", 0U);
+        realtest_mark("XHCI_AUX_HID_IRQ_UNAVAILABLE");
+        kernel_serial_write("OS_XHCI_AUX_HID_IRQ_UNAVAILABLE\r\n");
         (void)xhci_core_destroy(state);
         return false;
     }
     xhci_hid_controller_set_active(true);
-    liteos_realtest_mark_number("XHCI_AUX_HID_IRQ_MODE", 1U);
-    liteos_realtest_mark("XHCI_AUX_HID_READY");
-    liteos_serial_write("LITEOS_XHCI_AUX_HID_MSIX_OK\r\n");
+    realtest_mark_number("XHCI_AUX_HID_IRQ_MODE", 1U);
+    realtest_mark("XHCI_AUX_HID_READY");
+    kernel_serial_write("OS_XHCI_AUX_HID_MSIX_OK\r\n");
     (void)xhci_schedule_deferred_work();
     return true;
 }
@@ -241,9 +241,9 @@ static void xhci_start_auxiliary_hid_controllers(uint32_t primary_index) {
 
         if (index == primary_index) continue;
         controller = xhci_pci_controller_at(index);
-        liteos_realtest_mark_number("XHCI_AUX_CONTROLLER_BEGIN", index);
+        realtest_mark_number("XHCI_AUX_CONTROLLER_BEGIN", index);
         if (xhci_start_auxiliary_hid(controller)) {
-            liteos_realtest_mark_number("XHCI_AUX_CONTROLLER_READY", index);
+            realtest_mark_number("XHCI_AUX_CONTROLLER_READY", index);
             return;
         }
     }
@@ -256,32 +256,32 @@ bool xhci_hardware_self_test(void) {
     if (controller_count == 0U) return true;
     for (uint32_t index = 0U; index < controller_count; ++index) {
         const pci_device_t *controller = xhci_pci_controller_at(index);
-        liteos_realtest_mark_number("XHCI_CONTROLLER_BEGIN", index);
+        realtest_mark_number("XHCI_CONTROLLER_BEGIN", index);
         if (controller != 0) {
-            liteos_realtest_mark_number("XHCI_CONTROLLER_DEVICE",
+            realtest_mark_number("XHCI_CONTROLLER_DEVICE",
                                         controller->device_id);
-            liteos_realtest_mark_number("XHCI_CONTROLLER_BUS",
+            realtest_mark_number("XHCI_CONTROLLER_BUS",
                                         controller->bus);
         }
         if (!xhci_hardware_self_test_one(controller)) {
-            liteos_realtest_mark_number("XHCI_CONTROLLER_ERROR",
+            realtest_mark_number("XHCI_CONTROLLER_ERROR",
                                         xhci_last_error());
             continue;
         }
         /* An earlier controller may have produced a detailed EP0 failure.
          * That failure is no longer boot-fatal once a later controller owns
          * the usable USB topology. */
-        liteos_realtest_clear_failure_state();
+        realtest_clear_failure_state();
 
         /* A passing controller is not enough for a real boot: the FAT volume
          * must be reachable through its MSC device. Prefer that controller
          * when firmware exposes several independent xHCI functions. */
         if (xhci_usb_mass_storage_configured()) {
-            liteos_realtest_mark_number("XHCI_CONTROLLER_MSC", index);
+            realtest_mark_number("XHCI_CONTROLLER_MSC", index);
             xhci_start_auxiliary_hid_controllers(index);
             return true;
         }
-        liteos_realtest_mark_number("XHCI_CONTROLLER_NO_MSC", index);
+        realtest_mark_number("XHCI_CONTROLLER_NO_MSC", index);
         fallback_controller = controller;
         if (index + 1U < controller_count) {
             (void)xhci_core_destroy(xhci_controller_state());
@@ -289,7 +289,7 @@ bool xhci_hardware_self_test(void) {
             /* The last controller is usable for HID even when no USB mass
              * storage device is attached.  It is already initialized; do
              * not run the self-test a second time on the live controller. */
-            liteos_realtest_mark("XHCI_FALLBACK_READY");
+            realtest_mark("XHCI_FALLBACK_READY");
             return true;
         }
     }
@@ -299,8 +299,8 @@ bool xhci_hardware_self_test(void) {
      * down the shared xHCI state. */
     if (fallback_controller != 0 &&
         xhci_hardware_self_test_one(fallback_controller)) {
-        liteos_realtest_clear_failure_state();
-        liteos_realtest_mark("XHCI_FALLBACK_READY");
+        realtest_clear_failure_state();
+        realtest_mark("XHCI_FALLBACK_READY");
         return true;
     }
     return false;

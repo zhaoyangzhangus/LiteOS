@@ -12,11 +12,11 @@
 
 #define FRAMEBUFFER_KERNEL_VIRTUAL_BASE (X86_64_MMIO_BASE + 0x20000000ULL)
 
-static BOOLEAN memory_fail_at(const liteos_init_memory_hooks_t *hooks,
+static BOOLEAN memory_fail_at(const kernel_init_memory_hooks_t *hooks,
                               const CHAR8 *message, const char *file,
                               uint32_t line) {
-    liteos_debug_stage_fail_at(LITEOS_DEBUG_PHASE_MEMORY,
-                               LITEOS_DEBUG_STEP_FAIL, K_EIO, file, line);
+    kernel_debug_stage_fail_at(OS_DEBUG_PHASE_MEMORY,
+                               OS_DEBUG_STEP_FAIL, K_EIO, file, line);
     hooks->write(message);
     hooks->halt();
     return 0;
@@ -25,7 +25,7 @@ static BOOLEAN memory_fail_at(const liteos_init_memory_hooks_t *hooks,
 #define memory_fail(hooks, message) \
     memory_fail_at((hooks), (message), __FILE__, __LINE__)
 
-BOOLEAN liteos_map_framebuffer_wc(const LITEOS_BOOT_INFO *info,
+BOOLEAN map_framebuffer_wc(const OS_BOOT_INFO *info,
                                   UINT64 *virtual_base) {
     if (info == 0 || virtual_base == 0 || info->FrameBufferBase == 0 ||
         info->FrameBufferSize == 0) return 0;
@@ -49,7 +49,13 @@ BOOLEAN liteos_map_framebuffer_wc(const LITEOS_BOOT_INFO *info,
             (vaddr_t)(FRAMEBUFFER_KERNEL_VIRTUAL_BASE + mapped),
             paddr_make(physical_page + mapped),
             X86_PAGE_WRITE | X86_PAGE_GLOBAL,
-            X86_CACHE_WC);
+            /*
+             * The physical GOP range aliases NVIDIA BAR1 on this machine.
+             * Use UC for the firmware-owned scanout aperture so a cache-type
+             * conflict cannot leave CPU publication invisible to the display
+             * engine or to a subsequent diagnostic read.
+             */
+            X86_CACHE_UC);
         if (status != K_OK) {
             while (mapped != 0) {
                 mapped -= PAGE_SIZE;
@@ -66,7 +72,7 @@ BOOLEAN liteos_map_framebuffer_wc(const LITEOS_BOOT_INFO *info,
     return 1;
 }
 
-static BOOLEAN direct_map_self_test(const LITEOS_BOOT_INFO *info) {
+static BOOLEAN direct_map_self_test(const OS_BOOT_INFO *info) {
     if (info == 0) return 0;
     UINT64 boot_physical = info->BootInfoPhysicalBase != 0 ?
                            info->BootInfoPhysicalBase : (UINT64)(uintptr_t)info;
@@ -78,10 +84,10 @@ static BOOLEAN direct_map_self_test(const LITEOS_BOOT_INFO *info) {
         phys_to_direct(paddr_make(boot_physical)) !=
             (void *)(uintptr_t)boot_virtual) return 0;
 
-    paddr_t lapic = paddr_make(LITEOS_LAPIC_BASE);
+    paddr_t lapic = paddr_make(OS_LAPIC_BASE);
     if (!direct_map_range_is_ram(lapic, 1U)) {
         if (phys_to_direct(lapic) != 0 ||
-            x86_translate_page(root, X86_64_DIRECT_MAP_BASE + LITEOS_LAPIC_BASE,
+            x86_translate_page(root, X86_64_DIRECT_MAP_BASE + OS_LAPIC_BASE,
                                &translated, 0) != K_ENOENT) return 0;
     }
 
@@ -180,6 +186,27 @@ buddy_fail:
 
 static BOOLEAN canonical_mm_self_test(void) {
     uint64_t benchmark_start;
+    uint64_t total_pages_before;
+    uint64_t total_pages_after;
+    uint64_t free_pages_before;
+    uint64_t free_pages_after;
+    page_t *stats_probe;
+
+    if (page_memory_get_stats(&total_pages_before, &free_pages_before) != K_OK ||
+        total_pages_before == 0U || free_pages_before == 0U) return 0;
+    stats_probe = page_alloc(0U, 0U);
+    if (stats_probe == 0) return 0;
+    if (page_memory_get_stats(&total_pages_after, &free_pages_after) != K_OK ||
+        total_pages_after != total_pages_before ||
+        free_pages_after + 1U != free_pages_before) {
+        page_free(stats_probe);
+        return 0;
+    }
+    page_free(stats_probe);
+    if (page_memory_get_stats(&total_pages_after, &free_pages_after) != K_OK ||
+        total_pages_after != total_pages_before ||
+        free_pages_after != free_pages_before) return 0;
+
     benchmark_start = telemetry_timestamp();
     page_t *single = page_alloc(0, PAGE_ALLOC_ZERO | PAGE_ALLOC_DMA32);
     if (single == 0 ||
@@ -255,53 +282,53 @@ allocator_fail:
 #undef MM_ALLOCATOR_STRESS_COUNT
 }
 
-BOOLEAN liteos_init_memory(LITEOS_BOOT_INFO *info,
-                           const liteos_init_memory_hooks_t *hooks,
+BOOLEAN kernel_init_memory(OS_BOOT_INFO *info,
+                           const kernel_init_memory_hooks_t *hooks,
                            UINT64 *framebuffer_virtual_base) {
     if (info == 0 || hooks == 0 || hooks->write == 0 || hooks->halt == 0 ||
         hooks->console_init == 0 || hooks->console_disable == 0 ||
         framebuffer_virtual_base == 0) return 0;
 
-    liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_2);
-    liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_3);
+    kernel_debug_stage_enter(OS_DEBUG_PHASE_SPEC_2);
+    kernel_debug_stage_enter(OS_DEBUG_PHASE_SPEC_3);
     if (!canonical_uaccess_self_test()) {
-        return memory_fail(hooks, "LITEOS_UACCESS_TEST_FAIL\r\n");
+        return memory_fail(hooks, "OS_UACCESS_TEST_FAIL\r\n");
     }
-    hooks->write("LITEOS_UACCESS_OK\r\n");
-    if (!liteos_mm_init(info)) {
-        return memory_fail(hooks, "LITEOS_MM_INIT_FAIL\r\n");
+    hooks->write("OS_UACCESS_OK\r\n");
+    if (!mm_boot_init(info)) {
+        return memory_fail(hooks, "OS_MM_INIT_FAIL\r\n");
     }
-    if (!liteos_rebuild_ram_direct_map(info)) {
-        return memory_fail(hooks, "LITEOS_DIRECT_MAP_FAIL\r\n");
+    if (!arch_rebuild_ram_direct_map(info)) {
+        return memory_fail(hooks, "OS_DIRECT_MAP_FAIL\r\n");
     }
-    if (!liteos_map_framebuffer_wc(info, framebuffer_virtual_base)) {
+    if (!map_framebuffer_wc(info, framebuffer_virtual_base)) {
         hooks->console_disable();
-        return memory_fail(hooks, "LITEOS_FRAMEBUFFER_MAP_FAIL\r\n");
+        return memory_fail(hooks, "OS_FRAMEBUFFER_MAP_FAIL\r\n");
     }
     if (!hooks->console_init(info, *framebuffer_virtual_base)) {
         hooks->console_disable();
     }
     if (!direct_map_self_test(info)) {
-        return memory_fail(hooks, "LITEOS_DIRECT_MAP_FAIL\r\n");
+        return memory_fail(hooks, "OS_DIRECT_MAP_FAIL\r\n");
     }
     /* Direct-map validation is a boot diagnostic.  Keep it in serial and
      * realtest capture, but do not paint it over the desktop GOP surface. */
-    liteos_serial_write_serial_only("LITEOS_DIRECT_MAP_OK\r\n");
-    if (!liteos_lapic_use_kernel_mapping()) {
-        return memory_fail(hooks, "LITEOS_MM_INIT_FAIL\r\n");
+    kernel_serial_write_serial_only("OS_DIRECT_MAP_OK\r\n");
+    if (!lapic_use_kernel_mapping()) {
+        return memory_fail(hooks, "OS_MM_INIT_FAIL\r\n");
     }
     if (!canonical_mm_self_test()) {
-        return memory_fail(hooks, "LITEOS_MM_ALLOCATOR_FAIL\r\n");
+        return memory_fail(hooks, "OS_MM_ALLOCATOR_FAIL\r\n");
     }
-    hooks->write("LITEOS_BUDDY_RANDOM_OK\r\n");
-    hooks->write("LITEOS_MM_ALLOCATOR_OK\r\n");
-    hooks->write("LITEOS_MM_OK\r\n");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_2,
-                       LITEOS_DEBUG_STEP_PROGRESS, 7U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_MEMORY,
-                       LITEOS_DEBUG_STEP_READY, 1U);
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_2);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_3,
-                       LITEOS_DEBUG_STEP_PROGRESS, 2U);
+    hooks->write("OS_BUDDY_RANDOM_OK\r\n");
+    hooks->write("OS_MM_ALLOCATOR_OK\r\n");
+    hooks->write("OS_MM_OK\r\n");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_2,
+                       OS_DEBUG_STEP_PROGRESS, 7U);
+    kernel_debug_stage(OS_DEBUG_PHASE_MEMORY,
+                       OS_DEBUG_STEP_READY, 1U);
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_2);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_3,
+                       OS_DEBUG_STEP_PROGRESS, 2U);
     return 1;
 }

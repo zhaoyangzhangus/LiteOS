@@ -1,4 +1,5 @@
 #include <kernel/net_core.h>
+#include <kernel/sched.h>
 #include <uapi/socket.h>
 #include "internal.h"
 
@@ -7,14 +8,13 @@
 #define NET_FIREWALL_PROTOCOL_UDP 17U
 
 static void net_firewall_lock(net_firewall_t *firewall) {
-    while (atomic_exchange_explicit(&firewall->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    sched_preempt_disable();
+    spinlock_lock(&firewall->lock);
 }
 
 static void net_firewall_unlock(net_firewall_t *firewall) {
-    atomic_store_explicit(&firewall->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&firewall->lock);
+    sched_preempt_enable();
 }
 
 static bool net_firewall_prefix_matches(const uint8_t left[16],
@@ -58,7 +58,7 @@ static bool net_firewall_rule_matches(const net_firewall_rule_t *rule,
 void net_firewall_init(net_firewall_t *firewall, uint8_t default_action) {
     if (firewall == 0) return;
     net_zero(firewall, sizeof(*firewall));
-    atomic_init(&firewall->lock.state, 0U);
+    spinlock_init(&firewall->lock);
     firewall->default_action = default_action == NET_FIREWALL_ALLOW ?
                                NET_FIREWALL_ALLOW : NET_FIREWALL_DENY;
 }

@@ -210,6 +210,7 @@ int main(int argc, char **argv) {
     put_path(image, DATA_OFFSET + 0x500U, "/sbin/deviced");
     put_path(image, DATA_OFFSET + 0x520U, "/sbin/logd");
     put_path(image, DATA_OFFSET + 0x540U, "/sbin/crashd");
+    put_path(image, DATA_OFFSET + 0x560U, "/sbin/chrome-start");
 
     if (!write_image(argv[2], image)) {
         fprintf(stderr, "cannot write %s\n", argv[2]);

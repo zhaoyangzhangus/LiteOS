@@ -11,9 +11,20 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 function Get-WslDistro {
-    $preferred = @($env:LITEOS_WSL_DISTRO, 'Debian', 'Ubuntu')
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) { return $null }
+
+    $preferred = @($env:OS_WSL_DISTRO, 'Debian', 'Ubuntu')
+    try {
+        $rawAvailable = @(& $wsl.Source -l -q 2>$null)
+    }
+    catch {
+        return $null
+    }
+    if ($LASTEXITCODE -ne 0) { return $null }
+
     $available = @(
-        (& wsl.exe -l -q 2>$null) |
+        $rawAvailable |
             ForEach-Object { ("$_" -replace "`0", '').Trim() } |
             Where-Object { $_ }
     )
@@ -34,7 +45,7 @@ $drive = $projectRoot.Substring(0, 1).ToLowerInvariant()
 $rest = $projectRoot.Substring(2).Replace('\', '/')
 $wslRoot = "/mnt/$drive$rest"
 $escapedRoot = $wslRoot.Replace("'", "'\''")
-$buildName = if ($Build) { $Build } elseif ($env:LITEOS_BUILD) { $env:LITEOS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
+$buildName = if ($Build) { $Build } elseif ($env:OS_BUILD) { $env:OS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
 $escapedBuildName = $buildName.Replace("'", "'\''")
 & wsl.exe -d $distro -- bash -lc "cd '$escapedRoot' && BUILD='$escapedBuildName' ./tools/stop-qemu-debug.sh"
 exit $LASTEXITCODE

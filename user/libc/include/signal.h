@@ -1,14 +1,39 @@
 #pragma once
 
-#include <liteos/libc.h>
+#include <libc/libc.h>
 #include <uapi/signal.h>
 
+#ifndef __sigset_t_defined
+#define __sigset_t_defined 1
 typedef uint64_t sigset_t;
+#endif
 typedef int sig_atomic_t;
 typedef void (*sighandler_t)(int);
 
+typedef struct libc_siginfo {
+    int si_signo;
+    int si_errno;
+    int si_code;
+    pid_t si_pid;
+    uid_t si_uid;
+    int si_status;
+    void *si_addr;
+} siginfo_t;
+
+/* Linux-compatible alternate signal-stack shape.  System currently keeps
+ * signal delivery on the thread's normal stack, but exposing the POSIX type
+ * lets portable crash and tracing code compile against the ABI. */
+typedef struct {
+    void *ss_sp;
+    int ss_flags;
+    size_t ss_size;
+} stack_t;
+
 struct sigaction {
-    sighandler_t sa_handler;
+    union {
+        sighandler_t sa_handler;
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
     sigset_t sa_mask;
     int sa_flags;
     void (*sa_restorer)(void);
@@ -54,12 +79,78 @@ struct sigaction {
 #define SIG_IGN ((sighandler_t)OS_SIG_IGN)
 #define SIG_ERR ((sighandler_t)-1)
 
-#define SA_RESETHAND OS_SIG_FLAG_RESETHAND
-#define SA_NODEFER   OS_SIG_FLAG_NODEFER
+/* Expose the Linux signal flag values expected by portable Linux code.  The
+ * libc syscall adapter translates the two flags understood by System back to
+ * OS_SIG_FLAG_* before entering the kernel.  The remaining flags are accepted
+ * as ABI markers; System currently does not implement their extra semantics.
+ */
+#define SA_NOCLDSTOP  0x00000001U
+#define SA_NOCLDWAIT  0x00000002U
+#define SA_SIGINFO    0x00000004U
+#define SA_ONSTACK    0x08000000U
+#define SA_RESTART    0x10000000U
+#define SA_NODEFER    0x40000000U
+#define SA_RESETHAND  0x80000000U
+#define SS_ONSTACK   1
+#define SS_DISABLE   2
+#ifndef SIGSTKSZ
+#define SIGSTKSZ     65536
+#endif
+#ifndef MINSIGSTKSZ
+#define MINSIGSTKSZ  2048
+#endif
 #define SIG_BLOCK    OS_SIG_BLOCK
 #define SIG_UNBLOCK  OS_SIG_UNBLOCK
 #define SIG_SETMASK  OS_SIG_SETMASK
 
+/* POSIX siginfo si_code values used by Chromium's crash reporter. */
+#ifndef ILL_ILLOPC
+#define ILL_ILLOPC 1
+#define ILL_ILLOPN 2
+#define ILL_ILLADR 3
+#define ILL_ILLTRP 4
+#define ILL_PRVOPC 5
+#define ILL_PRVREG 6
+#define ILL_COPROC 7
+#define ILL_BADSTK 8
+#define FPE_INTDIV 1
+#define FPE_INTOVF 2
+#define FPE_FLTDIV 3
+#define FPE_FLTOVF 4
+#define FPE_FLTUND 5
+#define FPE_FLTRES 6
+#define FPE_FLTINV 7
+#define FPE_FLTSUB 8
+#define SEGV_MAPERR 1
+#define SEGV_ACCERR 2
+#define BUS_ADRALN 1
+#define BUS_ADRERR 2
+#define BUS_OBJERR 3
+#define SI_KERNEL 0x80
+#endif
+
+/* Linux siginfo si_code values used by V8's trap handler. */
+#ifndef SI_USER
+#define SI_USER 0
+#define SI_QUEUE (-1)
+#define SI_TIMER (-2)
+#define SI_MESGQ (-3)
+#define SI_ASYNCIO (-4)
+#endif
+
+/* Child-state codes returned by waitid(). */
+#ifndef CLD_EXITED
+#define CLD_EXITED 1
+#define CLD_KILLED 2
+#define CLD_DUMPED 3
+#define CLD_TRAPPED 4
+#define CLD_STOPPED 5
+#define CLD_CONTINUED 6
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, int signal);
@@ -69,6 +160,10 @@ int sigaction(int signal, const struct sigaction *action,
               struct sigaction *old_action);
 sighandler_t signal(int signal, sighandler_t handler);
 int sigprocmask(int how, const sigset_t *set, sigset_t *old_set);
+int sigaltstack(const stack_t *stack, stack_t *old_stack);
 int kill(pid_t pid, int signal);
 int raise(int signal);
 char *strsignal(int signal);
+#ifdef __cplusplus
+}
+#endif

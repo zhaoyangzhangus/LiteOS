@@ -7,6 +7,7 @@
 #include <kernel/realtest.h>
 #include <kernel/sched.h>
 #include <arch/x86_64/syscall_internal.h>
+#include "internal.h"
 
 enum {
     AP_STATE_OFFLINE = 0,
@@ -87,11 +88,11 @@ static void smp_record_bsp_failure(uint32_t cpu_index,
     atomic_store_explicit(&g_smp_fail_cpu, cpu_index, memory_order_relaxed);
     atomic_store_explicit(&g_smp_fail_apic, apic_id, memory_order_relaxed);
     atomic_store_explicit(&g_smp_fail_bsp_step, step, memory_order_release);
-    liteos_realtest_mark_number("SMP_FAIL_CPU", cpu_index);
-    liteos_realtest_mark_number("SMP_FAIL_APIC", apic_id);
-    liteos_realtest_mark_number("SMP_FAIL_BSP_STEP", step);
+    realtest_mark_number("SMP_FAIL_CPU", cpu_index);
+    realtest_mark_number("SMP_FAIL_APIC", apic_id);
+    realtest_mark_number("SMP_FAIL_BSP_STEP", step);
     if (cpu_index < MAX_CPUS) {
-        liteos_realtest_mark_number(
+        realtest_mark_number(
             "SMP_FAIL_AP_STEP",
             atomic_load_explicit(&g_ap_boot_steps[cpu_index],
                                  memory_order_acquire));
@@ -210,21 +211,25 @@ __noreturn void x86_smp_ap_entry(uint32_t cpu_index) {
     }
 
     if (valid) {
-        if (!x86_cpu_init_secondary(cpu_index, apic_id)) valid = false;
-        else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
-                                   SMP_AP_STEP_CPU_INIT, memory_order_release);
+        if (!x86_cpu_init_secondary(cpu_index, apic_id)) {
+            valid = false;
+        } else {
+            x86_paging_arch_init_secondary();
+            atomic_store_explicit(&g_ap_boot_steps[cpu_index],
+                                  SMP_AP_STEP_CPU_INIT, memory_order_release);
+        }
     }
 
     if (valid) {
         uint64_t stack_top = (uint64_t)(uintptr_t)g_ap_stacks[cpu_index] +
                              X86_AP_BOOT_STACK_SIZE;
-        if (!liteos_syscall_init(stack_top)) valid = false;
+        if (!syscall_init(stack_top)) valid = false;
         else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
                                    SMP_AP_STEP_SYSCALL_INIT, memory_order_release);
     }
 
     if (valid) {
-        if (!liteos_lapic_init_secondary(apic_id, 32U, 1000000U)) valid = false;
+        if (!lapic_init_secondary(apic_id, 32U, 1000000U)) valid = false;
         else atomic_store_explicit(&g_ap_boot_steps[cpu_index],
                                    SMP_AP_STEP_LAPIC_INIT, memory_order_release);
     }
@@ -263,7 +268,7 @@ __noreturn void x86_smp_ap_entry(uint32_t cpu_index) {
                     __asm__ volatile ("sti; hlt; cli" : : : "memory");
                     continue;
                 }
-                liteos_lapic_enable_timer();
+                lapic_enable_timer();
                 atomic_fetch_add_explicit(&g_ap_timer_enabled_count, 1U,
                                           memory_order_release);
                 ap_timer_enabled = true;
@@ -290,9 +295,9 @@ __noreturn void x86_smp_ap_entry(uint32_t cpu_index) {
     for (;;) __asm__ volatile ("cli; hlt");
 }
 
-bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
+bool x86_smp_start_aps(const OS_BOOT_INFO *boot_info) {
     const x86_acpi_platform_t *platform = x86_acpi_platform();
-    liteos_realtest_mark("SMP_START_BEGIN");
+    realtest_mark("SMP_START_BEGIN");
     atomic_init(&g_smp_fail_cpu, UINT32_MAX);
     atomic_init(&g_smp_fail_apic, UINT32_MAX);
     atomic_init(&g_smp_fail_bsp_step, SMP_BSP_FAIL_NONE);
@@ -307,7 +312,7 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
         smp_record_bsp_failure(UINT32_MAX, UINT32_MAX, SMP_BSP_FAIL_BAD_INPUT);
         return false;
     }
-    liteos_realtest_mark_number("SMP_CPU_COUNT", platform->cpu_count);
+    realtest_mark_number("SMP_CPU_COUNT", platform->cpu_count);
 
     size_t blob_size = (size_t)(x86_ap_trampoline_end - x86_ap_trampoline_start);
     size_t parameter_offset = (size_t)(x86_ap_trampoline_parameters -
@@ -346,8 +351,8 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
                                SMP_BSP_FAIL_BSP_BIND);
         return false;
     }
-    liteos_realtest_mark_number("SMP_BSP_INDEX", bsp_index);
-    liteos_realtest_mark_number("SMP_BSP_APIC", platform->bsp_apic_id);
+    realtest_mark_number("SMP_BSP_INDEX", bsp_index);
+    realtest_mark_number("SMP_BSP_APIC", platform->bsp_apic_id);
 
     g_discovered_count = platform->cpu_count;
     atomic_init(&g_started_count, 1U);
@@ -376,8 +381,8 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
         if (apic_id == platform->bsp_apic_id) continue;
         bool trace_this_ap = trace_protocol;
         trace_protocol = false;
-        liteos_realtest_mark_number("SMP_AP_BEGIN", i);
-        liteos_realtest_mark_number("SMP_APIC_ID", apic_id);
+        realtest_mark_number("SMP_AP_BEGIN", i);
+        realtest_mark_number("SMP_APIC_ID", apic_id);
         if (apic_id > 0xFFU || platform->cpus[i].x2apic) {
             smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_APIC_MODE);
             return false;
@@ -389,7 +394,7 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
         }
         g_ap_stacks[i] = stack;
         if (trace_this_ap) {
-            liteos_realtest_mark_number("SMP_AP_STACK_READY", i);
+            realtest_mark_number("SMP_AP_STACK_READY", i);
         }
         uint64_t stack_top = (uint64_t)(uintptr_t)stack + X86_AP_BOOT_STACK_SIZE;
         if (!x86_cpu_prepare_secondary(i, apic_id, stack_top)) {
@@ -397,7 +402,7 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
             return false;
         }
         if (trace_this_ap) {
-            liteos_realtest_mark_number("SMP_AP_CONTEXT_READY", i);
+            realtest_mark_number("SMP_AP_CONTEXT_READY", i);
         }
         parameters->cr3 = root.value;
         parameters->stack_top = stack_top;
@@ -408,53 +413,53 @@ bool x86_smp_start_aps(const LITEOS_BOOT_INFO *boot_info) {
         atomic_store_explicit(&g_ap_states[i], AP_STATE_BOOTING, memory_order_release);
         atomic_thread_fence(memory_order_seq_cst);
 
-        if (!liteos_lapic_send_init(apic_id)) {
+        if (!lapic_send_init(apic_id)) {
             smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_SEND_INIT);
             return false;
         }
         if (trace_this_ap) {
-            liteos_realtest_mark_number("SMP_AP_INIT_ASSERTED", i);
+            realtest_mark_number("SMP_AP_INIT_ASSERTED", i);
         }
         tsc_delay(10000000ULL);
         /* Follow the x86 Linux INIT sequence: level-triggered INIT must be
          * deasserted before the STARTUP IPI is issued. */
-        if (!liteos_lapic_send_init_deassert(apic_id)) {
+        if (!lapic_send_init_deassert(apic_id)) {
             smp_record_bsp_failure(i, apic_id,
                                    SMP_BSP_FAIL_SEND_INIT_DEASSERT);
             return false;
         }
         if (trace_this_ap) {
-            liteos_realtest_mark_number("SMP_AP_INIT_DEASSERTED", i);
+            realtest_mark_number("SMP_AP_INIT_DEASSERTED", i);
         }
         atomic_thread_fence(memory_order_seq_cst);
-        if (!liteos_lapic_send_startup(apic_id, vector)) {
+        if (!lapic_send_startup(apic_id, vector)) {
             smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_SEND_SIPI1);
             return false;
         }
         if (trace_this_ap) {
-            liteos_realtest_mark_number("SMP_AP_SIPI1_SENT", i);
+            realtest_mark_number("SMP_AP_SIPI1_SENT", i);
         }
         if (!wait_for_ap(i, 200000ULL)) {
-            if (!liteos_lapic_send_startup(apic_id, vector)) {
+            if (!lapic_send_startup(apic_id, vector)) {
                 smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_SEND_SIPI2);
                 return false;
             }
             if (trace_this_ap) {
-                liteos_realtest_mark_number("SMP_AP_SIPI2_SENT", i);
+                realtest_mark_number("SMP_AP_SIPI2_SENT", i);
             }
             if (!wait_for_ap(i, 1000000000ULL)) {
                 smp_record_bsp_failure(i, apic_id, SMP_BSP_FAIL_WAIT_AP);
                 return false;
             }
         }
-        liteos_realtest_mark_number("SMP_AP_STARTED", i);
+        realtest_mark_number("SMP_AP_STARTED", i);
     }
     if (atomic_load_explicit(&g_started_count, memory_order_acquire) !=
         platform->cpu_count) {
         smp_record_bsp_failure(UINT32_MAX, UINT32_MAX, SMP_BSP_FAIL_FINAL_COUNT);
         return false;
     }
-    liteos_realtest_mark("SMP_START_OK");
+    realtest_mark("SMP_START_OK");
     return true;
 }
 
@@ -529,12 +534,12 @@ bool x86_smp_enable_ap_timers(void) {
     }
     target = g_discovered_count > 0U ? g_discovered_count - 1U : 0U;
     atomic_store_explicit(&g_enable_ap_timers, true, memory_order_release);
-    liteos_realtest_checkpoint("SMP_AP_TIMER_ENABLE_ARMED");
+    realtest_checkpoint("SMP_AP_TIMER_ENABLE_ARMED");
     for (uint32_t cpu_index = 0U; cpu_index < g_discovered_count; ++cpu_index) {
         if (platform->cpus[cpu_index].apic_id == platform->bsp_apic_id) continue;
         if (!x86_smp_request_reschedule(cpu_index)) return false;
     }
-    liteos_realtest_checkpoint("SMP_AP_TIMER_ENABLE_REQUESTS_OK");
+    realtest_checkpoint("SMP_AP_TIMER_ENABLE_REQUESTS_OK");
 
     uint64_t start = x86_read_tsc();
     uint64_t ticks = x86_timeout_ns_to_tsc(1000000000ULL);
@@ -544,7 +549,7 @@ bool x86_smp_enable_ap_timers(void) {
         if ((int64_t)(x86_read_tsc() - deadline) >= 0) return false;
         __asm__ volatile ("pause");
     }
-    liteos_realtest_checkpoint("SMP_AP_TIMER_ENABLE_WAIT_OK");
+    realtest_checkpoint("SMP_AP_TIMER_ENABLE_WAIT_OK");
     return true;
 }
 
@@ -582,9 +587,10 @@ void x86_smp_ipi_interrupt(void) {
             memory_order_acq_rel);
     }
 
-    liteos_lapic_end_of_interrupt();
+    lapic_end_of_interrupt();
 
     if (reschedule) {
+        scheduler_trace_reschedule_interrupt(cpu_index);
         /*
          * Keep the request pending while a syscall is executing.  TLB IPIs
          * use a separate vector and remain serviceable; the syscall exit
@@ -620,7 +626,7 @@ bool x86_smp_ipi_self_test(void) {
         if (apic_id == platform->bsp_apic_id) continue;
         uint64_t before = atomic_load_explicit(&g_ipi_acknowledgements[cpu_index],
                                                memory_order_acquire);
-        if (!liteos_lapic_send_fixed(apic_id, X86_SMP_IPI_VECTOR)) return false;
+        if (!lapic_send_fixed(apic_id, X86_SMP_IPI_VECTOR)) return false;
 
         uint64_t start = x86_read_tsc();
         uint64_t ticks = x86_timeout_ns_to_tsc(100000000ULL);
@@ -650,6 +656,7 @@ bool x86_smp_request_reschedule(uint32_t cpu_index) {
      */
     if (atomic_load_explicit(&g_reschedule_pending[cpu_index],
                              memory_order_relaxed)) {
+        scheduler_trace_reschedule_request(cpu_index, false);
         return true;
     }
 
@@ -660,18 +667,23 @@ bool x86_smp_request_reschedule(uint32_t cpu_index) {
             true,
             memory_order_release,
             memory_order_relaxed)) {
+        scheduler_trace_reschedule_request(cpu_index, false);
         return true;
     }
 
+    scheduler_trace_reschedule_request(cpu_index, true);
+    uint64_t send_started = x86_read_tsc();
     for (uint32_t attempt = 0; attempt < 4U; ++attempt) {
-        if (liteos_lapic_send_fixed(platform->cpus[cpu_index].apic_id,
+        if (lapic_send_fixed(platform->cpus[cpu_index].apic_id,
                                     X86_SMP_IPI_VECTOR)) {
+            scheduler_trace_reschedule_send(cpu_index, send_started, true, attempt+1U);
             return true;
         }
         __asm__ volatile ("pause");
     }
 
     /* pending remains set; the target timer/idle polling is the fallback. */
+    scheduler_trace_reschedule_send(cpu_index, send_started, false, 4U);
     return false;
 }
 

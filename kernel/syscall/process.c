@@ -4,14 +4,21 @@
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/syscall_internal.h>
 #include <arch/x86_64/uaccess.h>
+#include <kernel/console.h>
 #include <kernel/debug_stage.h>
 #include <kernel/kmem.h>
 #include <kernel/process.h>
 #include <kernel/vm.h>
 #include <uapi/process.h>
 #include <uapi/signal.h>
+#include <uapi/linux_abi.h>
 
+#include "../process/internal.h"
 #include "internal.h"
+
+#ifndef OS_DEBUG_SERIAL
+#define OS_DEBUG_SERIAL 0
+#endif
 
 static volatile uint32_t g_thread_create_stage;
 
@@ -207,6 +214,38 @@ int64_t syscall_signal_send(uint64_t pid, uint64_t signal,
     return queue_current_signal((uint32_t)signal);
 }
 
+int64_t syscall_thread_signal(uint64_t thread_handle, uint64_t signal,
+                              uint64_t unused2, uint64_t unused3,
+                              uint64_t unused4, uint64_t unused5) {
+    (void)unused2; (void)unused3; (void)unused4; (void)unused5;
+    process_t *process = current_process();
+    void *object = 0;
+    kstatus_t status;
+    thread_t *thread;
+    if (process == 0 || thread_handle == OS_INVALID_HANDLE) return K_EINVAL;
+    if (signal > OS_SIGNAL_COUNT) return K_EINVAL;
+    status = handle_lookup(&process->handles, (handle_t)thread_handle,
+                           0U, &object);
+    if (status != K_OK) return status == K_ENOENT ? K_ESRCH : status;
+    thread = (thread_t *)object;
+    if (thread->object.type != KOBJECT_TYPE_THREAD ||
+        thread->process != process) {
+        object_put(object);
+        return K_ESRCH;
+    }
+    if (atomic_load_explicit(&thread->state, memory_order_acquire) ==
+        THREAD_DEAD) {
+        object_put(object);
+        return K_ESRCH;
+    }
+    if (signal != 0U) {
+        __atomic_fetch_or(&thread->signal_pending, signal_bit((uint32_t)signal),
+                          __ATOMIC_RELEASE);
+    }
+    object_put(object);
+    return K_OK;
+}
+
 int64_t syscall_signal_return(uint64_t frame_pointer, uint64_t unused1,
                               uint64_t unused2, uint64_t unused3,
                               uint64_t unused4, uint64_t unused5) {
@@ -230,7 +269,7 @@ int64_t syscall_signal_return(uint64_t frame_pointer, uint64_t unused1,
 }
 
 static int64_t thread_create_diag_fail(uint32_t step, kstatus_t status) {
-    liteos_debug_stage_fail(LITEOS_DEBUG_PHASE_USER, (uint16_t)step, status);
+    kernel_debug_stage_fail(OS_DEBUG_PHASE_USER, (uint16_t)step, status);
     return status;
 }
 
@@ -286,6 +325,38 @@ int64_t syscall_process_exit(uint64_t status, uint64_t unused1, uint64_t unused2
     (void)unused5;
     if (current_process() == 0) return K_EPERM;
     process_exit((int64_t)status);
+    return K_OK;
+}
+
+int64_t syscall_linux_activate(uint64_t unused0, uint64_t unused1,
+                               uint64_t unused2, uint64_t unused3,
+                               uint64_t unused4, uint64_t unused5) {
+    process_t *process = current_process();
+    bool activated = false;
+    bool native_noop = false;
+    (void)unused0;
+    (void)unused1;
+    (void)unused2;
+    (void)unused3;
+    (void)unused4;
+    (void)unused5;
+    if (process == 0) return K_EPERM;
+    process_thread_lock(process);
+    if (process->linux_loader_pending) {
+        process->linux_loader_pending = false;
+        process->personality = OS_PROCESS_PERSONALITY_LINUX_X86_64;
+        activated = true;
+    } else if (process->personality == OS_PROCESS_PERSONALITY_NATIVE) {
+        /* The same loader binary is also the interpreter for native System
+         * ELF services.  Their loader must be able to return to the native
+         * entry point without requesting a Linux ABI transition. */
+        native_noop = true;
+    }
+    process_thread_unlock(process);
+    if (!activated && !native_noop) return K_EPERM;
+#if OS_DEBUG_SERIAL
+    if (activated) kernel_serial_write("OS_LINUX_PERSONALITY_ACTIVATED\r\n");
+#endif
     return K_OK;
 }
 
@@ -365,6 +436,34 @@ int64_t syscall_process_enumerate(uint64_t arguments_pointer, uint64_t unused1,
                         &arguments, sizeof(arguments));
 }
 
+int64_t syscall_task_query(uint64_t pointer, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    os_task_info_t info;
+    kstatus_t status = copy_from_user(&info, (const void __user *)(uintptr_t)pointer, sizeof(info));
+    if (status != K_OK || !versioned_header_valid(&info.hdr, sizeof(info))) return status != K_OK ? status : K_EINVAL;
+    status = process_task_query(info.pid, info.tid, &info);
+    if (status != K_OK) return status;
+    process_t *caller = current_process();
+    if (caller != 0 && info.pid == caller->pid) info.flags |= OS_TASK_PROTECTED;
+    return copy_to_user((void __user *)(uintptr_t)pointer, &info, sizeof(info));
+}
+
+int64_t syscall_process_terminate(uint64_t pointer, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    os_process_terminate_t request;
+    kstatus_t status = copy_from_user(&request, (const void __user *)(uintptr_t)pointer, sizeof(request));
+    if (status != K_OK || !versioned_header_valid(&request.hdr, sizeof(request))) return status != K_OK ? status : K_EINVAL;
+    return process_terminate_pid(current_process(), request.pid, request.create_time_ns);
+}
+
+int64_t syscall_thread_terminate(uint64_t pointer, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+    (void)a; (void)b; (void)c; (void)d; (void)e;
+    os_thread_terminate_t request;
+    kstatus_t status = copy_from_user(&request, (const void __user *)(uintptr_t)pointer, sizeof(request));
+    if (status != K_OK || !versioned_header_valid(&request.hdr, sizeof(request))) return status != K_OK ? status : K_EINVAL;
+    return process_terminate_tid(current_process(), request.pid, request.tid, request.create_time_ns);
+}
+
 int64_t syscall_thread_enumerate(uint64_t arguments_pointer, uint64_t unused1,
                                  uint64_t unused2, uint64_t unused3,
                                  uint64_t unused4, uint64_t unused5) {
@@ -390,14 +489,49 @@ int64_t syscall_thread_enumerate(uint64_t arguments_pointer, uint64_t unused1,
                         &arguments, sizeof(arguments));
 }
 
-int64_t syscall_process_fork(uint64_t unused0, uint64_t unused1,
-                             uint64_t unused2, uint64_t unused3,
-                             uint64_t unused4, uint64_t frame_pointer) {
-    (void)unused0;
-    (void)unused1;
-    (void)unused2;
-    (void)unused3;
-    (void)unused4;
+/* Write into the suspended child's COW space, never the caller's TLS.
+ * Pins resolve COW and hold the page through unmap; no CR3 switching or
+ * raw access to another process's user pointer is required. */
+static kstatus_t process_fork_child_tid_write(process_t *process,
+                                             uint64_t pointer, uint32_t tid) {
+    process_thread_lock(process);
+    vm_space_t *space = process->vm;
+    if (space != 0) vm_space_get(space);
+    process_thread_unlock(process);
+    if (space == 0) return K_EINVAL;
+    const uint8_t *bytes = (const uint8_t *)&tid;
+    size_t copied = 0U;
+    kstatus_t result = K_OK;
+    while (copied < sizeof(tid)) {
+        uint64_t address = pointer + copied;
+        size_t offset = (size_t)(address & (PAGE_SIZE - 1U));
+        size_t length = PAGE_SIZE - offset;
+        if (length > sizeof(tid) - copied) length = sizeof(tid) - copied;
+        page_t *page = 0;
+        kstatus_t status = vm_pin_user_page(space,
+            (vaddr_t)(address & ~(uint64_t)(PAGE_SIZE - 1U)), true, &page);
+        if (status != K_OK) {
+            result = status;
+            break;
+        }
+        uint8_t *direct = (uint8_t *)phys_to_direct(page_to_phys(page));
+        if (direct == 0) {
+            vm_unpin_user_page(page);
+            result = K_EFAULT;
+            break;
+        }
+        for (size_t index = 0U; index < length; ++index)
+            direct[offset + index] = bytes[copied + index];
+        vm_unpin_user_page(page);
+        copied += length;
+    }
+    vm_space_put(space);
+    return result;
+}
+
+static int64_t process_fork_from_frame(uint64_t flags, uint64_t child_stack,
+                                       uint64_t parent_tid, uint64_t child_tid,
+                                       uint64_t frame_pointer) {
     process_t *parent = current_process();
     thread_t *current = sched_current_thread();
     arch_trap_frame_t *parent_frame =
@@ -411,6 +545,7 @@ int64_t syscall_process_fork(uint64_t unused0, uint64_t unused1,
 
     arch_trap_frame_t child_frame = *parent_frame;
     child_frame.rax = 0;
+    if (child_stack != 0U) child_frame.rsp = child_stack;
     child_frame.vector = 0;
     child_frame.error_code = 0;
     thread_t *child_thread = 0;
@@ -420,6 +555,21 @@ int64_t syscall_process_fork(uint64_t unused0, uint64_t unused1,
     if (status == K_OK) {
         x86_fp_state_clone_current(&current->arch, &child_thread->arch);
         child_thread->signal_mask = current->signal_mask;
+    }
+    if (status == K_OK && (flags & LINUX_CLONE_CHILD_SETTID) != 0U &&
+        child_tid != 0U) {
+        /* Linux exposes the group leader's TID as its PID. */
+        status = process_fork_child_tid_write(child, child_tid,
+                                              (uint32_t)child->pid);
+    }
+    if (status == K_OK && (flags & LINUX_CLONE_CHILD_CLEARTID) != 0U) {
+        child_thread->linux_clear_tid = (vaddr_t)child_tid;
+        child_thread->linux_clear_tid_pending = child_tid != 0U;
+    }
+    if (status == K_OK && (flags & LINUX_CLONE_PARENT_SETTID) != 0U &&
+        parent_tid != 0U) {
+        status = put_user_u32((uint32_t __user *)(uintptr_t)parent_tid,
+                              (uint32_t)child->pid);
     }
     if (status == K_OK) status = thread_start(child_thread);
     if (status != K_OK) {
@@ -436,6 +586,36 @@ int64_t syscall_process_fork(uint64_t unused0, uint64_t unused1,
     object_put(child_thread);
     object_put(child);
     return (int64_t)child_pid;
+}
+
+int64_t syscall_process_fork(uint64_t unused0, uint64_t unused1,
+                             uint64_t unused2, uint64_t unused3,
+                             uint64_t unused4, uint64_t frame_pointer) {
+    (void)unused0;
+    (void)unused1;
+    (void)unused2;
+    (void)unused3;
+    (void)unused4;
+    return process_fork_from_frame(0U, 0U, 0U, 0U, frame_pointer);
+}
+
+int64_t syscall_process_clone_linux(uint64_t flags, uint64_t child_stack,
+                                    uint64_t parent_tid, uint64_t child_tid,
+                                    uint64_t frame_pointer) {
+    const uint64_t allowed = 0xFFU | LINUX_CLONE_PARENT_SETTID |
+        LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID;
+    if ((flags & ~allowed) != 0U || (flags & 0xFFU) != OS_SIGCHLD ||
+        (child_stack != 0U &&
+         ((child_stack & 15U) != 0U || child_stack > X86_64_USER_TOP)))
+        return K_EINVAL;
+    if (((flags & LINUX_CLONE_PARENT_SETTID) != 0U && parent_tid != 0U &&
+         !x86_user_range_valid((const void __user *)(uintptr_t)parent_tid, 4U)) ||
+        ((flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID)) != 0U &&
+         child_tid != 0U &&
+         !x86_user_range_valid((const void __user *)(uintptr_t)child_tid, 4U)))
+        return K_EFAULT;
+    return process_fork_from_frame(flags, child_stack, parent_tid, child_tid,
+                                    frame_pointer);
 }
 
 int64_t syscall_process_wait(uint64_t pid, uint64_t options,
@@ -554,14 +734,22 @@ int64_t syscall_thread_create(uint64_t process_handle, uint64_t arguments_pointe
         .access = VM_PROT_WRITE,
         .cpu_error = 0,
     };
-    status = vm_handle_fault(target->vm, &entry_fault);
+    /* The process reference does not retain a VM detached by exit. Keep one
+     * owner-locked snapshot alive across both potentially blocking faults. */
+    process_thread_lock(target);
+    vm_space_t *space = target->vm;
+    if (space != 0) vm_space_get(space);
+    process_thread_unlock(target);
+    status = vm_handle_fault(space, &entry_fault);
     g_thread_create_stage = 3U;
     if (status != K_OK) {
+        vm_space_put(space);
         if (target_referenced) object_put(target);
         return thread_create_diag_fail(5U, status);
     }
 
-    status = vm_handle_fault(target->vm, &stack_fault);
+    status = vm_handle_fault(space, &stack_fault);
+    vm_space_put(space);
     g_thread_create_stage = 4U;
     if (status != K_OK) {
         if (target_referenced) object_put(target);
@@ -589,8 +777,23 @@ int64_t syscall_thread_create(uint64_t process_handle, uint64_t arguments_pointe
         }
     }
     g_thread_create_stage = 5U;
-    if (target_referenced) object_put(target);
     if (status != K_OK) {
+#if OS_DEBUG_SERIAL
+        if (status == K_EBUSY) {
+            uint32_t target_state;
+            uint32_t target_thread_count;
+            process_thread_lock(target);
+            target_state = atomic_load_explicit(&target->state,
+                                                memory_order_acquire);
+            target_thread_count = target->thread_count;
+            process_thread_unlock(target);
+            kernel_serial_printf_serial_only(
+                "OS_THREAD_CREATE_TARGET_BUSY pid=%llu state=%u threads=%u caller=%llu\r\n",
+                (unsigned long long)target->pid, target_state,
+                target_thread_count,
+                (unsigned long long)(caller != 0 ? caller->pid : 0U));
+        }
+#endif
         /* The suspended thread already owns an execution reference and may
          * also own the caller-provided stack.  Roll it back before exposing
          * the failure, otherwise the stack mapping and thread object leak. */
@@ -598,8 +801,10 @@ int64_t syscall_thread_create(uint64_t process_handle, uint64_t arguments_pointe
             (void)thread_terminate(thread, K_ECANCELED);
             object_put(thread);
         }
+        if (target_referenced) object_put(target);
         return thread_create_diag_fail(7U, status);
     }
+    if (target_referenced) object_put(target);
     status = handle_create(&caller->handles, thread, THREAD_RIGHT_ALL, &handle);
     g_thread_create_stage = 6U;
     uint32_t failure_step = 8U;
@@ -675,6 +880,6 @@ int64_t syscall_process_create(uint64_t flags, uint64_t output_pointer,
     return status;
 }
 
-uint32_t liteos_syscall_thread_create_stage(void) {
+uint32_t syscall_thread_create_stage(void) {
     return g_thread_create_stage;
 }

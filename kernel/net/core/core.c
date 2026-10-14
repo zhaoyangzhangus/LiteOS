@@ -8,9 +8,7 @@
 #define NET_IPV4_TCP       6U
 
 static void net_copy(void *destination, const void *source, size_t length) {
-    uint8_t *out = (uint8_t *)destination;
-    const uint8_t *in = (const uint8_t *)source;
-    while (length-- != 0) *out++ = *in++;
+    memmove(destination, source, length);
 }
 
 static bool net_address6_zero(const uint8_t address[16]) {
@@ -68,6 +66,28 @@ kstatus_t net_device_send(net_device_t *device, const void *frame, size_t length
 
 static uint32_t net_checksum_add(uint32_t sum, const uint8_t *data,
                                  size_t length) {
+    while ((sum >> 16) != 0) sum = (sum & 0xFFFFU) + (sum >> 16);
+    /* Bound each batch so the 32-bit accumulator cannot overflow, even for
+     * callers of net_checksum16 with buffers larger than an IP packet. */
+    while (length >= 8U) {
+        size_t batch = length < 65536U ? length : 65536U;
+        batch &= ~(size_t)7U;
+        length -= batch;
+        while (batch != 0U) {
+            uint64_t words;
+            __builtin_memcpy(&words, data, sizeof(words));
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            words = __builtin_bswap64(words);
+#endif
+            sum += (uint32_t)(words & 0xFFFFU) +
+                   (uint32_t)((words >> 16) & 0xFFFFU) +
+                   (uint32_t)((words >> 32) & 0xFFFFU) +
+                   (uint32_t)(words >> 48);
+            data += 8U;
+            batch -= 8U;
+        }
+        sum = (sum & 0xFFFFU) + (sum >> 16);
+    }
     while (length >= 2U) {
         sum += ((uint32_t)data[0] << 8) | data[1];
         data += 2;
@@ -84,71 +104,32 @@ uint16_t net_checksum16(const void *data, size_t length) {
     return (uint16_t)~sum;
 }
 
-static uint16_t net_udp_checksum(uint32_t source_address,
-                                 uint32_t destination_address,
-                                 const uint8_t *udp, uint16_t length) {
+static uint16_t net_transport_checksum_ipv4(uint32_t source_address,
+                                            uint32_t destination_address,
+                                            uint8_t next_header,
+                                            const uint8_t *payload, uint16_t length) {
     uint8_t address[8];
-    uint8_t protocol[4] = {0, NET_IPV4_UDP, (uint8_t)(length >> 8), (uint8_t)length};
+    uint8_t protocol[4] = {0, next_header, (uint8_t)(length >> 8), (uint8_t)length};
     net_store_be32(address, source_address);
     net_store_be32(address + 4U, destination_address);
     uint32_t sum = net_checksum_add(0, address, sizeof(address));
     sum = net_checksum_add(sum, protocol, sizeof(protocol));
-    sum = net_checksum_add(sum, udp, length);
+    sum = net_checksum_add(sum, payload, length);
     return (uint16_t)~sum;
 }
 
-static uint16_t net_udp_checksum_ipv6(const uint8_t source_address[16],
-                                      const uint8_t destination_address[16],
-                                      const uint8_t *udp, uint16_t length) {
-    uint8_t pseudo_header[40];
-    net_zero(pseudo_header, sizeof(pseudo_header));
-    net_copy(pseudo_header, source_address, 16U);
-    net_copy(pseudo_header + 16U, destination_address, 16U);
-    net_store_be32(pseudo_header + 32U, length);
-    pseudo_header[39] = NET_IPV4_UDP;
-    uint32_t sum = net_checksum_add(0, pseudo_header, sizeof(pseudo_header));
-    sum = net_checksum_add(sum, udp, length);
-    return (uint16_t)~sum;
-}
-
-static uint16_t net_tcp_checksum_ipv4(uint32_t source_address,
-                                      uint32_t destination_address,
-                                      const uint8_t *tcp, uint16_t length) {
-    uint8_t address[8];
-    uint8_t protocol[4] = {0, NET_IPV4_TCP, (uint8_t)(length >> 8), (uint8_t)length};
-    net_store_be32(address, source_address);
-    net_store_be32(address + 4U, destination_address);
-    uint32_t sum = net_checksum_add(0, address, sizeof(address));
-    sum = net_checksum_add(sum, protocol, sizeof(protocol));
-    sum = net_checksum_add(sum, tcp, length);
-    return (uint16_t)~sum;
-}
-
-static uint16_t net_tcp_checksum_ipv6(const uint8_t source_address[16],
-                                      const uint8_t destination_address[16],
-                                      const uint8_t *tcp, uint16_t length) {
-    uint8_t pseudo_header[40];
-    net_zero(pseudo_header, sizeof(pseudo_header));
-    net_copy(pseudo_header, source_address, 16U);
-    net_copy(pseudo_header + 16U, destination_address, 16U);
-    net_store_be32(pseudo_header + 32U, length);
-    pseudo_header[39] = NET_IPV4_TCP;
-    uint32_t sum = net_checksum_add(0, pseudo_header, sizeof(pseudo_header));
-    sum = net_checksum_add(sum, tcp, length);
-    return (uint16_t)~sum;
-}
-
-static uint16_t net_icmpv6_checksum(const uint8_t source_address[16],
-                                    const uint8_t destination_address[16],
-                                    const uint8_t *icmp, uint16_t length) {
-    uint8_t pseudo_header[40];
-    net_zero(pseudo_header, sizeof(pseudo_header));
-    net_copy(pseudo_header, source_address, 16U);
-    net_copy(pseudo_header + 16U, destination_address, 16U);
-    net_store_be32(pseudo_header + 32U, length);
-    pseudo_header[39] = NET_ICMPV6_NEXT_HEADER;
-    uint32_t sum = net_checksum_add(0, pseudo_header, sizeof(pseudo_header));
-    sum = net_checksum_add(sum, icmp, length);
+static uint16_t net_transport_checksum_ipv6(const uint8_t source_address[16],
+                                            const uint8_t destination_address[16],
+                                            uint8_t next_header,
+                                            const uint8_t *payload, uint16_t length) {
+    /* All pseudo-header components have even lengths: accumulate directly
+     * without materializing and clearing a 40-byte temporary header. */
+    uint8_t trailer[8] = {0, 0, (uint8_t)(length >> 8), (uint8_t)length,
+                         0, 0, 0, next_header};
+    uint32_t sum = net_checksum_add(0, source_address, 16U);
+    sum = net_checksum_add(sum, destination_address, 16U);
+    sum = net_checksum_add(sum, trailer, sizeof(trailer));
+    sum = net_checksum_add(sum, payload, length);
     return (uint16_t)~sum;
 }
 
@@ -213,9 +194,9 @@ static kstatus_t net_ndp_build(uint8_t *frame, size_t capacity,
                    NET_NDP_OPTION_SOURCE_LINK_LAYER : NET_NDP_OPTION_TARGET_LINK_LAYER;
     icmp[25] = 1U;
     net_copy(icmp + 26U, option_mac, 6U);
-    net_store_be16(icmp + 2U, net_icmpv6_checksum(source_address,
+    net_store_be16(icmp + 2U, net_transport_checksum_ipv6(source_address,
                                                   destination_address,
-                                                  icmp, icmp_length));
+                                                  NET_ICMPV6_NEXT_HEADER, icmp, icmp_length));
     *frame_length = total_length;
     return K_OK;
 }
@@ -255,8 +236,8 @@ static kstatus_t net_ndp_parse(const uint8_t *frame, size_t frame_length,
         payload_length < 32U || NET_ETHERNET_HEADER_SIZE + NET_IPV6_HEADER_SIZE +
         payload_length > frame_length) return K_EIO;
     icmp = ip + NET_IPV6_HEADER_SIZE;
-    if (icmp[0] != type || icmp[1] != 0U || net_icmpv6_checksum(ip + 8U, ip + 24U,
-                                                                  icmp, payload_length) != 0U ||
+    if (icmp[0] != type || icmp[1] != 0U || net_transport_checksum_ipv6(ip + 8U, ip + 24U,
+                                      NET_ICMPV6_NEXT_HEADER, icmp, payload_length) != 0U ||
         icmp[24] != (type == NET_ICMPV6_NEIGHBOR_SOLICITATION ?
                      NET_NDP_OPTION_SOURCE_LINK_LAYER : NET_NDP_OPTION_TARGET_LINK_LAYER) ||
         icmp[25] != 1U) return K_EIO;
@@ -367,8 +348,8 @@ kstatus_t net_udp_build_ipv4(uint8_t *frame, size_t capacity,
     net_store_be16(udp + 2U, destination_port);
     net_store_be16(udp + 4U, (uint16_t)(NET_UDP_HEADER_SIZE + payload_length));
     if (payload_length != 0) net_copy(udp + NET_UDP_HEADER_SIZE, payload, payload_length);
-    net_store_be16(udp + 6U, net_udp_checksum(source_address, destination_address,
-                                               udp,
+    net_store_be16(udp + 6U, net_transport_checksum_ipv4(source_address, destination_address,
+                                               NET_IPV4_UDP, udp,
                                                (uint16_t)(NET_UDP_HEADER_SIZE + payload_length)));
     if (net_load_be16(udp + 6U) == 0U) net_store_be16(udp + 6U, UINT16_MAX);
     *frame_length = total_length;
@@ -399,8 +380,8 @@ kstatus_t net_udp_parse_ipv4(const uint8_t *frame, size_t frame_length,
     if (udp_length < NET_UDP_HEADER_SIZE || udp_length > ip_total_length - ip_header_length ||
         /* IPv4 允许 UDP 校验和为 0，表示发送端明确关闭校验和；DHCP 常使用此形式。 */
         (net_load_be16(udp + 6U) != 0U &&
-         net_udp_checksum(net_load_be32(ip + 12U), net_load_be32(ip + 16U),
-                          udp, udp_length) != 0U)) return K_EIO;
+         net_transport_checksum_ipv4(net_load_be32(ip + 12U), net_load_be32(ip + 16U),
+                                     NET_IPV4_UDP, udp, udp_length) != 0U)) return K_EIO;
     net_copy(view->source_mac, frame + 6U, 6U);
     net_copy(view->destination_mac, frame, 6U);
     view->source_address = net_load_be32(ip + 12U);
@@ -446,9 +427,9 @@ kstatus_t net_udp_build_ipv6(uint8_t *frame, size_t capacity,
     net_store_be16(udp + 4U, (uint16_t)udp_length);
     if (payload_length != 0) net_copy(udp + NET_UDP_HEADER_SIZE,
                                       payload, payload_length);
-    net_store_be16(udp + 6U, net_udp_checksum_ipv6(source_address,
+    net_store_be16(udp + 6U, net_transport_checksum_ipv6(source_address,
                                                     destination_address,
-                                                    udp, (uint16_t)udp_length));
+                                                    NET_IPV4_UDP, udp, (uint16_t)udp_length));
     if (net_load_be16(udp + 6U) == 0U) net_store_be16(udp + 6U, UINT16_MAX);
     *frame_length = total_length;
     return K_OK;
@@ -473,7 +454,7 @@ kstatus_t net_udp_parse_ipv6(const uint8_t *frame, size_t frame_length,
     udp = ip + NET_IPV6_HEADER_SIZE;
     udp_length = net_load_be16(udp + 4U);
     if (udp_length < NET_UDP_HEADER_SIZE || udp_length > ip_payload_length ||
-        net_udp_checksum_ipv6(ip + 8U, ip + 24U, udp, udp_length) != 0U) return K_EIO;
+        net_transport_checksum_ipv6(ip + 8U, ip + 24U, NET_IPV4_UDP, udp, udp_length) != 0U) return K_EIO;
     net_copy(view->source_mac, frame + 6U, 6U);
     net_copy(view->destination_mac, frame, 6U);
     net_copy(view->source_address, ip + 8U, 16U);
@@ -534,9 +515,9 @@ kstatus_t net_tcp_build_ipv4(uint8_t *frame, size_t capacity,
     net_tcp_store_header(tcp, source_port, destination_port, sequence,
                          acknowledgement, flags, window);
     if (payload_length != 0U) net_copy(tcp + NET_TCP_HEADER_SIZE, payload, payload_length);
-    net_store_be16(tcp + 16U, net_tcp_checksum_ipv4(source_address,
+    net_store_be16(tcp + 16U, net_transport_checksum_ipv4(source_address,
                                                      destination_address,
-                                                     tcp, (uint16_t)tcp_length));
+                                                     NET_IPV4_TCP, tcp, (uint16_t)tcp_length));
     *frame_length = total_length;
     return K_OK;
 }
@@ -566,8 +547,8 @@ kstatus_t net_tcp_parse_ipv4(const uint8_t *frame, size_t frame_length,
     tcp_header_length = (uint32_t)(tcp[12] >> 4) * 4U;
     tcp_length = (uint16_t)(ip_total_length - ip_header_length);
     if (tcp_header_length < NET_TCP_HEADER_SIZE || tcp_header_length > tcp_length ||
-        net_tcp_checksum_ipv4(net_load_be32(ip + 12U), net_load_be32(ip + 16U),
-                              tcp, tcp_length) != 0U) return K_EIO;
+        net_transport_checksum_ipv4(net_load_be32(ip + 12U), net_load_be32(ip + 16U),
+                                   NET_IPV4_TCP, tcp, tcp_length) != 0U) return K_EIO;
     net_copy(view->source_mac, frame + 6U, 6U);
     net_copy(view->destination_mac, frame, 6U);
     view->source_address = net_load_be32(ip + 12U);
@@ -616,8 +597,8 @@ kstatus_t net_tcp_build_ipv6(uint8_t *frame, size_t capacity,
     net_tcp_store_header(tcp, source_port, destination_port, sequence,
                          acknowledgement, flags, window);
     if (payload_length != 0U) net_copy(tcp + NET_TCP_HEADER_SIZE, payload, payload_length);
-    net_store_be16(tcp + 16U, net_tcp_checksum_ipv6(source_address, destination_address,
-                                                    tcp, (uint16_t)tcp_length));
+    net_store_be16(tcp + 16U, net_transport_checksum_ipv6(source_address, destination_address,
+                                                    NET_IPV4_TCP, tcp, (uint16_t)tcp_length));
     *frame_length = total_length;
     return K_OK;
 }
@@ -643,7 +624,7 @@ kstatus_t net_tcp_parse_ipv6(const uint8_t *frame, size_t frame_length,
     tcp_length = ip_payload_length;
     tcp_header_length = (uint32_t)(tcp[12] >> 4) * 4U;
     if (tcp_header_length < NET_TCP_HEADER_SIZE || tcp_header_length > tcp_length ||
-        net_tcp_checksum_ipv6(ip + 8U, ip + 24U, tcp, tcp_length) != 0U) return K_EIO;
+        net_transport_checksum_ipv6(ip + 8U, ip + 24U, NET_IPV4_TCP, tcp, tcp_length) != 0U) return K_EIO;
     net_copy(view->source_mac, frame + 6U, 6U);
     net_copy(view->destination_mac, frame, 6U);
     net_copy(view->source_address6, ip + 8U, 16U);
@@ -660,38 +641,24 @@ kstatus_t net_tcp_parse_ipv6(const uint8_t *frame, size_t frame_length,
     return K_OK;
 }
 
-static void net_cache_lock(net_arp_cache_t *cache) {
-    while (atomic_exchange_explicit(&cache->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+static void net_cache_lock(spinlock_t *lock) {
+    spinlock_lock(lock);
 }
 
-static void net_cache_unlock(net_arp_cache_t *cache) {
-    atomic_store_explicit(&cache->lock.state, 0U, memory_order_release);
-}
-
-static void net_neighbor_lock(net_ipv6_neighbor_cache_t *cache) {
-    while (atomic_exchange_explicit(&cache->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
-}
-
-static void net_neighbor_unlock(net_ipv6_neighbor_cache_t *cache) {
-    atomic_store_explicit(&cache->lock.state, 0U, memory_order_release);
+static void net_cache_unlock(spinlock_t *lock) {
+    spinlock_unlock(lock);
 }
 
 void net_arp_cache_init(net_arp_cache_t *cache) {
     if (cache == 0) return;
     net_zero(cache, sizeof(*cache));
-    atomic_init(&cache->lock.state, 0U);
+    spinlock_init(&cache->lock);
 }
 
 kstatus_t net_arp_cache_update(net_arp_cache_t *cache, uint32_t address,
                                const uint8_t mac[6], uint64_t timestamp) {
     if (cache == 0 || mac == 0 || address == 0U) return K_EINVAL;
-    net_cache_lock(cache);
+    net_cache_lock(&cache->lock);
     uint32_t slot = NET_ARP_CACHE_SIZE;
     for (uint32_t i = 0; i < NET_ARP_CACHE_SIZE; ++i) {
         if (cache->entries[i].valid && cache->entries[i].address == address) {
@@ -714,7 +681,7 @@ kstatus_t net_arp_cache_update(net_arp_cache_t *cache, uint32_t address,
     cache->entries[slot].address = address;
     net_copy(cache->entries[slot].mac, mac, 6U);
     cache->entries[slot].updated = timestamp;
-    net_cache_unlock(cache);
+    net_cache_unlock(&cache->lock);
     return K_OK;
 }
 
@@ -722,21 +689,21 @@ bool net_arp_cache_lookup(net_arp_cache_t *cache, uint32_t address,
                           uint8_t mac[6]) {
     bool found = false;
     if (cache == 0 || mac == 0 || address == 0U) return false;
-    net_cache_lock(cache);
+    net_cache_lock(&cache->lock);
     for (uint32_t i = 0; i < NET_ARP_CACHE_SIZE; ++i) {
         if (!cache->entries[i].valid || cache->entries[i].address != address) continue;
         net_copy(mac, cache->entries[i].mac, 6U);
         found = true;
         break;
     }
-    net_cache_unlock(cache);
+    net_cache_unlock(&cache->lock);
     return found;
 }
 
 void net_ipv6_neighbor_cache_init(net_ipv6_neighbor_cache_t *cache) {
     if (cache == 0) return;
     net_zero(cache, sizeof(*cache));
-    atomic_init(&cache->lock.state, 0U);
+    spinlock_init(&cache->lock);
 }
 
 kstatus_t net_ipv6_neighbor_cache_update(net_ipv6_neighbor_cache_t *cache,
@@ -747,7 +714,7 @@ kstatus_t net_ipv6_neighbor_cache_update(net_ipv6_neighbor_cache_t *cache,
     if (cache == 0 || address == 0 || mac == 0 || net_address6_zero(address)) {
         return K_EINVAL;
     }
-    net_neighbor_lock(cache);
+    net_cache_lock(&cache->lock);
     for (uint32_t index = 0U; index < NET_NDP_CACHE_SIZE; ++index) {
         if (cache->entries[index].valid &&
             net_address6_equal(cache->entries[index].address, address)) {
@@ -770,7 +737,7 @@ kstatus_t net_ipv6_neighbor_cache_update(net_ipv6_neighbor_cache_t *cache,
     net_copy(cache->entries[slot].address, address, 16U);
     net_copy(cache->entries[slot].mac, mac, 6U);
     cache->entries[slot].updated = timestamp;
-    net_neighbor_unlock(cache);
+    net_cache_unlock(&cache->lock);
     return K_OK;
 }
 
@@ -778,7 +745,7 @@ bool net_ipv6_neighbor_cache_lookup(net_ipv6_neighbor_cache_t *cache,
                                     const uint8_t address[16], uint8_t mac[6]) {
     bool found = false;
     if (cache == 0 || address == 0 || mac == 0 || net_address6_zero(address)) return false;
-    net_neighbor_lock(cache);
+    net_cache_lock(&cache->lock);
     for (uint32_t index = 0U; index < NET_NDP_CACHE_SIZE; ++index) {
         if (!cache->entries[index].valid ||
             !net_address6_equal(cache->entries[index].address, address)) continue;
@@ -786,6 +753,6 @@ bool net_ipv6_neighbor_cache_lookup(net_ipv6_neighbor_cache_t *cache,
         found = true;
         break;
     }
-    net_neighbor_unlock(cache);
+    net_cache_unlock(&cache->lock);
     return found;
 }

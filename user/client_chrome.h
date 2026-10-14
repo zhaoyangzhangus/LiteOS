@@ -1,25 +1,30 @@
-#ifndef LITEOS_USER_CLIENT_CHROME_H
-#define LITEOS_USER_CLIENT_CHROME_H
+#ifndef OS_USER_CLIENT_CHROME_H
+#define OS_USER_CLIENT_CHROME_H
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <uapi/window_theme.h>
+#include "runtime/text.h"
 
-/* Shared Files-like client chrome metrics and palette.  Each application
- * still owns its content canvas, but its title strip and controls line up
- * with the same 56px light header. */
-#define USER_CLIENT_CHROME_HEIGHT       40U
-#define USER_CLIENT_CHROME_TITLE_Y      8U
-#define USER_CLIENT_CHROME_BACKGROUND   0x00FAFAFAU
-#define USER_CLIENT_CHROME_SEPARATOR    0x00D2D2D5U
-#define USER_CLIENT_CHROME_BORDER      0x00D2D2D5U
-#define USER_CLIENT_CHROME_TEXT         0x00303438U
-#define USER_CLIENT_CHROME_CLOSE_BG     0x00E2E2E4U
-#define USER_CLIENT_CHROME_CLOSE_FG     0x00484D53U
-#define USER_CLIENT_CHROME_ICON_BG      0x00E7E9ECU
-#define USER_CLIENT_CHROME_ICON_FG      0x00464E57U
-#define USER_CLIENT_CHROME_ICON_ACCENT  0x005B86D6U
-#define USER_CLIENT_CHROME_CARD         0x00FFFFFFU
-#define USER_CLIENT_CHROME_CARD_BORDER  0x00E1E5E9U
+/* Shared Chrome-style client decorations, sized from the current font.
+ * WINDOW_UPDATE publishes these metrics to the server's caption hit tests. */
+static inline uint32_t user_client_chrome_height(void) {
+    uint32_t height = ui_text_line_height() + 16U;
+    return height > 40U ? height : 40U;
+}
+#define USER_CLIENT_CHROME_HEIGHT       (user_client_chrome_height())
+#define USER_CLIENT_CHROME_TITLE_Y      ((USER_CLIENT_CHROME_HEIGHT - ui_text_line_height()) / 2U)
+#define USER_CLIENT_CHROME_BACKGROUND   OS_THEME_HEADER
+#define USER_CLIENT_CHROME_SEPARATOR    OS_THEME_BORDER
+#define USER_CLIENT_CHROME_BORDER       OS_THEME_BORDER
+#define USER_CLIENT_CHROME_TEXT         OS_THEME_TEXT
+#define USER_CLIENT_CHROME_CLOSE_BG     OS_THEME_HEADER
+#define USER_CLIENT_CHROME_CLOSE_FG     OS_THEME_MUTED
+#define USER_CLIENT_CHROME_ICON_BG      OS_THEME_FIELD
+#define USER_CLIENT_CHROME_ICON_FG      OS_THEME_MUTED
+#define USER_CLIENT_CHROME_ICON_ACCENT  OS_THEME_ACCENT
+#define USER_CLIENT_CHROME_CARD         OS_THEME_SURFACE
+#define USER_CLIENT_CHROME_CARD_BORDER  OS_THEME_BORDER
 
 static inline uint32_t user_client_chrome_blend_xrgb8888(
     uint32_t destination, uint32_t source, uint8_t alpha) {
@@ -116,9 +121,7 @@ static inline void user_client_chrome_round_rect(uint32_t *pixels,
     }
 }
 
-/* Client-decorated windows do not receive a compositor frame.  Paint the
- * shared one-pixel outline and title/content separator in the client surface
- * so every application has the same visible boundary. */
+/* The server owns the restored border; clients paint only the separator. */
 static inline void user_client_chrome_frame(uint32_t *pixels,
                                             uint32_t stride,
                                             uint32_t width,
@@ -126,18 +129,6 @@ static inline void user_client_chrome_frame(uint32_t *pixels,
                                             uint32_t header_height) {
     if (pixels == 0 || width < 2U || height < 2U) return;
 
-    user_client_chrome_fill_rect(pixels, stride, width, height,
-                                 0U, 0U, width, 1U,
-                                 USER_CLIENT_CHROME_BORDER);
-    user_client_chrome_fill_rect(pixels, stride, width, height,
-                                 0U, height - 1U, width, 1U,
-                                 USER_CLIENT_CHROME_BORDER);
-    user_client_chrome_fill_rect(pixels, stride, width, height,
-                                 0U, 0U, 1U, height,
-                                 USER_CLIENT_CHROME_BORDER);
-    user_client_chrome_fill_rect(pixels, stride, width, height,
-                                 width - 1U, 0U, 1U, height,
-                                 USER_CLIENT_CHROME_BORDER);
     if (header_height > 0U && header_height < height) {
         user_client_chrome_fill_rect(pixels, stride, width, height,
                                      0U, header_height - 1U, width, 1U,
@@ -241,25 +232,10 @@ static inline void user_client_chrome_close(uint32_t *pixels,
                                             uint32_t header_height,
                                             uint32_t background,
                                             uint32_t foreground) {
-    uint32_t x = width > 30U ? width - 30U : 0U;
-    uint32_t y = header_height > 24U ? (header_height - 24U) / 2U : 0U;
-    for (uint32_t row = 0U; row < 24U; ++row) {
-        uint32_t cut = row < 3U ? 2U : (row >= 21U ? 2U : 0U);
-        for (uint32_t column = cut; column < 24U - cut; ++column) {
-            user_client_chrome_pixel(pixels, stride, width, height,
-                                     x + column, y + row, background, 255U);
-        }
-    }
-    for (uint32_t row = 0U; row < 16U; ++row) {
-        for (uint32_t column = 0U; column < 16U; ++column) {
-            uint8_t alpha = (uint8_t)(
-                user_client_chrome_nibble(user_client_close_alpha[row][column]) *
-                17U);
-            user_client_chrome_pixel(pixels, stride, width, height,
-                                     x + 4U + column, y + 4U + row,
-                                     foreground, alpha);
-        }
-    }
+    /* Compatibility entry point: standard caption controls are exclusively
+     * painted by the compositor. Do not paint an obsolete client-side X. */
+    (void)pixels; (void)stride; (void)width; (void)height;
+    (void)header_height; (void)background; (void)foreground;
 }
 
 static inline bool user_client_chrome_close_hit(int32_t pointer_x,

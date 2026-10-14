@@ -2,6 +2,9 @@
 
 #include <netinet/in.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 uint16_t htons(uint16_t value);
 uint16_t ntohs(uint16_t value);
 uint32_t htonl(uint32_t value);
@@ -12,4 +15,7 @@ int inet_pton(int family, const char *text, void *address);
 const char *inet_ntop(int family, const void *address, char *buffer,
                       socklen_t capacity);
 char *inet_ntoa(struct in_addr address);
+#ifdef __cplusplus
+}
+#endif
 

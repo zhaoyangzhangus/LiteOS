@@ -1,5 +1,7 @@
 #include <arch/x86_64/syscall_internal.h>
 #include <arch/x86_64/paging.h>
+#include <arch/x86_64/cpu.h>
+#include <arch/x86_64/smp.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/futex.h>
 #include <kernel/console.h>
@@ -13,6 +15,77 @@
 #include <kernel/vm.h>
 #include <kernel/shared_section.h>
 #include <kernel/process.h>
+#include <kernel/linux_abi.h>
+
+typedef struct syscall_delay_diagnostic {
+    uint64_t pid, tid, number, argument0, argument1, result, duration_ns;
+} syscall_delay_diagnostic_t;
+static volatile syscall_delay_diagnostic_t g_syscall_delays[64];
+static atomic_flag g_syscall_delay_guard = ATOMIC_FLAG_INIT;
+/* Optional debugger-selected process, otherwise only group leaders. */
+static volatile uint64_t g_syscall_delay_process;
+typedef struct syscall_cost_diagnostic {
+    uint64_t number, count, total_ns, maximum_ns;
+} syscall_cost_diagnostic_t;
+static volatile syscall_cost_diagnostic_t g_syscall_costs[128];
+static atomic_flag g_syscall_cost_guard = ATOMIC_FLAG_INIT;
+static volatile uint64_t g_syscall_cost_tid;
+static uint64_t g_syscall_cost_dropped;
+
+/* Bounded, opt-in wall time (including waits), not CPU utilization. Never
+ * acquire a blocking lock or log user arguments on the interactive path. */
+static void syscall_record_cost(uint64_t tid, uint64_t number,
+                                uint64_t elapsed) {
+    if (tid == 0U || tid != g_syscall_cost_tid) return;
+    if (atomic_flag_test_and_set_explicit(&g_syscall_cost_guard,
+                                          memory_order_acquire)) {
+        __atomic_fetch_add(&g_syscall_cost_dropped, 1U, __ATOMIC_RELAXED);
+        return;
+    }
+    uint64_t ns = x86_tsc_to_ns(elapsed);
+    bool stored = false;
+    for (size_t index = 0U; index < 128U; ++index) {
+        if (g_syscall_costs[index].count != 0U &&
+            g_syscall_costs[index].number != number) continue;
+        g_syscall_costs[index].number = number;
+        ++g_syscall_costs[index].count;
+        g_syscall_costs[index].total_ns += ns;
+        if (ns > g_syscall_costs[index].maximum_ns)
+            g_syscall_costs[index].maximum_ns = ns;
+        stored = true;
+        break;
+    }
+    if (!stored)
+        __atomic_fetch_add(&g_syscall_cost_dropped, 1U, __ATOMIC_RELAXED);
+    atomic_flag_clear_explicit(&g_syscall_cost_guard, memory_order_release);
+}
+static bool syscall_measure_linux_delay(const thread_t *thread) {
+    if (thread == 0 || thread->process == 0) return false;
+    /* A selected process replaces the default leader-only filter. Otherwise
+     * unrelated renderer and service waits fill the bounded sample table. */
+    return g_syscall_delay_process != 0U ?
+        thread->process->pid == g_syscall_delay_process :
+        thread->tid == thread->process->linux_thread_group_leader_tid;
+}
+static void syscall_record_delay(uint64_t pid, uint64_t tid, uint64_t number,
+                                 uint64_t argument0, uint64_t argument1,
+                                 int64_t result, uint64_t elapsed) {
+    if (x86_boot_cpu_features.tsc_hz == 0U ||
+        elapsed < x86_boot_cpu_features.tsc_hz / 100U) return;
+    if (atomic_flag_test_and_set_explicit(&g_syscall_delay_guard,
+                                          memory_order_acquire)) return;
+    for (size_t index = 0U; index < 64U; ++index) {
+        if (g_syscall_delays[index].tid != 0U &&
+            (g_syscall_delays[index].tid != tid ||
+             g_syscall_delays[index].number != number)) continue;
+        uint64_t ns = x86_tsc_to_ns(elapsed);
+        if (ns > g_syscall_delays[index].duration_ns)
+            g_syscall_delays[index] = (syscall_delay_diagnostic_t){
+                pid, tid, number, argument0, argument1, (uint64_t)result, ns};
+        break;
+    }
+    atomic_flag_clear_explicit(&g_syscall_delay_guard, memory_order_release);
+}
 #include <kernel/vfs.h>
 #include <kernel/socket.h>
 #include <kernel/net_manager.h>
@@ -30,6 +103,7 @@
 #include <uapi/io.h>
 #include <uapi/ipc.h>
 #include <uapi/process.h>
+#include <uapi/signal.h>
 #include <uapi/socket.h>
 #include <uapi/device.h>
 #include <uapi/file.h>
@@ -84,12 +158,12 @@
 #define USER_ADDRESS_END        0x0000800000000000ULL
 #define USER_CODE_SELECTOR      0x23ULL
 #define USER_DATA_SELECTOR      0x1BULL
-#define SYSCALL_TABLE_SIZE      (OS_SYS_WINDOW_UPDATE + 1U)
+#define SYSCALL_TABLE_SIZE      (OS_SYS_WINDOW_TITLE + 1U)
 
 typedef int64_t (*syscall_handler_t)(uint64_t, uint64_t, uint64_t,
                                      uint64_t, uint64_t, uint64_t);
 
-syscall_cpu_local_t liteos_syscall_cpu_local;
+syscall_cpu_local_t syscall_cpu_local;
 volatile uint32_t g_syscall_return_progress[MAX_CPUS];
 volatile uint64_t g_syscall_return_number[MAX_CPUS];
 volatile uint64_t g_syscall_return_rip[MAX_CPUS];
@@ -144,6 +218,11 @@ static int64_t sys_debug_query(uint64_t query, uint64_t output, uint64_t output_
 static const syscall_handler_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [OS_SYS_THREAD_EXIT] = syscall_thread_exit,
     [OS_SYS_PROCESS_EXIT] = syscall_process_exit,
+    [OS_SYS_LINUX_ACTIVATE] = syscall_linux_activate,
+    [OS_SYS_MEMORY_INFO] = syscall_memory_info,
+    [OS_SYS_TASK_QUERY] = syscall_task_query,
+    [OS_SYS_PROCESS_TERMINATE] = syscall_process_terminate,
+    [OS_SYS_THREAD_TERMINATE] = syscall_thread_terminate,
     [OS_SYS_THREAD_CREATE] = syscall_thread_create,
     [OS_SYS_PROCESS_CREATE] = syscall_process_create,
     [OS_SYS_PROCESS_EXEC] = syscall_process_exec,
@@ -153,6 +232,7 @@ static const syscall_handler_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [OS_SYS_PROCESS_ENUMERATE] = syscall_process_enumerate,
     [OS_SYS_THREAD_ENUMERATE] = syscall_thread_enumerate,
     [OS_SYS_THREAD_CONTEXT] = syscall_thread_context,
+    [OS_SYS_THREAD_SIGNAL] = syscall_thread_signal,
     [OS_SYS_VM_MAP] = syscall_vm_map,
     [OS_SYS_VM_UNMAP] = syscall_vm_unmap,
     [OS_SYS_VM_PROTECT] = syscall_vm_protect,
@@ -174,6 +254,7 @@ static const syscall_handler_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [OS_SYS_TIMER_CREATE] = syscall_timer_create,
     [OS_SYS_CLOCK_SET] = syscall_clock_set,
     [OS_SYS_RANDOM_GET] = syscall_random_get,
+    [OS_SYS_SYSTEM_POWER] = syscall_system_power,
     [OS_SYS_EXCEPTION_RETURN] = syscall_signal_return,
     [OS_SYS_SIGNAL_ACTION] = syscall_signal_action,
     [OS_SYS_SIGNAL_MASK] = syscall_signal_mask,
@@ -240,13 +321,14 @@ static const syscall_handler_t g_syscall_table[SYSCALL_TABLE_SIZE] = {
     [OS_SYS_WINDOW_INPUT_DISPATCH] = syscall_window_input_dispatch,
     [OS_SYS_WINDOW_EVENT_READ] = syscall_window_event_read,
     [OS_SYS_WINDOW_UPDATE] = syscall_window_update,
+    [OS_SYS_WINDOW_TITLE] = syscall_window_title,
     [OS_SYS_AUDIO_OPEN] = syscall_audio_open,
     [OS_SYS_AUDIO_CONTROL] = syscall_audio_control,
     [OS_SYS_DEBUG_QUERY] = sys_debug_query,
     [OS_SYS_DEBUG_WRITE] = syscall_debug_write,
 };
 
-bool liteos_syscall_init(uint64_t kernel_stack_top) {
+bool syscall_init(uint64_t kernel_stack_top) {
     if (kernel_stack_top == 0 || (kernel_stack_top & 0xFULL) != 0) return 0;
     syscall_cpu_local_t *local = x86_cpu_local_current();
     if (local == 0) return 0;
@@ -264,7 +346,7 @@ bool liteos_syscall_init(uint64_t kernel_stack_top) {
      * 定时器 iretq 会把它视为错误的返回帧。
      */
     write_msr(IA32_STAR, (0x13ULL << 48) | (0x08ULL << 32));
-    write_msr(IA32_LSTAR, (uint64_t)(uintptr_t)&liteos_syscall_entry);
+    write_msr(IA32_LSTAR, (uint64_t)(uintptr_t)&syscall_entry);
     write_msr(IA32_FMASK, RFLAGS_DIRECTION | RFLAGS_INTERRUPT | RFLAGS_TRAP |
                              RFLAGS_ALIGNMENT_CHECK | RFLAGS_NESTED_TASK);
     /* 内核态始终使用 CPU-local GS；swapgs 后用户态得到零基址。 */
@@ -284,18 +366,100 @@ void x86_syscall_set_kernel_stack(uint64_t kernel_stack_top) {
 void x86_syscall_init(void) {
     uint64_t stack;
     __asm__ volatile ("mov %%rsp, %0" : "=r"(stack));
-    (void)liteos_syscall_init(stack & ~0xFULL);
+    (void)syscall_init(stack & ~0xFULL);
 }
 
-int64_t liteos_syscall_dispatch(arch_trap_frame_t *frame) {
+static int64_t syscall_complete_dispatch(thread_t *thread, int64_t status) {
+    if (thread != 0 && (__atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE) & THREAD_FLAG_TERMINATE_REQUEST))
+        thread_exit(-(int64_t)OS_SIGKILL);
+    /* The handler has released its locks and committed exec/signal frames.
+     * Schedule from this ordinary C continuation, whose saved stack resumes
+     * normally (as with a blocking syscall), not from the assembly restore
+     * stub. SyscallActive is saved/restored by the context switch. */
+    if (thread != 0 && thread->sched_class != SCHED_CLASS_IDLE &&
+        !thread->exec_pending && !sched_preempt_disabled() &&
+        !x86_tlb_shootdown_active() &&
+        (x86_smp_take_reschedule_request() || sched_tick_should_preempt())) {
+        /* Charge the syscall's execution tail before choosing among FAIR
+         * tasks. Merely draining the inbox does not preempt FAIR-for-FAIR
+         * wakes, and timers intentionally do not charge an active syscall.
+         * Local wakes only publish need_resched, not an IPI pending bit. */
+        schedule();
+    }
+    return status;
+}
+
+int64_t syscall_dispatch(arch_trap_frame_t *frame) {
     thread_t *executing_thread;
+    uint64_t number;
+    bool native_escape;
     if (frame == 0 || !user_address_valid(frame->rip) ||
         !user_address_valid(frame->rsp)) return K_EACCES;
     executing_thread = sched_current_thread();
-    /* 从硬中断排队的设备工作在普通内核上下文执行，严格限制本次预算。 */
-    (void)deferred_run(4U);
-    uint64_t number = frame->rax;
-    if (number >= SYSCALL_TABLE_SIZE || g_syscall_table[number] == 0) return K_ENOSYS;
+    number = frame->rax;
+    native_escape = (number & OS_SYSCALL_NATIVE_FLAG) != 0U;
+    number &= ~OS_SYSCALL_NATIVE_FLAG;
+    if (executing_thread != 0 && executing_thread->process != 0 &&
+        linux_process_is(executing_thread->process) && !native_escape) {
+        const uint64_t group_kill_bit = 1ULL << (OS_SIGKILL - 1U);
+        uint64_t pending = __atomic_fetch_and(
+            &executing_thread->signal_pending, ~group_kill_bit,
+            __ATOMIC_ACQ_REL);
+        if ((pending & group_kill_bit) != 0U) {
+            process_exit_signal(OS_SIGKILL);
+        }
+        bool measure = syscall_measure_linux_delay(executing_thread);
+        uint64_t argument0 = frame->rdi, argument1 = frame->rsi;
+        bool measure_cost = g_syscall_cost_tid != 0U &&
+                            executing_thread->tid == g_syscall_cost_tid;
+        uint64_t started = (measure || measure_cost) ? x86_read_tsc() : 0U;
+        int64_t status = linux_syscall_dispatch(frame);
+        uint64_t elapsed = (measure || measure_cost) ? x86_read_tsc() - started : 0U;
+        if (measure_cost)
+            syscall_record_cost(executing_thread->tid, number, elapsed);
+        if (measure)
+            syscall_record_delay(executing_thread->process->pid,
+                                  executing_thread->tid, number,
+                                  argument0, argument1, status,
+                                  elapsed);
+        pending = __atomic_fetch_and(&executing_thread->signal_pending,
+                                     ~group_kill_bit, __ATOMIC_ACQ_REL);
+        if ((pending & group_kill_bit) != 0U) {
+            process_exit_signal(OS_SIGKILL);
+        }
+        if (status == K_OK && executing_thread->exec_pending) {
+            process_exec_debug_mark(11U);
+            frame->rip = executing_thread->exec_entry;
+            frame->rsp = executing_thread->exec_stack;
+            frame->rflags = 0x202ULL;
+            frame->rax = 0U;
+            executing_thread->exec_pending = false;
+            process_exec_debug_mark(12U);
+        }
+        return syscall_complete_dispatch(executing_thread, status);
+    }
+    /* libc fork/exec use the native escape, including queued work before the
+     * handler. Keep them separate from Linux syscall numbers 6 and 4. */
+    bool measure_native_transition = native_escape &&
+        g_syscall_delay_process != 0U &&
+        executing_thread != 0 && executing_thread->process != 0 &&
+        ((number == OS_SYS_PROCESS_FORK &&
+          executing_thread->process->pid == g_syscall_delay_process) ||
+         (number == OS_SYS_PROCESS_EXEC && executing_thread->tid ==
+          executing_thread->process->linux_thread_group_leader_tid));
+    bool measure_native_cost = g_syscall_cost_tid != 0U &&
+        executing_thread != 0 && executing_thread->tid == g_syscall_cost_tid;
+    uint64_t native_started = (measure_native_transition || measure_native_cost) ?
+                             x86_read_tsc() : 0U;
+    uint64_t native_argument0 = frame->rdi;
+    /* Once the persistent worker owns bottom halves, a user syscall must
+     * not steal arbitrary callbacks (e.g. old-address-space reclamation).
+     * A four-item count is not a time bound and SyscallActive defers timer
+     * preemption. Keep synchronous draining only for pre-worker boot. */
+    if (!deferred_worker_started()) (void)deferred_run(4U);
+    if (number >= SYSCALL_TABLE_SIZE || g_syscall_table[number] == 0) {
+        return syscall_complete_dispatch(executing_thread, K_ENOSYS);
+    }
     uint64_t argument5 = frame->r9;
     /* PROCESS_FORK has no user argument; its private sixth argument carries
      * the kernel-owned return frame so the child can resume after syscall. */
@@ -304,6 +468,17 @@ int64_t liteos_syscall_dispatch(arch_trap_frame_t *frame) {
     }
     int64_t status = g_syscall_table[number](frame->rdi, frame->rsi, frame->rdx,
                                              frame->r10, frame->r8, argument5);
+    uint64_t native_elapsed = (measure_native_transition || measure_native_cost) ?
+                             x86_read_tsc() - native_started : 0U;
+    if (measure_native_cost)
+        syscall_record_cost(executing_thread->tid,
+                             number | OS_SYSCALL_NATIVE_FLAG, native_elapsed);
+    if (measure_native_transition)
+        syscall_record_delay(executing_thread->process->pid,
+                             executing_thread->tid,
+                             number | OS_SYSCALL_NATIVE_FLAG,
+                             native_argument0, 0U, status,
+                             native_elapsed);
     if (status == K_OK) {
         if (executing_thread != 0 && executing_thread->exec_pending) {
             process_exec_debug_mark(11U);
@@ -318,7 +493,7 @@ int64_t liteos_syscall_dispatch(arch_trap_frame_t *frame) {
     if (number != OS_SYS_SIGNAL_RETURN) {
         status = syscall_deliver_pending_signal(frame, status);
     }
-    return status;
+    return syscall_complete_dispatch(executing_thread, status);
 }
 
 
@@ -392,13 +567,13 @@ bool syscall_frame_self_test(void) {
     frame.rflags = RFLAGS_FIXED | RFLAGS_INTERRUPT;
     frame.rax = OS_SYS_DEBUG_QUERY;
     if (!x86_validate_user_frame(&frame) || x86_syscall_return_mode(&frame) != 1 ||
-        liteos_syscall_dispatch(&frame) != OS_SYSCALL_ABI_VERSION) return false;
+        syscall_dispatch(&frame) != OS_SYSCALL_ABI_VERSION) return false;
 
     frame.rflags |= RFLAGS_TRAP;
     if (x86_syscall_return_mode(&frame) != 0) return false;
     frame.rflags &= ~RFLAGS_TRAP;
     frame.rax = SYSCALL_TABLE_SIZE;
-    if (liteos_syscall_dispatch(&frame) != K_ENOSYS) return false;
+    if (syscall_dispatch(&frame) != K_ENOSYS) return false;
 
     frame.rip = 0x0000800000000000ULL;
     if (x86_validate_user_frame(&frame)) return false;
@@ -420,12 +595,12 @@ bool syscall_frame_self_test(void) {
         frame.ss = USER_DATA_SELECTOR;
         frame.rflags = RFLAGS_FIXED | RFLAGS_INTERRUPT;
         if (x86_validate_user_frame(&frame) ||
-            liteos_syscall_dispatch(&frame) != K_EACCES) return false;
+            syscall_dispatch(&frame) != K_EACCES) return false;
 
         frame.rip = 0x0000000040000000ULL;
         frame.rsp = 0x0000800000000000ULL | ((seed >> 16) & 0xFFFFU);
         if (x86_validate_user_frame(&frame) ||
-            liteos_syscall_dispatch(&frame) != K_EACCES) return false;
+            syscall_dispatch(&frame) != K_EACCES) return false;
 
         frame.rsp = 0x0000000080000000ULL;
         frame.cs = (uint16_t)(((seed | 1U) ^ USER_CODE_SELECTOR) | 0x0040U);

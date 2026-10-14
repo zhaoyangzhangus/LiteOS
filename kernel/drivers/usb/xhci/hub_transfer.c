@@ -158,8 +158,8 @@ bool xhci_configure_hub_endpoint(xhci_state_t *state) {
     input_slot[3] = 0U;
     control[0] = 0U;
     control[1] = 1U;
-    liteos_serial_printf_serial_only(
-        "LITEOS_DIAG_HUB_CONTEXT SLOT=%u HCI=%u OUT0=%u OUT1=%u "
+    kernel_serial_printf_serial_only(
+        "OS_DIAG_HUB_CONTEXT SLOT=%u HCI=%u OUT0=%u OUT1=%u "
         "OUT2=%u OUT3=%u IN0=%u IN1=%u IN2=%u\r\n",
         state->device_slot, state->hci_version,
         output_slot[0], output_slot[1], output_slot[2], output_slot[3],
@@ -171,14 +171,14 @@ bool xhci_configure_hub_endpoint(xhci_state_t *state) {
                                           XHCI_EVALUATE_CONTEXT_TYPE,
             state->device_slot,
             xhci_dma_address(&state->input_context.mapping), 0)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_HUB_CONTEXT_FAIL ERROR=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_HUB_CONTEXT_FAIL ERROR=%u\r\n",
             xhci_last_error());
         xhci_free_page(&state->hub_ring);
         xhci_free_page(&state->hub_report);
         return false;
     }
-    liteos_serial_write_serial_only("LITEOS_DIAG_HUB_CONTEXT_OK\r\n");
+    kernel_serial_write_serial_only("OS_DIAG_HUB_CONTEXT_OK\r\n");
 
     dma_sync_for_cpu(&state->output_context.mapping);
     for (uint32_t i = 0U; i < 4U; ++i) {
@@ -198,14 +198,14 @@ bool xhci_configure_hub_endpoint(xhci_state_t *state) {
     if (!xhci_submit_command(state, XHCI_CONFIGURE_ENDPOINT_TYPE,
                              state->device_slot,
                              xhci_dma_address(&state->input_context.mapping), 0)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_HUB_ENDPOINT_FAIL ERROR=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_HUB_ENDPOINT_FAIL ERROR=%u\r\n",
             xhci_last_error());
         xhci_free_page(&state->hub_ring);
         xhci_free_page(&state->hub_report);
         return false;
     }
-    liteos_serial_write_serial_only("LITEOS_DIAG_HUB_ENDPOINT_OK\r\n");
+    kernel_serial_write_serial_only("OS_DIAG_HUB_ENDPOINT_OK\r\n");
 
     /*
      * V3.10.6B10B8 HUB STATUS TD LIFETIME
@@ -219,9 +219,9 @@ bool xhci_configure_hub_endpoint(xhci_state_t *state) {
      * explicit startup->runtime barrier before MSI-X runtime begins.
      */
     bool queued = xhci_queue_hub_status_device(state, &state->device);
-    liteos_serial_write_serial_only(
-        queued ? "LITEOS_DIAG_HUB_STATUS_QUEUE_OK\r\n" :
-                 "LITEOS_DIAG_HUB_STATUS_QUEUE_FAIL\r\n");
+    kernel_serial_write_serial_only(
+        queued ? "OS_DIAG_HUB_STATUS_QUEUE_OK\r\n" :
+                 "OS_DIAG_HUB_STATUS_QUEUE_FAIL\r\n");
     return queued;
 }
 
@@ -292,16 +292,16 @@ bool xhci_restart_hub_status_endpoint(xhci_state_t *state,
     endpoint_id = (uint32_t)hub->hub_endpoint * 2U + 1U;
     if (endpoint_id == 0U || endpoint_id > 31U) return false;
 
-    liteos_serial_write_serial_only("LITEOS_DIAG_HUB_RESYNC_BEGIN\r\n");
+    kernel_serial_write_serial_only("OS_DIAG_HUB_RESYNC_BEGIN\r\n");
     if (!xhci_submit_command_ex(state, XHCI_STOP_ENDPOINT_TYPE, slot,
                                 (uint8_t)endpoint_id, 0U, 0)) {
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_RESYNC_STOP_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_RESYNC_STOP_FAIL\r\n");
         return false;
     }
     hub->hub_transfer_pending = false;
     if (!xhci_drop_endpoint_transfer_events(state, slot,
                                              (uint8_t)endpoint_id)) {
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_RESYNC_DRAIN_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_RESYNC_DRAIN_FAIL\r\n");
         return false;
     }
 
@@ -325,14 +325,14 @@ bool xhci_restart_hub_status_endpoint(xhci_state_t *state,
             state, XHCI_SET_TR_DEQUEUE_POINTER_TYPE, slot,
             (uint8_t)endpoint_id,
             xhci_dma_address(&hub->hub_ring.mapping) | 1ULL, 0)) {
-        liteos_serial_write_serial_only(
-            "LITEOS_DIAG_HUB_RESYNC_DEQUEUE_FAIL\r\n");
+        kernel_serial_write_serial_only(
+            "OS_DIAG_HUB_RESYNC_DEQUEUE_FAIL\r\n");
         return false;
     }
     if (!xhci_queue_hub_status_device(state, hub)) {
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_RESYNC_QUEUE_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_RESYNC_QUEUE_FAIL\r\n");
         return false;
     }
-    liteos_serial_write_serial_only("LITEOS_DIAG_HUB_RESYNC_OK\r\n");
+    kernel_serial_write_serial_only("OS_DIAG_HUB_RESYNC_OK\r\n");
     return true;
 }

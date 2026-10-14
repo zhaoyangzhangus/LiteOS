@@ -12,9 +12,11 @@
 
 typedef struct timer_object {
     object_header_t object;
-    spinlock_t lock;
     atomic_bool canceled;
     atomic_bool fired;
+    uint32_t registry_slot; /* assigned/retired under the timer registry lock */
+    /* The timer registry lock protects deadline updates and object lifetime;
+     * period_tsc is immutable after registration. */
     uint64_t deadline_tsc;
     uint64_t period_tsc;
 } timer_object_t;

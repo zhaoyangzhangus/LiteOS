@@ -2,13 +2,55 @@
 
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/smp.h>
+#include <kernel/nv_frontend.h>
+
+#include "../rm/include/nv_rm_driver.h"
+#include "../rm/include/nv_rm_vendor_bridge.h"
 
 static nv_port_registry_t g_nvabi_registry;
 static atomic_bool g_nvabi_registry_initialized = ATOMIC_VAR_INIT(false);
 
+nv_state_t *NV_API_CALL nv_get_ctl_state(void)
+{
+    /* The vendor Linux implementation returns the state embedded in its
+     * control device.  System keeps that device private, so the RM bridge
+     * exposes the same live state as an opaque OS-adapter result. */
+    return (nv_state_t *)nv_rm_vendor_ctl_state();
+}
+
+void NV_API_CALL nv_get_screen_info(
+    nv_state_t *nv, NvU64 *base, NvU32 *width, NvU32 *height,
+    NvU32 *depth, NvU32 *pitch, NvU64 *size)
+{
+    nv_rm_screen_info_t info;
+
+    (void)nv;
+    if (base != NULL) *base = 0U;
+    if (width != NULL) *width = 0U;
+    if (height != NULL) *height = 0U;
+    if (depth != NULL) *depth = 0U;
+    if (pitch != NULL) *pitch = 0U;
+    if (size != NULL) *size = 0U;
+
+    if (!nv_rm_driver_get_screen_info(&info))
+        return;
+
+    if (base != NULL) *base = info.physical_base;
+    if (width != NULL) *width = info.width;
+    if (height != NULL) *height = info.height;
+    if (depth != NULL) *depth = info.depth;
+    if (pitch != NULL) *pitch = info.pitch;
+    if (size != NULL) *size = info.size;
+}
+
 typedef struct nvabi_mutex {
     uint32_t magic;
-    nv_port_mutex_t lock;
+    /*
+     * The 595.84 Linux OS interface backs os_*mutex with struct semaphore
+     * (down/up), not an owner-tracked mutex.  RM may release it from a
+     * completion context different from the acquirer.
+     */
+    nv_port_semaphore_t semaphore;
 } nvabi_mutex_t;
 
 typedef struct nvabi_semaphore {
@@ -55,6 +97,56 @@ static process_t *nvabi_current_process(void) {
     return thread == NULL ? NULL : thread->process;
 }
 
+NV_STATUS NV_API_CALL nvabi_file_private_lookup(NvS32 fd, NvBool ctl,
+                                                 nv_file_private_t **out,
+                                                 void **os_private) {
+    process_t *process = nvabi_current_process();
+    nv_frontend_file_t *file = NULL;
+    linux_fd_entry_t entry;
+
+    if (out == NULL || os_private == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+    *out = NULL;
+    *os_private = NULL;
+    if (process == NULL || fd < 0 || fd >= (NvS32)OS_LINUX_FD_LIMIT)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    spinlock_lock(&process->linux_fds.lock);
+    entry = process->linux_fds.entries[(uint32_t)fd];
+    if (entry.kind == LINUX_FD_NVIDIA && entry.private_data != NULL) {
+        file = (nv_frontend_file_t *)entry.private_data;
+        nv_frontend_file_get(file);
+    }
+    spinlock_unlock(&process->linux_fds.lock);
+
+    if (file == NULL || nv_frontend_file_is_control(file) !=
+        (ctl != NV_FALSE)) {
+        if (file != NULL)
+            nv_frontend_file_put(file);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    *out = (nv_file_private_t *)nv_frontend_file_vendor_private(file);
+    if (*out == NULL) {
+        nv_frontend_file_put(file);
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+    *os_private = file;
+    return NV_OK;
+}
+
+nv_file_private_t *NV_API_CALL nv_get_file_private(NvS32 fd, NvBool ctl,
+                                                    void **os_private) {
+    nv_file_private_t *file_private = NULL;
+    if (nvabi_file_private_lookup(fd, ctl, &file_private, os_private) != NV_OK)
+        return NULL;
+    return file_private;
+}
+
+void NV_API_CALL nv_put_file_private(void *os_private) {
+    if (os_private != NULL)
+        nv_frontend_file_put((nv_frontend_file_t *)os_private);
+}
+
 static size_t nvabi_append_char(char *destination, size_t capacity,
                                 size_t used, char value) {
     if (destination != NULL && capacity != 0U && used + 1U < capacity) {
@@ -75,7 +167,8 @@ static size_t nvabi_append_string(char *destination, size_t capacity,
 static size_t nvabi_append_unsigned(char *destination, size_t capacity,
                                     size_t used, NvU64 value, NvU32 base,
                                     bool upper) {
-    char digits[sizeof(NvU64) * 2U + 1U];
+    /* A 64-bit decimal value needs 20 digits, more than hexadecimal's 16. */
+    char digits[sizeof(NvU64) * 3U];
     size_t count = 0U;
     const char *alphabet = upper ? "0123456789ABCDEF" : "0123456789abcdef";
 
@@ -179,20 +272,41 @@ static int nvabi_vsnprintf(char *destination, NvU32 capacity,
     return used > (size_t)INT32_MAX ? INT32_MAX : (int)used;
 }
 
+static atomic_uint_fast64_t g_nvabi_post_event_unsupported_count = ATOMIC_VAR_INIT(0);
+
 void nvabi_log_unsupported(const char *function, const char *caller_stage) {
-    liteos_serial_write("LITEOS_NVIDIA_ABI_UNSUPPORTED ");
-    liteos_serial_write(function == NULL ? "<unknown>" : function);
-    liteos_serial_write(" STAGE=");
-    liteos_serial_write(caller_stage == NULL ? "vendor_abi" : caller_stage);
-    liteos_serial_write("\r\n");
+    uint64_t count = 0U;
+    /* This remains an unsupported callback, not a successful notification.
+     * Video queues can invoke it thousands of times; synchronous UART output
+     * on every invocation obscures other diagnostics and stalls completion.
+     * Retain the first eight reports and cumulative power-of-two summaries.
+     * No allocation, sleep or logging lock is introduced in callback context. */
+    if (function != NULL && nvabi_string_compare(function, "nv_post_event") == 0) {
+        count = atomic_fetch_add_explicit(&g_nvabi_post_event_unsupported_count,
+                                         1U, memory_order_relaxed) + 1U;
+        if (count > 8U && (count & (count - 1U)) != 0U) return;
+    }
+    kernel_serial_write("OS_NVIDIA_ABI_UNSUPPORTED ");
+    kernel_serial_write(function == NULL ? "<unknown>" : function);
+    kernel_serial_write(" STAGE=");
+    kernel_serial_write(caller_stage == NULL ? "vendor_abi" : caller_stage);
+    if (count != 0U) {
+        char text[24];
+        size_t used = nvabi_append_unsigned(text, sizeof(text), 0U,
+                                            count, 10U, false);
+        text[used < sizeof(text) ? used : sizeof(text) - 1U] = '\0';
+        kernel_serial_write(" COUNT=");
+        kernel_serial_write(text);
+    }
+    kernel_serial_write("\r\n");
 }
 
 void nvabi_log_invalid(const char *function, const char *caller_stage) {
-    liteos_serial_write("LITEOS_NVIDIA_ABI_INVALID ");
-    liteos_serial_write(function == NULL ? "<unknown>" : function);
-    liteos_serial_write(" STAGE=");
-    liteos_serial_write(caller_stage == NULL ? "vendor_abi" : caller_stage);
-    liteos_serial_write("\r\n");
+    kernel_serial_write("OS_NVIDIA_ABI_INVALID ");
+    kernel_serial_write(function == NULL ? "<unknown>" : function);
+    kernel_serial_write(" STAGE=");
+    kernel_serial_write(caller_stage == NULL ? "vendor_abi" : caller_stage);
+    kernel_serial_write("\r\n");
 }
 
 NV_STATUS NV_API_CALL os_alloc_mem(void **address, NvU64 size) {
@@ -205,6 +319,44 @@ NV_STATUS NV_API_CALL os_alloc_mem(void **address, NvU64 size) {
 
 void NV_API_CALL os_free_mem(void *address) {
     if (address != NULL) kfree(address);
+}
+
+NV_STATUS NV_API_CALL os_match_mmap_offset(
+    void *pAllocPrivate, NvU64 offset, NvU64 *pPageIndex) {
+    nvabi_page_allocation_t *allocation =
+        (nvabi_page_allocation_t *)pAllocPrivate;
+
+    if (pPageIndex == NULL || allocation == NULL ||
+        allocation->magic != NVABI_PAGE_ALLOCATION_MAGIC ||
+        allocation->page_count == 0U ||
+        allocation->memory.page_count != allocation->page_count ||
+        allocation->memory.phys_pages == NULL ||
+        allocation->memory.page_objects == NULL) {
+        nvabi_log_invalid("os_match_mmap_offset", "os-memory-map");
+        return NV_ERR_INVALID_ARGUMENT;
+    }
+
+    for (NvU64 index = 0U; index < (NvU64)allocation->page_count; ++index) {
+        NvU64 page_address;
+        if (allocation->contiguous) {
+            if (index > UINT64_MAX / NVABI_PAGE_SIZE ||
+                allocation->memory.phys_pages[0] > UINT64_MAX -
+                    index * NVABI_PAGE_SIZE) {
+                nvabi_log_invalid("os_match_mmap_offset", "os-memory-map");
+                return NV_ERR_INVALID_ARGUMENT;
+            }
+            page_address = allocation->memory.phys_pages[0] +
+                           index * NVABI_PAGE_SIZE;
+        } else {
+            page_address = allocation->memory.phys_pages[(uint32_t)index];
+        }
+        if (offset == page_address) {
+            *pPageIndex = index;
+            return NV_OK;
+        }
+    }
+
+    return NV_ERR_OBJECT_NOT_FOUND;
 }
 
 NV_STATUS NV_API_CALL os_get_system_time(NvU32 *seconds, NvU32 *microseconds) {
@@ -228,6 +380,72 @@ NvU64 NV_API_CALL os_get_monotonic_time_ns_hr(void) {
 
 NvU64 NV_API_CALL os_get_monotonic_tick_resolution_ns(void) {
     return 1ULL;
+}
+
+/*
+ * Linux keeps a reference-counted struct pid for the duration of RM calls.
+ * System has no PID namespaces, so the process object is the corresponding
+ * stable identity.  Take an object reference on acquire and release exactly
+ * that reference on put; this preserves the lifetime rule without inventing a
+ * second PID object or a namespace-independent success value.
+ */
+void *NV_API_CALL os_get_pid_info(void) {
+    process_t *process = nvabi_current_process();
+    if (process == NULL) return NULL;
+    object_get(process);
+    return process;
+}
+
+void NV_API_CALL os_put_pid_info(void *pid_info) {
+    if (pid_info != NULL) object_put(pid_info);
+}
+
+NV_STATUS NV_API_CALL os_find_ns_pid(void *pid_info, NvU32 *ns_pid) {
+    process_t *process = (process_t *)pid_info;
+    if (process == NULL || ns_pid == NULL) {
+        return nvabi_invalid_status("os_find_ns_pid", "os-process");
+    }
+    if (atomic_load_explicit(&process->state, memory_order_acquire) ==
+        PROCESS_DEAD) {
+        *ns_pid = 0U;
+        return NV_ERR_OBJECT_NOT_FOUND;
+    }
+    *ns_pid = (NvU32)process->pid;
+    return *ns_pid == 0U ? NV_ERR_OBJECT_NOT_FOUND : NV_OK;
+}
+
+NvBool NV_API_CALL os_is_init_ns(void) {
+    /* System currently exposes one process/PID namespace. */
+    return NV_TRUE;
+}
+
+static NvBool nvabi_current_process_has_nvidia_fd(void) {
+    thread_t *thread = nvabi_current_thread();
+    process_t *process = thread == NULL ? NULL : thread->process;
+    bool found = false;
+
+    if (process == NULL) return NV_FALSE;
+    spinlock_lock(&process->linux_fds.lock);
+    for (NvU32 descriptor = 0U;
+         descriptor < OS_LINUX_FD_LIMIT; ++descriptor) {
+        const linux_fd_entry_t *entry =
+            &process->linux_fds.entries[descriptor];
+        if (entry->kind == LINUX_FD_NVIDIA && entry->private_data != NULL) {
+            found = true;
+            break;
+        }
+    }
+    spinlock_unlock(&process->linux_fds.lock);
+    return found ? NV_TRUE : NV_FALSE;
+}
+
+NvBool NV_API_CALL nv_is_gpu_accessible(nv_state_t *nv) {
+    (void)nv;
+    /* The immutable Linux implementation checks whether the current task has
+     * an NVIDIA file in its files_struct.  System keeps the same observable
+     * rule over its Linux personality fd table; this is not a readiness
+     * shortcut and does not grant access to a process without a real fd. */
+    return nvabi_current_process_has_nvidia_fd();
 }
 
 NV_STATUS NV_API_CALL os_delay(NvU32 milliseconds) {
@@ -313,10 +531,7 @@ NvU32 NV_API_CALL os_strtoul(const char *source, char **end,
 }
 
 NvS32 NV_API_CALL os_string_compare(const char *left, const char *right) {
-    return (NvS32)nvabi_memcmp(left, right,
-                               nvabi_strlen(left) > nvabi_strlen(right) ?
-                               nvabi_strlen(left) + 1U :
-                               nvabi_strlen(right) + 1U);
+    return (NvS32)nvabi_string_compare(left, right);
 }
 
 NvS32 NV_API_CALL os_vsnprintf(char *destination, NvU32 capacity,
@@ -341,8 +556,8 @@ void NV_API_CALL os_log_error(const char *format, va_list arguments) {
         return;
     }
     (void)os_vsnprintf(buffer, sizeof(buffer), format, arguments);
-    liteos_serial_write(buffer);
-    liteos_serial_write("\r\n");
+    kernel_serial_write(buffer);
+    kernel_serial_write("\r\n");
 }
 
 void *NV_API_CALL os_mem_copy(void *destination, const void *source, NvU32 size) {
@@ -510,7 +725,7 @@ NV_STATUS NV_API_CALL os_alloc_mutex(void **mutex) {
     nvabi_mutex_t *value = (nvabi_mutex_t *)kzalloc(sizeof(*value), 0U);
     if (value == NULL) return NV_ERR_NO_MEMORY;
     value->magic = NVABI_MUTEX_MAGIC;
-    nv_port_mutex_init(&value->lock);
+    nv_port_semaphore_init(&value->semaphore, 1U);
     *mutex = value;
     return NV_OK;
 }
@@ -529,8 +744,8 @@ NV_STATUS NV_API_CALL os_acquire_mutex(void *mutex) {
                      NVABI_MUTEX_MAGIC, "os_acquire_mutex")) {
         return NV_ERR_INVALID_ARGUMENT;
     }
-    return nvabi_status_from_kstatus(nv_port_mutex_lock(
-        &value->lock, UINT64_MAX));
+    return nvabi_status_from_kstatus(nv_port_semaphore_down(
+        &value->semaphore, UINT64_MAX));
 }
 
 NV_STATUS NV_API_CALL os_cond_acquire_mutex(void *mutex) {
@@ -539,16 +754,16 @@ NV_STATUS NV_API_CALL os_cond_acquire_mutex(void *mutex) {
                      NVABI_MUTEX_MAGIC, "os_cond_acquire_mutex")) {
         return NV_ERR_INVALID_ARGUMENT;
     }
-    return nvabi_status_from_kstatus(nv_port_mutex_try_lock(&value->lock));
+    kstatus_t status = nv_port_semaphore_down(&value->semaphore, 0U);
+    return status == K_ETIMEDOUT ? NV_ERR_TIMEOUT_RETRY :
+                                   nvabi_status_from_kstatus(status);
 }
 
 void NV_API_CALL os_release_mutex(void *mutex) {
     nvabi_mutex_t *value = (nvabi_mutex_t *)mutex;
     if (!nvabi_magic(value == NULL ? NULL : &value->magic,
                      NVABI_MUTEX_MAGIC, "os_release_mutex")) return;
-    if (nv_port_mutex_unlock(&value->lock) != K_OK) {
-        nvabi_log_invalid("os_release_mutex", "os-sync");
-    }
+    nv_port_semaphore_up(&value->semaphore);
 }
 
 void *NV_API_CALL os_alloc_semaphore(NvU32 initial_count) {
@@ -671,7 +886,7 @@ NvBool NV_API_CALL os_semaphore_may_sleep(void) {
 }
 
 NV_STATUS NV_API_CALL os_get_version_info(os_version_info *info) {
-    static const char version[] = "LiteOS NVIDIA ABI 595.84";
+    static const char version[] = "System NVIDIA ABI 595.84";
     static const char date[] = __DATE__ " " __TIME__;
     if (info == NULL) return nvabi_invalid_status(
         "os_get_version_info", "os-version");
@@ -737,9 +952,9 @@ NvU32 NV_API_CALL os_get_grid_csp_support(void) {
 
 void NV_API_CALL os_bug_check(NvU32 code, const char *message) {
     (void)code;
-    liteos_serial_write("LITEOS_NVIDIA_ABI_BUG_CHECK ");
-    liteos_serial_write(message == NULL ? "<null>" : message);
-    liteos_serial_write(" STAGE=os-debug\r\n");
+    kernel_serial_write("OS_NVIDIA_ABI_BUG_CHECK ");
+    kernel_serial_write(message == NULL ? "<null>" : message);
+    kernel_serial_write(" STAGE=os-debug\r\n");
 }
 
 NV_STATUS NV_API_CALL os_get_euid(NvU32 *euid) {

@@ -1,16 +1,23 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <fcntl.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
-#define LIBC_FD_LIMIT 256U
+#include <uapi/linux_abi.h>
+
+#define LIBC_FD_LIMIT 1024U
 #define LIBC_PATH_LIMIT 256U
 #define LIBC_FD_CLOEXEC (1U << 0)
+#define LIBC_MODE_OVERRIDE_LIMIT 64U
 
 int __libc_errno;
 
@@ -24,6 +31,7 @@ typedef struct libc_fd_resource {
     uint32_t references;
     bool used;
     bool debug_output;
+    bool linux_fd;
     bool socket_handle;
     uint32_t socket_family;
     bool pipe_handle;
@@ -39,8 +47,394 @@ typedef struct libc_fd_entry {
 
 static libc_fd_resource_t g_fd_resources[LIBC_FD_LIMIT];
 static libc_fd_entry_t g_fd_table[LIBC_FD_LIMIT];
+static volatile uint32_t g_fd_table_lock_word;
+static volatile uint32_t g_libc_open_fail_debug_calls;
+static volatile uint32_t g_libc_database_open_debug_calls;
+static volatile uint32_t g_libc_profile_open_debug_calls;
+static volatile uint32_t g_libc_fcntl_lock_debug_calls;
+static volatile uint32_t g_libc_fstat_fail_debug_calls;
+static volatile uint32_t g_libc_ftruncate_fail_debug_calls;
+static volatile uint32_t g_libc_fsync_fail_debug_calls;
+static volatile uint32_t g_libc_lseek_fail_debug_calls;
+#if OS_DEBUG_SERIAL
+static volatile uint32_t g_libc_close_fail_debug_calls;
+#endif
+/*
+ * Chromium's keyed-service startup trace is emitted as five separate write(2)
+ * calls.  Keep a small process-wide drain state so an old Chrome binary built
+ * before the trace gate cannot turn startup into thousands of UART writes.
+ * The state is intentionally only for diagnostics; it never changes the
+ * return value visible to the caller.
+ */
+static volatile uint32_t g_libc_service_trace_drop_chunks;
+
+/* Suffix after the neutral namespace or the deployed binary's legacy one. */
+#define LIBC_SERVICE_TRACE_PREFIX "PROFILE_SERVICE_"
+#define LIBC_SERVICE_TRACE_PREFIX_LENGTH \
+    (sizeof(LIBC_SERVICE_TRACE_PREFIX) - 1U)
+#define LIBC_SERVICE_TRACE_FOLLOWUP_CHUNKS 4U
+
+/* Saturate diagnostic quotas: exhausted hot paths need no atomic writes. */
+static bool libc_trace_budget(volatile uint32_t *counter, uint32_t limit) {
+    uint32_t observed = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    while (observed < limit) {
+        if (__atomic_compare_exchange_n(counter, &observed, observed + 1U,
+                                        false, __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) return true;
+    }
+    return false;
+}
+
+static void libc_debug_text(const char *text, size_t length) {
+#if defined(OS_RUNTIME_TRACE)
+    (void)__libc_linux_syscall6(OS_SYS_DEBUG_WRITE,
+                                (uint64_t)(uintptr_t)text, length,
+                                0U, 0U, 0U, 0U);
+#else
+    (void)text;
+    (void)length;
+#endif
+}
+
+static void libc_debug_fd_event(const char *event, int descriptor,
+                                os_handle_t handle, const char *path) {
+#if OS_DEBUG_SERIAL
+    char output[384];
+    static volatile uint32_t calls;
+    int length;
+    bool snapshot_open = event != 0 && event[0] == 'o' &&
+                         path != 0 && strstr(path, "snapshot") != 0;
+    bool trace = descriptor == 103 || snapshot_open;
+    int64_t process_id;
+    if (!trace ||
+        !libc_trace_budget(&calls, 64U)) {
+        return;
+    }
+    process_id = __libc_linux_syscall6(LINUX_SYS_GETPID,
+                                       0U, 0U, 0U, 0U, 0U, 0U);
+    length = snprintf(output, sizeof(output),
+                      "OS_LIBC_FD_TRACE pid=%lld event=%s fd=%d handle=%llx path=%s\r\n",
+                      (long long)process_id,
+                      event != 0 ? event : "?", descriptor,
+                      (unsigned long long)handle, path != 0 ? path : "?");
+    if (length > 0 && (size_t)length < sizeof(output)) {
+        (void)__libc_linux_syscall6(OS_SYS_DEBUG_WRITE,
+                                   (uint64_t)(uintptr_t)output,
+                                   (uint64_t)length, 0U, 0U, 0U, 0U);
+    }
+#else
+    (void)event;
+    (void)descriptor;
+    (void)handle;
+    (void)path;
+#endif
+}
+
+static void libc_debug_close_failure(const char *reason, int descriptor,
+                                    uintptr_t caller_pc) {
+#if OS_DEBUG_SERIAL
+    char output[112];
+    char digits[12];
+    char hex_digits[sizeof(uintptr_t) * 2U];
+    size_t length = 0U;
+    size_t digit_count = 0U;
+    size_t hex_count = 0U;
+    int saved_errno = errno;
+    int64_t signed_value = descriptor;
+    int64_t process_id;
+    uint32_t value;
+    uintptr_t pc = caller_pc;
+    static const char hex[] = "0123456789abcdef";
+    if (reason == 0 ||
+        !libc_trace_budget(&g_libc_close_fail_debug_calls, 64U)) {
+        errno = saved_errno;
+        return;
+    }
+    while (*reason != '\0' && length < sizeof(output) - 20U) {
+        output[length++] = *reason++;
+    }
+    output[length++] = ' ';
+    output[length++] = 'f';
+    output[length++] = 'd';
+    output[length++] = '=';
+    if (signed_value < 0) {
+        output[length++] = '-';
+        signed_value = -signed_value;
+    }
+    value = (uint32_t)signed_value;
+    do {
+        digits[digit_count++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value != 0U && digit_count < sizeof(digits));
+    while (digit_count != 0U) output[length++] = digits[--digit_count];
+    process_id = __libc_linux_syscall6(LINUX_SYS_GETPID,
+                                       0U, 0U, 0U, 0U, 0U, 0U);
+    output[length++] = ' ';
+    output[length++] = 'p';
+    output[length++] = 'i';
+    output[length++] = 'd';
+    output[length++] = '=';
+    value = process_id > 0 ? (uint32_t)process_id : 0U;
+    digit_count = 0U;
+    do {
+        digits[digit_count++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    } while (value != 0U && digit_count < sizeof(digits));
+    while (digit_count != 0U) output[length++] = digits[--digit_count];
+    output[length++] = ' ';
+    output[length++] = 'p';
+    output[length++] = 'c';
+    output[length++] = '=';
+    output[length++] = '0';
+    output[length++] = 'x';
+    do {
+        hex_digits[hex_count++] = hex[pc & 0x0fU];
+        pc >>= 4U;
+    } while (pc != 0U && hex_count < sizeof(hex_digits));
+    while (hex_count != 0U) output[length++] = hex_digits[--hex_count];
+    output[length++] = '\r';
+    output[length++] = '\n';
+    (void)__libc_linux_syscall6(OS_SYS_DEBUG_WRITE,
+                                (uint64_t)(uintptr_t)output, length,
+                                0U, 0U, 0U, 0U);
+    errno = saved_errno;
+#else
+    (void)reason;
+    (void)descriptor;
+    (void)caller_pc;
+#endif
+}
+
+static bool libc_debug_budget(volatile uint32_t *counter) {
+#if defined(OS_RUNTIME_TRACE)
+    return libc_trace_budget(counter, 128U);
+#else
+    (void)counter;
+    return false;
+#endif
+}
+
+static bool libc_drop_service_trace_chunk(const void *buffer, size_t length) {
+#if defined(OS_RUNTIME_TRACE)
+    (void)buffer;
+    (void)length;
+    return false;
+#else
+    uint32_t remaining;
+    /* Complete, unconditional porting-stage markers in the deployed Chrome.
+     * Drop before entering the kernel, even after its UART budget is spent.
+     * Keep this whitelist narrow: warnings/errors and unknown markers still
+     * reach stderr, and explicit runtime tracing bypasses the gate above. */
+    const char *marker = 0;
+    size_t marker_length = 0U;
+    if (length >= 3U && memcmp(buffer, "OS_", 3U) == 0) {
+        marker = (const char *)buffer + 3U;
+        marker_length = length - 3U;
+    }
+    static const struct {
+        const char *text;
+        size_t length;
+    } stage_prefixes[] = {
+        {"NAVIGATE_", sizeof("NAVIGATE_") - 1U},
+        {"TAB_MODEL_", sizeof("TAB_MODEL_") - 1U},
+        {"VIZ_BACK_TO_BACK_", sizeof("VIZ_BACK_TO_BACK_") - 1U},
+        {"CC_UPDATE_", sizeof("CC_UPDATE_") - 1U},
+        {"EXTERNAL_BEGIN_FRAME_", sizeof("EXTERNAL_BEGIN_FRAME_") - 1U},
+    };
+    for (size_t index = 0U;
+         index < sizeof(stage_prefixes) / sizeof(stage_prefixes[0]); ++index) {
+        size_t prefix_length = stage_prefixes[index].length;
+        if (marker != 0 && marker_length >= prefix_length &&
+            memcmp(marker, stage_prefixes[index].text, prefix_length) == 0) {
+            return true;
+        }
+    }
+    if (marker != 0 && marker_length >= LIBC_SERVICE_TRACE_PREFIX_LENGTH &&
+        memcmp(marker, LIBC_SERVICE_TRACE_PREFIX,
+               LIBC_SERVICE_TRACE_PREFIX_LENGTH) == 0) {
+        __atomic_store_n(&g_libc_service_trace_drop_chunks,
+                         LIBC_SERVICE_TRACE_FOLLOWUP_CHUNKS,
+                         __ATOMIC_RELAXED);
+        return true;
+    }
+    remaining = __atomic_load_n(&g_libc_service_trace_drop_chunks,
+                                __ATOMIC_RELAXED);
+    while (remaining != 0U) {
+        if (__atomic_compare_exchange_n(&g_libc_service_trace_drop_chunks,
+                                        &remaining, remaining - 1U, false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            return true;
+        }
+    }
+    return false;
+#endif
+}
+
+static void libc_debug_path(const char *prefix, const char *path) {
+    libc_debug_text(prefix, strlen(prefix));
+    libc_debug_text(path, strlen(path));
+    libc_debug_text("\n", 1U);
+}
+
+static bool libc_database_path(const char *path) {
+    return path != 0 &&
+           (strstr(path, "History") != 0 ||
+            strstr(path, "Local Storage") != 0 ||
+            strstr(path, "LocalStorage") != 0 ||
+            strstr(path, "UKM") != 0 ||
+            strstr(path, "Cookies") != 0 ||
+            strstr(path, "Web Data") != 0 ||
+            strstr(path, ".db") != 0 ||
+            strstr(path, "-journal") != 0 ||
+            strstr(path, "-wal") != 0);
+}
+
+static bool libc_profile_path(const char *path) {
+    return path != 0 && strncmp(path, "/tmp/chrome-data/", 17U) == 0;
+}
+
+static void libc_debug_profile_open(const char *path) {
+    if (!libc_profile_path(path)) return;
+    if (!libc_trace_budget(&g_libc_profile_open_debug_calls, 256U)) {
+        return;
+    }
+    libc_debug_path("OS_LIBC_PROFILE_OPEN_OK path=", path);
+}
+
+static void libc_debug_database_path(const char *prefix, const char *path) {
+    if (!libc_database_path(path)) return;
+    if (!libc_trace_budget(&g_libc_database_open_debug_calls, 128U)) {
+        return;
+    }
+    libc_debug_path(prefix, path);
+}
+
+static bool libc_linux_personality(void) {
+    return __libc_linux_personality();
+}
 static bool g_fd_table_initialized;
 static char g_current_directory[LIBC_PATH_LIMIT] = "/";
+
+/* FAT32 does not carry POSIX permission bits.  Keep the mode requested by
+ * the Linux personality for paths created during this process so stat() has
+ * the same observable result as mkdir(2).  Chrome's ProcessSingleton uses a
+ * 0700 temporary directory as a security check. */
+typedef struct libc_mode_override {
+    bool used;
+    char path[LIBC_PATH_LIMIT];
+    mode_t mode;
+} libc_mode_override_t;
+
+static libc_mode_override_t g_mode_overrides[LIBC_MODE_OVERRIDE_LIMIT];
+
+static int install_linux_fd(int linux_descriptor, int flags,
+                            const char *path);
+static void initialize_fd_table(void);
+static libc_fd_resource_t *resource_for_descriptor(int descriptor);
+static void libc_fd_table_lock(void);
+static void libc_fd_table_unlock(void);
+
+static void remember_linux_mode(const char *path, mode_t mode) {
+    libc_mode_override_t *free_slot = 0;
+    if (!libc_linux_personality() || path == 0) return;
+    for (unsigned int index = 0U; index < LIBC_MODE_OVERRIDE_LIMIT; ++index) {
+        libc_mode_override_t *entry = &g_mode_overrides[index];
+        if (!entry->used) {
+            if (free_slot == 0) free_slot = entry;
+            continue;
+        }
+        if (strcmp(entry->path, path) == 0) {
+            entry->mode = mode & 07777U;
+            return;
+        }
+    }
+    if (free_slot == 0 || strlen(path) >= LIBC_PATH_LIMIT) return;
+    free_slot->used = true;
+    strcpy(free_slot->path, path);
+    free_slot->mode = mode & 07777U;
+}
+
+static void apply_linux_mode_override(const char *path, struct stat *status) {
+    if (!libc_linux_personality() || path == 0 || status == 0) return;
+    for (unsigned int index = 0U; index < LIBC_MODE_OVERRIDE_LIMIT; ++index) {
+        const libc_mode_override_t *entry = &g_mode_overrides[index];
+        if (entry->used && strcmp(entry->path, path) == 0) {
+            status->st_mode = (status->st_mode & S_IFMT) | entry->mode;
+            return;
+        }
+    }
+}
+
+typedef struct libc_linux_timespec {
+    int64_t seconds;
+    int64_t nanoseconds;
+} libc_linux_timespec_t;
+
+/* This is the x86-64 Linux stat ABI returned by the compatibility layer.
+ * It intentionally stays private: the public libc exposes the POSIX stat
+ * layout below and converts at the boundary. */
+typedef struct libc_linux_stat {
+    uint64_t device;
+    uint64_t inode;
+    uint64_t links;
+    uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t mode_padding;
+    uint64_t rdevice;
+    int64_t size;
+    int64_t block_size;
+    int64_t blocks;
+    libc_linux_timespec_t access_time;
+    libc_linux_timespec_t modify_time;
+    libc_linux_timespec_t change_time;
+    int64_t reserved[3];
+} libc_linux_stat_t;
+
+static bool linux_abi_path(const char *path) {
+    if (path == 0) return false;
+    return strcmp(path, "/proc") == 0 || strncmp(path, "/proc/", 6U) == 0 ||
+           strcmp(path, "/sys") == 0 || strncmp(path, "/sys/", 5U) == 0 ||
+           strcmp(path, "/tmp") == 0 || strncmp(path, "/tmp/", 5U) == 0 ||
+           strcmp(path, "/dev/null") == 0 ||
+           strcmp(path, "/dev/nvidiactl") == 0 ||
+           strcmp(path, "/dev/nvidia0") == 0 ||
+           strcmp(path, LINUX_WINDOW_DEVICE_PATH) == 0;
+}
+
+static uint32_t linux_open_flags_from_libc(int flags) {
+    uint32_t result = (uint32_t)(flags & O_ACCMODE);
+    if ((flags & O_CREAT) != 0) result |= LINUX_O_CREAT;
+    if ((flags & O_EXCL) != 0) result |= LINUX_O_EXCL;
+    if ((flags & O_TRUNC) != 0) result |= LINUX_O_TRUNC;
+    if ((flags & O_APPEND) != 0) result |= LINUX_O_APPEND;
+    if ((flags & O_NONBLOCK) != 0) result |= LINUX_O_NONBLOCK;
+    if ((flags & O_NOCTTY) != 0) result |= LINUX_O_NOCTTY;
+    if ((flags & O_DIRECTORY) != 0) result |= LINUX_O_DIRECTORY;
+    if ((flags & O_CLOEXEC) != 0) result |= LINUX_O_CLOEXEC;
+    return result;
+}
+
+static void fill_linux_stat(const libc_linux_stat_t *source,
+                            struct stat *destination) {
+    memset(destination, 0, sizeof(*destination));
+    destination->st_dev = (dev_t)source->device;
+    destination->st_ino = (ino_t)source->inode;
+    destination->st_nlink = (nlink_t)source->links;
+    destination->st_mode = (mode_t)source->mode;
+    destination->st_uid = (uid_t)source->uid;
+    destination->st_gid = (gid_t)source->gid;
+    destination->st_rdev = (dev_t)source->rdevice;
+    destination->st_size = (off_t)source->size;
+    destination->st_blksize = (blksize_t)source->block_size;
+    destination->st_blocks = (blkcnt_t)source->blocks;
+    destination->st_atim.tv_sec = (time_t)source->access_time.seconds;
+    destination->st_atim.tv_nsec = (long)source->access_time.nanoseconds;
+    destination->st_mtim.tv_sec = (time_t)source->modify_time.seconds;
+    destination->st_mtim.tv_nsec = (long)source->modify_time.nanoseconds;
+    destination->st_ctim.tv_sec = (time_t)source->change_time.seconds;
+    destination->st_ctim.tv_nsec = (long)source->change_time.nanoseconds;
+}
 
 static int libc_error(int64_t status) {
     if (status < 0) {
@@ -55,42 +449,326 @@ static int libc_status_error(int64_t status) {
     return status < 0 ? libc_error(status) : 0;
 }
 
-static void initialize_fd_table(void) {
-    if (g_fd_table_initialized) return;
-    memset(g_fd_resources, 0, sizeof(g_fd_resources));
-    memset(g_fd_table, 0, sizeof(g_fd_table));
-    for (unsigned int descriptor = 0U; descriptor < 3U; ++descriptor) {
-        libc_fd_resource_t *resource = &g_fd_resources[descriptor];
-        resource->handle = descriptor;
-        resource->open_flags = descriptor == STDIN_FILENO ? O_RDONLY : O_WRONLY;
-        resource->references = 1U;
-        resource->used = true;
-        resource->debug_output = descriptor != STDIN_FILENO;
-        g_fd_table[descriptor].resource = resource;
-        g_fd_table[descriptor].handle = resource->handle;
+/* Failure-only diagnostics: keep the original errno and avoid allocating. */
+static void libc_tmp_open_failure(const char *stage, const char *path,
+                                  int64_t status) {
+    static uint32_t count;
+    if (path == 0 || strncmp(path, "/tmp/", 5U) != 0 ||
+        status == -EEXIST || status == -ENOENT ||
+        !libc_trace_budget(&count, 16U)) return;
+    int saved_errno = errno;
+    char output[384];
+    int length = snprintf(output, sizeof(output),
+                          "OS_LIBC_TMP_OPEN_FAIL stage=%s status=%lld errno=%d path=%s\n",
+                          stage, (long long)status, saved_errno, path);
+    if (length > 0) {
+        size_t bytes = (size_t)length < sizeof(output) ?
+                       (size_t)length : sizeof(output) - 1U;
+        (void)write(2, output, bytes);
     }
-    g_fd_table_initialized = true;
+    errno = saved_errno;
+}
+
+static void close_raw_linux_descriptor(int descriptor) {
+    if (descriptor >= 0) {
+        (void)__libc_linux_syscall6(
+            LINUX_SYS_CLOSE, (uint64_t)(uint32_t)descriptor,
+            0U, 0U, 0U, 0U, 0U);
+    }
+}
+
+static int install_linux_descriptor_at(int descriptor, int linux_descriptor,
+                                       int open_flags) {
+    libc_fd_resource_t *resource = 0;
+    if (descriptor < 0 || (unsigned int)descriptor >= LIBC_FD_LIMIT ||
+        linux_descriptor < 0 || (unsigned int)linux_descriptor >= LIBC_FD_LIMIT) {
+        errno = EMFILE;
+        return -1;
+    }
+    if (g_fd_table[descriptor].resource != 0) {
+        errno = EMFILE;
+        return -1;
+    }
+    for (unsigned int index = 3U; index < LIBC_FD_LIMIT; ++index) {
+        if (!g_fd_resources[index].used) {
+            resource = &g_fd_resources[index];
+            break;
+        }
+    }
+    if (resource == 0) {
+        errno = EMFILE;
+        return -1;
+    }
+    memset(resource, 0, sizeof(*resource));
+    resource->handle = (os_handle_t)(uint32_t)linux_descriptor;
+    resource->open_flags = (uint32_t)open_flags;
+    resource->references = 1U;
+    resource->used = true;
+    resource->linux_fd = true;
+    resource->path[0] = '\0';
+    g_fd_table[descriptor].resource = resource;
+    g_fd_table[descriptor].handle = resource->handle;
+    g_fd_table[descriptor].descriptor_flags =
+        (open_flags & O_CLOEXEC) != 0 ? FD_CLOEXEC : 0U;
+    return descriptor;
+}
+
+static int adopt_linux_fd_locked(int linux_descriptor, int open_flags) {
+    int duplicate_descriptors[LIBC_FD_LIMIT];
+    unsigned int duplicate_count = 0U;
+    if (g_fd_table[linux_descriptor].resource == 0) {
+        int result = install_linux_descriptor_at(
+            linux_descriptor, linux_descriptor, open_flags);
+        if (result < 0) close_raw_linux_descriptor(linux_descriptor);
+        return result;
+    }
+
+    /* The Linux kernel allocates descriptors without knowing about the
+     * native System descriptor table.  If the returned number is occupied by
+     * a native descriptor, keep each temporary Linux duplicate open while
+     * walking upward.  Closing a colliding duplicate immediately would make
+     * the kernel return the same number on the next DUP and could also make a
+     * requested F_DUPFD slot replace an existing Linux descriptor. */
+    while (duplicate_count < LIBC_FD_LIMIT) {
+        int64_t duplicate;
+        duplicate = __libc_linux_syscall6(
+            LINUX_SYS_DUP, (uint64_t)(uint32_t)linux_descriptor,
+            0U, 0U, 0U, 0U, 0U);
+        if (duplicate < 0) {
+            while (duplicate_count != 0U) {
+                close_raw_linux_descriptor(
+                    duplicate_descriptors[--duplicate_count]);
+            }
+            close_raw_linux_descriptor(linux_descriptor);
+            (void)libc_error(duplicate);
+            return -1;
+        }
+        if (duplicate >= (int64_t)LIBC_FD_LIMIT) {
+            close_raw_linux_descriptor((int)duplicate);
+            while (duplicate_count != 0U) {
+                close_raw_linux_descriptor(
+                    duplicate_descriptors[--duplicate_count]);
+            }
+            close_raw_linux_descriptor(linux_descriptor);
+            errno = EMFILE;
+            return -1;
+        }
+        if (g_fd_table[(int)duplicate].resource == 0) {
+            if ((open_flags & O_CLOEXEC) != 0) {
+                int64_t flag_status = __libc_linux_syscall6(
+                    LINUX_SYS_FCNTL, (uint64_t)(uint32_t)duplicate,
+                    LINUX_F_SETFD, LINUX_FD_CLOEXEC, 0U, 0U, 0U);
+                if (flag_status < 0) {
+                    close_raw_linux_descriptor((int)duplicate);
+                    while (duplicate_count != 0U) {
+                        close_raw_linux_descriptor(
+                            duplicate_descriptors[--duplicate_count]);
+                    }
+                    close_raw_linux_descriptor(linux_descriptor);
+                    return libc_error(flag_status);
+                }
+            }
+            close_raw_linux_descriptor(linux_descriptor);
+            while (duplicate_count != 0U) {
+                close_raw_linux_descriptor(
+                    duplicate_descriptors[--duplicate_count]);
+            }
+            int result = install_linux_descriptor_at(
+                (int)duplicate, (int)duplicate, open_flags);
+            if (result < 0) close_raw_linux_descriptor((int)duplicate);
+            return result;
+        }
+        duplicate_descriptors[duplicate_count++] = (int)duplicate;
+    }
+    while (duplicate_count != 0U) {
+        close_raw_linux_descriptor(duplicate_descriptors[--duplicate_count]);
+    }
+    close_raw_linux_descriptor(linux_descriptor);
+    errno = EMFILE;
+    return -1;
+}
+
+int __libc_adopt_linux_fd(int linux_descriptor, int open_flags) {
+    int result;
+    if (linux_descriptor < 0 ||
+        (unsigned int)linux_descriptor >= LIBC_FD_LIMIT) {
+        errno = EBADF;
+        return -1;
+    }
+    initialize_fd_table();
+    libc_fd_table_lock();
+    result = adopt_linux_fd_locked(linux_descriptor, open_flags);
+    libc_fd_table_unlock();
+    return result;
+}
+
+int __libc_linux_fd_for_descriptor(int descriptor) {
+    libc_fd_resource_t *resource = resource_for_descriptor(descriptor);
+    if (resource == 0 || !resource->linux_fd) {
+        errno = EBADF;
+        return -1;
+    }
+    return (int)g_fd_table[descriptor].handle;
+}
+
+bool __libc_descriptor_is_linux_fd(int descriptor) {
+    int saved_errno = errno;
+    libc_fd_resource_t *resource = resource_for_descriptor(descriptor);
+    bool result = resource != 0 && resource->linux_fd;
+    errno = saved_errno;
+    return result;
+}
+
+int __libc_mark_linux_socket_descriptor(int descriptor, uint32_t family) {
+    libc_fd_resource_t *resource = resource_for_descriptor(descriptor);
+    if (resource == 0 || !resource->linux_fd) {
+        errno = EBADF;
+        return -1;
+    }
+    resource->socket_handle = true;
+    resource->socket_family = family;
+    return 0;
+}
+
+static void libc_fd_table_lock(void) {
+    while (__atomic_exchange_n(&g_fd_table_lock_word, 1U,
+                               __ATOMIC_ACQUIRE) != 0U) {
+        while (__atomic_load_n(&g_fd_table_lock_word,
+                               __ATOMIC_RELAXED) != 0U) {
+            __asm__ volatile("pause");
+        }
+    }
+}
+
+static void libc_fd_table_unlock(void) {
+    __atomic_store_n(&g_fd_table_lock_word, 0U, __ATOMIC_RELEASE);
+}
+
+static void initialize_fd_table(void) {
+    if (__atomic_load_n(&g_fd_table_initialized, __ATOMIC_ACQUIRE)) return;
+    libc_fd_table_lock();
+    if (!g_fd_table_initialized) {
+        memset(g_fd_resources, 0, sizeof(g_fd_resources));
+        memset(g_fd_table, 0, sizeof(g_fd_table));
+        for (unsigned int descriptor = 0U; descriptor < 3U; ++descriptor) {
+            libc_fd_resource_t *resource = &g_fd_resources[descriptor];
+            resource->handle = descriptor;
+            resource->open_flags = descriptor == STDIN_FILENO ?
+                                   O_RDONLY : O_WRONLY;
+            resource->references = 1U;
+            resource->used = true;
+            resource->debug_output = descriptor != STDIN_FILENO;
+            g_fd_table[descriptor].resource = resource;
+            g_fd_table[descriptor].handle = resource->handle;
+        }
+        __atomic_store_n(&g_fd_table_initialized, true, __ATOMIC_RELEASE);
+    }
+    libc_fd_table_unlock();
+}
+
+/* fork() copies this lock word along with the address space.  Serialize the
+ * fork snapshot with descriptor-table mutations, then release the copied lock
+ * in both resulting processes before running user atfork callbacks. */
+void __libc_fd_table_fork_prepare(void) {
+    initialize_fd_table();
+    libc_fd_table_lock();
+}
+
+void __libc_fd_table_fork_parent(void) {
+    libc_fd_table_unlock();
+}
+
+void __libc_fd_table_fork_child(void) {
+    libc_fd_table_unlock();
 }
 
 static libc_fd_resource_t *resource_for_descriptor(int descriptor) {
     initialize_fd_table();
-    if (descriptor < 0 || (unsigned int)descriptor >= LIBC_FD_LIMIT ||
-        g_fd_table[descriptor].resource == 0) {
+    if (descriptor < 0 || (unsigned int)descriptor >= LIBC_FD_LIMIT) {
         errno = EBADF;
         return 0;
     }
-    return g_fd_table[descriptor].resource;
+    if (g_fd_table[descriptor].resource != 0) {
+        return g_fd_table[descriptor].resource;
+    }
+    libc_fd_table_lock();
+    if (g_fd_table[descriptor].resource == 0 && descriptor >= 3 &&
+        libc_linux_personality()) {
+        int64_t descriptor_flags = __libc_linux_syscall6(
+            LINUX_SYS_FCNTL, (uint64_t)(uint32_t)descriptor,
+            LINUX_F_GETFD, 0U, 0U, 0U, 0U);
+        int64_t linux_flags = descriptor_flags < 0 ? descriptor_flags :
+            __libc_linux_syscall6(
+                LINUX_SYS_FCNTL, (uint64_t)(uint32_t)descriptor,
+                LINUX_F_GETFL, 0U, 0U, 0U, 0U);
+        if (descriptor_flags >= 0 && linux_flags >= 0) {
+            int open_flags = (int)(linux_flags &
+                (LINUX_O_WRONLY | LINUX_O_RDWR));
+            if ((linux_flags & LINUX_O_APPEND) != 0U) open_flags |= O_APPEND;
+            if ((linux_flags & LINUX_O_NONBLOCK) != 0U) open_flags |= O_NONBLOCK;
+            if ((linux_flags & LINUX_O_DIRECTORY) != 0U) open_flags |= O_DIRECTORY;
+            if ((descriptor_flags & LINUX_FD_CLOEXEC) != 0U) open_flags |= O_CLOEXEC;
+            if (install_linux_descriptor_at(descriptor, descriptor,
+                                            open_flags) >= 0) {
+                libc_fd_resource_t *resource =
+                    g_fd_table[descriptor].resource;
+                libc_fd_table_unlock();
+                return resource;
+            }
+            if (g_fd_table[descriptor].resource != 0) {
+                libc_fd_resource_t *resource =
+                    g_fd_table[descriptor].resource;
+                libc_fd_table_unlock();
+                return resource;
+            }
+        }
+    }
+    if (g_fd_table[descriptor].resource == 0) {
+        libc_fd_table_unlock();
+        errno = EBADF;
+        return 0;
+    }
+    libc_fd_resource_t *resource = g_fd_table[descriptor].resource;
+    libc_fd_table_unlock();
+    return resource;
 }
 
-static int allocate_descriptor(libc_fd_resource_t *resource,
-                               unsigned int minimum) {
-    initialize_fd_table();
+static int allocate_descriptor_locked(libc_fd_resource_t *resource,
+                                      unsigned int minimum) {
     if (resource == 0 || minimum >= LIBC_FD_LIMIT) {
         errno = EMFILE;
         return -1;
     }
     for (unsigned int descriptor = minimum; descriptor < LIBC_FD_LIMIT; ++descriptor) {
         if (g_fd_table[descriptor].resource == 0) {
+            /* Linux exec inheritance populates the kernel's Linux fd table,
+             * not this libc table. Reserve/adopt such slots before assigning
+             * a native System handle the same numeric descriptor. */
+            if (libc_linux_personality()) {
+                int64_t descriptor_flags = __libc_linux_syscall6(
+                    LINUX_SYS_FCNTL, (uint64_t)descriptor,
+                    LINUX_F_GETFD, 0U, 0U, 0U, 0U);
+                if (descriptor_flags >= 0) {
+                    int64_t linux_flags = __libc_linux_syscall6(
+                        LINUX_SYS_FCNTL, (uint64_t)descriptor,
+                        LINUX_F_GETFL, 0U, 0U, 0U, 0U);
+                    if (linux_flags >= 0) {
+                        int open_flags = (int)(linux_flags &
+                            (LINUX_O_WRONLY | LINUX_O_RDWR));
+                        if ((linux_flags & LINUX_O_APPEND) != 0U)
+                            open_flags |= O_APPEND;
+                        if ((linux_flags & LINUX_O_NONBLOCK) != 0U)
+                            open_flags |= O_NONBLOCK;
+                        if ((linux_flags & LINUX_O_DIRECTORY) != 0U)
+                            open_flags |= O_DIRECTORY;
+                        if ((descriptor_flags & LINUX_FD_CLOEXEC) != 0U)
+                            open_flags |= O_CLOEXEC;
+                        (void)install_linux_descriptor_at(
+                            (int)descriptor, (int)descriptor, open_flags);
+                    }
+                    continue;
+                }
+            }
             g_fd_table[descriptor].resource = resource;
             g_fd_table[descriptor].descriptor_flags = 0U;
             ++resource->references;
@@ -110,6 +788,7 @@ int __libc_install_handle(os_handle_t handle, uint32_t open_flags,
         return -1;
     }
     initialize_fd_table();
+    libc_fd_table_lock();
     for (unsigned int index = 3U; index < LIBC_FD_LIMIT; ++index) {
         if (!g_fd_resources[index].used) {
             resource = &g_fd_resources[index];
@@ -117,7 +796,8 @@ int __libc_install_handle(os_handle_t handle, uint32_t open_flags,
         }
     }
     if (resource == 0) {
-        (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
+        libc_fd_table_unlock();
+        (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
         errno = EMFILE;
         return -1;
     }
@@ -126,16 +806,18 @@ int __libc_install_handle(os_handle_t handle, uint32_t open_flags,
     resource->references = 0U;
     resource->used = true;
     resource->debug_output = false;
+    resource->linux_fd = false;
     resource->socket_handle = socket_handle;
     resource->socket_family = socket_family;
     resource->pipe_handle = false;
     resource->pipe_read_end = false;
     resource->path[0] = '\0';
-    descriptor = allocate_descriptor(resource, 3U);
+    descriptor = allocate_descriptor_locked(resource, 3U);
     if (descriptor >= 0) g_fd_table[descriptor].handle = handle;
+    if (descriptor < 0) resource->used = false;
+    libc_fd_table_unlock();
     if (descriptor < 0) {
-        resource->used = false;
-        (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
+        (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
     }
     return descriptor;
 }
@@ -214,26 +896,49 @@ int __libc_status_result(int64_t status) {
     return libc_status_error(status);
 }
 
-static int release_descriptor(int descriptor) {
-    libc_fd_resource_t *resource = g_fd_table[descriptor].resource;
-    os_handle_t handle = g_fd_table[descriptor].handle;
-    int result = 0;
-    if (resource == 0 || resource->references == 0U) return 0;
-    if (!resource->debug_output) {
-        int64_t status = liteos_syscall6(OS_SYS_HANDLE_CLOSE, handle,
-                                         0U, 0U, 0U, 0U, 0U);
-        result = libc_status_error(status);
-    }
+static void release_resource_reference(libc_fd_resource_t *resource) {
+    if (resource == 0 || resource->references == 0U) return;
     --resource->references;
-    if (resource->references != 0U) return result;
+    if (resource->references != 0U) return;
     resource->open_flags = 0U;
     resource->debug_output = false;
+    resource->linux_fd = false;
     resource->socket_handle = false;
     resource->socket_family = 0U;
     resource->pipe_handle = false;
     resource->pipe_read_end = false;
     resource->path[0] = '\0';
     resource->used = false;
+}
+
+static int release_descriptor(int descriptor) {
+    libc_fd_resource_t *resource = g_fd_table[descriptor].resource;
+    os_handle_t handle = g_fd_table[descriptor].handle;
+    int result = 0;
+    if (resource == 0 || resource->references == 0U) return 0;
+    if (!resource->debug_output) {
+        int64_t status = resource->linux_fd ?
+            __libc_linux_syscall6(LINUX_SYS_CLOSE, (uint64_t)handle,
+                                  0U, 0U, 0U, 0U, 0U) :
+            __libc_native_syscall6(OS_SYS_HANDLE_CLOSE, handle,
+                            0U, 0U, 0U, 0U, 0U);
+        result = libc_status_error(status);
+    }
+    release_resource_reference(resource);
+    return result;
+}
+
+static int close_descriptor_locked(int descriptor) {
+    int result;
+    if (descriptor < 0 || (unsigned int)descriptor >= LIBC_FD_LIMIT ||
+        g_fd_table[descriptor].resource == 0) {
+        errno = EBADF;
+        return -1;
+    }
+    result = release_descriptor(descriptor);
+    g_fd_table[descriptor].resource = 0;
+    g_fd_table[descriptor].handle = OS_INVALID_HANDLE;
+    g_fd_table[descriptor].descriptor_flags = 0U;
     return result;
 }
 
@@ -248,7 +953,7 @@ void __libc_build_exec_fd_map(os_exec_fd_map_t *map) {
          ++descriptor) {
         libc_fd_resource_t *resource = g_fd_table[descriptor].resource;
         os_exec_fd_entry_t *entry;
-        if (resource == 0 ||
+        if (resource == 0 || resource->linux_fd ||
             (g_fd_table[descriptor].descriptor_flags & FD_CLOEXEC) != 0U) {
             continue;
         }
@@ -277,7 +982,7 @@ void __libc_init_descriptors(char **envp) {
     for (unsigned int index = 0U; index < 128U; ++index) {
         uint64_t type = auxiliary[index * 2U];
         if (type == 0U) break;
-        if (type == OS_AUX_LITEOS_FD_MAP) {
+        if (type == OS_AUX_FD_MAP) {
             map = (os_exec_fd_map_t *)(uintptr_t)auxiliary[index * 2U + 1U];
             break;
         }
@@ -309,6 +1014,7 @@ void __libc_init_descriptors(char **envp) {
         resource->used = true;
         resource->debug_output =
             (entry->resource_flags & OS_EXEC_FD_DEBUG) != 0U;
+        resource->linux_fd = false;
         resource->socket_handle =
             (entry->resource_flags & OS_EXEC_FD_SOCKET) != 0U;
         resource->socket_family = entry->socket_family;
@@ -483,7 +1189,26 @@ static void fill_stat(const os_file_info_t *info, struct stat *status) {
     status->st_blocks = (blkcnt_t)((info->size + 511U) / 512U);
 }
 
-int64_t liteos_syscall6(uint64_t number, uint64_t argument0,
+/* The native file ABI predates POSIX inode identity and therefore returns
+ * zero for st_dev/st_ino.  SQLite uses the pair as its in-process lock key;
+ * leaving both fields zero makes every database look like the same file.
+ * System has no hard links, so a stable hash of the canonical path provides
+ * the required identity for native files while keeping stat() and fstat()
+ * consistent. */
+static void libc_set_file_identity(const char *path, struct stat *status) {
+    const unsigned char *cursor = (const unsigned char *)path;
+    uint64_t hash = 1469598103934665603ULL;
+    if (path == 0 || status == 0) return;
+    while (*cursor != 0U) {
+        hash ^= (uint64_t)*cursor++;
+        hash *= 1099511628211ULL;
+    }
+    if (hash == 0U) hash = 1U;
+    status->st_dev = (dev_t)1U;
+    status->st_ino = (ino_t)hash;
+}
+
+static int64_t libc_raw_syscall6(uint64_t number, uint64_t argument0,
                         uint64_t argument1, uint64_t argument2,
                         uint64_t argument3, uint64_t argument4,
                         uint64_t argument5) {
@@ -499,6 +1224,169 @@ int64_t liteos_syscall6(uint64_t number, uint64_t argument0,
     return (int64_t)result;
 }
 
+int64_t __libc_linux_syscall6(uint64_t number, uint64_t argument0,
+                              uint64_t argument1, uint64_t argument2,
+                              uint64_t argument3, uint64_t argument4,
+                              uint64_t argument5) {
+    return libc_raw_syscall6(number, argument0, argument1, argument2,
+                               argument3, argument4, argument5);
+}
+
+int64_t __libc_native_syscall6(uint64_t number, uint64_t argument0,
+                        uint64_t argument1, uint64_t argument2,
+                        uint64_t argument3, uint64_t argument4,
+                        uint64_t argument5) {
+    return libc_raw_syscall6(number | OS_SYSCALL_NATIVE_FLAG,
+                               argument0, argument1, argument2, argument3,
+                               argument4, argument5);
+}
+
+/* Linux-compatible varargs entry point.  Chromium uses syscall() for a
+ * handful of hot paths (futex, getrandom, gettid, and signal helpers) rather
+ * than going through a named libc wrapper.  Linux-personality processes are
+ * dispatched by the kernel based on the raw syscall number, so preserve all
+ * six ABI argument slots exactly. */
+static size_t linux_syscall_argument_count(long number) {
+    switch ((uint64_t)number) {
+    case LINUX_SYS_READ:
+    case LINUX_SYS_WRITE:
+    case LINUX_SYS_OPEN:
+    case LINUX_SYS_POLL:
+    case LINUX_SYS_READV:
+    case LINUX_SYS_WRITEV:
+    case LINUX_SYS_LSEEK:
+    case LINUX_SYS_MPROTECT:
+    case LINUX_SYS_MADVISE:
+    case LINUX_SYS_SOCKET:
+    case LINUX_SYS_CONNECT:
+    case LINUX_SYS_ACCEPT:
+    case LINUX_SYS_BIND:
+    case LINUX_SYS_SENDMSG:
+    case LINUX_SYS_RECVMSG:
+    case LINUX_SYS_GETSOCKNAME:
+    case LINUX_SYS_GETPEERNAME:
+    case LINUX_SYS_IOCTL:
+    case LINUX_SYS_FCNTL:
+    case LINUX_SYS_GETDENTS64:
+    case LINUX_SYS_READLINK:
+    case LINUX_SYS_GETRANDOM:
+    case LINUX_SYS_SCHED_GETAFFINITY:
+    case LINUX_SYS_DUP3:
+    case LINUX_SYS_EXECVE:
+    case LINUX_SYS_GETRESUID:
+    case LINUX_SYS_GETRESGID:
+        return 3U;
+    case LINUX_SYS_CLOSE:
+    case LINUX_SYS_PIPE:
+    case LINUX_SYS_DUP:
+    case LINUX_SYS_BRK:
+    case LINUX_SYS_FSYNC:
+    case LINUX_SYS_FDATASYNC:
+    case LINUX_SYS_CHDIR:
+    case LINUX_SYS_SET_TID_ADDRESS:
+    case LINUX_SYS_EXIT:
+    case LINUX_SYS_EXIT_GROUP:
+    case LINUX_SYS_UNAME:
+    case LINUX_SYS_EVENTFD:
+    case LINUX_SYS_EPOLL_CREATE:
+    case LINUX_SYS_EPOLL_CREATE1:
+    case LINUX_SYS_WINDOW_CREATE:
+    case LINUX_SYS_DISPLAY_GET_INFO:
+        return 1U;
+    case LINUX_SYS_STAT:
+    case LINUX_SYS_FSTAT:
+    case LINUX_SYS_LSTAT:
+    case LINUX_SYS_ACCESS:
+    case LINUX_SYS_MUNMAP:
+    case LINUX_SYS_FTRUNCATE:
+    case LINUX_SYS_SHUTDOWN:
+    case LINUX_SYS_LISTEN:
+    case LINUX_SYS_RENAME:
+    case LINUX_SYS_KILL:
+    case LINUX_SYS_PRCTL:
+    case LINUX_SYS_ARCH_PRCTL:
+    case LINUX_SYS_GETCWD:
+    case LINUX_SYS_SET_ROBUST_LIST:
+    case LINUX_SYS_DUP2:
+    case LINUX_SYS_PIPE2:
+    case LINUX_SYS_EVENTFD2:
+    case LINUX_SYS_NANOSLEEP:
+    case LINUX_SYS_CLOCK_GETTIME:
+        return 2U;
+    case LINUX_SYS_RT_SIGACTION:
+    case LINUX_SYS_RT_SIGPROCMASK:
+    case LINUX_SYS_PREAD64:
+    case LINUX_SYS_PWRITE64:
+    case LINUX_SYS_SOCKETPAIR:
+    case LINUX_SYS_WAIT4:
+    case LINUX_SYS_EPOLL_WAIT:
+    case LINUX_SYS_EPOLL_CTL:
+    case LINUX_SYS_OPENAT:
+    case LINUX_SYS_NEWFSTATAT:
+    case LINUX_SYS_READLINKAT:
+    case LINUX_SYS_FACCESSAT2:
+    case LINUX_SYS_ACCEPT4:
+    case LINUX_SYS_RSEQ:
+    case LINUX_SYS_PRLIMIT64:
+        return 4U;
+    case LINUX_SYS_MREMAP:
+    case LINUX_SYS_CLONE:
+    case LINUX_SYS_SETSOCKOPT:
+    case LINUX_SYS_GETSOCKOPT:
+    case LINUX_SYS_PREADV:
+    case LINUX_SYS_PWRITEV:
+    case LINUX_SYS_STATX:
+        return 5U;
+    case LINUX_SYS_EPOLL_PWAIT:
+    case LINUX_SYS_FUTEX:
+    case LINUX_SYS_SENDTO:
+    case LINUX_SYS_RECVFROM:
+        return 6U;
+    case LINUX_SYS_MMAP:
+        return 6U;
+    case LINUX_SYS_SCHED_YIELD:
+    case LINUX_SYS_GETPID:
+    case LINUX_SYS_GETTID:
+    case LINUX_SYS_GETUID:
+    case LINUX_SYS_GETGID:
+    case LINUX_SYS_GETEUID:
+    case LINUX_SYS_GETEGID:
+    case LINUX_SYS_FORK:
+    case LINUX_SYS_VFORK:
+        return 0U;
+    default:
+        /* An unsupported syscall does not need any varargs.  Avoid reading
+         * arguments that the caller did not provide before returning ENOSYS. */
+        return 0U;
+    }
+}
+
+/* Chromium can enter this varargs ABI from callbacks whose stack alignment is
+ * not controlled by the System CRT (notably early thread/bootstrap paths).
+ * GCC's realignment prologue prevents SSE stores used for the va_arg array
+ * from raising #GP on an otherwise valid Linux syscall. */
+__attribute__((force_align_arg_pointer))
+long syscall(long number, ...) {
+    va_list arguments;
+    uint64_t values[6] = {0U};
+    size_t count = linux_syscall_argument_count(number);
+    int64_t result;
+
+    va_start(arguments, number);
+    for (size_t index = 0U; index < count; ++index) {
+        values[index] = va_arg(arguments, uint64_t);
+    }
+    va_end(arguments);
+    result = __libc_linux_syscall6((uint64_t)number,
+                                   values[0], values[1], values[2], values[3],
+                                   values[4], values[5]);
+    if (result < 0) {
+        (void)libc_error(result);
+        return -1L;
+    }
+    return (long)result;
+}
+
 ssize_t read(int descriptor, void *buffer, size_t length) {
     libc_fd_resource_t *resource = resource_for_descriptor(descriptor);
     uint64_t bytes = 0U;
@@ -511,18 +1399,28 @@ ssize_t read(int descriptor, void *buffer, size_t length) {
         errno = EINVAL;
         return -1;
     }
-    if (resource->socket_handle) {
+    if (resource->linux_fd) {
+        status = __libc_linux_syscall6(
+            LINUX_SYS_READ, (uint64_t)g_fd_table[descriptor].handle,
+            (uint64_t)(uintptr_t)buffer, length, 0U, 0U, 0U);
+        if (status < 0) {
+            (void)libc_error(status);
+            return -1;
+        }
+        return status > INT64_MAX ? (errno = EOVERFLOW, -1) :
+               (ssize_t)status;
+    } else if (resource->socket_handle) {
         uint64_t timeout = (resource->open_flags & O_NONBLOCK) != 0U ?
                            0U : OS_WAIT_INFINITE;
         if (resource->socket_family == AF_INET6) {
-            status = liteos_syscall6(OS_SYS_SOCKET_RECV6,
+            status = __libc_native_syscall6(OS_SYS_SOCKET_RECV6,
                                      g_fd_table[descriptor].handle,
                                      (uint64_t)(uintptr_t)buffer, length,
                                      (uint64_t)(uintptr_t)source_address6,
                                      (uint64_t)(uintptr_t)&source_port,
                                      timeout);
         } else {
-            status = liteos_syscall6(OS_SYS_SOCKET_RECV,
+            status = __libc_native_syscall6(OS_SYS_SOCKET_RECV,
                                      g_fd_table[descriptor].handle,
                                      (uint64_t)(uintptr_t)buffer, length,
                                      (uint64_t)(uintptr_t)&source_address,
@@ -532,11 +1430,11 @@ ssize_t read(int descriptor, void *buffer, size_t length) {
     } else if (resource->pipe_handle) {
         uint64_t timeout = (resource->open_flags & O_NONBLOCK) != 0U ?
                            0U : OS_WAIT_INFINITE;
-        status = liteos_syscall6(OS_SYS_PIPE_READ, g_fd_table[descriptor].handle,
+        status = __libc_native_syscall6(OS_SYS_PIPE_READ, g_fd_table[descriptor].handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  timeout, (uint64_t)(uintptr_t)&bytes, 0U);
     } else {
-        status = liteos_syscall6(OS_SYS_FILE_READ, g_fd_table[descriptor].handle,
+        status = __libc_native_syscall6(OS_SYS_FILE_READ, g_fd_table[descriptor].handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  (uint64_t)(uintptr_t)&bytes, 0U, 0U);
     }
@@ -564,9 +1462,10 @@ static ssize_t debug_write(const void *buffer, size_t length) {
     const unsigned char *cursor = (const unsigned char *)buffer;
     size_t remaining = length;
     if (length == 0U) return 0;
+    if (libc_drop_service_trace_chunk(buffer, length)) return (ssize_t)length;
     while (remaining != 0U) {
         size_t chunk = remaining > 240U ? 240U : remaining;
-        int64_t status = liteos_syscall6(OS_SYS_DEBUG_WRITE,
+        int64_t status = __libc_native_syscall6(OS_SYS_DEBUG_WRITE,
                                          (uint64_t)(uintptr_t)cursor, chunk,
                                          0U, 0U, 0U, 0U);
         if (status < 0) {
@@ -593,16 +1492,26 @@ ssize_t write(int descriptor, const void *buffer, size_t length) {
         errno = EINVAL;
         return -1;
     }
-    if (resource->debug_output) return debug_write(buffer, length);
-    if (resource->socket_handle) {
+    if (resource->linux_fd) {
+        status = __libc_linux_syscall6(
+            LINUX_SYS_WRITE, (uint64_t)g_fd_table[descriptor].handle,
+            (uint64_t)(uintptr_t)buffer, length, 0U, 0U, 0U);
+        if (status < 0) {
+            (void)libc_error(status);
+            return -1;
+        }
+        return status > INT64_MAX ? (errno = EOVERFLOW, -1) :
+               (ssize_t)status;
+    } else if (resource->debug_output) return debug_write(buffer, length);
+    else if (resource->socket_handle) {
         if (resource->socket_family == AF_INET6) {
-            status = liteos_syscall6(OS_SYS_SOCKET_SEND6,
+            status = __libc_native_syscall6(OS_SYS_SOCKET_SEND6,
                                      g_fd_table[descriptor].handle,
                                      (uint64_t)(uintptr_t)buffer, length,
                                      (uint64_t)(uintptr_t)destination_address6,
                                      0U, 0U);
         } else {
-            status = liteos_syscall6(OS_SYS_SOCKET_SEND,
+            status = __libc_native_syscall6(OS_SYS_SOCKET_SEND,
                                      g_fd_table[descriptor].handle,
                                      (uint64_t)(uintptr_t)buffer, length,
                                      0U, 0U, 0U);
@@ -610,12 +1519,12 @@ ssize_t write(int descriptor, const void *buffer, size_t length) {
     } else if (resource->pipe_handle) {
         uint64_t timeout = (resource->open_flags & O_NONBLOCK) != 0U ?
                            0U : OS_WAIT_INFINITE;
-        status = liteos_syscall6(OS_SYS_PIPE_WRITE,
+        status = __libc_native_syscall6(OS_SYS_PIPE_WRITE,
                                  g_fd_table[descriptor].handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  timeout, (uint64_t)(uintptr_t)&bytes, 0U);
     } else {
-        status = liteos_syscall6(OS_SYS_FILE_WRITE,
+        status = __libc_native_syscall6(OS_SYS_FILE_WRITE,
                                  g_fd_table[descriptor].handle,
                                  (uint64_t)(uintptr_t)buffer, length,
                                  (uint64_t)(uintptr_t)&bytes, 0U, 0U);
@@ -643,22 +1552,38 @@ ssize_t write(int descriptor, const void *buffer, size_t length) {
 int open(const char *path, int flags, ...) {
     os_handle_t handle = OS_INVALID_HANDLE;
     uint32_t mode = 0U;
+    uint32_t file_flags = 0U;
     libc_fd_resource_t *resource;
     int descriptor;
     int64_t status;
     char absolute_path[LIBC_PATH_LIMIT];
-    const int supported_flags = (int)(OS_FILE_OPEN_READ |
-                                      OS_FILE_OPEN_WRITE |
-                                      OS_FILE_OPEN_CREATE |
-                                      OS_FILE_OPEN_EXCLUSIVE |
-                                      OS_FILE_OPEN_TRUNCATE |
-                                      OS_FILE_OPEN_APPEND |
-                                      OS_FILE_OPEN_DIRECTORY |
-                                      O_NONBLOCK | O_CLOEXEC);
+    const int supported_flags = O_ACCMODE | O_CREAT | O_EXCL | O_NOCTTY |
+                                O_TRUNC | O_APPEND | O_NONBLOCK | O_LARGEFILE |
+                                O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
     if ((flags & ~supported_flags) != 0) {
         errno = EINVAL;
         return -1;
     }
+    switch (flags & O_ACCMODE) {
+    case O_RDONLY:
+        file_flags |= OS_FILE_OPEN_READ;
+        break;
+    case O_WRONLY:
+        file_flags |= OS_FILE_OPEN_WRITE;
+        break;
+    case O_RDWR:
+        file_flags |= OS_FILE_OPEN_READ | OS_FILE_OPEN_WRITE;
+        break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    if ((flags & O_CREAT) != 0) file_flags |= OS_FILE_OPEN_CREATE;
+    if ((flags & O_EXCL) != 0) file_flags |= OS_FILE_OPEN_EXCLUSIVE;
+    if ((flags & O_TRUNC) != 0) file_flags |= OS_FILE_OPEN_TRUNCATE;
+    if ((flags & O_APPEND) != 0) file_flags |= OS_FILE_OPEN_APPEND;
+    if ((flags & O_DIRECTORY) != 0) file_flags |= OS_FILE_OPEN_DIRECTORY;
+    if ((flags & O_CLOEXEC) != 0) file_flags |= OS_FILE_OPEN_CLOEXEC;
     if (!make_absolute_path(path, absolute_path)) return -1;
     if ((flags & O_CREAT) != 0) {
         va_list arguments;
@@ -666,24 +1591,46 @@ int open(const char *path, int flags, ...) {
         mode = (uint32_t)va_arg(arguments, int);
         va_end(arguments);
     }
-    status = liteos_syscall6(OS_SYS_FILE_OPEN,
+    if (linux_abi_path(absolute_path) && libc_linux_personality()) {
+        status = __libc_linux_syscall6(
+            LINUX_SYS_OPENAT, (uint64_t)(int64_t)LINUX_AT_FDCWD,
+            (uint64_t)(uintptr_t)absolute_path,
+            linux_open_flags_from_libc(flags), mode, 0U, 0U);
+        if (status < 0) {
+            (void)libc_error(status);
+            libc_tmp_open_failure("openat", absolute_path, status);
+            return -1;
+        }
+        int result = install_linux_fd((int)status, flags, absolute_path);
+        if (result < 0)
+            libc_tmp_open_failure("adopt", absolute_path, -(int64_t)errno);
+        return result;
+    }
+    status = __libc_native_syscall6(OS_SYS_FILE_OPEN,
                              (uint64_t)(uintptr_t)absolute_path,
-                             (uint32_t)flags & (OS_FILE_OPEN_READ |
-                                                OS_FILE_OPEN_WRITE |
-                                                OS_FILE_OPEN_CREATE |
-                                                OS_FILE_OPEN_EXCLUSIVE |
-                                                OS_FILE_OPEN_TRUNCATE |
-                                                OS_FILE_OPEN_APPEND |
-                                                OS_FILE_OPEN_DIRECTORY |
-                                                ((flags & O_CLOEXEC) != 0 ?
-                                                 OS_FILE_OPEN_CLOEXEC : 0U)),
+                             file_flags,
                              mode,
                              (uint64_t)(uintptr_t)&handle, 0U, 0U);
     if (status < 0) {
+        if (libc_debug_budget(&g_libc_open_fail_debug_calls)) {
+            libc_debug_text("OS_LIBC_OPEN_FAIL status=",
+                            sizeof("OS_LIBC_OPEN_FAIL status=") - 1U);
+            char status_text[24];
+            int status_length = snprintf(status_text, sizeof(status_text),
+                                         "%lld path=", (long long)status);
+            if (status_length > 0) {
+                libc_debug_text(status_text, (size_t)status_length);
+            }
+            libc_debug_text(absolute_path, strlen(absolute_path));
+            libc_debug_text("\n", 1U);
+        }
+        libc_debug_database_path("OS_LIBC_DB_OPEN_FAIL path=", absolute_path);
         libc_error(status);
+        libc_tmp_open_failure("native-open", absolute_path, status);
         return -1;
     }
     initialize_fd_table();
+    libc_fd_table_lock();
     resource = 0;
     for (unsigned int index = 3U; index < LIBC_FD_LIMIT; ++index) {
         if (!g_fd_resources[index].used) {
@@ -692,7 +1639,10 @@ int open(const char *path, int flags, ...) {
         }
     }
     if (resource == 0) {
-        (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
+        libc_fd_table_unlock();
+        (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
+        libc_debug_database_path("OS_LIBC_DB_OPEN_NO_RESOURCE path=",
+                                 absolute_path);
         errno = EMFILE;
         return -1;
     }
@@ -706,14 +1656,22 @@ int open(const char *path, int flags, ...) {
     resource->pipe_handle = false;
     resource->pipe_read_end = false;
     strcpy(resource->path, absolute_path);
-    descriptor = allocate_descriptor(resource, 3U);
+    descriptor = allocate_descriptor_locked(resource, 3U);
     if (descriptor >= 0) g_fd_table[descriptor].handle = handle;
     if (descriptor >= 0 && (flags & O_CLOEXEC) != 0) {
         g_fd_table[descriptor].descriptor_flags |= FD_CLOEXEC;
     }
+    if (descriptor < 0) resource->used = false;
+    libc_fd_table_unlock();
     if (descriptor < 0) {
-        resource->used = false;
-        (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
+        (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, handle, 0U, 0U, 0U, 0U, 0U);
+        libc_debug_database_path("OS_LIBC_DB_OPEN_NO_DESCRIPTOR path=",
+                                 absolute_path);
+    }
+    if (descriptor >= 0) {
+    libc_debug_fd_event("open-native", descriptor, handle, absolute_path);
+        libc_debug_profile_open(absolute_path);
+        libc_debug_database_path("OS_LIBC_DB_OPEN_OK path=", absolute_path);
     }
     return descriptor;
 }
@@ -763,12 +1721,114 @@ int creat64(const char *path, unsigned int mode) {
     return creat(path, mode);
 }
 
+int memfd_create(const char *name, unsigned int flags) {
+    char path[] = "/tmp/memfd-XXXXXX";
+    int descriptor;
+
+    (void)name;
+    if ((flags & ~(MFD_CLOEXEC | MFD_ALLOW_SEALING)) != 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    descriptor = mkstemp(path);
+    if (descriptor < 0) return -1;
+    if ((flags & MFD_CLOEXEC) != 0U && fcntl(descriptor, F_SETFD,
+                                             FD_CLOEXEC) < 0) {
+        int saved_errno = errno;
+        (void)close(descriptor);
+        (void)unlink(path);
+        errno = saved_errno;
+        return -1;
+    }
+    /* Keep the descriptor alive while making the backing file anonymous. */
+    if (unlink(path) < 0) {
+        int saved_errno = errno;
+        (void)close(descriptor);
+        errno = saved_errno;
+        return -1;
+    }
+    return descriptor;
+}
+
+static int install_linux_fd(int linux_descriptor, int flags,
+                            const char *path) {
+    libc_fd_resource_t *resource;
+    int descriptor;
+    if (linux_descriptor < 0 || path == 0) {
+        errno = EBADF;
+        return -1;
+    }
+    descriptor = __libc_adopt_linux_fd(linux_descriptor, flags);
+    if (descriptor < 0) return -1;
+    resource = g_fd_table[descriptor].resource;
+    if (resource == 0) {
+        (void)close(descriptor);
+        errno = EIO;
+        return -1;
+    }
+    strcpy(resource->path, path);
+    libc_debug_fd_event("open-linux", descriptor, resource->handle, path);
+    return descriptor;
+}
+
 int close(int descriptor) {
-    if (resource_for_descriptor(descriptor) == 0) return -1;
-    int result = release_descriptor(descriptor);
-    g_fd_table[descriptor].resource = 0;
-    g_fd_table[descriptor].handle = OS_INVALID_HANDLE;
-    g_fd_table[descriptor].descriptor_flags = 0U;
+    libc_fd_resource_t *resource;
+    int result;
+    uintptr_t caller_pc = (uintptr_t)__builtin_return_address(0);
+    initialize_fd_table();
+    if (descriptor < 0 || (unsigned int)descriptor >= LIBC_FD_LIMIT) {
+        errno = EBADF;
+        libc_debug_close_failure("OS_LIBC_CLOSE_RANGE", descriptor,
+                                 caller_pc);
+        return -1;
+    }
+
+    /* Keep a mapped descriptor stable through the kernel close.  Looking up
+     * the resource before taking the table lock allowed another thread to
+     * retire/reuse the slot between lookup and close. */
+    libc_fd_table_lock();
+    resource = g_fd_table[descriptor].resource;
+    if (resource != 0) {
+        bool linux_fd = resource->linux_fd;
+        libc_debug_fd_event(linux_fd ? "close-linux" : "close-native",
+                            descriptor, g_fd_table[descriptor].handle,
+                            resource->path);
+        result = close_descriptor_locked(descriptor);
+        libc_fd_table_unlock();
+        if (result != 0) {
+            libc_debug_close_failure(linux_fd ?
+                "OS_LIBC_CLOSE_MAPPED_LINUX" :
+                "OS_LIBC_CLOSE_MAPPED_NATIVE", descriptor, caller_pc);
+        }
+        return result;
+    }
+
+    /* Direct Linux syscall users can introduce descriptors without first
+     * passing through a libc wrapper.  Adopt those only after releasing the
+     * lock, because resource_for_descriptor() performs its own locked probe. */
+    libc_fd_table_unlock();
+    resource = resource_for_descriptor(descriptor);
+    if (resource == 0) {
+        libc_debug_close_failure("OS_LIBC_CLOSE_ADOPT_MISS", descriptor,
+                                 caller_pc);
+        return -1;
+    }
+    libc_fd_table_lock();
+    if (g_fd_table[descriptor].resource != resource) {
+        libc_fd_table_unlock();
+        errno = EBADF;
+        libc_debug_close_failure("OS_LIBC_CLOSE_ADOPT_RACE", descriptor,
+                                 caller_pc);
+        return -1;
+    }
+    bool linux_fd = resource->linux_fd;
+    result = close_descriptor_locked(descriptor);
+    libc_fd_table_unlock();
+    if (result != 0) {
+        libc_debug_close_failure(linux_fd ?
+            "OS_LIBC_CLOSE_ADOPTED_LINUX" :
+            "OS_LIBC_CLOSE_ADOPTED_NATIVE", descriptor, caller_pc);
+    }
     return result;
 }
 
@@ -788,12 +1848,38 @@ int pipe2(int pipefd[2], int flags) {
         errno = EINVAL;
         return -1;
     }
+    if (libc_linux_personality()) {
+        int32_t linux_descriptors[2] = {-1, -1};
+        int64_t linux_status = __libc_linux_syscall6(
+            LINUX_SYS_PIPE2, (uint64_t)(uintptr_t)linux_descriptors,
+            (uint64_t)(uint32_t)flags, 0U, 0U, 0U, 0U);
+        if (linux_status < 0) return libc_error(linux_status);
+        read_descriptor = __libc_adopt_linux_fd(
+            linux_descriptors[0],
+            O_RDONLY | (flags & (O_NONBLOCK | O_CLOEXEC)));
+        if (read_descriptor < 0) {
+            close_raw_linux_descriptor(linux_descriptors[1]);
+            return -1;
+        }
+        write_descriptor = __libc_adopt_linux_fd(
+            linux_descriptors[1],
+            O_WRONLY | (flags & (O_NONBLOCK | O_CLOEXEC)));
+        if (write_descriptor < 0) {
+            int saved_errno = errno;
+            (void)close(read_descriptor);
+            errno = saved_errno;
+            return -1;
+        }
+        pipefd[0] = read_descriptor;
+        pipefd[1] = write_descriptor;
+        return 0;
+    }
     if ((flags & O_CLOEXEC) != 0) pipe_flags |= OS_PIPE_FLAG_CLOEXEC;
     if ((flags & O_NONBLOCK) != 0) pipe_flags |= OS_PIPE_FLAG_NONBLOCK;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.flags = pipe_flags;
-    status = liteos_syscall6(OS_SYS_PIPE_CREATE,
+    status = __libc_native_syscall6(OS_SYS_PIPE_CREATE,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (status < 0) return libc_error(status);
@@ -801,7 +1887,7 @@ int pipe2(int pipefd[2], int flags) {
     read_descriptor = __libc_install_pipe_handle(request.read_handle,
                                                   open_flags, true);
     if (read_descriptor < 0) {
-        (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, request.write_handle,
+        (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, request.write_handle,
                               0U, 0U, 0U, 0U, 0U);
         return -1;
     }
@@ -831,6 +1917,16 @@ off_t lseek(int descriptor, off_t offset, int whence) {
     os_file_seek_t request = {0};
     int64_t status;
     if (resource == 0) return -1;
+    if (resource->linux_fd) {
+        status = __libc_linux_syscall6(
+            LINUX_SYS_LSEEK, (uint64_t)g_fd_table[descriptor].handle,
+            (uint64_t)offset, (uint64_t)(uint32_t)whence, 0U, 0U, 0U);
+        if (status < 0) {
+            (void)libc_error(status);
+            return -1;
+        }
+        return status > INT64_MAX ? (errno = EOVERFLOW, -1) : (off_t)status;
+    }
     if (resource->pipe_handle) {
         errno = ESPIPE;
         return -1;
@@ -840,10 +1936,12 @@ off_t lseek(int descriptor, off_t offset, int whence) {
     request.handle = g_fd_table[descriptor].handle;
     request.offset = offset;
     request.whence = (uint32_t)whence;
-    status = liteos_syscall6(OS_SYS_FILE_SEEK,
+    status = __libc_native_syscall6(OS_SYS_FILE_SEEK,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (status < 0) {
+        if (libc_debug_budget(&g_libc_lseek_fail_debug_calls))
+            libc_debug_path("OS_LIBC_LSEEK_FAIL path=", resource->path);
         libc_error(status);
         return -1;
     }
@@ -859,6 +1957,16 @@ off_t lseek64(int descriptor, off_t offset, int whence) {
 }
 
 ssize_t pread(int descriptor, void *buffer, size_t length, off_t offset) {
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int raw = __libc_linux_fd_for_descriptor(descriptor);
+        if (raw < 0) return -1;
+        int64_t result = __libc_linux_syscall6(
+            LINUX_SYS_PREAD64, (uint64_t)(uint32_t)raw,
+            (uint64_t)(uintptr_t)buffer, length, (uint64_t)offset, 0U, 0U);
+        if (result < 0) return libc_error(result);
+        return (ssize_t)result;
+    }
     off_t saved = lseek(descriptor, 0, SEEK_CUR);
     ssize_t result;
     if (saved < 0 || lseek(descriptor, offset, SEEK_SET) < 0) return -1;
@@ -875,6 +1983,16 @@ ssize_t pread64(int descriptor, void *buffer, size_t length, off_t offset) {
 }
 
 ssize_t pwrite(int descriptor, const void *buffer, size_t length, off_t offset) {
+    if (libc_linux_personality() &&
+        __libc_descriptor_is_linux_fd(descriptor)) {
+        int raw = __libc_linux_fd_for_descriptor(descriptor);
+        if (raw < 0) return -1;
+        int64_t result = __libc_linux_syscall6(
+            LINUX_SYS_PWRITE64, (uint64_t)(uint32_t)raw,
+            (uint64_t)(uintptr_t)buffer, length, (uint64_t)offset, 0U, 0U);
+        if (result < 0) return libc_error(result);
+        return (ssize_t)result;
+    }
     off_t saved = lseek(descriptor, 0, SEEK_CUR);
     ssize_t result;
     if (saved < 0 || lseek(descriptor, offset, SEEK_SET) < 0) return -1;
@@ -895,8 +2013,14 @@ int fsync(int descriptor) {
     int64_t status;
     if (resource == 0) return -1;
     if (resource->debug_output) return 0;
-    status = liteos_syscall6(OS_SYS_FILE_FSYNC, g_fd_table[descriptor].handle,
+    status = resource->linux_fd ?
+        __libc_linux_syscall6(LINUX_SYS_FSYNC,
+                              (uint64_t)g_fd_table[descriptor].handle,
+                              0U, 0U, 0U, 0U, 0U) :
+        __libc_native_syscall6(OS_SYS_FILE_FSYNC, g_fd_table[descriptor].handle,
                              0U, 0U, 0U, 0U, 0U);
+    if (status < 0 && libc_debug_budget(&g_libc_fsync_fail_debug_calls))
+        libc_debug_path("OS_LIBC_FSYNC_FAIL path=", resource->path);
     return libc_error(status);
 }
 
@@ -913,13 +2037,21 @@ int ftruncate(int descriptor, off_t length) {
         errno = EINVAL;
         return -1;
     }
+    if (resource->linux_fd) {
+        status = __libc_linux_syscall6(
+            LINUX_SYS_FTRUNCATE, (uint64_t)g_fd_table[descriptor].handle,
+            (uint64_t)length, 0U, 0U, 0U, 0U);
+        return libc_error(status);
+    }
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.handle = g_fd_table[descriptor].handle;
     request.size = (uint64_t)length;
-    status = liteos_syscall6(OS_SYS_FILE_TRUNCATE,
+    status = __libc_native_syscall6(OS_SYS_FILE_TRUNCATE,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
+    if (status < 0 && libc_debug_budget(&g_libc_ftruncate_fail_debug_calls))
+        libc_debug_path("OS_LIBC_FTRUNCATE_FAIL path=", resource->path);
     return libc_error(status);
 }
 
@@ -969,19 +2101,30 @@ int stat(const char *path, struct stat *status) {
     if (!make_absolute_path(path, absolute_path)) {
         return -1;
     }
+    if (linux_abi_path(absolute_path) && libc_linux_personality()) {
+        libc_linux_stat_t linux_status = {0};
+        result = __libc_linux_syscall6(
+            LINUX_SYS_STAT, (uint64_t)(uintptr_t)absolute_path,
+            (uint64_t)(uintptr_t)&linux_status, 0U, 0U, 0U, 0U);
+        if (result < 0) return libc_error(result);
+        fill_linux_stat(&linux_status, status);
+        return 0;
+    }
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.path = (uint64_t)(uintptr_t)absolute_path;
-    result = liteos_syscall6(OS_SYS_FILE_STAT,
+    result = __libc_native_syscall6(OS_SYS_FILE_STAT,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (result < 0) return libc_error(result);
     fill_stat(&request.info, status);
+    libc_set_file_identity(absolute_path, status);
+    apply_linux_mode_override(absolute_path, status);
     return 0;
 }
 
 int lstat(const char *path, struct stat *status) {
-    /* LiteOS has no symbolic-link vnode type; stat and lstat are identical. */
+    /* System has no symbolic-link vnode type; stat and lstat are identical. */
     return stat(path, status);
 }
 
@@ -1006,6 +2149,15 @@ int fstat(int descriptor, struct stat *status) {
     }
     resource = resource_for_descriptor(descriptor);
     if (resource == 0) return -1;
+    if (resource->linux_fd) {
+        libc_linux_stat_t linux_status = {0};
+        result = __libc_linux_syscall6(
+            LINUX_SYS_FSTAT, (uint64_t)g_fd_table[descriptor].handle,
+            (uint64_t)(uintptr_t)&linux_status, 0U, 0U, 0U, 0U);
+        if (result < 0) return libc_error(result);
+        fill_linux_stat(&linux_status, status);
+        return 0;
+    }
     if (resource->debug_output) {
         memset(status, 0, sizeof(*status));
         status->st_mode = S_IFCHR | S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP |
@@ -1023,11 +2175,16 @@ int fstat(int descriptor, struct stat *status) {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.handle = g_fd_table[descriptor].handle;
-    result = liteos_syscall6(OS_SYS_FILE_FSTAT,
+    result = __libc_native_syscall6(OS_SYS_FILE_FSTAT,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
-    if (result < 0) return libc_error(result);
+    if (result < 0) {
+        if (libc_debug_budget(&g_libc_fstat_fail_debug_calls))
+            libc_debug_path("OS_LIBC_FSTAT_FAIL path=", resource->path);
+        return libc_error(result);
+    }
     fill_stat(&request.info, status);
+    libc_set_file_identity(resource->path, status);
     return 0;
 }
 
@@ -1069,7 +2226,7 @@ static int path_operation(const char *path, uint64_t syscall_number,
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.path = (uint64_t)(uintptr_t)absolute_path;
     request.mode = mode;
-    return libc_error(liteos_syscall6(syscall_number,
+    return libc_error(__libc_native_syscall6(syscall_number,
                                       (uint64_t)(uintptr_t)&request,
                                       0U, 0U, 0U, 0U, 0U));
 }
@@ -1106,7 +2263,13 @@ int rmdir(const char *path) {
 }
 
 int mkdir(const char *path, unsigned int mode) {
-    return path_operation(path, OS_SYS_FILE_MKDIR, mode);
+    char absolute_path[LIBC_PATH_LIMIT];
+    int result = path_operation(path, OS_SYS_FILE_MKDIR, mode);
+    if (result == 0 && libc_linux_personality() &&
+        make_absolute_path(path, absolute_path)) {
+        remember_linux_mode(absolute_path, (mode_t)mode);
+    }
+    return result;
 }
 
 int mkdirat(int directory_descriptor, const char *path, unsigned int mode) {
@@ -1125,7 +2288,7 @@ int rename(const char *old_path, const char *new_path) {
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.old_path = (uint64_t)(uintptr_t)absolute_old;
     request.new_path = (uint64_t)(uintptr_t)absolute_new;
-    return libc_error(liteos_syscall6(OS_SYS_FILE_RENAME,
+    return libc_error(__libc_native_syscall6(OS_SYS_FILE_RENAME,
                                       (uint64_t)(uintptr_t)&request,
                                       0U, 0U, 0U, 0U, 0U));
 }
@@ -1188,6 +2351,22 @@ char *getcwd(char *buffer, size_t size) {
     }
     memcpy(buffer, g_current_directory, length);
     return buffer;
+}
+
+int gethostname(char *buffer, size_t size) {
+    static const char hostname[] = "localhost";
+    const size_t hostname_size = sizeof(hostname);
+    if (buffer == 0 || size == 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (size < hostname_size) {
+        memcpy(buffer, hostname, size);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(buffer, hostname, hostname_size);
+    return 0;
 }
 
 int isatty(int descriptor) {
@@ -1270,7 +2449,15 @@ static int duplicate_kernel_handle(int descriptor, uint32_t flags,
         *duplicate = g_fd_table[descriptor].handle;
         return 0;
     }
-    status = liteos_syscall6(OS_SYS_HANDLE_DUP,
+    if (resource->linux_fd) {
+        status = __libc_linux_syscall6(
+            LINUX_SYS_DUP, (uint64_t)g_fd_table[descriptor].handle,
+            0U, 0U, 0U, 0U, 0U);
+        if (status < 0) return libc_error(status);
+        *duplicate = (os_handle_t)(uint32_t)status;
+        return 0;
+    }
+    status = __libc_native_syscall6(OS_SYS_HANDLE_DUP,
                              g_fd_table[descriptor].handle,
                              flags, (uint64_t)(uintptr_t)duplicate,
                              0U, 0U, 0U);
@@ -1283,20 +2470,75 @@ static int duplicate_descriptor(int descriptor, unsigned int minimum,
     os_handle_t duplicate = OS_INVALID_HANDLE;
     int new_descriptor;
     if (resource == 0) return -1;
-    if (duplicate_kernel_handle(descriptor, handle_flags, &duplicate) < 0) {
+    libc_fd_table_lock();
+    if (descriptor < 0 || (unsigned int)descriptor >= LIBC_FD_LIMIT ||
+        g_fd_table[descriptor].resource != resource) {
+        libc_fd_table_unlock();
+        errno = EBADF;
         return -1;
     }
-    new_descriptor = allocate_descriptor(resource, minimum);
+    if (resource->linux_fd) {
+        unsigned int candidate = minimum;
+        uint32_t command = (handle_flags & OS_HANDLE_FLAG_CLOEXEC) != 0U ?
+            LINUX_F_DUPFD_CLOEXEC : LINUX_F_DUPFD;
+        while (candidate < LIBC_FD_LIMIT) {
+            int64_t status = __libc_linux_syscall6(
+                LINUX_SYS_FCNTL,
+                (uint64_t)g_fd_table[descriptor].handle,
+                command, (uint64_t)candidate, 0U, 0U, 0U);
+            if (status < 0) {
+                libc_fd_table_unlock();
+                return libc_error(status);
+            }
+            if ((uint64_t)status >= LIBC_FD_LIMIT) {
+                close_raw_linux_descriptor((int)status);
+                libc_fd_table_unlock();
+                errno = EMFILE;
+                return -1;
+            }
+            new_descriptor = (int)status;
+            if (g_fd_table[new_descriptor].resource != 0) {
+                close_raw_linux_descriptor(new_descriptor);
+                candidate = (unsigned int)new_descriptor + 1U;
+                continue;
+            }
+            g_fd_table[new_descriptor].resource = resource;
+            g_fd_table[new_descriptor].handle =
+                (os_handle_t)(uint32_t)new_descriptor;
+            g_fd_table[new_descriptor].descriptor_flags =
+                (handle_flags & OS_HANDLE_FLAG_CLOEXEC) != 0U ?
+                    FD_CLOEXEC : 0U;
+            ++resource->references;
+            libc_fd_table_unlock();
+            return new_descriptor;
+        }
+        libc_fd_table_unlock();
+        errno = EMFILE;
+        return -1;
+    }
+    if (duplicate_kernel_handle(descriptor, handle_flags, &duplicate) < 0) {
+        libc_fd_table_unlock();
+        return -1;
+    }
+    new_descriptor = allocate_descriptor_locked(resource, minimum);
     if (new_descriptor < 0) {
         if (!resource->debug_output) {
-            (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, duplicate,
+            if (resource->linux_fd) {
+                (void)__libc_linux_syscall6(
+                    LINUX_SYS_CLOSE, (uint64_t)duplicate,
+                    0U, 0U, 0U, 0U, 0U);
+            } else {
+            (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, duplicate,
                                   0U, 0U, 0U, 0U, 0U);
         }
+        }
+        libc_fd_table_unlock();
         return -1;
     }
     g_fd_table[new_descriptor].handle = duplicate;
     g_fd_table[new_descriptor].descriptor_flags =
         (handle_flags & OS_HANDLE_FLAG_CLOEXEC) != 0U ? FD_CLOEXEC : 0U;
+    libc_fd_table_unlock();
     return new_descriptor;
 }
 
@@ -1309,16 +2551,66 @@ static int duplicate_to_descriptor(int old_descriptor, int new_descriptor,
         errno = EBADF;
         return -1;
     }
-    if (old_descriptor == new_descriptor) return new_descriptor;
-    if (duplicate_kernel_handle(old_descriptor, handle_flags, &duplicate) < 0) {
+    libc_fd_table_lock();
+    if (old_descriptor < 0 || (unsigned int)old_descriptor >= LIBC_FD_LIMIT ||
+        g_fd_table[old_descriptor].resource != resource) {
+        libc_fd_table_unlock();
+        errno = EBADF;
         return -1;
     }
-    if (g_fd_table[new_descriptor].resource != 0) (void)close(new_descriptor);
+    if (old_descriptor == new_descriptor) {
+        libc_fd_table_unlock();
+        return new_descriptor;
+    }
+    if (resource != 0 && resource->linux_fd) {
+        int64_t status = __libc_linux_syscall6(
+            LINUX_SYS_DUP3, (uint64_t)g_fd_table[old_descriptor].handle,
+            (uint64_t)(uint32_t)new_descriptor,
+            (handle_flags & OS_HANDLE_FLAG_CLOEXEC) != 0U ?
+                LINUX_O_CLOEXEC : 0U, 0U, 0U, 0U);
+        if (status < 0) {
+            libc_fd_table_unlock();
+            return libc_error(status);
+        }
+        if (g_fd_table[new_descriptor].resource != 0) {
+            libc_fd_resource_t *replaced =
+                g_fd_table[new_descriptor].resource;
+            if (replaced->linux_fd) {
+                /* dup3 already closed the old Linux descriptor and installed
+                 * the replacement at this number.  Only release libc's
+                 * reference; close(new_descriptor) here would close the new
+                 * descriptor we just created. */
+                release_resource_reference(replaced);
+            } else {
+                /* The numeric slot may have held a native System handle,
+                 * which is outside the Linux dup3 table and still needs
+                 * closing. */
+                (void)release_descriptor(new_descriptor);
+            }
+            g_fd_table[new_descriptor].resource = 0;
+            g_fd_table[new_descriptor].handle = OS_INVALID_HANDLE;
+            g_fd_table[new_descriptor].descriptor_flags = 0U;
+        }
+        g_fd_table[new_descriptor].resource = resource;
+        g_fd_table[new_descriptor].handle = (os_handle_t)(uint32_t)status;
+        g_fd_table[new_descriptor].descriptor_flags =
+            (handle_flags & OS_HANDLE_FLAG_CLOEXEC) != 0U ? FD_CLOEXEC : 0U;
+        ++resource->references;
+        libc_fd_table_unlock();
+        return new_descriptor;
+    }
+    if (duplicate_kernel_handle(old_descriptor, handle_flags, &duplicate) < 0) {
+        libc_fd_table_unlock();
+        return -1;
+    }
+    if (g_fd_table[new_descriptor].resource != 0)
+        (void)close_descriptor_locked(new_descriptor);
     g_fd_table[new_descriptor].resource = resource;
     g_fd_table[new_descriptor].handle = duplicate;
     g_fd_table[new_descriptor].descriptor_flags =
         (handle_flags & OS_HANDLE_FLAG_CLOEXEC) != 0U ? FD_CLOEXEC : 0U;
     ++resource->references;
+    libc_fd_table_unlock();
     return new_descriptor;
 }
 
@@ -1346,8 +2638,13 @@ int fcntl(int descriptor, int command, ...) {
     case F_GETFD:
         if (resource->debug_output) {
             value = (int)g_fd_table[descriptor].descriptor_flags;
+        } else if (resource->linux_fd) {
+            int64_t status = __libc_linux_syscall6(
+                LINUX_SYS_FCNTL, (uint64_t)g_fd_table[descriptor].handle,
+                LINUX_F_GETFD, 0U, 0U, 0U, 0U);
+            value = status < 0 ? libc_error(status) : (int)status;
         } else {
-            int64_t status = liteos_syscall6(
+            int64_t status = __libc_native_syscall6(
                 OS_SYS_HANDLE_GET_FLAGS, g_fd_table[descriptor].handle,
                 0U, 0U, 0U, 0U, 0U);
             if (status < 0) {
@@ -1361,8 +2658,18 @@ int fcntl(int descriptor, int command, ...) {
     case F_SETFD:
         value = va_arg(arguments, int);
         value = (uint32_t)value & FD_CLOEXEC;
-        if (!resource->debug_output) {
-            int64_t status = liteos_syscall6(
+        if (resource->linux_fd) {
+            int64_t status = __libc_linux_syscall6(
+                LINUX_SYS_FCNTL, (uint64_t)g_fd_table[descriptor].handle,
+                LINUX_F_SETFD,
+                (value & FD_CLOEXEC) != 0 ? LINUX_FD_CLOEXEC : 0U,
+                0U, 0U, 0U);
+            if (status < 0) {
+                value = libc_error(status);
+                break;
+            }
+        } else if (!resource->debug_output) {
+            int64_t status = __libc_native_syscall6(
                 OS_SYS_HANDLE_SET_FLAGS, g_fd_table[descriptor].handle,
                 (value & FD_CLOEXEC) != 0 ? OS_HANDLE_FLAG_CLOEXEC : 0U,
                 0U, 0U, 0U, 0U);
@@ -1375,15 +2682,79 @@ int fcntl(int descriptor, int command, ...) {
         value = 0;
         break;
     case F_GETFL:
+        if (resource->linux_fd) {
+            int64_t status = __libc_linux_syscall6(
+                LINUX_SYS_FCNTL, (uint64_t)g_fd_table[descriptor].handle,
+                LINUX_F_GETFL, 0U, 0U, 0U, 0U);
+            if (status < 0) {
+                value = libc_error(status);
+                break;
+            }
+            value = (int)(status & (LINUX_O_WRONLY | LINUX_O_RDWR));
+            if ((status & LINUX_O_APPEND) != 0U) value =
+                value | O_APPEND;
+            if ((status & LINUX_O_NONBLOCK) != 0U) value =
+                value | O_NONBLOCK;
+            if ((status & LINUX_O_DIRECTORY) != 0U) value |= O_DIRECTORY;
+        } else {
         value = (int)resource->open_flags;
+        }
         break;
     case F_SETFL:
         value = va_arg(arguments, int);
+        if (resource->linux_fd) {
+            uint32_t linux_flags = 0U;
+            if ((value & O_APPEND) != 0) linux_flags |= LINUX_O_APPEND;
+            if ((value & O_NONBLOCK) != 0) linux_flags |= LINUX_O_NONBLOCK;
+            int64_t status = __libc_linux_syscall6(
+                LINUX_SYS_FCNTL, (uint64_t)g_fd_table[descriptor].handle,
+                LINUX_F_SETFL, linux_flags, 0U, 0U, 0U);
+            if (status < 0) {
+                value = libc_error(status);
+                break;
+            }
+            resource->open_flags = (resource->open_flags &
+                                    ~(O_APPEND | O_NONBLOCK)) |
+                                   ((uint32_t)value & (O_APPEND | O_NONBLOCK));
+            value = 0;
+        } else {
         resource->open_flags = (resource->open_flags &
                                 ~(O_APPEND | O_NONBLOCK)) |
                                ((uint32_t)value & (O_APPEND | O_NONBLOCK));
         value = 0;
+        }
         break;
+    case F_GETLK:
+    case F_SETLK:
+    case F_SETLKW: {
+        /*
+         * System currently runs the Chromium browser as one process and does
+         * not expose a kernel-wide POSIX record-lock table.  SQLite's Unix
+         * VFS nevertheless probes and acquires these advisory locks for
+         * every database.  Treat the lock as uncontended in this mode; for
+         * F_GETLK, report the required POSIX "no conflicting lock" result.
+         * The browser's own SQLite connection state still serializes access
+         * between its threads, while this keeps sqlite3_open_v2() usable.
+         */
+        struct flock *lock = va_arg(arguments, struct flock *);
+        if (lock == 0) {
+            errno = EFAULT;
+            value = -1;
+            break;
+        }
+        if (command == F_GETLK) {
+            lock->l_type = F_UNLCK;
+            lock->l_pid = 0;
+        }
+        if (libc_trace_budget(&g_libc_fcntl_lock_debug_calls, 64U)) {
+            libc_debug_text("OS_LIBC_FCNTL_LOCK path=",
+                            sizeof("OS_LIBC_FCNTL_LOCK path=") - 1U);
+            libc_debug_text(resource->path, strlen(resource->path));
+            libc_debug_text("\n", 1U);
+        }
+        value = 0;
+        break;
+    }
     case F_DUPFD:
     case F_DUPFD_CLOEXEC:
         value = va_arg(arguments, int);
@@ -1410,7 +2781,7 @@ int fcntl(int descriptor, int command, ...) {
 int ioctl(int descriptor, unsigned long request, ...) {
     (void)request;
     if (resource_for_descriptor(descriptor) == 0) return -1;
-    /* No device-specific ioctl namespace is exposed by the LiteOS ABI yet. */
+    /* No device-specific ioctl namespace is exposed by the System ABI yet. */
     errno = ENOTTY;
     return -1;
 }
@@ -1424,7 +2795,7 @@ static int process_info(os_process_info_t *info) {
     memset(info, 0, sizeof(*info));
     info->hdr.size = sizeof(*info);
     info->hdr.version = OS_SYSCALL_ABI_VERSION;
-    status = liteos_syscall6(OS_SYS_PROCESS_INFO,
+    status = __libc_native_syscall6(OS_SYS_PROCESS_INFO,
                              (uint64_t)(uintptr_t)info,
                              0U, 0U, 0U, 0U, 0U);
     return status < 0 ? libc_error(status) : 0;
@@ -1452,6 +2823,122 @@ int geteuid(void) { return 0; }
 int getgid(void) { return 0; }
 int getegid(void) { return 0; }
 
+__attribute__((force_align_arg_pointer))
+int prctl(int option, ...) {
+    va_list arguments;
+    uint64_t argument0 = 0U;
+    int64_t status;
+    switch (option) {
+    case PR_SET_PDEATHSIG:
+    case PR_GET_DUMPABLE:
+    case PR_SET_DUMPABLE:
+    case PR_SET_NAME:
+    case PR_GET_NAME:
+        va_start(arguments, option);
+        argument0 = va_arg(arguments, uint64_t);
+        va_end(arguments);
+        break;
+    default:
+        break;
+    }
+    if (!libc_linux_personality()) {
+    errno = ENOSYS;
+    return -1;
+}
+    status = __libc_linux_syscall6(LINUX_SYS_PRCTL, (uint64_t)option,
+                                    argument0, 0U, 0U, 0U, 0U);
+    return status < 0 ? __libc_status_result(status) : 0;
+}
+
+ssize_t readlink(const char *path, char *buffer, size_t size) {
+    int64_t status;
+    if (!libc_linux_personality()) {
+        errno = ENOSYS;
+        return -1;
+    }
+    status = __libc_linux_syscall6(
+        LINUX_SYS_READLINK, (uint64_t)(uintptr_t)path,
+        (uint64_t)(uintptr_t)buffer, (uint64_t)size, 0U, 0U, 0U);
+    if (status < 0) {
+        (void)libc_error(status);
+        return -1;
+    }
+    return (ssize_t)status;
+}
+
+ssize_t readlinkat(int directory_descriptor, const char *path,
+                   char *buffer, size_t size) {
+    if (directory_descriptor == AT_FDCWD ||
+        (path != 0 && path[0] == '/')) {
+        return readlink(path, buffer, size);
+    }
+    (void)path;
+    (void)buffer;
+    (void)size;
+    errno = ENOSYS;
+    return -1;
+}
+
+int link(const char *old_path, const char *new_path) {
+    (void)old_path;
+    (void)new_path;
+    errno = ENOSYS;
+    return -1;
+}
+
+int symlink(const char *target, const char *link_path) {
+    if (libc_linux_personality()) {
+        return __libc_status_result(__libc_linux_syscall6(
+            LINUX_SYS_SYMLINK, (uint64_t)(uintptr_t)target,
+            (uint64_t)(uintptr_t)link_path, 0U, 0U, 0U, 0U));
+    }
+    (void)target;
+    (void)link_path;
+    errno = ENOSYS;
+    return -1;
+}
+
+int chmod(const char *path, mode_t mode) {
+    char absolute_path[LIBC_PATH_LIMIT];
+    if (!libc_linux_personality()) {
+        errno = ENOSYS;
+        return -1;
+    }
+    if (!make_absolute_path(path, absolute_path) ||
+        access(absolute_path, F_OK) < 0) return -1;
+    remember_linux_mode(absolute_path, mode);
+    return 0;
+}
+
+int fchmod(int descriptor, mode_t mode) {
+    (void)descriptor;
+    (void)mode;
+    errno = ENOSYS;
+    return -1;
+}
+
+int fchmodat(int directory_descriptor, const char *path, mode_t mode,
+             int flags) {
+    (void)directory_descriptor;
+    (void)path;
+    (void)mode;
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+pid_t setsid(void) {
+    errno = ENOSYS;
+    return (pid_t)-1;
+}
+
+int setpgid(pid_t pid, pid_t process_group) {
+    (void)pid;
+    (void)process_group;
+    errno = ENOSYS;
+    return -1;
+}
+
 unsigned int sleep(unsigned int seconds) {
     struct timespec request = {(time_t)seconds, 0};
     return nanosleep(&request, 0) == 0 ? 0U : seconds;
@@ -1465,14 +2952,37 @@ int usleep(unsigned int microseconds) {
     return nanosleep(&request, 0);
 }
 
+int pause(void) {
+    /* Avoid a busy loop in the child-side sandbox wait.  A delivered signal
+     * interrupts nanosleep when signal delivery is available; SIGKILL still
+     * terminates the process while it is sleeping. */
+    for (;;) {
+        struct timespec request = {(time_t)3600, 0};
+        if (nanosleep(&request, 0) < 0) return -1;
+    }
+}
+
 int clock_gettime(int clock_id, struct timespec *value) {
+    if (libc_linux_personality()) {
+        struct {
+            int64_t seconds;
+            int64_t nanoseconds;
+        } linux_value = {0};
+        int64_t linux_status = __libc_linux_syscall6(
+            LINUX_SYS_CLOCK_GETTIME, (uint64_t)(uint32_t)clock_id,
+            (uint64_t)(uintptr_t)&linux_value, 0U, 0U, 0U, 0U);
+        if (linux_status < 0) return libc_error(linux_status);
+        value->tv_sec = (time_t)linux_value.seconds;
+        value->tv_nsec = (long)linux_value.nanoseconds;
+        return 0;
+    }
     os_timespec_t raw = {0};
     int64_t status;
     if (value == 0) {
         errno = EINVAL;
         return -1;
     }
-    status = liteos_syscall6(OS_SYS_CLOCK_GET, (uint64_t)(uint32_t)clock_id,
+    status = __libc_native_syscall6(OS_SYS_CLOCK_GET, (uint64_t)(uint32_t)clock_id,
                              (uint64_t)(uintptr_t)&raw, 0U, 0U, 0U, 0U);
     if (status < 0) return libc_error(status);
     value->tv_sec = raw.seconds;
@@ -1492,13 +3002,20 @@ int clock_settime(int clock_id, const struct timespec *value) {
     request.clock_id = (uint32_t)clock_id;
     request.value.seconds = value->tv_sec;
     request.value.nanoseconds = (int32_t)value->tv_nsec;
-    status = liteos_syscall6(OS_SYS_CLOCK_SET,
+    status = __libc_native_syscall6(OS_SYS_CLOCK_SET,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     return libc_error(status);
 }
 
 int nanosleep(const struct timespec *request, struct timespec *remaining) {
+    if (libc_linux_personality()) {
+        int64_t linux_status = __libc_linux_syscall6(
+            LINUX_SYS_NANOSLEEP, (uint64_t)(uintptr_t)request,
+            (uint64_t)(uintptr_t)remaining, 0U, 0U, 0U, 0U);
+        if (linux_status < 0) return libc_error(linux_status);
+        return 0;
+    }
     uint64_t delay_ns;
     os_handle_t timer = OS_INVALID_HANDLE;
     os_wait_result_t result = {0};
@@ -1515,12 +3032,12 @@ int nanosleep(const struct timespec *request, struct timespec *remaining) {
     }
     delay_ns = (uint64_t)request->tv_sec * 1000000000ULL +
                (uint64_t)request->tv_nsec;
-    status = liteos_syscall6(OS_SYS_TIMER_CREATE, delay_ns, 0U,
+    status = __libc_native_syscall6(OS_SYS_TIMER_CREATE, delay_ns, 0U,
                              (uint64_t)(uintptr_t)&timer, 0U, 0U, 0U);
     if (status < 0) return libc_error(status);
-    status = liteos_syscall6(OS_SYS_WAIT_ONE, timer, OS_WAIT_INFINITE,
+    status = __libc_native_syscall6(OS_SYS_WAIT_ONE, timer, OS_WAIT_INFINITE,
                              (uint64_t)(uintptr_t)&result, 0U, 0U, 0U);
-    (void)liteos_syscall6(OS_SYS_HANDLE_CLOSE, timer, 0U, 0U, 0U, 0U, 0U);
+    (void)__libc_native_syscall6(OS_SYS_HANDLE_CLOSE, timer, 0U, 0U, 0U, 0U, 0U);
     if (status < 0) {
         if (remaining != 0) *remaining = *request;
         return libc_error(status);

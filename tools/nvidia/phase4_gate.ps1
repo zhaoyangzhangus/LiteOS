@@ -47,8 +47,8 @@ if ($p3ExitCode -ne 0 -or
 Require-File $kernelElf 'Phase 4 kernel image'
 Require-File $linkList 'Phase 4 link list'
 Require-File $bridgeSource 'vendor bridge source'
-Require-File $driverSource 'LiteOS RM driver source'
-Require-File $workQueueSource 'LiteOS RM workqueue adapter source'
+Require-File $driverSource 'System RM driver source'
+Require-File $workQueueSource 'System RM workqueue adapter source'
 
 $readelfCommand = Get-Command x86_64-elf-readelf -ErrorAction SilentlyContinue
 if ($null -eq $readelfCommand) { $readelfCommand = Get-Command readelf -ErrorAction Stop }
@@ -108,7 +108,7 @@ if (@($linkRows | Where-Object { $_ -like '*phase3/vendor-rm.o' }).Count -ne 1 -
     }).Count -ne 11) {
     Fail-Gate 'Phase 4 link list does not contain the expected RM/ABI closure'
 }
-Require-File $workQueueObject 'compiled LiteOS RM workqueue adapter'
+Require-File $workQueueObject 'compiled System RM workqueue adapter'
 Require-File $abiWorkQueueObject 'compiled fail-closed OS ABI object'
 
 $workQueueNmArgs = @('-g', '-S', '--defined-only', '--', $workQueueObject)
@@ -175,7 +175,7 @@ if ($bridgeText -match '(?im)(chipInfo\.(platformId|implementationId)|pGpuArch)\
     Fail-Gate 'vendor bridge writes an architecture/chip override'
 }
 if ($bridgeText -match '(?im)\b(gsp|gmmu|pma|gpu\s*va)\b\s*[:=]') {
-    Fail-Gate 'Phase 4 bridge contains a LiteOS-side GPU-owned implementation'
+    Fail-Gate 'Phase 4 bridge contains a System-side GPU-owned implementation'
 }
 $disableIndex = $bridgeText.IndexOf(
     'rm_disable_adapter(context->stack, context->state);',
@@ -206,7 +206,7 @@ if ($workQueueText -match '(?im)\b(scheduler|gsp|gmmu|pma|gpu\s*va)\b\s*[:=]') {
 }
 
 $driverText = Get-Content -LiteralPath $driverSource -Raw
-if ($driverText -notmatch 'LITEOS_NVIDIA_RM_NOT_LINKED' -or
+if ($driverText -notmatch 'OS_NVIDIA_RM_NOT_LINKED' -or
     $driverText -notmatch 'return\s+K_ENOSYS') {
     Fail-Gate 'normal-image vendor boundary is not fail-closed'
 }
@@ -231,20 +231,20 @@ if ([string]::IsNullOrWhiteSpace($HardwareLog)) {
 }
 
 $hardwareLogPath = [System.IO.Path]::GetFullPath($HardwareLog)
-Require-File $hardwareLogPath 'LiteOS hardware serial log'
+Require-File $hardwareLogPath 'System hardware serial log'
 $hardwareText = Get-Content -LiteralPath $hardwareLogPath -Raw
 
 if ($hardwareText -match '(?i)qemu|std\s+vga|bochs|virtual\s+machine') {
     Fail-Gate 'QEMU or virtual-machine log cannot satisfy the real-hardware Gate'
 }
 foreach ($requiredHardwareText in @(
-        'LITEOS_NVIDIA_PCI_FOUND\s+\S+\s+ID=10de:2f04',
-        'LITEOS_NVIDIA_BAR0_READY', 'LITEOS_NVIDIA_BAR1_METADATA',
-        'LITEOS_NVIDIA_PHASE4_RM_READY',
-        'LITEOS_NVIDIA_PHASE4_GPU_OBJECT_READY',
-        'LITEOS_NVIDIA_ARCH=[0-9a-fA-F]+\s+IMPL=[0-9a-fA-F]+\s+HAL=[0-9a-fA-F]+',
-        'LITEOS_NVIDIA_PHASE4_HAL_READY\s+BLACKWELL\s+GB205',
-        'LITEOS_NVIDIA_PHASE4_GATE_READY')) {
+        'OS_NVIDIA_PCI_FOUND\s+\S+\s+ID=10de:2f04',
+        'OS_NVIDIA_BAR0_READY', 'OS_NVIDIA_BAR1_METADATA',
+        'OS_NVIDIA_PHASE4_RM_READY',
+        'OS_NVIDIA_PHASE4_GPU_OBJECT_READY',
+        'OS_NVIDIA_ARCH=[0-9a-fA-F]+\s+IMPL=[0-9a-fA-F]+\s+HAL=[0-9a-fA-F]+',
+        'OS_NVIDIA_PHASE4_HAL_READY\s+BLACKWELL\s+GB205',
+        'OS_NVIDIA_PHASE4_GATE_READY')) {
     if ($hardwareText -notmatch $requiredHardwareText) {
         Fail-Gate "hardware log evidence is absent: $requiredHardwareText"
     }

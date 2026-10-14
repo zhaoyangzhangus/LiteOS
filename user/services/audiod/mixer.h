@@ -1,5 +1,5 @@
-#ifndef LITEOS_AUDIOD_MIXER_H
-#define LITEOS_AUDIOD_MIXER_H
+#ifndef OS_AUDIOD_MIXER_H
+#define OS_AUDIOD_MIXER_H
 
 #include <uapi/audio.h>
 

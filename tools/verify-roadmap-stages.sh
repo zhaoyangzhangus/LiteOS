@@ -6,7 +6,7 @@ root_dir="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 cd "$root_dir"
 
 contracts_path="$script_dir/roadmap-stage-contracts.tsv"
-build_dir="${BUILD:-build-refactor}"
+build_dir="${BUILD:-build}"
 static_only=0
 
 usage() {
@@ -36,7 +36,7 @@ elif (($# > 2)); then
     exit 2
 fi
 
-elf_path="${1:-$build_dir/esp/EFI/LITEOS/kernel.elf}"
+elf_path="${1:-$build_dir/esp/EFI/OS/kernel.elf}"
 log_path="${2:-$build_dir/qemu-serial.log}"
 
 if [[ ! -f "$contracts_path" ]]; then
@@ -95,7 +95,7 @@ while IFS='|' read -r family phase serial_name owner_source; do
         continue
     fi
 
-    symbol="LITEOS_DEBUG_PHASE_${family}_${phase}"
+    symbol="OS_DEBUG_PHASE_${family}_${phase}"
     if ! grep -Fq -- "$symbol" include/kernel/debug_stage.h; then
         printf 'roadmap stage verification: enum missing for %s: %s\n' \
             "$serial_name" "$symbol" >&2
@@ -109,7 +109,7 @@ while IFS='|' read -r family phase serial_name owner_source; do
 
     # Match a location-aware stage macro invocation in the declared Owner,
     # rather than accepting a bare enum mention in a comment or header.
-    call_pattern="liteos_debug_(stage|trace_stage)(_[[:alnum:]_]+)?[[:space:]]*\\(${symbol}"
+    call_pattern="(kernel_debug_stage|debug_trace_stage)(_[[:alnum:]_]+)?[[:space:]]*\\(${symbol}"
     if ! grep -Eq -- "$call_pattern" "$owner_source"; then
         printf 'roadmap stage verification: no publication call for %s in %s\n' \
             "$serial_name" "$owner_source" >&2
@@ -148,7 +148,7 @@ fi
 runtime_contract_errors=0
 while IFS='|' read -r family phase serial_name owner_source; do
     [[ -n "$family" && "${family:0:1}" != "#" ]] || continue
-    phase_records=$(grep -F "LITEOS_STAGE phase=$serial_name " "$log_path" || true)
+    phase_records=$(grep -F "OS_STAGE phase=$serial_name " "$log_path" || true)
     if [[ -z "$phase_records" ]]; then
         printf 'roadmap stage verification: runtime phase missing: %s\n' \
             "$serial_name" >&2

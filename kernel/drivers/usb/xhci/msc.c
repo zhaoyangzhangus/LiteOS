@@ -7,8 +7,8 @@
 
 /* REFACTOR_P8_XHCI_MSC_OWNER: bulk-only transport and session ownership. */
 
-#ifndef LITEOS_XHCI_DIAGNOSTIC_BOT
-#define LITEOS_XHCI_DIAGNOSTIC_BOT 0
+#ifndef OS_XHCI_DIAGNOSTIC_BOT
+#define OS_XHCI_DIAGNOSTIC_BOT 0
 #endif
 
 #define XHCI_RING_TRB_COUNT 256U
@@ -505,7 +505,7 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
         (state->msc_uas_status_address & 0x80U) == 0U ||
         (state->msc_uas_data_in_address & 0x80U) == 0U ||
         (state->msc_uas_data_out_address & 0x80U) != 0U) {
-        liteos_realtest_mark("USB_MSC_UAS_DIRECTION_INVALID");
+        realtest_mark("USB_MSC_UAS_DIRECTION_INVALID");
         return false;
     }
 
@@ -528,22 +528,22 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
         for (uint32_t previous = 0U; previous < index; ++previous)
             if (ids[index] == ids[previous]) return false;
     }
-    liteos_realtest_mark_number("USB_MSC_UAS_COMMAND_ADDRESS",
+    realtest_mark_number("USB_MSC_UAS_COMMAND_ADDRESS",
                                 state->msc_uas_command_address);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_ADDRESS",
+    realtest_mark_number("USB_MSC_UAS_STATUS_ADDRESS",
                                 state->msc_uas_status_address);
-    liteos_realtest_mark_number("USB_MSC_UAS_DATA_IN_ADDRESS",
+    realtest_mark_number("USB_MSC_UAS_DATA_IN_ADDRESS",
                                 state->msc_uas_data_in_address);
-    liteos_realtest_mark_number("USB_MSC_UAS_DATA_OUT_ADDRESS",
+    realtest_mark_number("USB_MSC_UAS_DATA_OUT_ADDRESS",
                                 state->msc_uas_data_out_address);
-    liteos_realtest_mark_number("USB_MSC_UAS_COMMAND_ID", command_id);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_ID", status_id);
-    liteos_realtest_mark_number("USB_MSC_UAS_DATA_IN_ID", data_in_id);
-    liteos_realtest_mark_number("USB_MSC_UAS_DATA_OUT_ID", data_out_id);
+    realtest_mark_number("USB_MSC_UAS_COMMAND_ID", command_id);
+    realtest_mark_number("USB_MSC_UAS_STATUS_ID", status_id);
+    realtest_mark_number("USB_MSC_UAS_DATA_IN_ID", data_in_id);
+    realtest_mark_number("USB_MSC_UAS_DATA_OUT_ID", data_out_id);
     slot = state->device_slot;
     uas_alternate = state->msc_uas_alternate;
-    liteos_serial_printf_serial_only(
-        "LITEOS_UAS_CONFIG_BEGIN SLOT=%u SPEED=%u ALT=%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_UAS_CONFIG_BEGIN SLOT=%u SPEED=%u ALT=%u\r\n",
         slot, state->device_speed, uas_alternate);
     xhci_msc_transport_release(slot);
     transport = &g_xhci_msc_transports[slot];
@@ -565,13 +565,13 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
     transport->uas_status_max_streams = state->msc_uas_status_max_streams;
     transport->uas_data_in_max_streams = state->msc_uas_data_in_max_streams;
     transport->uas_data_out_max_streams = state->msc_uas_data_out_max_streams;
-    liteos_realtest_mark_number("USB_MSC_UAS_COMMAND_BURST",
+    realtest_mark_number("USB_MSC_UAS_COMMAND_BURST",
                                 transport->uas_command_max_burst);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_BURST",
+    realtest_mark_number("USB_MSC_UAS_STATUS_BURST",
                                 transport->uas_status_max_burst);
-    liteos_realtest_mark_number("USB_MSC_UAS_DATA_IN_BURST",
+    realtest_mark_number("USB_MSC_UAS_DATA_IN_BURST",
                                 transport->uas_data_in_max_burst);
-    liteos_realtest_mark_number("USB_MSC_UAS_DATA_OUT_BURST",
+    realtest_mark_number("USB_MSC_UAS_DATA_OUT_BURST",
                                 transport->uas_data_out_max_burst);
     /* USB 2.x UAS has no xHCI streams.  SuperSpeed UAS uses streams when
      * the companion descriptors advertise a usable depth. */
@@ -580,13 +580,13 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
                              state->max_primary_stream_array_size >= 4U;
     if (state->device_speed >= 4U &&
         state->max_primary_stream_array_size < 4U) {
-        liteos_realtest_mark_number("USB_MSC_UAS_HOST_STREAMS_UNSUPPORTED",
+        realtest_mark_number("USB_MSC_UAS_HOST_STREAMS_UNSUPPORTED",
                                     state->max_primary_stream_array_size);
         xhci_msc_transport_release(slot);
         return false;
     }
     if (transport->uas_streams && stream_depth == 0U) {
-        liteos_realtest_mark_number("USB_MSC_UAS_STREAM_DEPTH_INVALID",
+        realtest_mark_number("USB_MSC_UAS_STREAM_DEPTH_INVALID",
                                     stream_depth);
         xhci_msc_transport_release(slot);
         return false;
@@ -596,7 +596,7 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
         !xhci_msc_select_stream_exponent(state, stream_depth,
                                          &primary_stream_exponent,
                                          &stream_context_count)) {
-        liteos_realtest_mark_number("USB_MSC_UAS_STREAM_DEPTH_INVALID",
+        realtest_mark_number("USB_MSC_UAS_STREAM_DEPTH_INVALID",
                                     stream_depth);
         xhci_msc_transport_release(slot);
         return false;
@@ -610,12 +610,12 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
             return false;
         }
     }
-    liteos_realtest_mark_number("USB_MSC_UAS_STREAMS",
+    realtest_mark_number("USB_MSC_UAS_STREAMS",
                                 transport->uas_streams ? 1U : 0U);
-    liteos_realtest_mark_number("USB_MSC_UAS_STREAM_DEPTH", stream_depth);
-    liteos_realtest_mark_number("USB_MSC_UAS_PRIMARY_STREAM_EXPONENT",
+    realtest_mark_number("USB_MSC_UAS_STREAM_DEPTH", stream_depth);
+    realtest_mark_number("USB_MSC_UAS_PRIMARY_STREAM_EXPONENT",
                                 primary_stream_exponent);
-    liteos_realtest_mark_number("USB_MSC_UAS_STREAM_CONTEXT_COUNT",
+    realtest_mark_number("USB_MSC_UAS_STREAM_CONTEXT_COUNT",
                                 stream_context_count);
 
     if (!xhci_alloc_dma_region(state, &transport->uas_command_ring,
@@ -687,7 +687,7 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
     xhci_msc_prepare_input_context(state, max_id, 0U, 0U);
     for (uint32_t index = 0U; index < 4U; ++index)
         control[1] |= 1U << ids[index];
-    liteos_realtest_mark_number("USB_MSC_UAS_BASE_ADD_FLAGS", control[1]);
+    realtest_mark_number("USB_MSC_UAS_BASE_ADD_FLAGS", control[1]);
     xhci_msc_set_uas_endpoint(
         state,
         (uint32_t *)((uint8_t *)input +
@@ -727,19 +727,19 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
     dma_sync_for_device(&transport->uas_command_buffer.mapping);
     dma_sync_for_device(&transport->uas_status_buffer.mapping);
     dma_sync_for_device(&transport->uas_data_buffer.mapping);
-    liteos_serial_printf_serial_only(
-        "LITEOS_UAS_CONFIGURE SLOT=%u PHASE=BASE MAX_ID=%u FLAGS=%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_UAS_CONFIGURE SLOT=%u PHASE=BASE MAX_ID=%u FLAGS=%u\r\n",
         slot, max_id, control[1]);
     if (!xhci_submit_command(state, XHCI_CONFIGURE_ENDPOINT_TYPE, slot,
                              xhci_dma_address(&state->input_context.mapping),
                              0)) {
-        liteos_realtest_mark("USB_MSC_UAS_BASE_CONFIGURE_FAIL");
+        realtest_mark("USB_MSC_UAS_BASE_CONFIGURE_FAIL");
         xhci_msc_transport_release(slot);
         return false;
     }
-    liteos_serial_printf_serial_only(
-        "LITEOS_UAS_CONFIGURE_OK SLOT=%u PHASE=BASE\r\n", slot);
-    liteos_realtest_mark("USB_MSC_UAS_BASE_CONFIGURED");
+    kernel_serial_printf_serial_only(
+        "OS_UAS_CONFIGURE_OK SLOT=%u PHASE=BASE\r\n", slot);
+    realtest_mark("USB_MSC_UAS_BASE_CONFIGURED");
     /* xHCI owns endpoint context activation.  Configure the host endpoints
      * first, then select the USB UAS alternate setting.  This is the order
      * used by the xHCI HCD during usb_set_interface(): bandwidth/endpoint
@@ -747,13 +747,13 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
     if (!xhci_msc_control_no_data(state, &state->device, 0x01U, 0x0BU,
                                   uas_alternate,
                                   transport->interface_number)) {
-        liteos_realtest_mark("USB_MSC_UAS_SET_INTERFACE_FAIL");
+        realtest_mark("USB_MSC_UAS_SET_INTERFACE_FAIL");
         xhci_msc_transport_release(slot);
         return false;
     }
-    liteos_realtest_mark("USB_MSC_UAS_SET_INTERFACE_OK");
-    liteos_serial_printf_serial_only(
-        "LITEOS_UAS_SET_INTERFACE_OK SLOT=%u ALT=%u\r\n",
+    realtest_mark("USB_MSC_UAS_SET_INTERFACE_OK");
+    kernel_serial_printf_serial_only(
+        "OS_UAS_SET_INTERFACE_OK SLOT=%u ALT=%u\r\n",
         slot, uas_alternate);
 
     if (transport->uas_streams) {
@@ -775,7 +775,7 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
             !xhci_msc_copy_output_endpoint(state, data_in_context, data_in_id) ||
             !xhci_msc_copy_output_endpoint(state, data_out_context,
                                             data_out_id)) {
-            liteos_realtest_mark("USB_MSC_UAS_STREAM_CONTEXT_FAIL");
+            realtest_mark("USB_MSC_UAS_STREAM_CONTEXT_FAIL");
             xhci_msc_transport_release(slot);
             return false;
         }
@@ -798,58 +798,58 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
         dma_sync_for_device(&transport->uas_status_streams.mapping);
         dma_sync_for_device(&transport->uas_data_in_streams.mapping);
         dma_sync_for_device(&transport->uas_data_out_streams.mapping);
-        liteos_realtest_mark_number("USB_MSC_UAS_STREAM_DROP_FLAGS",
+        realtest_mark_number("USB_MSC_UAS_STREAM_DROP_FLAGS",
                                     stream_flags);
-        liteos_realtest_mark_number("USB_MSC_UAS_STREAM_ADD_FLAGS",
+        realtest_mark_number("USB_MSC_UAS_STREAM_ADD_FLAGS",
                                     stream_flags);
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_CONFIGURE SLOT=%u PHASE=STREAMS MAX_ID=%u "
+        kernel_serial_printf_serial_only(
+            "OS_UAS_CONFIGURE SLOT=%u PHASE=STREAMS MAX_ID=%u "
             "FLAGS=%u STATUS_CTX=%u,%u,%u\r\n",
             slot, max_id, stream_flags, status_context[0],
             status_context[1], status_context[2]);
         if (!xhci_submit_command(
                 state, XHCI_CONFIGURE_ENDPOINT_TYPE, slot,
                 xhci_dma_address(&state->input_context.mapping), 0)) {
-            liteos_realtest_mark("USB_MSC_UAS_STREAM_CONFIGURE_FAIL");
+            realtest_mark("USB_MSC_UAS_STREAM_CONFIGURE_FAIL");
             xhci_msc_transport_release(slot);
             return false;
         }
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_CONFIGURE_OK SLOT=%u PHASE=STREAMS\r\n", slot);
-        liteos_realtest_mark("USB_MSC_UAS_STREAMS_CONFIGURED");
+        kernel_serial_printf_serial_only(
+            "OS_UAS_CONFIGURE_OK SLOT=%u PHASE=STREAMS\r\n", slot);
+        realtest_mark("USB_MSC_UAS_STREAMS_CONFIGURED");
     }
 
     status_context =
         (uint32_t *)((uint8_t *)input +
                      state->context_size * (status_id + 1U));
 
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_CTX0", status_context[0]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_CTX1", status_context[1]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_CTX2", status_context[2]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_CTX3", status_context[3]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_CTX4", status_context[4]);
-    liteos_realtest_mark("USB_MSC_UAS_ENDPOINTS_CONFIGURED");
+    realtest_mark_number("USB_MSC_UAS_STATUS_CTX0", status_context[0]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_CTX1", status_context[1]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_CTX2", status_context[2]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_CTX3", status_context[3]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_CTX4", status_context[4]);
+    realtest_mark("USB_MSC_UAS_ENDPOINTS_CONFIGURED");
 
     dma_sync_for_cpu(&state->output_context.mapping);
     uint32_t *output_status =
         (uint32_t *)state->output_context.cpu +
         (uint32_t)(state->context_size / sizeof(uint32_t)) * status_id;
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_OUT0", output_status[0]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_OUT1", output_status[1]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_OUT2", output_status[2]);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_OUT3", output_status[3]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_OUT0", output_status[0]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_OUT1", output_status[1]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_OUT2", output_status[2]);
+    realtest_mark_number("USB_MSC_UAS_STATUS_OUT3", output_status[3]);
 
     uint8_t active_alternate = 0xFFU;
     if (!xhci_msc_get_interface(state, &state->device,
                                 transport->interface_number,
                                 &active_alternate)) {
-        liteos_realtest_mark("USB_MSC_UAS_GET_INTERFACE_FAIL");
+        realtest_mark("USB_MSC_UAS_GET_INTERFACE_FAIL");
         xhci_msc_transport_release(slot);
         return false;
     }
-    liteos_realtest_mark_number("USB_MSC_UAS_ACTIVE_ALT", active_alternate);
+    realtest_mark_number("USB_MSC_UAS_ACTIVE_ALT", active_alternate);
     if (active_alternate != uas_alternate) {
-        liteos_realtest_mark("USB_MSC_UAS_ALT_MISMATCH");
+        realtest_mark("USB_MSC_UAS_ALT_MISMATCH");
         xhci_msc_transport_release(slot);
         return false;
     }
@@ -865,7 +865,7 @@ static bool xhci_configure_uas_endpoints(xhci_state_t *state) {
     transport->uas_data_out_cycle = 1U;
     state->msc_configured = true;
     g_xhci_usb_msc = true;
-    liteos_realtest_mark("USB_MSC_UAS_CONFIGURED");
+    realtest_mark("USB_MSC_UAS_CONFIGURED");
     return true;
 }
 
@@ -890,7 +890,7 @@ static bool xhci_configure_msc_bot_endpoints(xhci_state_t *state) {
     existing = &g_xhci_msc_transports[slot];
     recovering_uas = existing->configured && existing->uas;
     if (recovering_uas && !xhci_stop_uas_transport(state, existing)) {
-        liteos_realtest_mark("USB_MSC_UAS_FALLBACK_STOP_FAIL");
+        realtest_mark("USB_MSC_UAS_FALLBACK_STOP_FAIL");
         return false;
     }
 
@@ -898,20 +898,20 @@ static bool xhci_configure_msc_bot_endpoints(xhci_state_t *state) {
      * firmware-selected UAS setting active across the loader handoff. */
     if (!xhci_msc_control_no_data(state, &state->device, 0x01U, 0x0BU, 0U,
                                   state->msc_interface)) {
-        liteos_realtest_mark("USB_MSC_SET_INTERFACE_FAIL");
+        realtest_mark("USB_MSC_SET_INTERFACE_FAIL");
         return false;
     }
-    liteos_realtest_mark("USB_MSC_SET_INTERFACE_OK");
+    realtest_mark("USB_MSC_SET_INTERFACE_OK");
     uint8_t active_alternate = 0xFFU;
     if (!xhci_msc_get_interface(state, &state->device, state->msc_interface,
                                 &active_alternate)) {
-        liteos_realtest_mark("USB_MSC_GET_INTERFACE_FAIL");
+        realtest_mark("USB_MSC_GET_INTERFACE_FAIL");
         return false;
     }
-    liteos_realtest_mark_number("USB_MSC_INTERFACE_ALT", active_alternate);
+    realtest_mark_number("USB_MSC_INTERFACE_ALT", active_alternate);
 
     if (recovering_uas && !xhci_drop_uas_endpoint_contexts(state, existing)) {
-        liteos_realtest_mark("USB_MSC_UAS_FALLBACK_DROP_FAIL");
+        realtest_mark("USB_MSC_UAS_FALLBACK_DROP_FAIL");
         return false;
     }
 
@@ -963,10 +963,10 @@ static bool xhci_configure_msc_bot_endpoints(xhci_state_t *state) {
     xhci_endpoint_context_set_max_burst(
         (uint32_t *)((uint8_t *)input + state->context_size * (out_id + 1U)),
         state->msc_bulk_out_max_burst);
-    liteos_realtest_mark_number("USB_MSC_IN_ENDPOINT", state->msc_bulk_in_endpoint);
-    liteos_realtest_mark_number("USB_MSC_OUT_ENDPOINT", state->msc_bulk_out_endpoint);
-    liteos_realtest_mark_number("USB_MSC_IN_BURST", state->msc_bulk_in_max_burst);
-    liteos_realtest_mark_number("USB_MSC_OUT_BURST", state->msc_bulk_out_max_burst);
+    realtest_mark_number("USB_MSC_IN_ENDPOINT", state->msc_bulk_in_endpoint);
+    realtest_mark_number("USB_MSC_OUT_ENDPOINT", state->msc_bulk_out_endpoint);
+    realtest_mark_number("USB_MSC_IN_BURST", state->msc_bulk_in_max_burst);
+    realtest_mark_number("USB_MSC_OUT_BURST", state->msc_bulk_out_max_burst);
 
     dma_sync_for_device(&state->input_context.mapping);
     dma_sync_for_device(&transport->bulk_in_ring.mapping);
@@ -996,12 +996,12 @@ static bool xhci_configure_msc_bot_endpoints(xhci_state_t *state) {
      * freshly selected alternate setting starts with clean endpoints and can
      * accept its first CBW directly; resetting it here would require a device
      * recovery interval and can make the first bulk transaction time out. */
-    liteos_realtest_mark("USB_MSC_BOT_CONFIGURED");
+    realtest_mark("USB_MSC_BOT_CONFIGURED");
     return true;
 }
 
 bool xhci_configure_msc_endpoints(xhci_state_t *state) {
-    if (!LITEOS_XHCI_DIAGNOSTIC_BOT &&
+    if (!OS_XHCI_DIAGNOSTIC_BOT &&
         state != 0 && state->device_speed >= 3U &&
         state->msc_uas_present &&
         state->msc_uas_command_endpoint != 0U &&
@@ -1014,14 +1014,14 @@ bool xhci_configure_msc_endpoints(xhci_state_t *state) {
              * primary stream-context entries.  Prefer the device's BOT
              * alternate setting when it is available instead of leaving a
              * storage device unusable. */
-            liteos_realtest_mark_number(
+            realtest_mark_number(
                 "USB_MSC_UAS_HOST_STREAMS_UNSUPPORTED",
                 state->max_primary_stream_array_size);
             if (state->msc_bulk_in_endpoint != 0U &&
                 state->msc_bulk_out_endpoint != 0U &&
                 state->msc_bulk_in_max_packet != 0U &&
                 state->msc_bulk_out_max_packet != 0U) {
-                liteos_realtest_mark("USB_MSC_UAS_BOT_FALLBACK");
+                realtest_mark("USB_MSC_UAS_BOT_FALLBACK");
                 return xhci_configure_msc_bot_endpoints(state);
             }
             return false;
@@ -1029,8 +1029,8 @@ bool xhci_configure_msc_endpoints(xhci_state_t *state) {
         return xhci_configure_uas_endpoints(state);
     }
 
-    if (LITEOS_XHCI_DIAGNOSTIC_BOT && state != 0 && state->msc_uas_present)
-        liteos_realtest_mark("USB_MSC_DIAGNOSTIC_BOT");
+    if (OS_XHCI_DIAGNOSTIC_BOT && state != 0 && state->msc_uas_present)
+        realtest_mark("USB_MSC_DIAGNOSTIC_BOT");
     return xhci_configure_msc_bot_endpoints(state);
 }
 
@@ -1069,54 +1069,54 @@ static void xhci_msc_log_bulk_error(
     if (slot_device != 0 && slot_device->used)
         root_port = slot_device->root_port;
 
-    liteos_realtest_mark_number("USB_MSC_BULK_EVENT_ENDPOINT", endpoint_id);
-    liteos_realtest_mark_number("USB_MSC_BULK_EVENT_CONTROL", event->control);
-    liteos_realtest_mark_number("USB_MSC_BULK_EVENT_PTR_LO",
+    realtest_mark_number("USB_MSC_BULK_EVENT_ENDPOINT", endpoint_id);
+    realtest_mark_number("USB_MSC_BULK_EVENT_CONTROL", event->control);
+    realtest_mark_number("USB_MSC_BULK_EVENT_PTR_LO",
                                 (uint32_t)event->parameter);
-    liteos_realtest_mark_number("USB_MSC_BULK_EVENT_PTR_HIGH",
+    realtest_mark_number("USB_MSC_BULK_EVENT_PTR_HIGH",
                                 (uint32_t)(event->parameter >> 32));
     if (endpoint_context != 0) {
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_CTX0",
+        realtest_mark_number("USB_MSC_BULK_FAIL_CTX0",
                                     endpoint_context[0]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_CTX1",
+        realtest_mark_number("USB_MSC_BULK_FAIL_CTX1",
                                     endpoint_context[1]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_CTX2",
+        realtest_mark_number("USB_MSC_BULK_FAIL_CTX2",
                                     endpoint_context[2]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_CTX3",
+        realtest_mark_number("USB_MSC_BULK_FAIL_CTX3",
                                     endpoint_context[3]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_CTX4",
+        realtest_mark_number("USB_MSC_BULK_FAIL_CTX4",
                                     endpoint_context[4]);
     }
     if (trb != 0) {
         uint64_t trb_dma = xhci_dma_address(&ring_page->mapping) +
                            (uint64_t)trb_index * sizeof(*trb);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_RING_CTRL",
+        realtest_mark_number("USB_MSC_BULK_FAIL_RING_CTRL",
                                     trb->control);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_RING_STATUS",
+        realtest_mark_number("USB_MSC_BULK_FAIL_RING_STATUS",
                                     trb->status);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_RING_PARAM_LO",
+        realtest_mark_number("USB_MSC_BULK_FAIL_RING_PARAM_LO",
                                     (uint32_t)trb->parameter);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_RING_PARAM_HIGH",
+        realtest_mark_number("USB_MSC_BULK_FAIL_RING_PARAM_HIGH",
                                     (uint32_t)(trb->parameter >> 32));
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_TRB_LO",
+        realtest_mark_number("USB_MSC_BULK_FAIL_TRB_LO",
                                     (uint32_t)trb_dma);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_TRB_HIGH",
+        realtest_mark_number("USB_MSC_BULK_FAIL_TRB_HIGH",
                                     (uint32_t)(trb_dma >> 32));
     }
-    liteos_realtest_mark_number("USB_MSC_BULK_FAIL_DATA_LO",
+    realtest_mark_number("USB_MSC_BULK_FAIL_DATA_LO",
         (uint32_t)xhci_dma_address(&transport->data_buffer.mapping));
-    liteos_realtest_mark_number("USB_MSC_BULK_FAIL_DATA_HIGH",
+    realtest_mark_number("USB_MSC_BULK_FAIL_DATA_HIGH",
         (uint32_t)(xhci_dma_address(&transport->data_buffer.mapping) >> 32));
     if (data != 0) {
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_DATA0", data[0]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_DATA1", data[1]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_DATA2", data[2]);
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_DATA3", data[3]);
+        realtest_mark_number("USB_MSC_BULK_FAIL_DATA0", data[0]);
+        realtest_mark_number("USB_MSC_BULK_FAIL_DATA1", data[1]);
+        realtest_mark_number("USB_MSC_BULK_FAIL_DATA2", data[2]);
+        realtest_mark_number("USB_MSC_BULK_FAIL_DATA3", data[3]);
     }
-    liteos_realtest_mark_number("USB_MSC_BULK_FAIL_USBSTS",
+    realtest_mark_number("USB_MSC_BULK_FAIL_USBSTS",
         xhci_controller_read32(state, state->operational_offset + 0x04U));
     if (root_port != 0U) {
-        liteos_realtest_mark_number("USB_MSC_BULK_FAIL_PORTSC",
+        realtest_mark_number("USB_MSC_BULK_FAIL_PORTSC",
             xhci_controller_read32(
                 state, state->operational_offset + 0x400U +
                        (uint32_t)(root_port - 1U) * 0x10U));
@@ -1167,10 +1167,10 @@ static kstatus_t xhci_msc_transfer_locked(
                        (uint32_t)(root_port - 1U) *
                            XHCI_PORT_REGISTER_STRIDE) :
             UINT32_MAX;
-        liteos_realtest_mark_number("USB_MSC_BULK_PORTSC_BEFORE", portsc);
+        realtest_mark_number("USB_MSC_BULK_PORTSC_BEFORE", portsc);
         if (portsc == UINT32_MAX ||
             (portsc & XHCI_PORTSC_READY) != XHCI_PORTSC_READY) {
-            liteos_realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 9U);
+            realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 9U);
             return K_EDEVREMOVED;
         }
     }
@@ -1220,7 +1220,7 @@ static kstatus_t xhci_msc_transfer_locked(
         if (type != XHCI_TRANSFER_EVENT_TYPE ||
             event_slot != transport->slot || event_endpoint != endpoint_id) {
             if (!xhci_defer_event(state, &event)) {
-                liteos_realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 5U);
+                realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 5U);
                 return K_EIO;
             }
             continue;
@@ -1230,16 +1230,16 @@ static kstatus_t xhci_msc_transfer_locked(
         uint32_t residual = event.status & 0x00FFFFFFU;
         if (completion != XHCI_COMPLETION_SUCCESS &&
             completion != XHCI_COMPLETION_SHORT_PACKET) {
-            liteos_realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 6U);
-            liteos_realtest_mark_number("USB_MSC_BULK_FAIL_CODE", completion);
-            liteos_realtest_mark_number("USB_MSC_BULK_FAIL_STATUS", event.status);
+            realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 6U);
+            realtest_mark_number("USB_MSC_BULK_FAIL_CODE", completion);
+            realtest_mark_number("USB_MSC_BULK_FAIL_STATUS", event.status);
             xhci_msc_log_bulk_error(state, transport, ring_page, index,
                                     endpoint_id, &event);
             return K_EIO;
         }
         if (residual > length) {
-            liteos_realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 7U);
-            liteos_realtest_mark_number("USB_MSC_BULK_FAIL_RESIDUAL", residual);
+            realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 7U);
+            realtest_mark_number("USB_MSC_BULK_FAIL_RESIDUAL", residual);
             return K_EIO;
         }
 
@@ -1253,7 +1253,7 @@ static kstatus_t xhci_msc_transfer_locked(
         if (actual != 0) *actual = completed;
         return K_OK;
     }
-    liteos_realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 8U);
+    realtest_mark_number("USB_MSC_BULK_FAIL_STAGE", 8U);
     return K_ETIMEDOUT;
 }
 
@@ -1280,8 +1280,8 @@ static bool xhci_uas_queue_transfer(
         *enqueue >= XHCI_RING_TOTAL_TRB_COUNT ||
         (*enqueue % XHCI_RING_TRB_COUNT) == XHCI_RING_TRB_COUNT - 1U ||
         !xhci_msc_ring_valid(ring_page)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_QUEUE_FAIL STAGE=1 EP=%u IN=%u STREAM=%u LEN=%u ENQ=%u RING=%u CPU=%u PAGES=%u SEGS=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_UAS_QUEUE_FAIL STAGE=1 EP=%u IN=%u STREAM=%u LEN=%u ENQ=%u RING=%u CPU=%u PAGES=%u SEGS=%u\r\n",
             endpoint, direction_in ? 1U : 0U, stream_id, length,
             enqueue != 0 ? *enqueue : 0U,
             ring_page != 0 && ring_page->cpu != 0 ? 1U : 0U,
@@ -1292,8 +1292,8 @@ static bool xhci_uas_queue_transfer(
     }
     endpoint_id = xhci_msc_endpoint_id(endpoint, direction_in);
     if (endpoint_id > 31U) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_QUEUE_FAIL STAGE=2 EP=%u IN=%u STREAM=%u LEN=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_UAS_QUEUE_FAIL STAGE=2 EP=%u IN=%u STREAM=%u LEN=%u\r\n",
             endpoint, direction_in ? 1U : 0U, stream_id, length);
         return false;
     }
@@ -1320,8 +1320,8 @@ static bool xhci_uas_queue_transfer(
                        (uint64_t)index * sizeof(xhci_trb_t);
 
     if (!xhci_msc_ring_advance(ring_page, enqueue, cycle)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_QUEUE_FAIL STAGE=3 EP=%u IN=%u STREAM=%u LEN=%u ENQ=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_UAS_QUEUE_FAIL STAGE=3 EP=%u IN=%u STREAM=%u LEN=%u ENQ=%u\r\n",
             endpoint, direction_in ? 1U : 0U, stream_id, length, index);
         return false;
     }
@@ -1415,10 +1415,10 @@ static kstatus_t xhci_uas_scsi_command_locked(
                                  &transport->uas_data_out_cycle;
     emit_diagnostic = !transport->uas_diagnostic_emitted;
     transport->uas_diagnostic_emitted = true;
-    liteos_realtest_mark_number("USB_MSC_UAS_STREAM_ID", stream_id);
+    realtest_mark_number("USB_MSC_UAS_STREAM_ID", stream_id);
     if (emit_diagnostic) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_SCSI_BEGIN SLOT=%u STREAM=%u CMD=%u STATUS=%u DATA=%u LEN=%u IN=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_UAS_SCSI_BEGIN SLOT=%u STREAM=%u CMD=%u STATUS=%u DATA=%u LEN=%u IN=%u\r\n",
             transport->slot, stream_id, command_id, status_id, data_id, length,
             direction_in ? 1U : 0U);
     }
@@ -1448,23 +1448,23 @@ static kstatus_t xhci_uas_scsi_command_locked(
             &transport->uas_status_buffer, 0, XHCI_UAS_STATUS_LENGTH,
             transport->uas_status_endpoint, true, stream_id,
             &status_trb)) {
-        liteos_serial_write_serial_only("LITEOS_UAS_STATUS_QUEUE_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_UAS_STATUS_QUEUE_FAIL\r\n");
         return K_EIO;
     }
     if (emit_diagnostic) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_STATUS_QUEUED TRB=%u\r\n", (uint32_t)status_trb);
+        kernel_serial_printf_serial_only(
+            "OS_UAS_STATUS_QUEUED TRB=%u\r\n", (uint32_t)status_trb);
     }
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_LENGTH",
+    realtest_mark_number("USB_MSC_UAS_STATUS_LENGTH",
                                 XHCI_UAS_STATUS_LENGTH);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_RING_LO",
+    realtest_mark_number("USB_MSC_UAS_STATUS_RING_LO",
                                 (uint32_t)xhci_dma_address(
                                     &status_ring->mapping));
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_TRB_LO",
+    realtest_mark_number("USB_MSC_UAS_STATUS_TRB_LO",
                                 (uint32_t)status_trb);
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_TRB_HIGH",
+    realtest_mark_number("USB_MSC_UAS_STATUS_TRB_HIGH",
                                 (uint32_t)(status_trb >> 32));
-    liteos_realtest_mark_number("USB_MSC_UAS_STATUS_DOORBELL",
+    realtest_mark_number("USB_MSC_UAS_STATUS_DOORBELL",
                                 xhci_msc_endpoint_id(
                                     transport->uas_status_endpoint, true) |
                                 ((uint32_t)stream_id << 16));
@@ -1476,13 +1476,13 @@ static kstatus_t xhci_uas_scsi_command_locked(
                 direction_in ? transport->uas_data_in_endpoint :
                                transport->uas_data_out_endpoint,
                 direction_in, stream_id, &data_trb)) {
-            liteos_serial_write_serial_only("LITEOS_UAS_DATA_QUEUE_FAIL\r\n");
+            kernel_serial_write_serial_only("OS_UAS_DATA_QUEUE_FAIL\r\n");
             return K_EIO;
         }
         data_submitted = true;
         if (emit_diagnostic) {
-            liteos_serial_printf_serial_only(
-                "LITEOS_UAS_DATA_QUEUED TRB=%u\r\n", (uint32_t)data_trb);
+            kernel_serial_printf_serial_only(
+                "OS_UAS_DATA_QUEUED TRB=%u\r\n", (uint32_t)data_trb);
         }
     }
 
@@ -1492,12 +1492,12 @@ static kstatus_t xhci_uas_scsi_command_locked(
             &transport->uas_command_buffer, command_iu,
             XHCI_UAS_COMMAND_LENGTH, transport->uas_command_endpoint, false,
             0U, &command_trb)) {
-        liteos_serial_write_serial_only("LITEOS_UAS_COMMAND_QUEUE_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_UAS_COMMAND_QUEUE_FAIL\r\n");
         return K_EIO;
     }
     if (emit_diagnostic) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_COMMAND_QUEUED TRB=%u\r\n", (uint32_t)command_trb);
+        kernel_serial_printf_serial_only(
+            "OS_UAS_COMMAND_QUEUED TRB=%u\r\n", (uint32_t)command_trb);
     }
 
     xhci_uas_ring_doorbell(state, transport->slot,
@@ -1513,8 +1513,8 @@ static kstatus_t xhci_uas_scsi_command_locked(
     xhci_uas_ring_doorbell(state, transport->slot,
                            transport->uas_command_endpoint, false, 0U);
     if (emit_diagnostic) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_DOORBELLS SLOT=%u STREAM=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_UAS_DOORBELLS SLOT=%u STREAM=%u\r\n",
             transport->slot, stream_id);
     }
 
@@ -1523,9 +1523,9 @@ static kstatus_t xhci_uas_scsi_command_locked(
         xhci_trb_t event;
         if (!xhci_next_ring_event(state, &event)) {
             if (xhci_controller_timeout_reached(deadline)) {
-                liteos_realtest_mark("USB_MSC_UAS_TIMEOUT");
-                liteos_serial_printf_serial_only(
-                    "LITEOS_UAS_TIMEOUT SLOT=%u STREAM=%u\r\n",
+                realtest_mark("USB_MSC_UAS_TIMEOUT");
+                kernel_serial_printf_serial_only(
+                    "OS_UAS_TIMEOUT SLOT=%u STREAM=%u\r\n",
                     transport->slot, stream_id);
                 result = K_ETIMEDOUT;
                 goto out;
@@ -1542,8 +1542,8 @@ static kstatus_t xhci_uas_scsi_command_locked(
             (event_endpoint != command_id && event_endpoint != status_id &&
              (length == 0U || event_endpoint != data_id))) {
             if (!xhci_defer_event(state, &event)) {
-                liteos_serial_printf_serial_only(
-                    "LITEOS_UAS_EVENT_QUEUE_FAIL SLOT=%u TYPE=%u CTRL=%u\r\n",
+                kernel_serial_printf_serial_only(
+                    "OS_UAS_EVENT_QUEUE_FAIL SLOT=%u TYPE=%u CTRL=%u\r\n",
                     transport->slot, type, event.control);
                 result = K_EIO;
                 goto out;
@@ -1599,59 +1599,59 @@ static kstatus_t xhci_uas_scsi_command_locked(
                     (uint32_t *)output_page->cpu +
                     context_words * event_endpoint;
             }
-            liteos_realtest_mark_number("USB_MSC_UAS_EVENT_CODE", completion);
-            liteos_realtest_mark_number("USB_MSC_UAS_EVENT_ENDPOINT",
+            realtest_mark_number("USB_MSC_UAS_EVENT_CODE", completion);
+            realtest_mark_number("USB_MSC_UAS_EVENT_ENDPOINT",
                                         event_endpoint);
-            liteos_realtest_mark_number("USB_MSC_UAS_EVENT_STATUS",
+            realtest_mark_number("USB_MSC_UAS_EVENT_STATUS",
                                         event.status);
-            liteos_realtest_mark_number("USB_MSC_UAS_EVENT_CONTROL",
+            realtest_mark_number("USB_MSC_UAS_EVENT_CONTROL",
                                         event.control);
-            liteos_realtest_mark_number("USB_MSC_UAS_EVENT_PTR_LO",
+            realtest_mark_number("USB_MSC_UAS_EVENT_PTR_LO",
                                         (uint32_t)event.parameter);
-            liteos_realtest_mark_number("USB_MSC_UAS_EVENT_PTR_HIGH",
+            realtest_mark_number("USB_MSC_UAS_EVENT_PTR_HIGH",
                                         (uint32_t)(event.parameter >> 32));
             if (failure_context != 0) {
-                liteos_realtest_mark_number("USB_MSC_UAS_FAIL_CTX0",
+                realtest_mark_number("USB_MSC_UAS_FAIL_CTX0",
                                             failure_context[0]);
-                liteos_realtest_mark_number("USB_MSC_UAS_FAIL_CTX1",
+                realtest_mark_number("USB_MSC_UAS_FAIL_CTX1",
                                             failure_context[1]);
-                liteos_realtest_mark_number("USB_MSC_UAS_FAIL_CTX2",
+                realtest_mark_number("USB_MSC_UAS_FAIL_CTX2",
                                             failure_context[2]);
-                liteos_realtest_mark_number("USB_MSC_UAS_FAIL_CTX3",
+                realtest_mark_number("USB_MSC_UAS_FAIL_CTX3",
                                             failure_context[3]);
-                liteos_realtest_mark_number("USB_MSC_UAS_FAIL_CTX4",
+                realtest_mark_number("USB_MSC_UAS_FAIL_CTX4",
                                             failure_context[4]);
             }
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_STREAM_LO",
+            realtest_mark_number("USB_MSC_UAS_FAIL_STREAM_LO",
                 failure_streams != 0 && failure_streams->cpu != 0 ?
                 (uint32_t)((uint64_t *)failure_streams->cpu)
                     [stream_id * 2U] : 0U);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_RING_CTRL",
+            realtest_mark_number("USB_MSC_UAS_FAIL_RING_CTRL",
                 failure_ring != 0 && failure_ring->cpu != 0 ?
                 ((xhci_trb_t *)failure_ring->cpu)[0].control : 0U);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_RING_STATUS",
+            realtest_mark_number("USB_MSC_UAS_FAIL_RING_STATUS",
                 failure_ring != 0 && failure_ring->cpu != 0 ?
                 ((xhci_trb_t *)failure_ring->cpu)[0].status : 0U);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_RING_PARAM_LO",
+            realtest_mark_number("USB_MSC_UAS_FAIL_RING_PARAM_LO",
                 failure_ring != 0 && failure_ring->cpu != 0 ?
                 (uint32_t)((xhci_trb_t *)failure_ring->cpu)[0].parameter : 0U);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_RING_PARAM_HIGH",
+            realtest_mark_number("USB_MSC_UAS_FAIL_RING_PARAM_HIGH",
                 failure_ring != 0 && failure_ring->cpu != 0 ?
                 (uint32_t)(((xhci_trb_t *)failure_ring->cpu)[0].parameter >> 32) :
                 0U);
-            liteos_realtest_mark_number(
+            realtest_mark_number(
                 "USB_MSC_UAS_FAIL_USBSTS",
                 xhci_controller_read32(state,
                     state->operational_offset + 0x04U));
-            liteos_serial_printf_serial_only(
-                "LITEOS_UAS_EVENT_FAIL SLOT=%u STREAM=%u CODE=%u ENDPOINT=%u PTR=%u\r\n",
+            kernel_serial_printf_serial_only(
+                "OS_UAS_EVENT_FAIL SLOT=%u STREAM=%u CODE=%u ENDPOINT=%u PTR=%u\r\n",
                 transport->slot, stream_id, completion, event_endpoint,
                 (uint32_t)event.parameter);
             dma_sync_for_cpu(&transport->uas_status_buffer.mapping);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_IU0", status_iu[0]);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_IU1", status_iu[1]);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_IU2", status_iu[2]);
-            liteos_realtest_mark_number("USB_MSC_UAS_FAIL_IU3", status_iu[3]);
+            realtest_mark_number("USB_MSC_UAS_FAIL_IU0", status_iu[0]);
+            realtest_mark_number("USB_MSC_UAS_FAIL_IU1", status_iu[1]);
+            realtest_mark_number("USB_MSC_UAS_FAIL_IU2", status_iu[2]);
+            realtest_mark_number("USB_MSC_UAS_FAIL_IU3", status_iu[3]);
             result = K_EIO;
             goto out;
         }
@@ -1684,7 +1684,7 @@ static kstatus_t xhci_uas_scsi_command_locked(
         }
         uint8_t iu_id = status_iu[0];
         if (xhci_uas_iu_tag(status_iu) != XHCI_UAS_TASK_TAG) {
-            liteos_realtest_mark_number("USB_MSC_UAS_TAG",
+            realtest_mark_number("USB_MSC_UAS_TAG",
                                         xhci_uas_iu_tag(status_iu));
             result = K_EIO;
             goto out;
@@ -1717,7 +1717,7 @@ static kstatus_t xhci_uas_scsi_command_locked(
         }
         if (iu_id == XHCI_UAS_STATUS_IU) {
             if (status_length < 7U || status_iu[6] != 0U) {
-                liteos_realtest_mark_number(
+                realtest_mark_number(
                     "USB_MSC_UAS_SCSI_STATUS",
                     status_length >= 7U ? status_iu[6] : 0xFFU);
                 result = K_EIO;
@@ -1726,7 +1726,7 @@ static kstatus_t xhci_uas_scsi_command_locked(
             status_done = true;
         } else if (iu_id == XHCI_UAS_RESPONSE_IU) {
             if (status_length < 8U || status_iu[7] != 0x08U) {
-                liteos_realtest_mark_number(
+                realtest_mark_number(
                     "USB_MSC_UAS_RESPONSE",
                     status_length >= 8U ? status_iu[7] : 0xFFU);
                 result = K_EIO;
@@ -1734,15 +1734,15 @@ static kstatus_t xhci_uas_scsi_command_locked(
             }
             status_done = true;
         } else {
-            liteos_realtest_mark_number("USB_MSC_UAS_IU", iu_id);
+            realtest_mark_number("USB_MSC_UAS_IU", iu_id);
             result = K_EIO;
             goto out;
         }
     }
     result = K_OK;
     if (emit_diagnostic) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_SCSI_OK SLOT=%u STREAM=%u LEN=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_UAS_SCSI_OK SLOT=%u STREAM=%u LEN=%u\r\n",
             transport->slot, stream_id, actual != 0 ? *actual : 0U);
     }
 
@@ -1794,7 +1794,7 @@ bool xhci_usb_msc_recover_uas(uint8_t slot) {
     transport = &g_xhci_msc_transports[slot];
     if (!transport->configured || !transport->uas) return false;
 
-    liteos_realtest_mark_number("USB_MSC_UAS_RECOVERY_BEGIN", slot);
+    realtest_mark_number("USB_MSC_UAS_RECOVERY_BEGIN", slot);
     xhci_event_lock(state);
     ok = xhci_stop_uas_transport(state, transport);
     if (!xhci_drop_uas_endpoint_contexts(state, transport)) ok = false;
@@ -1807,7 +1807,7 @@ bool xhci_usb_msc_recover_uas(uint8_t slot) {
     }
     xhci_event_unlock(state);
     if (xhci_event_pending(state)) (void)xhci_schedule_deferred_work();
-    liteos_realtest_mark(ok ? "USB_MSC_UAS_RECOVERY_OK" :
+    realtest_mark(ok ? "USB_MSC_UAS_RECOVERY_OK" :
                          "USB_MSC_UAS_RECOVERY_FAIL");
     return ok;
 }
@@ -1818,13 +1818,13 @@ bool xhci_usb_msc_fallback_to_bot(uint8_t slot) {
 
     if (slot == 0U || state == 0 || state->device_slot != slot) return false;
     if (!xhci_usb_msc_is_uas(slot)) return true;
-    liteos_realtest_mark_number("USB_MSC_UAS_FALLBACK_BEGIN", slot);
+    realtest_mark_number("USB_MSC_UAS_FALLBACK_BEGIN", slot);
     ok = xhci_configure_msc_bot_endpoints(state);
     if (ok && !xhci_usb_msc_is_uas(slot)) {
-        liteos_realtest_mark("USB_MSC_UAS_FALLBACK_OK");
+        realtest_mark("USB_MSC_UAS_FALLBACK_OK");
         return true;
     }
-    liteos_realtest_mark("USB_MSC_UAS_FALLBACK_FAIL");
+    realtest_mark("USB_MSC_UAS_FALLBACK_FAIL");
     return false;
 }
 
@@ -1857,8 +1857,8 @@ kstatus_t xhci_usb_bulk_session_begin(uint8_t slot) {
     for (;;) {
         if (xhci_event_try_lock(state)) break;
         if (xhci_controller_timeout_reached(deadline)) {
-            liteos_realtest_mark_number("USB_MSC_EVENT_LOCK_TIMEOUT", slot);
-            liteos_realtest_mark_number(
+            realtest_mark_number("USB_MSC_EVENT_LOCK_TIMEOUT", slot);
+            realtest_mark_number(
                 "USB_MSC_EVENT_LOCK_OWNER",
                 __atomic_load_n(&state->event_lock_owner, __ATOMIC_ACQUIRE));
             return K_ETIMEDOUT;

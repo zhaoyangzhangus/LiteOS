@@ -3,6 +3,7 @@
 #include <arch/x86_64/uaccess.h>
 #include <arch/x86_64/cpu.h>
 #include <kernel/completion_port.h>
+#include <kernel/console.h>
 #include <kernel/debug_stage.h>
 #include <kernel/e1000.h>
 #include <kernel/message_port.h>
@@ -10,10 +11,21 @@
 #include <kernel/socket.h>
 #include <uapi/network.h>
 #include <uapi/socket.h>
+#include <uapi/syscall.h>
 
 #include "internal.h"
 
 static atomic_uint g_socket_create_progress[MAX_CPUS];
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_debug_socket_create_logs;
+static uint32_t g_debug_socket_stream_create_logs;
+static uint32_t g_debug_socket_connect_logs;
+static uint32_t g_debug_socket_io_logs;
+static uint32_t g_debug_socket_zero_destination_logs;
+static uint32_t g_debug_socket_recv_enter_logs;
+static uint32_t g_debug_socket_recv_detail_logs;
+#endif
 
 static void socket_create_progress(uint32_t value) {
     uint32_t cpu = x86_current_cpu_index();
@@ -153,8 +165,8 @@ int64_t syscall_socket_create(uint64_t family, uint64_t type, uint64_t protocol,
     (void)unused5;
     process_t *process = current_process();
     socket_create_progress(1U);
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_USER_MARK, 0x5000U);
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_USER_MARK, 0x5000U);
     if (process == 0 || family > UINT16_MAX || type > UINT16_MAX ||
         protocol > UINT16_MAX ||
         (create_flags & ~((uint64_t)OS_SOCKET_CREATE_FLAG_MASK)) != 0U) {
@@ -163,9 +175,21 @@ int64_t syscall_socket_create(uint64_t family, uint64_t type, uint64_t protocol,
     socket_t *socket = 0;
     kstatus_t status = socket_create((uint16_t)family, (uint16_t)type,
                                      (uint16_t)protocol, &socket);
+#if OS_DEBUG_SERIAL
+    if ((type == OS_SOCK_STREAM &&
+         g_debug_socket_stream_create_logs < 64U) ||
+        g_debug_socket_create_logs < 128U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_CREATE family=%llu type=%llu status=%lld\r\n",
+            (unsigned long long)family, (unsigned long long)type,
+            (long long)status);
+        if (type == OS_SOCK_STREAM) ++g_debug_socket_stream_create_logs;
+        else ++g_debug_socket_create_logs;
+    }
+#endif
     socket_create_progress(2U);
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_USER_MARK, 0x5001U);
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_USER_MARK, 0x5001U);
     socket_create_progress(3U);
     if (status != K_OK) return status;
     handle_t handle = 0;
@@ -174,19 +198,19 @@ int64_t syscall_socket_create(uint64_t family, uint64_t type, uint64_t protocol,
     status = handle_create_with_flags(&process->handles, socket,
                                       SOCKET_RIGHT_ALL, handle_flags, &handle);
     socket_create_progress(4U);
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_USER_MARK, 0x5002U);
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_USER_MARK, 0x5002U);
     socket_create_progress(5U);
     if (status == K_OK) {
         status = copy_to_user((void __user *)(uintptr_t)output_pointer,
                               &handle, sizeof(handle));
-        liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                                 LITEOS_DEBUG_STEP_USER_MARK, 0x5003U);
+        debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                                 OS_DEBUG_STEP_USER_MARK, 0x5003U);
     }
     if (status != K_OK && handle != 0) (void)handle_close(&process->handles, handle);
     object_put(socket);
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_USER_MARK, 0x5004U);
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_USER_MARK, 0x5004U);
     return status;
 }
 
@@ -323,6 +347,15 @@ int64_t syscall_socket_connect(uint64_t handle, uint64_t address, uint64_t port,
     socket_t *socket = (socket_t *)object;
     status = socket->object.type == KOBJECT_TYPE_SOCKET ?
              socket_connect(socket, (uint32_t)address, (uint16_t)port) : K_EINVAL;
+#if OS_DEBUG_SERIAL
+    if (g_debug_socket_connect_logs < 128U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_CONNECT handle=%llx addr=%llx port=%llu status=%lld\r\n",
+            (unsigned long long)handle, (unsigned long long)address,
+            (unsigned long long)port, (long long)status);
+        ++g_debug_socket_connect_logs;
+    }
+#endif
     object_put(object);
     return status;
 }
@@ -448,10 +481,38 @@ int64_t syscall_socket_send(uint64_t handle, uint64_t buffer, uint64_t length,
     if (status != K_OK) return status;
     socket_t *socket = (socket_t *)object;
     uint64_t bytes = 0;
+#if OS_DEBUG_SERIAL
+    if (address == 0U && port == 0U &&
+        g_debug_socket_zero_destination_logs < 64U) {
+        os_socket_info_t info = {0};
+        kstatus_t info_status;
+        info.hdr.size = sizeof(info);
+        info.hdr.version = OS_SYSCALL_ABI_VERSION;
+        info.socket = handle;
+        info_status = socket_get_info(socket, &info);
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_SEND_STATE handle=%llx status=%d type=%u flags=%x local=%x:%u peer=%x:%u\r\n",
+            (unsigned long long)handle, info_status, info.type, info.flags,
+            info.local_address, info.local_port, info.peer_address,
+            info.peer_port);
+        ++g_debug_socket_zero_destination_logs;
+    }
+#endif
     status = socket->object.type == KOBJECT_TYPE_SOCKET ?
              socket_send(socket, payload, (size_t)length, (uint32_t)address,
                          (uint16_t)port, &bytes) : K_EINVAL;
     object_put(object);
+#if OS_DEBUG_SERIAL
+    if (g_debug_socket_io_logs < 256U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_SEND handle=%llx len=%llu addr=%llx port=%llu status=%lld bytes=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)address, (unsigned long long)port,
+            (long long)status,
+            status == K_OK ? (unsigned long long)bytes : 0ULL);
+        ++g_debug_socket_io_logs;
+    }
+#endif
     return status == K_OK ? (int64_t)bytes : status;
 }
 
@@ -589,8 +650,27 @@ int64_t syscall_socket_recv(uint64_t handle, uint64_t buffer, uint64_t length,
     void *object = 0;
     kstatus_t status = handle_lookup(&process->handles, (handle_t)handle,
                                      SOCKET_RIGHT_READ, &object);
-    if (status != K_OK) return status;
+    if (status != K_OK) {
+#if OS_DEBUG_SERIAL
+        if (g_debug_socket_recv_enter_logs < 128U) {
+            kernel_serial_printf_serial_only(
+                "OS_SOCKET_RECV_LOOKUP_FAIL handle=%llu status=%lld\r\n",
+                (unsigned long long)handle, (long long)status);
+            ++g_debug_socket_recv_enter_logs;
+        }
+#endif
+        return status;
+    }
     socket_t *socket = (socket_t *)object;
+#if OS_DEBUG_SERIAL
+    if (g_debug_socket_recv_enter_logs < 128U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_RECV_ENTER handle=%llu len=%llu timeout=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)timeout_ns);
+        ++g_debug_socket_recv_enter_logs;
+    }
+#endif
     status = socket->object.type == KOBJECT_TYPE_SOCKET ?
              socket_recv(socket, payload, (size_t)length, &source, timeout_ns,
                          &bytes) : K_EINVAL;
@@ -605,6 +685,24 @@ int64_t syscall_socket_recv(uint64_t handle, uint64_t buffer, uint64_t length,
                 sizeof(source.port)) != K_OK) status = K_EACCES;
     }
     object_put(object);
+#if OS_DEBUG_SERIAL
+    if (g_debug_socket_io_logs < 256U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_RECV handle=%llx len=%llu timeout=%llu status=%lld bytes=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)timeout_ns, (long long)status,
+            status == K_OK ? (unsigned long long)bytes : 0ULL);
+        ++g_debug_socket_io_logs;
+    }
+    if (g_debug_socket_recv_detail_logs < 512U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_RECV_DETAIL family=4 handle=%llx len=%llu timeout=%llu status=%lld bytes=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)timeout_ns, (long long)status,
+            status == K_OK ? (unsigned long long)bytes : 0ULL);
+        ++g_debug_socket_recv_detail_logs;
+    }
+#endif
     return status == K_OK ? (int64_t)bytes : status;
 }
 
@@ -622,8 +720,27 @@ int64_t syscall_socket_recv6(uint64_t handle, uint64_t buffer, uint64_t length,
     if (length != 0U && buffer == 0U) return K_EINVAL;
     kstatus_t status = handle_lookup(&process->handles, (handle_t)handle,
                                      SOCKET_RIGHT_READ, &object);
-    if (status != K_OK) return status;
+    if (status != K_OK) {
+#if OS_DEBUG_SERIAL
+        if (g_debug_socket_recv_enter_logs < 128U) {
+            kernel_serial_printf_serial_only(
+                "OS_SOCKET_RECV6_LOOKUP_FAIL handle=%llu status=%lld\r\n",
+                (unsigned long long)handle, (long long)status);
+            ++g_debug_socket_recv_enter_logs;
+        }
+#endif
+        return status;
+    }
     socket_t *socket = (socket_t *)object;
+#if OS_DEBUG_SERIAL
+    if (g_debug_socket_recv_enter_logs < 128U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_RECV6_ENTER handle=%llu len=%llu timeout=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)timeout_ns);
+        ++g_debug_socket_recv_enter_logs;
+    }
+#endif
     status = socket->object.type == KOBJECT_TYPE_SOCKET ?
              socket_recv_ipv6(socket, payload, (size_t)length, &source, timeout_ns,
                               &bytes) : K_EINVAL;
@@ -638,5 +755,23 @@ int64_t syscall_socket_recv6(uint64_t handle, uint64_t buffer, uint64_t length,
                 sizeof(source.port)) != K_OK) status = K_EACCES;
     }
     object_put(object);
+#if OS_DEBUG_SERIAL
+    if (g_debug_socket_io_logs < 256U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_RECV6 handle=%llx len=%llu timeout=%llu status=%lld bytes=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)timeout_ns, (long long)status,
+            status == K_OK ? (unsigned long long)bytes : 0ULL);
+        ++g_debug_socket_io_logs;
+    }
+    if (g_debug_socket_recv_detail_logs < 512U) {
+        kernel_serial_printf_serial_only(
+            "OS_SOCKET_RECV_DETAIL family=6 handle=%llx len=%llu timeout=%llu status=%lld bytes=%llu\r\n",
+            (unsigned long long)handle, (unsigned long long)length,
+            (unsigned long long)timeout_ns, (long long)status,
+            status == K_OK ? (unsigned long long)bytes : 0ULL);
+        ++g_debug_socket_recv_detail_logs;
+    }
+#endif
     return status == K_OK ? (int64_t)bytes : status;
 }

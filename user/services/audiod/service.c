@@ -30,7 +30,9 @@ static int64_t audiod_syscall_two(uint64_t number, uint64_t arg0,
 
 static void audiod_debug_write(const char *text) {
     size_t length = 0U;
-    while (text[length] != '\0') ++length;
+    if (text == 0) return;
+    while (length < 240U && text[length] != '\0') ++length;
+    if (length == 0U) return;
     (void)audiod_syscall_two(OS_SYS_DEBUG_WRITE, (uint64_t)text, length);
 }
 
@@ -42,7 +44,7 @@ __attribute__((noreturn)) static void audiod_exit(uint64_t status) {
 /* Audio hardware is optional during boot. Keep the reason in the real-test
  * log, but never let a missing or partially supported endpoint block desktop. */
 __attribute__((noreturn)) static void audiod_unavailable(const char *stage) {
-    audiod_debug_write("LITEOS_AUDIOD_UNAVAILABLE ");
+    audiod_debug_write("OS_AUDIOD_UNAVAILABLE ");
     audiod_debug_write(stage);
     audiod_debug_write("\r\n");
     audiod_exit(0U);
@@ -134,6 +136,6 @@ __attribute__((noreturn)) void audiod_entry(void) {
     (void)audiod_client_close(&server, client);
     (void)audiod_syscall_one(OS_SYS_HANDLE_CLOSE, handle);
     if (status < 0) audiod_unavailable("GET_STATS");
-    audiod_debug_write("LITEOS_AUDIOD_READY\r\n");
+    audiod_debug_write("OS_AUDIOD_READY\r\n");
     audiod_exit(0U);
 }

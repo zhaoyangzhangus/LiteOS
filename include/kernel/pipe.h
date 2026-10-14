@@ -37,3 +37,6 @@ kstatus_t pipe_stat(const pipe_endpoint_t *endpoint, os_file_info_t *info);
 bool pipe_is_endpoint(const void *object);
 bool pipe_endpoint_is_read(const pipe_endpoint_t *endpoint);
 int64_t pipe_wait_value(const pipe_endpoint_t *endpoint);
+/* Byte count snapshot; the caller retains an endpoint reference. */
+kstatus_t pipe_pending_bytes(const pipe_endpoint_t *endpoint, uint64_t *bytes);
+kstatus_t pipe_shutdown(pipe_endpoint_t *endpoint);

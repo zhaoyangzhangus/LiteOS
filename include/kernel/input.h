@@ -71,6 +71,8 @@ void input_core_bind_wakeup(wait_queue_t *wait_queue);
 kstatus_t input_core_push(const input_event_t *event);
 kstatus_t input_core_push_pointer(const input_pointer_motion_t *motion);
 kstatus_t input_core_pop(input_event_t *event);
+/* Nonblocking FIFO extraction; returns zero for invalid/empty requests. */
+size_t input_core_pop_batch(input_event_t *events, size_t capacity);
 kstatus_t input_core_wait(uint64_t timeout_ns);
 kstatus_t input_core_read(input_event_t *event, uint64_t timeout_ns);
 uint32_t input_core_pending(void);

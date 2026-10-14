@@ -311,16 +311,16 @@ static bool xhci_evaluate_ep0_max_packet(
     if (!xhci_prepare_ep0_update(state, device, descriptor, true)) {
         return false;
     }
-    liteos_realtest_mark_number("XHCI_EP0_EVALUATE_BEGIN",
+    realtest_mark_number("XHCI_EP0_EVALUATE_BEGIN",
                                 device->device_slot);
     if (!xhci_submit_command_ex(
             state, XHCI_EVALUATE_CONTEXT_TYPE, device->device_slot, 0U,
             xhci_dma_address(&device->input_context.mapping), 0)) {
-        liteos_realtest_mark_number("XHCI_EP0_EVALUATE_ERROR",
+        realtest_mark_number("XHCI_EP0_EVALUATE_ERROR",
                                     xhci_last_error());
         return false;
     }
-    liteos_realtest_mark_number("XHCI_EP0_EVALUATE_OK",
+    realtest_mark_number("XHCI_EP0_EVALUATE_OK",
                                 device->device_slot);
     return true;
 }
@@ -340,10 +340,10 @@ static bool xhci_slot_is_addressed(xhci_state_t *state, uint8_t slot) {
     slot_state = (slot_state >> XHCI_SLOT_STATE_SHIFT) &
                  XHCI_SLOT_STATE_MASK;
 
-    liteos_serial_printf_serial_only(
-        "LITEOS_DIAG_XHCI_SLOT_ADDRESSED SLOT=%u STATE=%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_DIAG_XHCI_SLOT_ADDRESSED SLOT=%u STATE=%u\r\n",
         slot, slot_state);
-    liteos_realtest_mark_number("XHCI_SLOT_STATE", slot_state);
+    realtest_mark_number("XHCI_SLOT_STATE", slot_state);
     return slot_state == XHCI_SLOT_STATE_ADDRESSED;
 }
 
@@ -364,8 +364,8 @@ static bool xhci_complete_device_address(
         return false;
     }
 
-    liteos_realtest_mark_number("XHCI_ADDRESS_SLOT", device->device_slot);
-    liteos_realtest_mark_number("XHCI_EP0_MPS", descriptor_max_packet);
+    realtest_mark_number("XHCI_ADDRESS_SLOT", device->device_slot);
+    realtest_mark_number("XHCI_EP0_MPS", descriptor_max_packet);
     if (descriptor_max_packet != initial_max_packet &&
         !xhci_evaluate_ep0_max_packet(state, device, descriptor)) {
         return false;
@@ -374,7 +374,7 @@ static bool xhci_complete_device_address(
         !xhci_submit_address_device(
             state, device->device_slot,
             xhci_dma_address(&device->input_context.mapping), false)) {
-        liteos_realtest_mark_number("XHCI_ADDRESS_ERROR", xhci_last_error());
+        realtest_mark_number("XHCI_ADDRESS_ERROR", xhci_last_error());
         return false;
     }
     return xhci_slot_is_addressed(state, device->device_slot);
@@ -461,8 +461,8 @@ static bool xhci_read_hub_descriptor(xhci_state_t *state) {
     if (power_good_ms < USB_HUB_MIN_POWER_GOOD_MS) {
         power_good_ms = USB_HUB_MIN_POWER_GOOD_MS;
     }
-    liteos_serial_printf_serial_only(
-        "LITEOS_DIAG_HUB_POWER SLOT=%u PORTS=%u POWERED=%u DELAY_MS=%u\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_DIAG_HUB_POWER SLOT=%u PORTS=%u POWERED=%u DELAY_MS=%u\r\n",
         state->device.device_slot, state->hub_port_count, powered_ports,
         power_good_ms);
     xhci_controller_delay_ns((uint64_t)power_good_ms * 1000000ULL);
@@ -497,7 +497,7 @@ static bool xhci_read_configuration_descriptor(xhci_state_t *state) {
         xhci_set_error(57U);
         return false;
     }
-    liteos_realtest_mark_number("XHCI_CONFIG_LENGTH", total_length);
+    realtest_mark_number("XHCI_CONFIG_LENGTH", total_length);
     if (total_length == 9U) return true;
 
     request[6] = (uint8_t)total_length;
@@ -823,8 +823,8 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
         offset += length;
     }
     if (state->msc_uas_present) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_UAS_DESC SLOT=%u ALT=%u CMD=%u STATUS=%u IN=%u OUT=%u "
+        kernel_serial_printf_serial_only(
+            "OS_UAS_DESC SLOT=%u ALT=%u CMD=%u STATUS=%u IN=%u OUT=%u "
             "MPS=%u/%u/%u/%u STREAMS=%u/%u/%u\r\n",
             state->device_slot, state->msc_uas_alternate,
             state->msc_uas_command_endpoint, state->msc_uas_status_endpoint,
@@ -836,55 +836,55 @@ static bool xhci_parse_configuration(xhci_state_t *state) {
             state->msc_uas_status_max_streams,
             state->msc_uas_data_in_max_streams,
             state->msc_uas_data_out_max_streams);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_INTERFACE",
+        realtest_mark_number("USB_MSC_UAS_DESC_INTERFACE",
                                     state->msc_uas_interface);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_ALTERNATE",
+        realtest_mark_number("USB_MSC_UAS_DESC_ALTERNATE",
                                     state->msc_uas_alternate);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_COMMAND",
+        realtest_mark_number("USB_MSC_UAS_DESC_COMMAND",
                                     state->msc_uas_command_endpoint);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_STATUS",
+        realtest_mark_number("USB_MSC_UAS_DESC_STATUS",
                                     state->msc_uas_status_endpoint);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_DATA_IN",
+        realtest_mark_number("USB_MSC_UAS_DESC_DATA_IN",
                                     state->msc_uas_data_in_endpoint);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_DATA_OUT",
+        realtest_mark_number("USB_MSC_UAS_DESC_DATA_OUT",
                                     state->msc_uas_data_out_endpoint);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_COMMAND_MPS",
+        realtest_mark_number("USB_MSC_UAS_DESC_COMMAND_MPS",
                                     state->msc_uas_command_max_packet);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_STATUS_MPS",
+        realtest_mark_number("USB_MSC_UAS_DESC_STATUS_MPS",
                                     state->msc_uas_status_max_packet);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_DATA_IN_MPS",
+        realtest_mark_number("USB_MSC_UAS_DESC_DATA_IN_MPS",
                                     state->msc_uas_data_in_max_packet);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_DATA_OUT_MPS",
+        realtest_mark_number("USB_MSC_UAS_DESC_DATA_OUT_MPS",
                                     state->msc_uas_data_out_max_packet);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_STATUS_STREAMS",
+        realtest_mark_number("USB_MSC_UAS_DESC_STATUS_STREAMS",
                                     state->msc_uas_status_max_streams);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_DATA_IN_STREAMS",
+        realtest_mark_number("USB_MSC_UAS_DESC_DATA_IN_STREAMS",
                                     state->msc_uas_data_in_max_streams);
-        liteos_realtest_mark_number("USB_MSC_UAS_DESC_DATA_OUT_STREAMS",
+        realtest_mark_number("USB_MSC_UAS_DESC_DATA_OUT_STREAMS",
                                     state->msc_uas_data_out_max_streams);
     }
     if (auxiliary) {
-        liteos_realtest_mark_number("XHCI_AUX_CONFIG_TOTAL_LENGTH",
+        realtest_mark_number("XHCI_AUX_CONFIG_TOTAL_LENGTH",
                                     total_length);
-        liteos_realtest_mark_number("XHCI_AUX_CONFIG_VALUE",
+        realtest_mark_number("XHCI_AUX_CONFIG_VALUE",
                                     state->configuration_value);
-        liteos_realtest_mark_number("XHCI_AUX_HID_INTERFACE",
+        realtest_mark_number("XHCI_AUX_HID_INTERFACE",
                                     state->hid_interface);
-        liteos_realtest_mark_number("XHCI_AUX_HID_PROTOCOL",
+        realtest_mark_number("XHCI_AUX_HID_PROTOCOL",
                                     state->hid_protocol);
-        liteos_realtest_mark_number("XHCI_AUX_HID_ENDPOINT",
+        realtest_mark_number("XHCI_AUX_HID_ENDPOINT",
                                     state->hid_endpoint);
-        liteos_realtest_mark_number("XHCI_AUX_HID_MAX_PACKET",
+        realtest_mark_number("XHCI_AUX_HID_MAX_PACKET",
                                     state->hid_max_packet);
-        liteos_realtest_mark_number("XHCI_AUX_HID_INTERVAL",
+        realtest_mark_number("XHCI_AUX_HID_INTERVAL",
                                     state->hid_interval);
-        liteos_realtest_mark_number("XHCI_AUX_HID2_INTERFACE",
+        realtest_mark_number("XHCI_AUX_HID2_INTERFACE",
                                     state->hid_secondary.interface_number);
-        liteos_realtest_mark_number("XHCI_AUX_HID2_PROTOCOL",
+        realtest_mark_number("XHCI_AUX_HID2_PROTOCOL",
                                     state->hid_secondary.protocol);
-        liteos_realtest_mark_number("XHCI_AUX_HID2_ENDPOINT",
+        realtest_mark_number("XHCI_AUX_HID2_ENDPOINT",
                                     state->hid_secondary.endpoint);
-        liteos_realtest_mark_number("XHCI_AUX_HID2_MAX_PACKET",
+        realtest_mark_number("XHCI_AUX_HID2_MAX_PACKET",
                                     state->hid_secondary.max_packet);
     }
     return ((state->hid_endpoint != 0U && state->hid_max_packet != 0U) ||
@@ -1121,7 +1121,7 @@ static bool xhci_configure_hid_endpoint(xhci_state_t *state) {
     last_endpoint_id = endpoint_id > secondary_endpoint_id ?
         endpoint_id : secondary_endpoint_id;
     if (state == xhci_hid_controller_state()) {
-        liteos_realtest_mark_number("XHCI_AUX_HID_CONTEXT_ENTRIES",
+        realtest_mark_number("XHCI_AUX_HID_CONTEXT_ENTRIES",
                                     last_endpoint_id);
     }
     if (state->hid_endpoint != 0U &&
@@ -1229,7 +1229,7 @@ static void xhci_enumeration_rollback(bool publish_topology,
 static void xhci_mark_aux_enumeration_stage(bool auxiliary_hid,
                                              uint32_t stage) {
     if (auxiliary_hid) {
-        liteos_realtest_mark_number("XHCI_AUX_ENUM_STAGE", stage);
+        realtest_mark_number("XHCI_AUX_ENUM_STAGE", stage);
     }
 }
 
@@ -1421,8 +1421,8 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
         xhci_mark_aux_enumeration_stage(auxiliary_hid, 4U);
         uint8_t *header = (uint8_t *)state->descriptor_buffer.cpu;
         if (auxiliary_hid) {
-            liteos_realtest_mark_number("XHCI_AUX_EP0_MPS", header[7]);
-            liteos_realtest_mark_number("XHCI_AUX_EP0_MPS_EFFECTIVE",
+            realtest_mark_number("XHCI_AUX_EP0_MPS", header[7]);
+            realtest_mark_number("XHCI_AUX_EP0_MPS_EFFECTIVE",
                 xhci_ep0_descriptor_max_packet(&state->device, header));
         }
         /* The first Address Device command used BSR so EP0 could read the
@@ -1444,7 +1444,7 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
                                               get_device_descriptor,
                                               XHCI_DESCRIPTOR_DEVICE_LENGTH,
                                               true)) {
-        liteos_realtest_mark_number("XHCI_AUX_FULL_ERROR", xhci_last_error());
+        realtest_mark_number("XHCI_AUX_FULL_ERROR", xhci_last_error());
         do {
             xhci_unpublish_slot_device(slot, parent_slot, parent_port);
             return false;
@@ -1468,13 +1468,13 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
                           ((uint16_t)descriptor[9] << 8);
         uint16_t product = (uint16_t)descriptor[10] |
                            ((uint16_t)descriptor[11] << 8);
-        liteos_realtest_mark_number("XHCI_DEVICE_SLOT", slot);
-        liteos_realtest_mark_number("XHCI_DEVICE_ROOT", root_port);
-        liteos_realtest_mark_number("XHCI_DEVICE_VID", vendor);
-        liteos_realtest_mark_number("XHCI_DEVICE_PID", product);
-        liteos_realtest_mark_number("XHCI_DEVICE_CLASS", descriptor[4]);
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_USB_DEVICE SLOT=%u ROOT=%u PARENT=%u PORT=%u "
+        realtest_mark_number("XHCI_DEVICE_SLOT", slot);
+        realtest_mark_number("XHCI_DEVICE_ROOT", root_port);
+        realtest_mark_number("XHCI_DEVICE_VID", vendor);
+        realtest_mark_number("XHCI_DEVICE_PID", product);
+        realtest_mark_number("XHCI_DEVICE_CLASS", descriptor[4]);
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_USB_DEVICE SLOT=%u ROOT=%u PARENT=%u PORT=%u "
             "VID=%u PID=%u\r\n",
             slot, root_port, parent_slot, parent_port, vendor, product);
     }
@@ -1509,12 +1509,12 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
     set_configuration[1] = XHCI_SETUP_SET_CONFIGURATION;
     set_configuration[2] = state->configuration_value;
     if (auxiliary_hid) {
-        liteos_realtest_mark_number("XHCI_AUX_SET_CONFIGURATION",
+        realtest_mark_number("XHCI_AUX_SET_CONFIGURATION",
                                     state->configuration_value);
     }
     if (!xhci_submit_control_transfer_device(state, &state->device,  set_configuration, 0U, false)) {
         if (auxiliary_hid) {
-            liteos_realtest_mark_number("XHCI_AUX_SET_CONFIGURATION_ERROR",
+            realtest_mark_number("XHCI_AUX_SET_CONFIGURATION_ERROR",
                                         xhci_last_error());
         }
         xhci_set_error(58U);
@@ -1529,14 +1529,14 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
     /* Hub 绗竴闃舵鍙畬鎴愮被璇嗗埆鍜?Hub 鎻忚堪绗﹁鍙栵紱涓嬫父绔彛鐨?     * route string銆乻lot/context 闅旂浠ュ強绔彛浜嬩欢澶勭悊鍦ㄥ悗缁樁娈垫帴鍏ャ€?*/
     if (state->hub_interface_present) {
         if (!xhci_read_hub_descriptor(state)) do {
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_DESCRIPTOR_FAIL\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_DESCRIPTOR_FAIL\r\n");
         xhci_unpublish_slot_device(
             slot,
             parent_slot,
             parent_port);
         return false;
     } while (0);
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_DESCRIPTOR_OK\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_DESCRIPTOR_OK\r\n");
 
         /*
          * Establish a clean Hub change baseline before interrupt-IN is
@@ -1548,7 +1548,7 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
                state,
                &state->device))
         {
-            liteos_serial_write_serial_only("LITEOS_DIAG_HUB_ACK_FAIL\r\n");
+            kernel_serial_write_serial_only("OS_DIAG_HUB_ACK_FAIL\r\n");
             if(xhci_last_error() == 0U)
             {
                 xhci_set_error(68U);
@@ -1562,11 +1562,11 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
         return false;
     } while (0);
         }
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_ACK_OK\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_ACK_OK\r\n");
 
         if (state->hub_endpoint != 0U && !xhci_configure_hub_endpoint(state)) {
-            liteos_serial_write_serial_only(
-                "LITEOS_DIAG_HUB_CONFIGURE_FAIL\r\n");
+            kernel_serial_write_serial_only(
+                "OS_DIAG_HUB_CONFIGURE_FAIL\r\n");
             if (xhci_last_error() == 0U) xhci_set_error(68U);
             do {
         xhci_unpublish_slot_device(
@@ -1576,7 +1576,7 @@ static bool xhci_enumerate_device_mode(xhci_state_t *state, uint8_t slot,
         return false;
     } while (0);
         }
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_CONFIGURE_OK\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_CONFIGURE_OK\r\n");
     } else if (state->bt_event_endpoint != 0U) {
         if (!xhci_configure_bt_endpoints(state)) {
             if (xhci_last_error() == 0U) xhci_set_error(65U);

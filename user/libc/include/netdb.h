@@ -16,8 +16,6 @@
 #define NO_ADDRESS     NO_DATA
 #define NETDB_INTERNAL -1
 
-extern int h_errno;
-
 struct hostent {
     char *h_name;
     char **h_aliases;
@@ -52,6 +50,11 @@ struct addrinfo {
     struct addrinfo *ai_next;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern int h_errno;
+
 #define AI_PASSIVE      0x0001
 #define AI_CANONNAME    0x0002
 #define AI_NUMERICHOST  0x0004
@@ -64,6 +67,7 @@ struct addrinfo {
 #define EAI_NONAME      (-2)
 #define EAI_AGAIN       (-3)
 #define EAI_FAIL        (-4)
+#define EAI_NODATA      (-5)
 #define EAI_FAMILY      (-6)
 #define EAI_SOCKTYPE    (-7)
 #define EAI_SERVICE     (-8)
@@ -116,3 +120,6 @@ int getprotobyname_r(const char *name, struct protoent *result,
 int getprotobynumber_r(int number, struct protoent *result,
                        char *buffer, size_t buffer_length,
                        struct protoent **result_pointer);
+#ifdef __cplusplus
+}
+#endif

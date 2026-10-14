@@ -3,24 +3,26 @@
 
 #include <uapi/all.h>
 
-#include "../../runtime/liteos_text.h"
-#include "../../client_chrome.h"
+#include "../../runtime/text.h"
+#include "../../runtime/caption.h"
+#include "../../runtime/paint.h"
+#include <uapi/window_theme.h>
 
 #define NETMGR_MAP_BASE          0x0C000000ULL
 #define NETMGR_EVENT_TIMEOUT     100000000ULL
 #define NETMGR_REFRESH_TICKS     5U
 #define NETMGR_MIN_WIDTH         520U
 #define NETMGR_MIN_HEIGHT        320U
-#define NETMGR_CONTENT_BACKGROUND 0x00F7F8FAU
-#define NETMGR_CARD_BACKGROUND    0x00FFFFFFU
-#define NETMGR_CARD_BORDER        0x00E1E5E9U
-#define NETMGR_SECTION_TEXT       0x005B6C7AU
-#define NETMGR_VALUE_TEXT         0x003D4852U
-#define NETMGR_HINT_TEXT          0x006B7782U
-#define NETMGR_COMMAND_TEXT       0x005B6670U
+#define NETMGR_CONTENT_BACKGROUND OS_THEME_SURFACE
+#define NETMGR_CARD_BACKGROUND    OS_THEME_SURFACE
+#define NETMGR_CARD_BORDER        OS_THEME_BORDER
+#define NETMGR_SECTION_TEXT       OS_THEME_MUTED
+#define NETMGR_VALUE_TEXT         OS_THEME_TEXT
+#define NETMGR_HINT_TEXT          OS_THEME_MUTED
+#define NETMGR_COMMAND_TEXT       OS_THEME_MUTED
 #define NETMGR_CONNECTED_TEXT     0x002D8A63U
 #define NETMGR_DISCONNECTED_TEXT  0x00B56A28U
-#define NETMGR_FOOTER_BACKGROUND  0x00E9EDF1U
+#define NETMGR_FOOTER_BACKGROUND  OS_THEME_TOOLBAR
 #define NETMGR_ERROR_TEXT         0x00B24F3EU
 
 typedef struct netmgr_window {
@@ -276,20 +278,20 @@ static void fill_rect(uint32_t x, uint32_t y,
     }
 }
 
-static void draw_text(uint32_t x, uint32_t y,
-                      const char *text, uint32_t color) {
-    liteos_text_draw(g_window.pixels, g_window.width,
-                     g_window.width, g_window.height,
-                     (int32_t)x, (int32_t)y, text, color);
+
+static bool g_scale_content;
+static uint32_t content_y(uint32_t y) {
+    return (y > 40U ? y - 40U : 0U) * ui_text_line_height() / 24U;
 }
 
 static void draw_text_clipped(uint32_t x, uint32_t y, uint32_t right,
                               const char *text, uint32_t color) {
     uint32_t max_right;
+    if (g_scale_content) y = content_y(y);
     if (text == 0 || x >= g_window.width || y >= g_window.height) return;
     max_right = right < g_window.width ? right : g_window.width;
     if (max_right <= x) return;
-    liteos_text_draw_clipped(g_window.pixels, g_window.width,
+    ui_text_draw_clipped(g_window.pixels, g_window.width,
                              g_window.width, g_window.height,
                              (int32_t)x, (int32_t)y, max_right,
                              text, color);
@@ -297,12 +299,16 @@ static void draw_text_clipped(uint32_t x, uint32_t y, uint32_t right,
 
 static void draw_card(uint32_t x, uint32_t y,
                       uint32_t width, uint32_t height) {
-    user_client_chrome_round_rect(g_window.pixels, g_window.width,
+    if (g_scale_content) {
+        y = content_y(y);
+        height = height * ui_text_line_height() / 24U;
+    }
+    user_paint_round_rect(g_window.pixels, g_window.width,
                                   g_window.width, g_window.height,
                                   x, y, width, height,
                                   NETMGR_CARD_BORDER);
     if (width > 2U && height > 2U) {
-        user_client_chrome_round_rect(g_window.pixels, g_window.width,
+        user_paint_round_rect(g_window.pixels, g_window.width,
                                       g_window.width, g_window.height,
                                       x + 1U, y + 1U,
                                       width - 2U, height - 2U,
@@ -312,6 +318,7 @@ static void draw_card(uint32_t x, uint32_t y,
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    request.flags = OS_WINDOW_CAPTION_HEIGHT(user_caption_height());
     if (!g_damage_full && g_damage_count == 0U) return;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
@@ -360,16 +367,7 @@ static void render(void) {
     fill_rect(0U, 0U, g_window.width, g_window.height,
               NETMGR_CONTENT_BACKGROUND);
 
-    fill_rect(0U, 0U, g_window.width, USER_CLIENT_CHROME_HEIGHT,
-              USER_CLIENT_CHROME_BACKGROUND);
-    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_window.width, 1U,
-              USER_CLIENT_CHROME_SEPARATOR);
-    user_client_chrome_app_icon(g_window.pixels, g_window.width,
-                                g_window.width, g_window.height,
-                                16U, USER_CLIENT_CHROME_TITLE_Y,
-                                USER_CLIENT_CHROME_ICON_NETWORK);
-    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "NETWORK",
-              USER_CLIENT_CHROME_TEXT);
+    g_scale_content = true;
 
     content_width = g_window.width > 36U ? g_window.width - 36U :
                                            g_window.width;
@@ -483,17 +481,19 @@ static void render(void) {
                           NETMGR_COMMAND_TEXT);
     }
 
-    if (g_window.height > 42U) {
-        uint32_t footer_y = g_window.height - 34U;
-        fill_rect(0U, footer_y, g_window.width, 34U,
+    g_scale_content = false;
+    uint32_t footer_height = ui_text_line_height() + 10U;
+    if (g_window.height > footer_height + 8U) {
+        uint32_t footer_y = g_window.height - footer_height;
+        fill_rect(0U, footer_y, g_window.width, footer_height,
                   NETMGR_CONTENT_BACKGROUND);
-        user_client_chrome_round_rect(g_window.pixels, g_window.width,
+        user_paint_round_rect(g_window.pixels, g_window.width,
                                       g_window.width, g_window.height,
                                       12U, footer_y + 3U,
                                       g_window.width > 24U ?
                                       g_window.width - 24U : g_window.width,
-                                      28U, NETMGR_FOOTER_BACKGROUND);
-        draw_text_clipped(24U, g_window.height - 29U,
+                                      footer_height - 6U, NETMGR_FOOTER_BACKGROUND);
+        draw_text_clipped(24U, footer_y + 5U,
                           g_window.width > 24U ? g_window.width - 24U :
                           g_window.width,
                           g_status_valid ?
@@ -502,14 +502,6 @@ static void render(void) {
                           g_status_valid ? NETMGR_COMMAND_TEXT : NETMGR_ERROR_TEXT);
     }
 
-    user_client_chrome_close(g_window.pixels, g_window.width,
-                             g_window.width, g_window.height,
-                             USER_CLIENT_CHROME_HEIGHT,
-                             USER_CLIENT_CHROME_CLOSE_BG,
-                             USER_CLIENT_CHROME_CLOSE_FG);
-    user_client_chrome_frame(g_window.pixels, g_window.width,
-                             g_window.width, g_window.height,
-                             USER_CLIENT_CHROME_HEIGHT);
 
     update_window();
 }
@@ -518,15 +510,13 @@ static bool refresh_status(void) {
     os_net_status_t status;
     if (netmgr_get_status(&status) < 0) {
         g_status_valid = false;
-        netmgr_damage_rect(0U, 60U, g_window.width,
-                           g_window.height > 60U ? g_window.height - 60U : 0U);
+        netmgr_damage_rect(0U, 0U, g_window.width, g_window.height);
         render();
         return false;
     }
     g_status = status;
     g_status_valid = true;
-    netmgr_damage_rect(0U, 60U, g_window.width,
-                       g_window.height > 60U ? g_window.height - 60U : 0U);
+    netmgr_damage_rect(0U, 0U, g_window.width, g_window.height);
     render();
     return true;
 }
@@ -569,7 +559,7 @@ static bool create_window(void) {
         (int32_t)((display.height - request.height) / 2U) : 0;
     request.flags = OS_WINDOW_VISIBLE |
                     OS_WINDOW_RESIZABLE |
-                    OS_WINDOW_CLIENT_DECORATIONS;
+                    OS_WINDOW_STANDARD_CAPTION_CONTROLS;
     request.background = NETMGR_CONTENT_BACKGROUND;
     request.title[0] = 'N';
     request.title[1] = 'E';
@@ -625,13 +615,13 @@ static void handle_key(const os_window_event_t *event) {
         netmgr_exit(0U);
     }
     if (g_ctrl && input->code == 0x2EU) {
-        (void)liteos_text_adjust(1);
+        (void)ui_text_adjust(1);
         netmgr_damage_all();
         render();
         return;
     }
     if (g_ctrl && input->code == 0x2DU) {
-        (void)liteos_text_adjust(-1);
+        (void)ui_text_adjust(-1);
         netmgr_damage_all();
         render();
         return;
@@ -667,29 +657,18 @@ static void handle_event(const os_window_event_t *event) {
         event->input.type == OS_INPUT_EVENT_RELATIVE &&
         event->input.code == OS_INPUT_REL_WHEEL &&
         event->input.value != 0 && g_ctrl) {
-        (void)liteos_text_adjust(event->input.value > 0 ? 1 : -1);
+        (void)ui_text_adjust(event->input.value > 0 ? 1 : -1);
         netmgr_damage_all();
         render();
         return;
-    }
-    if (event->type == OS_WINDOW_EVENT_INPUT &&
-        event->input.type == OS_INPUT_EVENT_BUTTON &&
-        event->input.code == OS_INPUT_BUTTON_LEFT &&
-        event->input.value == OS_INPUT_VALUE_PRESS &&
-        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
-                                     g_window.width,
-                                     USER_CLIENT_CHROME_HEIGHT)) {
-        netmgr_exit(0U);
     }
     handle_key(event);
 }
 
 static int netmgr_main(void) {
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE) ||
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE) ||
         !create_window()) return 1;
-    /* The first status refresh only dirties the content area.  Paint and
-     * publish the complete client chrome once so the close button is visible
-     * immediately when the window opens. */
+    /* Publish client content; the compositor paints the entire frame. */
     netmgr_damage_all();
     (void)refresh_status();
 

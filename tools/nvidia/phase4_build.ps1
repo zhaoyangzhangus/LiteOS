@@ -27,7 +27,7 @@ $rmSourceRoot = Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\rm'
 $phase3Root = Join-Path $repoRoot 'build\nvidia\phase3'
 $outputRoot = Join-Path $repoRoot 'build\nvidia\phase4'
 $objectRoot = Join-Path $outputRoot 'objects'
-$liteosObjectRoot = Join-Path $objectRoot 'liteos'
+$systemObjectRoot = Join-Path $objectRoot 'system'
 $abiObjectRoot = Join-Path $objectRoot 'vendor_abi'
 $strongBridgeObject = Join-Path $objectRoot 'nv_rm_vendor_bridge.o'
 $workQueueObject = Join-Path $objectRoot 'nv_rm_workqueue.o'
@@ -72,23 +72,23 @@ if ($gateExitCode -ne 0 -or
 
 Require-File (Join-Path $phase3Root 'vendor-rm.o') 'Phase 3 RM object'
 Require-File (Join-Path $phase3Root 'vendor_abi_link_objects.list') 'Phase 3 ABI link list'
-Require-File (Join-Path $phase3Root 'liteos_probe_objects.list') 'Phase 3 LiteOS object list'
+Require-File (Join-Path $phase3Root 'system_probe_objects.list') 'Phase 3 System object list'
 Require-File $linkerScript 'Phase 4 linker script'
 
 $makeArguments = @("BUILD=$Build")
 if ($RealTest) {
     # Real-test images need serial evidence and the FAT32 log path.  Keep this
-    # opt-in so the normal LiteOS build remains byte-for-byte out of scope for
+    # opt-in so the normal System build remains byte-for-byte out of scope for
     # the Phase 4 hardware preparation path.
-    # LITEOS_REALTEST changes compiled code, while the shared make dependency
+    # OS_REALTEST changes compiled code, while the shared make dependency
     # stamps do not encode every CFLAGS value.  Force a clean target rebuild so
     # a reused Build directory cannot mix ordinary and real-test objects.
     $makeArguments = @('-B') + $makeArguments
     $makeArguments += @(
         'DEBUG=2',
-        'LITEOS_DEBUG_SERIAL=1',
-        'LITEOS_REALTEST=1',
-        'KERNEL_EXTRA_CFLAGS=-DLITEOS_NVIDIA_REALTEST_NO_DESKTOP=1'
+        'OS_DEBUG_SERIAL=1',
+        'OS_REALTEST=1',
+        'KERNEL_EXTRA_CFLAGS=-DOS_NVIDIA_REALTEST_NO_DESKTOP=1'
     )
     $makeArguments += 'esp'
 }
@@ -117,11 +117,11 @@ if ($makeExitCode -ne 0) {
 # A native Windows build emits PE/COFF kernel objects.  They are suitable for
 # the normal PE kernel link, but converting each relocatable object to ELF
 # loses the section-relative addends used by local .bss/.rdata references.
-# Build the Phase 4 LiteOS object graph directly as ELF instead; the native
+# Build the Phase 4 System object graph directly as ELF instead; the native
 # build above remains the source of the UEFI loader and ESP payload.
 $elfKernelExtraCFlags = '-mcmodel=kernel'
 if ($RealTest) {
-    $elfKernelExtraCFlags += ' -DLITEOS_NVIDIA_REALTEST_NO_DESKTOP=1'
+    $elfKernelExtraCFlags += ' -DOS_NVIDIA_REALTEST_NO_DESKTOP=1'
 }
 $elfMakeArguments = @(
     '-B', ('BUILD={0}' -f $elfBuildName),
@@ -131,7 +131,7 @@ $elfMakeArguments = @(
     ('KERNEL_LDFLAGS=-nostdlib -Wl,-T,{0}' -f $linkerScript.Replace('\', '/'))
 )
 if ($RealTest) {
-    $elfMakeArguments += @('DEBUG=2', 'LITEOS_DEBUG_SERIAL=1', 'LITEOS_REALTEST=1')
+    $elfMakeArguments += @('DEBUG=2', 'OS_DEBUG_SERIAL=1', 'OS_REALTEST=1')
 }
 $elfMakeArguments += 'kernel'
 $previousMakeErrorActionPreference = $ErrorActionPreference
@@ -146,7 +146,7 @@ finally {
 }
 foreach ($line in $elfMakeOutput) { Write-Output $line }
 if ($elfMakeExitCode -ne 0) {
-    throw 'Phase 4 ELF LiteOS kernel build failed'
+    throw 'Phase 4 ELF System kernel build failed'
 }
 
 $gccCommand = Get-Command x86_64-elf-gcc -ErrorAction Stop
@@ -154,24 +154,24 @@ $linkerCommand = Get-Command x86_64-elf-ld -ErrorAction Stop
 $gcc = $gccCommand.Source
 $linker = $linkerCommand.Source
 
-New-Item -ItemType Directory -Path $liteosObjectRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $systemObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $abiObjectRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 
-$liteosBuildRoot = Join-Path $repoRoot $elfBuildName
-$liteosInputRoot = Join-Path $liteosBuildRoot 'kernel'
-$liteosEspRoot = Join-Path (Join-Path $repoRoot $Build) 'esp'
-$liteosBuildDescription = if ($RealTest) { 'real-test' } else { 'production' }
-Require-File (Join-Path $liteosInputRoot 'entry.o') "$liteosBuildDescription kernel objects"
-$liteosFiles = @(Get-ChildItem -LiteralPath $liteosInputRoot -File -Filter '*.o' |
+$systemBuildRoot = Join-Path $repoRoot $elfBuildName
+$systemInputRoot = Join-Path $systemBuildRoot 'kernel'
+$systemEspRoot = Join-Path (Join-Path $repoRoot $Build) 'esp'
+$systemBuildDescription = if ($RealTest) { 'real-test' } else { 'production' }
+Require-File (Join-Path $systemInputRoot 'entry.o') "$systemBuildDescription kernel objects"
+$systemFiles = @(Get-ChildItem -LiteralPath $systemInputRoot -File -Filter '*.o' |
     Sort-Object Name)
-if ($liteosFiles.Count -eq 0) { throw 'production kernel object directory is empty' }
+if ($systemFiles.Count -eq 0) { throw 'production kernel object directory is empty' }
 
-$liteosObjects = New-Object 'System.Collections.Generic.List[string]'
-foreach ($file in $liteosFiles) {
+$systemObjects = New-Object 'System.Collections.Generic.List[string]'
+foreach ($file in $systemFiles) {
     # These objects are produced by x86_64-elf-gcc and already carry ELF
     # relocations.  Do not pass them through the PE objcopy backend.
-    [void]$liteosObjects.Add($file.FullName.Replace('\', '/'))
+    [void]$systemObjects.Add($file.FullName.Replace('\', '/'))
 }
 
 # The vendor source include graph intentionally selects src/nvidia's Unix
@@ -236,7 +236,7 @@ $bridgeDefines = @(
     '-DRS_PROVIDES_API_STATE=0', '-DNV_CONTAINERS_NO_TEMPLATES',
     '-DINCLUDE_NVLINK_LIB', '-DINCLUDE_NVSWITCH_LIB',
     '-DNV_PRINTF_STRINGS_ALLOWED=0', '-DNV_ASSERT_FAILED_USES_STRINGS=0',
-    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DLITEOS_KERNEL_BUILD'
+    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DOS_KERNEL_BUILD'
 )
 $bridgeFlags = @(
     '-include', $cpuOpsysHeader
@@ -283,13 +283,13 @@ if (Test-Path -LiteralPath $workQueueStderrLog -PathType Leaf) {
 foreach ($line in $workQueueDiagnostics) { Write-Output $line }
 if ($workQueueExitCode -ne 0 -or
     -not (Test-Path -LiteralPath $workQueueObject -PathType Leaf)) {
-    throw 'Phase 4 LiteOS workqueue adapter compilation failed'
+    throw 'Phase 4 System workqueue adapter compilation failed'
 }
 
 # Recompile the 11 linkable ABI adapters with the kernel code model.  Phase 3
 # intentionally compiles them as a relocatable ABI probe; their absolute
 # diagnostic-string relocations are not valid once the final Phase 4 image is
-# placed at LiteOS' high-half address.
+# placed at System' high-half address.
 $abiIncludeArgs = @(
     ('-I' + (Join-Path $repoRoot 'include')),
     ('-I' + (Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\port\include')),
@@ -313,7 +313,7 @@ $abiDefines = @(
     '-DRS_PROVIDES_API_STATE=0', '-DNV_CONTAINERS_NO_TEMPLATES',
     '-DINCLUDE_NVLINK_LIB', '-DINCLUDE_NVSWITCH_LIB',
     '-DNV_PRINTF_STRINGS_ALLOWED=0', '-DNV_ASSERT_FAILED_USES_STRINGS=0',
-    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DLITEOS_KERNEL_BUILD'
+    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DOS_KERNEL_BUILD'
 )
 $abiCommonFlags = @(
     '-fno-strict-aliasing', '-fno-omit-frame-pointer', '-Wformat=2',
@@ -366,7 +366,7 @@ if ($abiObjects.Count -ne 11) {
 Write-AsciiLines $abiLinkList $abiObjects
 
 $linkObjects = New-Object 'System.Collections.Generic.List[string]'
-foreach ($object in $liteosObjects) { [void]$linkObjects.Add($object) }
+foreach ($object in $systemObjects) { [void]$linkObjects.Add($object) }
 [void]$linkObjects.Add((Join-Path $phase3Root 'vendor-rm.o').Replace('\', '/'))
 [void]$linkObjects.Add($workQueueObject.Replace('\', '/'))
 foreach ($object in $abiObjects) { [void]$linkObjects.Add($object) }
@@ -381,23 +381,23 @@ $linkDiagnostics = @(& $linker @linkArgs 2>&1 |
     ForEach-Object { $_.ToString() })
 foreach ($line in $linkDiagnostics) { Write-Output $line }
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $kernelElf -PathType Leaf)) {
-    throw 'Phase 4 RM/LiteOS final link failed'
+    throw 'Phase 4 RM/System final link failed'
 }
 
 New-Item -ItemType Directory -Path $phase4Esp -Force | Out-Null
-if (-not (Test-Path -LiteralPath $liteosEspRoot -PathType Container)) {
-    throw "$liteosBuildDescription ESP directory is missing: $liteosEspRoot"
+if (-not (Test-Path -LiteralPath $systemEspRoot -PathType Container)) {
+    throw "$systemBuildDescription ESP directory is missing: $systemEspRoot"
 }
-Copy-Item -Path (Join-Path $liteosEspRoot '*') -Destination $phase4Esp -Recurse -Force
-New-Item -ItemType Directory -Path (Join-Path $phase4Esp 'EFI\LITEOS') -Force |
+Copy-Item -Path (Join-Path $systemEspRoot '*') -Destination $phase4Esp -Recurse -Force
+New-Item -ItemType Directory -Path (Join-Path $phase4Esp 'EFI\OS') -Force |
     Out-Null
-Copy-Item -LiteralPath $kernelElf -Destination (Join-Path $phase4Esp 'EFI\LITEOS\kernel.elf') -Force
+Copy-Item -LiteralPath $kernelElf -Destination (Join-Path $phase4Esp 'EFI\OS\kernel.elf') -Force
 
 Write-Output ('PHASE4_KERNEL={0}' -f $kernelElf)
 Write-Output ('PHASE4_ESP={0}' -f $phase4Esp)
-Write-Output ('PHASE4_LITEOS_OBJECTS={0}' -f $liteosObjects.Count)
+Write-Output ('PHASE4_OS_OBJECTS={0}' -f $systemObjects.Count)
 Write-Output ('PHASE4_LINK_OBJECTS={0}' -f $linkObjects.Count)
-Write-Output ('PHASE4_LITEOS_BUILD={0}' -f $Build)
-Write-Output ('PHASE4_LITEOS_ELF_BUILD={0}' -f $elfBuildName)
+Write-Output ('PHASE4_OS_BUILD={0}' -f $Build)
+Write-Output ('PHASE4_OS_ELF_BUILD={0}' -f $elfBuildName)
 Write-Output ('PHASE4_REALTEST={0}' -f ($(if ($RealTest) { '1' } else { '0' })))
 Write-Output 'PHASE4_BUILD=PASS'

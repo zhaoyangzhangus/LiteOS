@@ -33,7 +33,7 @@ $matrixDirectory = Join-Path $buildDirectory 'native-matrix'
 $runScript = Join-Path $projectRoot 'run-qemu-windows.ps1'
 $verifyScript = 'tools/verify-qemu-stages.sh'
 $verifyLocationsScript = 'tools/verify-debug-locations.sh'
-$kernelRelative = "$Build/esp/EFI/LITEOS/kernel.elf"
+$kernelRelative = "$Build/esp/EFI/OS/kernel.elf"
 
 New-Item -ItemType Directory -Force -Path $buildDirectory,$matrixDirectory | Out-Null
 Set-Location $projectRoot
@@ -90,11 +90,11 @@ if (-not $NoBuild) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript `
         -Build $Build -Debug $Debug -Serial
     if ($LASTEXITCODE -ne 0) {
-        throw "Native LiteOS build failed ($LASTEXITCODE)."
+        throw "Native System build failed ($LASTEXITCODE)."
     }
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory 'esp\EFI\LITEOS\kernel.elf'))) {
+if (-not (Test-Path -LiteralPath (Join-Path $buildDirectory 'esp\EFI\OS\kernel.elf'))) {
     throw "Kernel ELF not found in $Build."
 }
 
@@ -130,10 +130,10 @@ foreach ($cpuCount in $cpuCounts) {
         while ((Get-Date) -lt $deadline) {
             if (Test-Path -LiteralPath $serialLog) {
                 $serial = Get-Content -LiteralPath $serialLog -Raw -ErrorAction SilentlyContinue
-                if ($serial -match 'LITEOS_LIBC_TEST_OK' -and
-                    $serial -match 'LITEOS_USER_RUNTIME_OK' -and
-                    $serial -match 'LITEOS_WINDOW_OK' -and
-                    $serial -match 'LITEOS_NET_DHCP_OK') {
+                if ($serial -match 'OS_LIBC_TEST_OK' -and
+                    $serial -match 'OS_USER_RUNTIME_OK' -and
+                    $serial -match 'OS_WINDOW_OK' -and
+                    $serial -match 'OS_NET_DHCP_OK') {
                     $success = $true
                     break
                 }
@@ -173,7 +173,7 @@ foreach ($cpuCount in $cpuCounts) {
         continue
     }
 
-    $stageCount = @(Select-String -LiteralPath $savedLog -Pattern '^LITEOS_STAGE phase=').Count
+    $stageCount = @(Select-String -LiteralPath $savedLog -Pattern '^OS_STAGE phase=').Count
     Write-Host "native QEMU matrix: cpu=$cpuCount PASS stages=$stageCount"
 }
 

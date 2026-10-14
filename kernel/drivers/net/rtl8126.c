@@ -52,6 +52,8 @@
 #define RTL8126_CHIP_RESET  (1U << 4)
 #define RTL8126_CHIP_RX_EN  (1U << 3)
 #define RTL8126_CHIP_TX_EN  (1U << 2)
+#define RTL8126_CHIP_STOP_REQ (1U << 7)
+#define RTL8126_TXCFG_AUTO_FIFO (1U << 7)
 #define RTL8126_PHY_LINK     (1U << 1)
 #define RTL8126_CONFIG3_L23   (1U << 1)
 #define RTL8126_MCU_NOW_IS_OOB (1U << 7)
@@ -632,6 +634,15 @@ static bool rtl8126_phy_page(e1000_state_t *state, uint16_t page,
     return success;
 }
 
+static bool rtl8126_phy_start_autoneg(e1000_state_t *state) {
+    /* Clause-22 BMCR is mapped into vendor OCP at A400. Firmware and a
+     * previous OS may leave power-down/isolate set; a MAC reset alone does
+     * not restart copper negotiation. Preserve speed advertisements. */
+    const uint16_t stopped = (1U << 11) | (1U << 10) | (1U << 14);
+    const uint16_t negotiate = (1U << 12) | (1U << 9);
+    return rtl8126_phy_page(state, 0U, 0U, stopped, negotiate);
+}
+
 static bool rtl8126_phy_config(e1000_state_t *state) {
     bool success = true;
     bool firmware_loaded;
@@ -652,7 +663,7 @@ static bool rtl8126_phy_config(e1000_state_t *state) {
     success = rtl8126_phy_page(state, 0x0A4AU, 0x11U, (uint16_t)(1U << 9),
                                0U) && success;
     state->rtl_phy_ocp_base = RTL8126_PHY_OCP_BASE;
-    return success;
+    return success && rtl8126_phy_start_autoneg(state);
 }
 
 static bool rtl8126_hardware_start(e1000_state_t *state) {
@@ -697,10 +708,20 @@ static bool rtl8126_hardware_start(e1000_state_t *state) {
     success = rtl8126_mac_ocp_modify(state, 0xD430U, 0x0FFFU, 0x047FU) && success;
     success = rtl8126_mac_ocp_modify(state, 0xEA1CU, 0x0004U, 0U) && success;
     success = rtl8126_mac_ocp_modify(state, 0xEB54U, 0U, 0x0001U) && success;
+    /* The MCU reset pulse must not collapse into consecutive PCI writes. */
+    rtl8126_delay_ms(1U);
     success = rtl8126_mac_ocp_modify(state, 0xEB54U, 0x0001U, 0U) && success;
     rtl8126_write16(state, 0x1880U,
                     rtl8126_read16(state, 0x1880U) & (uint16_t)~0x0030U);
     success = rtl8126_mac_ocp_write(state, 0xE098U, 0xC302U) && success;
+    bool mcu_ready = false;
+    for (uint32_t attempt = 0U; attempt < 10U; ++attempt) {
+        uint16_t value;
+        if (!rtl8126_mac_ocp_read(state, 0xE00EU, &value)) return false;
+        if ((value & (1U << 13)) == 0U) { mcu_ready = true; break; }
+        rtl8126_delay_ms(1U);
+    }
+    if (!mcu_ready) return false;
     success = rtl8126_mac_ocp_modify(state, 0xC0ACU, 0U, 0x1F80U) && success;
     rtl8126_write32(state, RTL8126_REG_MISC,
                     rtl8126_read32(state, RTL8126_REG_MISC) & ~(1U << 19));
@@ -1004,6 +1025,44 @@ static void rtl8126_program_mac(const e1000_state_t *state) {
     (void)rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
 }
 
+/* Only the normal manager context calls this, never the ISR/RX worker.
+ * Eight small records per boot keep physical-machine evidence on its boot
+ * volume even when no serial cable is attached. Values are hexadecimal. */
+static void rtl8126_persist_diagnostic(uint32_t report, const uint32_t values[27]) {
+    static const char *const labels[27] = {
+        " IRQ=", " IRQSTATUS=", " RXDESC=", " RXFRAME=", " TX=",
+        " RXNEXT=", " TXLAST=", " INT=", " INTV2=", " CMD=", " TXCFG=",
+        " RXCFG=", " PCICMD=", " MISC=", " TXBASELO=", " TXBASEHI=",
+        " RXBASELO=", " RXBASEHI=", " TXOWN=", " TXFIRST=",
+        " CMDSTART=", " CMDPREIRQ=", " CMDPOSTIRQ=", " CMDPRE=", " CMDPOST=",
+        " ENABLES=", " ENABLEFAIL="
+    };
+    static const char hex[] = "0123456789abcdef";
+    char line[512];
+    size_t used = 0U;
+    const char *prefix = "OS_RTL8126_DIAG";
+    file_t *file = 0;
+    while (*prefix != '\0') line[used++] = *prefix++;
+    for (unsigned i = 0U; i < 27U; ++i) {
+        const char *label = labels[i];
+        while (*label != '\0') line[used++] = *label++;
+        for (unsigned digit = 0U; digit < 8U; ++digit)
+            line[used++] = hex[(values[i] >> (28U - 4U * digit)) & 15U];
+    }
+    line[used++] = '\n';
+    if (vfs_open_kernel("/rtl8126.log", VFS_OPEN_WRITE | VFS_OPEN_CREATE |
+                        (report == 0U ? VFS_OPEN_TRUNCATE : VFS_OPEN_APPEND),
+                        0644U, &file) != K_OK || file == 0) return;
+    for (size_t offset = 0U; offset < used;) {
+        uint64_t written = 0U;
+        if (vfs_write_kernel(file, line + offset, used - offset, &written) != K_OK ||
+            written == 0U || written > used - offset) break;
+        offset += (size_t)written;
+    }
+    (void)vfs_fsync(file);
+    vfs_close(file);
+}
+
 void rtl8126_emit_diagnostic(void) {
     e1000_state_t *state = e1000_controller_state();
     uint32_t report;
@@ -1026,7 +1085,7 @@ void rtl8126_emit_diagnostic(void) {
     if (state == 0 || state->backend != NET_BACKEND_RTL8126 ||
         !state->initialized || !state->link_up) return;
     report = __atomic_load_n(&state->rtl_diagnostic_reports, __ATOMIC_RELAXED);
-    if (report >= 2U) return;
+    if (report >= 8U) return;
     now = x86_read_tsc();
     interval = x86_timeout_ns_to_tsc(2000000000ULL);
     if (report != 0U && interval != 0U &&
@@ -1062,8 +1121,8 @@ void rtl8126_emit_diagnostic(void) {
         (void)pci_msix_read_entry(state->pci, 0U, &msix_address, &msix_data,
                                   &msix_control);
     }
-    liteos_serial_printf_serial_only(
-        "LITEOS_RTL8126_DIAG IRQ=%u STATUS=%u RXDESC=%u RXFRAME=%u TX=%u "
+    kernel_serial_printf_serial_only(
+        "OS_RTL8126_DIAG IRQ=%u STATUS=%u RXDESC=%u RXFRAME=%u TX=%u "
         "CMD=%x INTCFG=%x RXCFG=%x RX0=%x INT=%x MASK=%x INTV2=%x "
         "PCICMD=%x MSI=%x MSIX=%x MSIXAL=%x MSIXAH=%x MSIXD=%x MSIXC=%x\r\n",
         irq, irq_status, rx_descriptor, rx_frame, tx,
@@ -1076,6 +1135,34 @@ void rtl8126_emit_diagnostic(void) {
         pci_command, msi_capability, msix_capability,
         (uint32_t)msix_address, (uint32_t)(msix_address >> 32), msix_data,
         msix_control);
+    uint32_t rx_next = 0U;
+    uint32_t tx_last = 0U;
+    uint32_t tx_owned = 0U;
+    uint32_t tx_first = 0U;
+    if (state->rtl_rx_ring != 0)
+        rx_next = state->rtl_rx_ring[state->rtl_rx_next].options1;
+    if (state->rtl_tx_ring != 0) {
+        dma_sync_for_cpu(&state->rtl_tx_ring_dma);
+        tx_last = state->rtl_tx_ring[(state->rtl_tx_next + RTL8126_RING_COUNT - 1U) %
+                                     RTL8126_RING_COUNT].options1;
+        tx_first = state->rtl_tx_ring[0].options1;
+        for (uint32_t i = 0U; i < RTL8126_RING_COUNT; ++i)
+            if ((state->rtl_tx_ring[i].options1 & RTL8126_DESC_OWN) != 0U) ++tx_owned;
+    }
+    const uint32_t values[27] = {irq, irq_status, rx_descriptor, rx_frame, tx,
+        rx_next, tx_last, rtl8126_read32(state, RTL8126_REG_INT_STATUS), irq_status_v2,
+        rtl8126_read8(state, RTL8126_REG_CHIP_CMD),
+        rtl8126_read32(state, RTL8126_REG_TX_CONFIG),
+        rtl8126_read32(state, RTL8126_REG_RX_CONFIG), pci_command,
+        rtl8126_read32(state, RTL8126_REG_MISC),
+        rtl8126_read32(state, RTL8126_REG_TX_DESC_LO),
+        rtl8126_read32(state, RTL8126_REG_TX_DESC_LO + 4U),
+        rtl8126_read32(state, RTL8126_REG_RX_DESC_LO),
+        rtl8126_read32(state, RTL8126_REG_RX_DESC_LO + 4U), tx_owned, tx_first,
+        state->rtl_cmd_after_start, state->rtl_cmd_before_irq, state->rtl_cmd_after_irq,
+        state->rtl_cmd_last_before_enable, state->rtl_cmd_last_after_enable,
+        state->rtl_enable_attempts, state->rtl_enable_failures};
+    rtl8126_persist_diagnostic(report, values);
 }
 
 static void rtl8126_clear_interrupts(e1000_state_t *state) {
@@ -1106,6 +1193,31 @@ static void rtl8126_write_dma_base(const e1000_state_t *state,
     /* Realtek documents the high dword as the first half of a 64-bit update. */
     rtl8126_write32(state, low_offset + 4U, (uint32_t)(address >> 32));
     rtl8126_write32(state, low_offset, (uint32_t)address);
+}
+
+/* Caller owns the controller lifecycle. Never reset DMA rings here: hardware
+ * may still own descriptors. Only restart a stopped, already configured MAC.
+ * Failed readback is an error, never a successful packet submission. */
+static bool rtl8126_ensure_mac_enabled(e1000_state_t *state) {
+    const uint8_t enabled = RTL8126_CHIP_RX_EN | RTL8126_CHIP_TX_EN;
+    if (state == 0) return false;
+    uint8_t command = rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
+    if (command == UINT8_MAX || (command & RTL8126_CHIP_RESET) != 0U) return false;
+    if ((command & (enabled | RTL8126_CHIP_STOP_REQ)) == enabled) return true;
+    state->rtl_cmd_last_before_enable = command;
+    ++state->rtl_enable_attempts;
+    /* One retry after a short settling interval; bounded even on broken HW. */
+    for (unsigned attempt = 0U; attempt < 2U; ++attempt) {
+        rtl8126_write8(state, RTL8126_REG_CHIP_CMD,
+                       (uint8_t)((command & (uint8_t)~RTL8126_CHIP_STOP_REQ) | enabled));
+        command = rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
+        state->rtl_cmd_last_after_enable = command;
+        if (command == UINT8_MAX || (command & RTL8126_CHIP_RESET) != 0U) break;
+        if ((command & (enabled | RTL8126_CHIP_STOP_REQ)) == enabled) return true;
+        if (attempt == 0U) rtl8126_delay_ms(1U);
+    }
+    ++state->rtl_enable_failures;
+    return false;
 }
 
 static bool rtl8126_start_controller(e1000_state_t *state) {
@@ -1141,16 +1253,18 @@ static bool rtl8126_start_controller(e1000_state_t *state) {
     rtl8126_write32(state, RTL8126_REG_MAR0 + 4U, UINT32_MAX);
     rtl8126_write32(state, RTL8126_REG_MAR0, UINT32_MAX);
 
-    rx_config = (8U << 27) | (7U << 8) | (1U << 11) | 0x0EU;
-    rtl8126_write32(state, RTL8126_REG_RX_CONFIG, rx_config);
-    tx_config = (7U << 8) | (3U << 24);
-    rtl8126_write32(state, RTL8126_REG_TX_CONFIG, tx_config);
-    /* Commit descriptor/configuration writes before starting DMA. */
+    /* Match r8169's RTL8126 start order: lock/commit descriptors, enable
+     * the MAC, then program RX/TX configuration. Its FIFO is dynamic, not
+     * the legacy static-FIFO layout selected when AUTO_FIFO is absent. */
+    rtl8126_write8(state, RTL8126_REG_CFG9346, 0U);
     (void)rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
     rtl8126_write8(state, RTL8126_REG_CHIP_CMD,
                    RTL8126_CHIP_RX_EN | RTL8126_CHIP_TX_EN);
-    (void)rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
-    rtl8126_write8(state, RTL8126_REG_CFG9346, 0U);
+    rx_config = (8U << 27) | (7U << 8) | (1U << 11) | 0x0EU;
+    rtl8126_write32(state, RTL8126_REG_RX_CONFIG, rx_config);
+    tx_config = (7U << 8) | (3U << 24) | RTL8126_TXCFG_AUTO_FIFO;
+    rtl8126_write32(state, RTL8126_REG_TX_CONFIG, tx_config);
+    state->rtl_cmd_after_start = rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
     return true;
 }
 
@@ -1189,8 +1303,9 @@ bool rtl8126_bind_interrupt_state(e1000_state_t *state) {
     entries = 0U;
     (void)pci_msix_table(state->pci, &table, &entries);
     if (state->pci->msi_capability == 0U) return false;
-    liteos_serial_printf_serial_only(
-        "LITEOS_RTL8126_IRQ_SETUP MODE=%u MSI=%u CAP=%u ENTRIES=%u BAR=%u "
+    state->rtl_cmd_before_irq = rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
+    kernel_serial_printf_serial_only(
+        "OS_RTL8126_IRQ_SETUP MODE=%u MSI=%u CAP=%u ENTRIES=%u BAR=%u "
         "OFF=%x TABLE=%x APIC=%u VECTOR=%u\r\n",
         use_msix ? 1U : 0U, state->pci->msi_capability != 0U ? 1U : 0U,
         state->pci->msix_capability, entries, state->pci->msix_table_bar,
@@ -1222,8 +1337,9 @@ bool rtl8126_bind_interrupt_state(e1000_state_t *state) {
                    (uint8_t)~RTL8126_INT_CFG_ENABLE);
     rtl8126_clear_interrupts(state);
     rtl8126_write32(state, RTL8126_REG_INT_MASK, RTL8126_INT_MASK_VALUE);
-    liteos_serial_printf_serial_only(
-        "LITEOS_RTL8126_IRQ_ARMED MODE=%u INTCFG=%x INT=%x MASK=%x "
+    state->rtl_cmd_after_irq = rtl8126_read8(state, RTL8126_REG_CHIP_CMD);
+    kernel_serial_printf_serial_only(
+        "OS_RTL8126_IRQ_ARMED MODE=%u INTCFG=%x INT=%x MASK=%x "
         "INTV2=%x MASKV2=%x\r\n",
         use_msix ? 1U : 0U,
         (uint32_t)rtl8126_read8(state, RTL8126_REG_INT_CFG),
@@ -1311,6 +1427,7 @@ bool rtl8126_transmit_state(e1000_state_t *state, const uint8_t *frame,
         frame == 0 || length == 0U || length > RTL8126_TX_BUFFER_SIZE) {
         return false;
     }
+    if (!rtl8126_ensure_mac_enabled(state)) return false;
     descriptor = &state->rtl_tx_ring[state->rtl_tx_next];
     dma_sync_for_cpu(&state->rtl_tx_ring_dma);
     if ((descriptor->options1 & RTL8126_DESC_OWN) != 0U) return false;
@@ -1338,6 +1455,7 @@ bool rtl8126_link_up_state(e1000_state_t *state) {
     state->link_up = (rtl8126_read8(state, RTL8126_REG_PHY_STATUS) &
                       RTL8126_PHY_LINK) != 0U;
     state->device.link_up = state->link_up;
+    if (state->link_up) (void)rtl8126_ensure_mac_enabled(state);
     return state->link_up;
 }
 

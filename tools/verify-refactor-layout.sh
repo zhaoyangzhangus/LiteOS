@@ -40,9 +40,9 @@ forbidden_text() {
 # Phase 1: BootInfo is a single loader/kernel ABI source. The old include is
 # allowed to remain only as a compatibility forwarding header.
 require_file include/kernel/bootinfo.h
-require_text include/kernel/bootinfo.h 'typedef struct liteos_boot_info'
+require_text include/kernel/bootinfo.h 'typedef struct os_boot_info'
 require_file tools/verify-debug-locations.sh
-require_text tools/verify-debug-locations.sh 'liteos_debug_stage_at'
+require_text tools/verify-debug-locations.sh 'kernel_debug_stage_at'
 require_text tools/verify-debug-locations.sh 'unlocated_benchmarks'
 require_text tools/verify-debug-locations.sh 'unlocated_kmalloc'
 require_file tools/verify-roadmap-stages.sh
@@ -60,10 +60,10 @@ require_text makefile 'verify-roadmap-stages.sh "$(KERNEL_ELF)" "$(STAGE_LOG)"'
 require_text include/kernel/perf.h 'kernel_perf_emit_scope_at'
 require_text include/kernel/perf.h 'kernel_perf_emit_value_at'
 require_text include/kernel/perf.h 'kernel_perf_emit_report_at'
-require_text kernel/perf.c 'LITEOS_PERF_KMALLOC_OK SAMPLES=%llu'
+require_text kernel/perf.c 'OS_PERF_KMALLOC_OK SAMPLES=%llu'
 require_text kernel/init/self_tests.c 'kernel_perf_emit_report(&perf_report)'
-require_text kernel/perf.c 'LITEOS_BENCH name=%s cycles=%llu loc=%s:%u'
-require_text kernel/perf.c 'LITEOS_BENCH_VALUE name=%s value=%llu loc=%s:%u'
+require_text kernel/perf.c 'OS_BENCH name=%s cycles=%llu loc=%s:%u'
+require_text kernel/perf.c 'OS_BENCH_VALUE name=%s value=%llu loc=%s:%u'
 require_file tools/run-qemu-native-matrix.ps1
 require_text tools/run-qemu-native-matrix.ps1 'Native QEMU matrix passed'
 require_text tools/run-qemu-native-matrix.ps1 'verify-debug-locations.sh'
@@ -88,11 +88,11 @@ require_text makefile 'debug-locations:'
 require_file include/uefi.h
 require_text include/uefi.h 'typedef struct EFI_BOOT_SERVICES'
 require_file include/kernel/block_device.h
-require_text include/kernel/block_device.h 'LITEOS_BLOCK_DEVICE_COUNT'
+require_text include/kernel/block_device.h 'OS_BLOCK_DEVICE_COUNT'
 require_file include/kernel/block_cache.h
-require_text include/kernel/block_cache.h 'LITEOS_BLOCK_CACHE_ENTRY_COUNT'
+require_text include/kernel/block_cache.h 'OS_BLOCK_CACHE_ENTRY_COUNT'
 require_file include/kernel/fat32.h
-require_text include/kernel/fat32.h 'liteos_fat32_open'
+require_text include/kernel/fat32.h 'fat32_open'
 require_file kernel/fs/vfs/internal.h
 require_file kernel/fs/vfs/backend.c
 require_text kernel/fs/vfs/backend.c \
@@ -134,7 +134,7 @@ forbidden_text '^[[:space:]]*void[[:space:]]+vfs_close[[:space:]]*\(' \
     kernel/fs/vfs/core.c
 forbidden_text '^[[:space:]]*(static[[:space:]]+)?kstatus_t[[:space:]]+(vfs_(memory|fat32)_backend_|vfs_register_backend_file)[[:alnum:]_]*[[:space:]]*\(' \
     kernel/fs/vfs/core.c
-for path in user/libc/include/liteos/libc.h user/libc/memory.c \
+for path in user/libc/include/libc/libc.h user/libc/memory.c \
             user/libc/syscall.c user/libc/alloc.c user/libc/stdio.c \
             user/libc/stdlib.c user/libc/crt_start.S \
             user/libc/include/stdio.h user/libc/include/stdlib.h \
@@ -182,16 +182,16 @@ require_text kernel/fs/nativefs/file_lifecycle.c \
     'REFACTOR_FS_FAT32_FILE_LIFECYCLE_OWNER'
 forbidden_text '^[[:space:]]*static[[:space:]]+BOOLEAN[[:space:]]+(locate_file_cluster|count_file_clusters|update_file_directory_entry|extend_file_to|truncate_file_to|fat32_read|fat32_write_locked|fat32_write|fat32_truncate_path_locked)[[:space:]]*\(' \
     kernel/fs/nativefs/fat32.c
-forbidden_text '^[[:space:]]*BOOLEAN[[:space:]]+liteos_fat32_(close|read_path|write_path|truncate_path)[[:space:]]*\(' \
+forbidden_text '^[[:space:]]*BOOLEAN[[:space:]]+(liteos_)?fat32_(close|read_path|write_path|truncate_path)[[:space:]]*\(' \
     kernel/fs/nativefs/fat32.c
 require_file include/kernel/memory_map.h
-require_text include/kernel/memory_map.h 'liteos_merge_usable_memory_map'
+require_text include/kernel/memory_map.h 'boot_merge_usable_memory_map'
 require_file include/boot/elf.h
 require_text include/boot/elf.h 'typedef struct __attribute__((packed))'
 require_file include/boot/pe.h
 require_text include/boot/pe.h 'IMAGE_OPTIONAL_HEADER64'
 require_file include/boot/sha256.h
-require_text include/boot/sha256.h 'LITEOS_SHA256_DIGEST_SIZE'
+require_text include/boot/sha256.h 'OS_SHA256_DIGEST_SIZE'
 require_file include/usb/storage.h
 require_text include/usb/storage.h 'bool usb_msc_attach'
 for path in boot/uefi/rsa.c include/kernel/rsa.h \
@@ -216,7 +216,7 @@ for path in security include/kernel/security.h \
 done
 forbidden_text 'security_(check_access|token_create|core_self_test)|security_token|security_descriptor|SECURITY_CAPABILITY|AUDIT_EVENT|audit_(init|emit|self_test|snapshot)|credential_(manager_init|add_user|remove_user|set_enabled|authenticate|login|session_close|core_self_test)|kernel_sha256|OS_SYS_TOKEN_QUERY|syscall_token_query' \
     kernel include kernel/drivers kernel/fs kernel/net kernel/io kernel/block tests makefile
-forbidden_text 'LITEOS_BOOTINFO_(SECURE_BOOT|KERNEL_VERIFIED|HAS_UPDATE_STATE|UPDATE_PENDING|UPDATE_SAFE_MODE|HAS_KERNEL_HASH|KERNEL_SIGNED)|KernelImageHash|Update(ActiveSlot|BootSlot|BootAttempts|Version|Generation)|kernel_update_commit_boot|update_core_self_test|rsa2048_|kernel_(a|b)_(sha256|signature)|kernel_signature|verify_required|select_kernel_for_boot|LOADER_UPDATE_SELECTION' \
+forbidden_text 'OS_BOOTINFO_(SECURE_BOOT|KERNEL_VERIFIED|HAS_UPDATE_STATE|UPDATE_PENDING|UPDATE_SAFE_MODE|HAS_KERNEL_HASH|KERNEL_SIGNED)|KernelImageHash|Update(ActiveSlot|BootSlot|BootAttempts|Version|Generation)|kernel_update_commit_boot|update_core_self_test|rsa2048_|kernel_(a|b)_(sha256|signature)|kernel_signature|verify_required|select_kernel_for_boot|LOADER_UPDATE_SELECTION' \
     boot/uefi/main.c kernel include/kernel makefile loader.conf.example
 for path in compat/include/bootinfo.h compat/include/update_state.h; do
     if [[ -f "$path" ]]; then
@@ -270,7 +270,7 @@ for path in compat/include/fat32.h compat/include/vfs.h \
 done
 forbidden_text '#include[[:space:]]+["<](fat32|vfs)\.h[">]' \
     kernel kernel/fs tests
-forbidden_text 'liteos_vfs_|liteos_ramfs_|LITEOS_VFS_(NODE|MOUNT|MANAGER|FILE_OPERATIONS)|LITEOS_RAMFS_|LITEOS_FILE|liteos_security_|LITEOS_SECURITY_(TOKEN|DESCRIPTOR|ACL)|liteos_fat32_lookup' \
+forbidden_text 'liteos_vfs_|liteos_ramfs_|LITEOS_VFS_(NODE|MOUNT|MANAGER|FILE_OPERATIONS)|LITEOS_RAMFS_|LITEOS_FILE|liteos_security_|LITEOS_SECURITY_(TOKEN|DESCRIPTOR|ACL)|(liteos_)?fat32_lookup' \
     kernel kernel/fs tests include
 forbidden_text '#include[[:space:]]+"sha256\.h"|#include[[:space:]]+<sha256\.h>' \
     boot tools tests
@@ -361,8 +361,8 @@ require_text kernel/sched/core.c 'sched_publish_dead'
 # graphics/display ownership in its canonical directory.
 require_file include/kernel/console_backend.h
 require_file kernel/console.c
-require_text kernel/console.c 'BOOLEAN liteos_console_init'
-require_text kernel/console.c 'void liteos_serial_write'
+require_text kernel/console.c 'BOOLEAN kernel_console_init'
+require_text kernel/console.c 'void kernel_serial_write'
 forbidden_text '(^|[^[:alnum:]_])serial_write(_u(32|64))?([^[:alnum:]_]|$)' \
     kernel include
 require_file include/kernel/init_self_tests.h
@@ -379,9 +379,9 @@ if [[ -f include/kernel/user_init.h || -f kernel/process/user_init.c ]]; then
     printf 'refactor layout: user-service startup remains in the retired process path\n' >&2
     failures=1
 fi
-require_text kernel/init/main.c 'liteos_init_post_scheduler'
-require_text kernel/init/main.c 'liteos_init_runtime_start'
-forbidden_text 'display_core_init|window_lifecycle_self_test|liteos_userspace_run_runtime_self_test|net_manager_poll|x86_rebase_stack_and_call' \
+require_text kernel/init/main.c 'kernel_init_post_scheduler'
+require_text kernel/init/main.c 'kernel_init_runtime_start'
+forbidden_text 'display_core_init|window_lifecycle_self_test|userspace_run_runtime_self_test|net_manager_poll|x86_rebase_stack_and_call' \
     kernel/init/main.c
 require_file kernel/init/filesystem_internal.h
 require_file kernel/init/filesystem_self_test.c
@@ -415,7 +415,7 @@ require_file include/kernel/object.h
 require_text include/kernel/object.h 'void object_get'
 require_text include/kernel/object.h 'handle_close'
 require_file include/kernel/mm_boot.h
-require_text include/kernel/mm_boot.h 'liteos_enable_kernel_paging'
+require_text include/kernel/mm_boot.h 'arch_enable_kernel_paging'
 require_file kernel/object/object.c
 require_file kernel/object/handle.c
 require_text kernel/object/handle.c 'header->ops->handle_close'
@@ -444,7 +444,7 @@ forbidden_text 'LITEOS_OBJECT_MANAGER|liteos_object_manager|liteos_object_create
 forbidden_text '^static BOOLEAN (buddy_self_test|slab_self_test|object_self_test|io_self_test|canonical_device_dma_io_self_test|driver_self_test|pci_self_test|nvme_self_test|security_self_test)\(' \
     kernel/init/main.c
 forbidden_text 'gop_debug_console|GOP_DEBUG_' kernel/init/main.c
-forbidden_text 'void (liteos_serial_write|serial_write)' kernel/init/main.c
+forbidden_text 'void (kernel_serial_write|serial_write)' kernel/init/main.c
 require_text kernel/init/main.c 'halt_forever_at'
 for path in \
     kernel/process/process.c \
@@ -458,7 +458,7 @@ done
 require_file kernel/process/exec_internal.h
 require_text kernel/process/exec_internal.h 'REFACTOR_P5_EXEC_INTERNAL'
 for path in user/runtime/elf64.h user/runtime/ld_start.S user/runtime/ld.c \
-            user/runtime/liteos_gfx.h user/runtime/libliteos_gfx.c \
+            user/runtime/graphics.h user/runtime/graphics.c \
             user/runtime/dyn_gfx_start.S user/runtime/dyn_gfx.c \
             user/runtime/libc_test.c tools/verify-dynamic-loader.sh \
             tools/verify-dynamic-loader.ps1 tools/verify-libc.sh \
@@ -466,13 +466,13 @@ for path in user/runtime/elf64.h user/runtime/ld_start.S user/runtime/ld.c \
     require_file "$path"
 done
 require_text kernel/process/exec.c 'ELF_PT_INTERP'
-require_text user/runtime/ld.c 'LITEOS_RT_DT_NEEDED'
-require_text user/runtime/ld.c 'LITEOS_RT_R_X86_64_JUMP_SLOT'
+require_text user/runtime/ld.c 'OS_RT_DT_NEEDED'
+require_text user/runtime/ld.c 'OS_RT_R_X86_64_JUMP_SLOT'
 require_text user/runtime/ld.c 'OS_SYS_VM_PROTECT'
-require_text user/runtime/liteos_gfx.h 'caller-owned XRGB8888 buffer'
-require_text user/runtime/libliteos_gfx.c 'void liteos_gfx_gradient_rect'
-require_text user/runtime/dyn_gfx.c 'liteos_gfx_gradient_rect'
-require_text user/libc/include/liteos/libc.h 'REFACTOR_P5_LIBC_OWNER'
+require_text user/runtime/graphics.h 'caller-owned XRGB8888 buffer'
+require_text user/runtime/graphics.c 'void gfx_gradient_rect'
+require_text user/runtime/dyn_gfx.c 'gfx_gradient_rect'
+require_text user/libc/include/libc/libc.h 'REFACTOR_P5_LIBC_OWNER'
 for path in user/libc/complex.c user/libc/uchar.c \
             user/libc/include/complex.h user/libc/include/tgmath.h \
             user/libc/include/uchar.h user/libc/threads.c \
@@ -483,7 +483,7 @@ require_text tools/libc_header_sanity.c 'mbrtoc16'
 require_text tools/verify-libc.sh 'c16rtomb'
 require_text tools/verify-libc.ps1 'c32rtomb'
 require_text user/libc/syscall.c 'OS_SYS_DEBUG_WRITE'
-require_text user/libc/crt_start.S 'liteos_crt_entry'
+require_text user/libc/crt_start.S 'libc_crt_entry'
 require_text kernel/syscall/debug.c 'REFACTOR_SYSCALL_DEBUG_OWNER'
 require_text include/uapi/syscall.h 'OS_SYS_DEBUG_WRITE'
 require_file include/uapi/image.h
@@ -492,9 +492,9 @@ require_text include/uapi/syscall.h 'OS_SYS_IMAGE_DECODE'
 require_file kernel/graphics/png.h
 require_file kernel/syscall/image.c
 require_text kernel/syscall/image.c 'REFACTOR_SYSCALL_IMAGE_OWNER'
-require_text makefile '$(BUILD)/esp/lib/ld-liteos.so.1'
-require_text makefile '$(BUILD)/esp/lib/libliteosc.so.1'
-require_text makefile '$(BUILD)/esp/lib/libliteosgfx.so.1'
+require_text makefile '$(BUILD)/esp/lib/ld-system.so.1'
+require_text makefile '$(BUILD)/esp/lib/libsystemc.so.1'
+require_text makefile '$(BUILD)/esp/lib/libgraphics.so.1'
 require_text makefile '$(BUILD)/esp/sbin/dyn-gfx'
 require_text makefile '$(BUILD)/esp/sbin/libc-test'
 require_text makefile '$(BUILD)/esp/sbin/imageview'
@@ -552,7 +552,7 @@ if [[ -f kernel/mm/page_db.c ]]; then
 fi
 require_text kernel/mm/phys/internal.h 'REFACTOR_P2_PHYS_INTERNAL'
 require_text kernel/mm/phys/page_db.c 'REFACTOR_P2_PAGE_DB_OWNER'
-require_text kernel/mm/phys/page_db.c 'bool liteos_mm_init'
+require_text kernel/mm/phys/page_db.c 'bool mm_boot_init'
 require_text kernel/mm/phys/page_alloc.c 'REFACTOR_P2_PAGE_ALLOC_OWNER'
 require_text kernel/mm/phys/page_alloc.c 'page_t *page_alloc_slow'
 require_text kernel/mm/phys/percpu_page.c 'REFACTOR_P2_PERCPU_PAGE_OWNER'
@@ -879,7 +879,7 @@ for path in kernel/graphics/*.c; do
             ;;
     esac
 done
-require_text kernel/graphics/present.c 'LITEOS_QEMU_INCREMENTAL_REPAIR_V1'
+require_text kernel/graphics/present.c 'OS_QEMU_INCREMENTAL_REPAIR_V1'
 require_text kernel/graphics/present.c 'compositor_commit_qemu_stdvga'
 require_text kernel/graphics/present.c 'g_compositor_scanout_flipped'
 require_text kernel/graphics/present.c \

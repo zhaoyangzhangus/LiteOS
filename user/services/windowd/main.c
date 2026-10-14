@@ -2,8 +2,9 @@
 #include <stdbool.h>
 
 #include <uapi/all.h>
+#include <uapi/window_theme.h>
 
-#include "../../runtime/liteos_text.h"
+#include "../../runtime/text.h"
 
 #define WM_MAX_WINDOWS       64U
 #define WM_TITLEBAR_HEIGHT   24U
@@ -89,7 +90,7 @@ static void fill_rect(int32_t x, int32_t y, uint32_t width, uint32_t height,
 }
 
 static void draw_text(int32_t x, int32_t y, const char *text, uint32_t color) {
-    liteos_text_draw(g_frame, g_stride, g_width, g_height,
+    ui_text_draw(g_frame, g_stride, g_width, g_height,
                      x, y, text, color);
 }
 
@@ -245,12 +246,12 @@ static bool handle_input(const os_input_event_t *event) {
         }
         if (event->value != OS_INPUT_VALUE_RELEASE && g_ctrl &&
             event->code == 0x2EU) {
-            (void)liteos_text_adjust(1);
+            (void)ui_text_adjust(1);
             return true;
         }
         if (event->value != OS_INPUT_VALUE_RELEASE && g_ctrl &&
             event->code == 0x2DU) {
-            (void)liteos_text_adjust(-1);
+            (void)ui_text_adjust(-1);
             return true;
         }
         if (event->value != OS_INPUT_VALUE_RELEASE && event->code == 0x2BU) {
@@ -297,22 +298,22 @@ static void copy_surface(const os_window_info_t *info) {
 }
 
 static void render_frame(void) {
-    fill_rect(0, 0, g_width, g_height, 0x00101928U);
-    fill_rect(0, 0, g_width, WM_TOPBAR_HEIGHT, 0x00213D5AU);
-    draw_text(20, 6, "LITEOS WINDOW SERVER", 0x00E8F1F5U);
+    fill_rect(0, 0, g_width, g_height, OS_THEME_TOOLBAR);
+    fill_rect(0, 0, g_width, WM_TOPBAR_HEIGHT, OS_THEME_HEADER);
+    draw_text(20, 6, "WINDOW SERVER", OS_THEME_TEXT);
     for (uint32_t index = 0U; index < g_window_count; ++index) {
         const os_window_info_t *info = &g_windows[index];
-        uint32_t frame_color = info->focused != 0U ? 0x005C99C6U : 0x002A3B4BU;
+        uint32_t frame_color = OS_THEME_BORDER;
         fill_rect(info->x, info->y, info->width + 4U,
                   info->height + WM_TITLEBAR_HEIGHT + 4U, frame_color);
         fill_rect(info->x + 2, info->y + 2, info->width,
-                  WM_TITLEBAR_HEIGHT, info->focused != 0U ? 0x002A6691U : 0x0022394FU);
+                  WM_TITLEBAR_HEIGHT, info->focused != 0U ? OS_THEME_HEADER : OS_THEME_HEADER_INACTIVE);
         draw_text(info->x + 8, info->y + 2, info->title,
-                  info->focused != 0U ? 0x00F3FAFFU : 0x00B5C8D8U);
+                  info->focused != 0U ? OS_THEME_TEXT : OS_THEME_MUTED);
         copy_surface(info);
     }
     fill_rect(0, (int32_t)g_height - WM_TASKBAR_HEIGHT, g_width,
-              WM_TASKBAR_HEIGHT, 0x00162538U);
+              WM_TASKBAR_HEIGHT, OS_THEME_TOOLBAR);
     if (g_window_count != 0U) {
         uint32_t button_width = g_width / g_window_count;
         for (uint32_t index = 0U; index < g_window_count; ++index) {
@@ -320,9 +321,9 @@ static void render_frame(void) {
             fill_rect(x, (int32_t)g_height - WM_TASKBAR_HEIGHT + 7,
                       button_width > 12U ? button_width - 12U : button_width,
                       WM_TASKBAR_HEIGHT - 14U,
-                      g_windows[index].focused != 0U ? 0x003B7198U : 0x001C2D40U);
+                      g_windows[index].focused != 0U ? OS_THEME_SELECTED : OS_THEME_SURFACE);
             draw_text(x + 8, (int32_t)g_height - WM_TASKBAR_HEIGHT + 7,
-                      g_windows[index].title, 0x00E8F1F5U);
+                      g_windows[index].title, OS_THEME_TEXT);
         }
     }
     draw_cursor();
@@ -392,7 +393,7 @@ static bool commit_frame(void) {
 __attribute__((noreturn)) void wm_entry(void) {
     os_input_event_t event;
     uint64_t last_frame = 0U;
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE) ||
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE) ||
         !setup_graphics() ||
         wm_syscall_one(OS_SYS_WINDOW_REGISTER_MANAGER, 0U) != 0) wm_exit(1U);
     g_cursor_x = g_width / 2U;

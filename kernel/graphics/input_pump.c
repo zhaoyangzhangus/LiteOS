@@ -26,11 +26,15 @@ bool window_input_router_self_test(void) {
     return window_input_router_is_relative_motion(&relative_x) &&
            window_input_router_is_relative_motion(&relative_y) &&
            !window_input_router_is_relative_motion(&key) &&
-           WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS >= WINDOW_EVENT_CAPACITY;
+           WINDOW_COMPOSITOR_DRAG_INPUT_EVENTS >= WINDOW_EVENT_CAPACITY &&
+           desktop_chrome_launch_guard_self_test();
 }
 
 void window_server_pump_input_mode(bool compose_now) {
     input_event_t event;
+    input_event_t events[16];
+    size_t batch_count = 0U;
+    size_t batch_index = 0U;
     window_motion_batch_t motion = {0};
     bool wake = false;
     uint32_t consumed = 0U;
@@ -47,8 +51,16 @@ void window_server_pump_input_mode(bool compose_now) {
 
     /* Relative X/Y and pure pointer-motion reports are coalesced. Any
      * button, wheel, key, or absolute event remains an ordering barrier. */
-    while (consumed < input_budget &&
-           input_core_pop(&event) == K_OK) {
+    while (consumed < input_budget) {
+        if (batch_index == batch_count) {
+            size_t capacity = input_budget - consumed;
+            if (capacity > sizeof(events) / sizeof(events[0]))
+                capacity = sizeof(events) / sizeof(events[0]);
+            batch_count = input_core_pop_batch(events, capacity);
+            batch_index = 0U;
+            if (batch_count == 0U) break;
+        }
+        event = events[batch_index++];
         bool is_motion =
             window_input_router_is_relative_motion(&event);
 
@@ -149,10 +161,6 @@ void window_server_pump_input_mode(bool compose_now) {
         window_unlock();
     }
 
-    /* Resize events are already published; populate their newly visible
-     * surface pages before waking the client or composing the next frame. */
-    window_surface_populate_pending();
-
     if (wake &&
         window_flush_event_wakes()) {
         (void)wake_all(&g_window_server.event_waitq);
@@ -178,7 +186,8 @@ void window_server_pump_input_mode(bool compose_now) {
         }
 
         if (app != DESKTOP_APP_NONE) {
-            if (!desktop_restore_minimized_app(app)) {
+            if (!desktop_launch_enqueue(app) &&
+                !desktop_restore_minimized_app(app)) {
                 (void)desktop_launch_program(app);
             }
         }

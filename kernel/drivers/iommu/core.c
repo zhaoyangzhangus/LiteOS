@@ -3,6 +3,7 @@
 #include <kernel/iommu.h>
 #include <kernel/kmem.h>
 #include <kernel/spinlock.h>
+#include <kernel/sched.h>
 
 /*
  * 这是一个最小的 Intel VT-d 后端。当前硬件模型使用 legacy root/context
@@ -85,14 +86,14 @@ static void iommu_write64(uint32_t offset, uint64_t value) {
 }
 
 static void iommu_lock(void) {
-    while (atomic_exchange_explicit(&g_iommu_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    /* DMA can already pin its caller; this guard must nest with that one. */
+    sched_preempt_disable();
+    spinlock_lock(&g_iommu_lock);
 }
 
 static void iommu_unlock(void) {
-    atomic_store_explicit(&g_iommu_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_iommu_lock);
+    sched_preempt_enable();
 }
 
 static bool iommu_wait_register(uint32_t offset, uint32_t mask, bool set) {
@@ -265,7 +266,7 @@ bool iommu_init(void) {
     const x86_acpi_platform_t *platform = x86_acpi_platform();
     g_iommu_has_dmar = platform != 0 && platform->iommu_count != 0;
     bool success = true;
-    atomic_init(&g_iommu_lock.state, 0U);
+    spinlock_init(&g_iommu_lock);
     if (g_iommu_has_dmar) {
         const x86_acpi_iommu_t *description = &platform->iommus[0];
         g_iommu.base = description->base;

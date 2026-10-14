@@ -1,16 +1,16 @@
     .text
     .p2align 4
-    .globl liteos_arch_enter_user
+    .globl arch_enter_user
     .globl x86_user_thread_start
 #ifndef __ELF__
-    .def liteos_arch_enter_user; .scl 2; .type 32; .endef
+    .def arch_enter_user; .scl 2; .type 32; .endef
 #endif
     .extern x86_return_to_user
     .extern sched_finish_switch
     .extern x86_cpu_note_user_entry
 
 /* 通过 iretq 进入用户代码；退出系统调用会恢复此函数的调用栈。 */
-liteos_arch_enter_user:
+arch_enter_user:
     /* iretq 帧必须一次性构造完成，避免定时器中断看到半帧。 */
     cli
     movq %rsp, %gs:16

@@ -7,44 +7,44 @@
  * compatibility detail. Keep its ABI in the canonical kernel header so
  * NVMe, USB MSC, page-cache, and filesystem code share one declaration.
  */
-#define LITEOS_BLOCK_DEVICE_COUNT 32U
-#define LITEOS_BLOCK_NAME_LENGTH  32U
+#define OS_BLOCK_DEVICE_COUNT 32U
+#define OS_BLOCK_NAME_LENGTH  32U
 
-typedef BOOLEAN (*LITEOS_BLOCK_READ)(VOID *context, UINT64 lba,
+typedef BOOLEAN (*OS_BLOCK_READ)(VOID *context, UINT64 lba,
                                      UINT32 count, VOID *buffer);
-typedef BOOLEAN (*LITEOS_BLOCK_WRITE)(VOID *context, UINT64 lba,
+typedef BOOLEAN (*OS_BLOCK_WRITE)(VOID *context, UINT64 lba,
                                       UINT32 count, const VOID *buffer);
-typedef BOOLEAN (*LITEOS_BLOCK_FLUSH)(VOID *context);
+typedef BOOLEAN (*OS_BLOCK_FLUSH)(VOID *context);
 
 typedef struct {
-    CHAR8 Name[LITEOS_BLOCK_NAME_LENGTH];
+    CHAR8 Name[OS_BLOCK_NAME_LENGTH];
     UINT32 BlockSize;
     UINT64 BlockCount;
-    LITEOS_BLOCK_READ Read;
-    LITEOS_BLOCK_WRITE Write;
-    LITEOS_BLOCK_FLUSH Flush;
+    OS_BLOCK_READ Read;
+    OS_BLOCK_WRITE Write;
+    OS_BLOCK_FLUSH Flush;
     VOID *Context;
     BOOLEAN Registered;
-} LITEOS_BLOCK_DEVICE;
+} OS_BLOCK_DEVICE;
 
 typedef struct {
-    LITEOS_BLOCK_DEVICE Devices[LITEOS_BLOCK_DEVICE_COUNT];
+    OS_BLOCK_DEVICE Devices[OS_BLOCK_DEVICE_COUNT];
     UINT32 DeviceCount;
     BOOLEAN Initialized;
-} LITEOS_BLOCK_MANAGER;
+} OS_BLOCK_MANAGER;
 
-BOOLEAN liteos_block_manager_init(LITEOS_BLOCK_MANAGER *manager);
-BOOLEAN liteos_block_manager_destroy(LITEOS_BLOCK_MANAGER *manager);
-BOOLEAN liteos_block_register(LITEOS_BLOCK_MANAGER *manager,
+BOOLEAN block_manager_init(OS_BLOCK_MANAGER *manager);
+BOOLEAN block_manager_destroy(OS_BLOCK_MANAGER *manager);
+BOOLEAN block_register(OS_BLOCK_MANAGER *manager,
                               const CHAR8 *name, UINT32 block_size,
-                              UINT64 block_count, LITEOS_BLOCK_READ read,
-                              LITEOS_BLOCK_WRITE write,
-                              LITEOS_BLOCK_FLUSH flush, VOID *context,
-                              LITEOS_BLOCK_DEVICE **device);
-BOOLEAN liteos_block_unregister(LITEOS_BLOCK_MANAGER *manager,
-                                 LITEOS_BLOCK_DEVICE *device);
-BOOLEAN liteos_block_read(const LITEOS_BLOCK_DEVICE *device, UINT64 lba,
+                              UINT64 block_count, OS_BLOCK_READ read,
+                              OS_BLOCK_WRITE write,
+                              OS_BLOCK_FLUSH flush, VOID *context,
+                              OS_BLOCK_DEVICE **device);
+BOOLEAN block_unregister(OS_BLOCK_MANAGER *manager,
+                                 OS_BLOCK_DEVICE *device);
+BOOLEAN block_read(const OS_BLOCK_DEVICE *device, UINT64 lba,
                           UINT32 count, VOID *buffer);
-BOOLEAN liteos_block_write(const LITEOS_BLOCK_DEVICE *device, UINT64 lba,
+BOOLEAN block_write(const OS_BLOCK_DEVICE *device, UINT64 lba,
                            UINT32 count, const VOID *buffer);
-BOOLEAN liteos_block_flush(const LITEOS_BLOCK_DEVICE *device);
+BOOLEAN block_flush(const OS_BLOCK_DEVICE *device);

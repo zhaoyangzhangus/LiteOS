@@ -1,4 +1,5 @@
 #include "internal.h"
+#include <kernel/string.h>
 
 static thread_t *rt_thread_from_node(list_head_t *node) {
     return (thread_t *)((uint8_t *)node -
@@ -18,7 +19,29 @@ static bool fair_before(const thread_t *left, const thread_t *right) {
     return (uintptr_t)left < (uintptr_t)right;
 }
 
+void scheduler_update_min_vruntime(run_queue_t *queue) {
+    bool found = queue->fair_leftmost != 0;
+    uint64_t candidate = found ? queue->fair_leftmost->sched.vruntime : 0U;
+    thread_t *current = queue->current;
+    if (current != 0 && current != queue->idle &&
+        current->sched_class == SCHED_CLASS_FAIR &&
+        atomic_load_explicit(&current->state, memory_order_relaxed) == THREAD_RUNNING) {
+        if (!found || current->sched.vruntime < candidate)
+            candidate = current->sched.vruntime;
+        found = true;
+    }
+    /* Idle and dequeue must not reset the fair clock. Otherwise each new
+     * renderer starts at zero and runs until it catches up with the browser. */
+    if (found && candidate > queue->min_vruntime)
+        queue->min_vruntime = candidate;
+}
+
 static void fair_insert(run_queue_t *queue, thread_t *thread) {
+    scheduler_update_min_vruntime(queue);
+    /* Bound the advantage of new threads and stale sleepers. Never forgive
+     * CPU time already charged to a runnable thread ahead of the floor. */
+    if (thread->sched.vruntime < queue->min_vruntime)
+        thread->sched.vruntime = queue->min_vruntime;
     rb_node_t *parent = 0;
     rb_node_t **link = &queue->fair_root.root;
     while (*link != 0) {
@@ -37,7 +60,7 @@ static void fair_insert(run_queue_t *queue, thread_t *thread) {
         fair_before(thread, queue->fair_leftmost)) {
         queue->fair_leftmost = thread;
     }
-    queue->min_vruntime = queue->fair_leftmost->sched.vruntime;
+    scheduler_update_min_vruntime(queue);
 }
 
 static void fair_remove(run_queue_t *queue, thread_t *thread) {
@@ -47,8 +70,7 @@ static void fair_remove(run_queue_t *queue, thread_t *thread) {
         rb_node_t *first = rb_tree_first(&queue->fair_root);
         queue->fair_leftmost = first != 0 ? fair_thread_from_node(first) : 0;
     }
-    queue->min_vruntime = queue->fair_leftmost != 0 ?
-                          queue->fair_leftmost->sched.vruntime : 0U;
+    scheduler_update_min_vruntime(queue);
 }
 
 bool validate_fair_node(rb_node_t *node, rb_node_t *parent,
@@ -77,10 +99,11 @@ bool validate_fair_node(rb_node_t *node, rb_node_t *parent,
 
 void initialize_thread(thread_t *thread, uint64_t tid, uint8_t class_id,
                        uint8_t priority) {
-    uint8_t *bytes = (uint8_t *)thread;
-    for (size_t index = 0; index < sizeof(*thread); ++index) bytes[index] = 0;
+    memset(thread, 0, sizeof(*thread));
     refcount_init(&thread->object.refs, 1U);
     atomic_init(&thread->state, THREAD_READY);
+    atomic_init(&thread->remote_wake_queued, false);
+    atomic_init(&thread->remote_wake_lock, 0U);
     atomic_init(&thread->block_epoch, 0U);
     atomic_init(&thread->start_pending, false);
     atomic_init(&thread->blocked_waiter, 0);
@@ -105,6 +128,8 @@ void sched_initialize_new_thread(thread_t *thread, uint32_t cpu_id,
     if (thread == 0) return;
 
     atomic_init(&thread->state, THREAD_NEW);
+    atomic_init(&thread->remote_wake_queued, false);
+    atomic_init(&thread->remote_wake_lock, 0U);
     atomic_init(&thread->block_epoch, 0U);
     atomic_init(&thread->start_pending, false);
     atomic_init(&thread->blocked_waiter, 0);
@@ -129,13 +154,11 @@ void sched_initialize_new_thread(thread_t *thread, uint32_t cpu_id,
     thread->migration_pending = false;
     thread->command_release_next = 0;
     thread->command_release_count = 0U;
+    bool pinned = pin_to_cpu && cpu_id < MAX_CPUS;
     for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
-        thread->affinity.bits[word] = UINT64_MAX;
+        thread->affinity.bits[word] = pinned ? 0U : UINT64_MAX;
     }
-    if (pin_to_cpu && cpu_id < MAX_CPUS) {
-        for (uint32_t word = 0U; word < MAX_CPUS / 64U; ++word) {
-            thread->affinity.bits[word] = 0U;
-        }
+    if (pinned) {
         thread->affinity.bits[cpu_id >> 6] = 1ULL << (cpu_id & 63U);
     }
     sched_mark_initial_placement(thread);

@@ -184,7 +184,7 @@ long double rintl(long double value) {
 }
 
 long double nearbyintl(long double value) {
-    /* LiteOS currently advertises errno-only math error handling, so the
+    /* System currently advertises errno-only math error handling, so the
      * FE_INEXACT distinction from rint() is not externally observable. */
     return x87_round_current(value);
 }
@@ -500,7 +500,7 @@ typedef union {
 } x87_value_t;
 
 _Static_assert(sizeof(long double) == sizeof(x87_value_t),
-               "LiteOS requires the x86 extended-precision ABI");
+               "System requires the x86 extended-precision ABI");
 
 static void note_nextafter_range(int classification) {
     if (classification == FP_INFINITE || classification == FP_SUBNORMAL ||
@@ -729,6 +729,23 @@ DEFINE_UNARY(sqrt)
 DEFINE_UNARY(cbrt)
 DEFINE_UNARY(sin)
 DEFINE_UNARY(cos)
+
+__attribute__((target("sse"))) void sincosf(float value, float *sine,
+                                               float *cosine) {
+    if (sine != 0) *sine = sinf(value);
+    if (cosine != 0) *cosine = cosf(value);
+}
+
+void sincos(double value, double *sine, double *cosine) {
+    if (sine != 0) *sine = sin(value);
+    if (cosine != 0) *cosine = cos(value);
+}
+
+void sincosl(long double value, long double *sine, long double *cosine) {
+    if (sine != 0) *sine = sinl(value);
+    if (cosine != 0) *cosine = cosl(value);
+}
+
 DEFINE_UNARY(tan)
 DEFINE_UNARY(asin)
 DEFINE_UNARY(acos)

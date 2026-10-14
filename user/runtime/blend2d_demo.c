@@ -10,7 +10,7 @@ static bool result_ok(BLResult result) {
     return result == BL_SUCCESS;
 }
 
-bool liteos_blend2d_draw_demo(uint32_t *pixels, uint32_t stride,
+bool blend2d_draw_demo(uint32_t *pixels, uint32_t stride,
                               uint32_t width, uint32_t height,
                               uint32_t font_size) {
     BLImageCore image = {0};
@@ -64,8 +64,8 @@ bool liteos_blend2d_draw_demo(uint32_t *pixels, uint32_t stride,
     if (pixels == 0 || width == 0U || height == 0U || stride < width ||
         width > (uint32_t)INT_MAX || height > (uint32_t)INT_MAX ||
         stride > (uint32_t)(INTPTR_MAX / sizeof(uint32_t)) ||
-        font_size < LITEOS_BLEND2D_FONT_MIN ||
-        font_size > LITEOS_BLEND2D_FONT_MAX) return false;
+        font_size < OS_BLEND2D_FONT_MIN ||
+        font_size > OS_BLEND2D_FONT_MAX) return false;
 
     result = bl_runtime_init();
     if (!result_ok(result)) goto cleanup;
@@ -130,7 +130,7 @@ bool liteos_blend2d_draw_demo(uint32_t *pixels, uint32_t stride,
     if (!result_ok(result)) goto cleanup;
     font_data_ready = true;
     if (!result_ok(bl_font_data_create_from_file(
-            &font_data, "/etc/fonts/liteos.ttf", BL_FILE_READ_NO_FLAGS))) {
+            &font_data, "/etc/fonts/default.ttf", BL_FILE_READ_NO_FLAGS))) {
         goto cleanup;
     }
     result = bl_font_face_init(&font_face);

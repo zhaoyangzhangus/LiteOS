@@ -92,7 +92,8 @@ typedef struct thread {
 
     /* Scheduler-owned post-context-switch reaper FIFO link. */
     struct thread *reap_next;
-    /* Scheduler-owned coalesced command-reference release link. */
+    /* Shared across command consumers; remote_wake_lock protects this node
+     * and its count. The containing CPU FIFO remains IRQ-local. */
     struct thread *command_release_next;
     uint32_t command_release_count;
     /* Remote state/remove commands may wait for owner-side consumption. */
@@ -111,7 +112,29 @@ typedef struct thread {
     uint64_t signal_mask;
     vaddr_t signal_frame;
     uint32_t signal_depth;
+
+    /* Linux CLONE_CHILD_CLEARTID / set_tid_address state. */
+    vaddr_t linux_clear_tid;
+    bool linux_clear_tid_pending;
+    vaddr_t linux_robust_list;
+    uint64_t linux_robust_length;
+    /* Intrusive remote wake mailbox; queued publication owns an object ref. */
+    atomic_bool remote_wake_queued;
+    /* Serializes wake mailbox reuse and coalesced command-release ownership. */
+    atomic_uint remote_wake_lock;
+    struct thread *remote_wake_next;
+    uint32_t remote_wake_epoch;
 } thread_t;
+
+/*
+ * A woken waiter keeps queue nodes on its kernel stack until it resumes and
+ * unlinks them. A READY thread with this association is not safe to reap yet.
+ */
+static inline bool sched_wait_cleanup_pending(const thread_t *thread) {
+    return thread != 0 &&
+           atomic_load_explicit(&thread->blocked_waiter,
+                                memory_order_acquire) != 0;
+}
 
 #define RT_PRIORITY_LEVELS 32u
 
@@ -160,6 +183,9 @@ void schedule(void);
 /* Consume an IPI doorbell and schedule only when the local policy requires it. */
 void sched_handle_reschedule_request(void);
 void sched_tick(uint64_t now_ns);
+/* Bounded, opt-in wake-delay diagnostics; never schedules from this hook. */
+void sched_trace_wake_stall(uint64_t now_tsc);
+void sched_trace_inbox_stall(uint64_t now_tsc, uint64_t rip, uint64_t rflags);
 bool sched_tick_should_preempt(void);
 kstatus_t sched_set_affinity(thread_t *thread, const cpumask_t *mask);
 void sched_set_effective_priority(thread_t *thread, uint8_t class_id,
@@ -179,6 +205,7 @@ bool sched_fair_policy_self_test(void);
 bool sched_rt_policy_self_test(void);
 bool sched_balance_self_test(void);
 bool sched_state_transition_self_test(void);
+bool sched_remote_remove_ack_self_test(void);
 bool sched_remote_wake_self_test(void);
 bool sched_context_switch_self_test(void);
 bool sched_debug_cpu(uint32_t cpu_id, uint32_t *current_state,

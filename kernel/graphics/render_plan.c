@@ -29,7 +29,8 @@ bool compositor_view_fully_covers_snapshot_bounds(
     uint64_t frame_width;
     uint64_t frame_height;
 
-    if (window == 0 || bounds == 0) {
+    if (window == 0 || bounds == 0 ||
+        (window->flags & OS_WINDOW_PREMULTIPLIED_ALPHA) != 0U) {
         return false;
     }
 

@@ -2,12 +2,12 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "LiteOS: build Windows native",
-            "type": "shell",
+            "label": "System: build target for QEMU",
+            "type": "process",
             "command": "bash",
             "args": [
                 "-lc",
-                "BUILD=build-refactor ./build-wsl.sh esp DEBUG=2 LITEOS_DEBUG_SERIAL=1"
+                "make -f GNUmakefile esp BUILD=build DEBUG=2 OS_DEBUG_SERIAL=1 -j4"
             ],
             "windows": {
                 "command": "powershell.exe",
@@ -18,7 +18,7 @@
                     "-File",
                     "${workspaceFolder}\\tools\\build-windows.ps1",
                     "-Build",
-                    "build-refactor",
+                    "build",
                     "-Debug",
                     "2",
                     "-Serial"
@@ -27,18 +27,18 @@
             "options": {
                 "cwd": "${workspaceFolder}",
                 "env": {
-                    "BUILD": "build-refactor"
+                    "BUILD": "build"
                 }
             },
             "problemMatcher": []
         },
         {
-            "label": "LiteOS: start QEMU debug (auto)",
-            "type": "shell",
+            "label": "System: start QEMU debug (auto)",
+            "type": "process",
             "command": "bash",
             "args": [
                 "-lc",
-                "BUILD=build-refactor ./run-qemu.sh --debug --gdb-port 1234 --cpu 4"
+                "BUILD=build ./run-qemu.sh --debug --gdb-port 1234 --cpu 4"
             ],
             "windows": {
                 "command": "powershell.exe",
@@ -54,14 +54,14 @@
                     "-Cpu",
                     "4",
                     "-Build",
-                    "build-refactor"
+                    "build"
                 ]
             },
             "options": {
                 "cwd": "${workspaceFolder}",
                 "env": {
-                    "LITEOS_DEBUG_PROTOCOL": "1",
-                    "BUILD": "build-refactor"
+                    "OS_DEBUG_PROTOCOL": "1",
+                    "BUILD": "build"
                 }
             },
             "isBackground": true,
@@ -73,7 +73,7 @@
                 "clear": true
             },
             "problemMatcher": {
-                "owner": "liteos-qemu-auto",
+                "owner": "system-qemu-auto",
                 "pattern": {
                     "regexp": "a^"
                 },
@@ -85,12 +85,12 @@
             }
         },
         {
-            "label": "LiteOS: stop QEMU debug (auto)",
-            "type": "shell",
+            "label": "System: stop QEMU debug (auto)",
+            "type": "process",
             "command": "bash",
             "args": [
                 "-lc",
-                "BUILD=build-refactor ./tools/stop-qemu-debug.sh"
+                "BUILD=build ./tools/stop-qemu-debug.sh"
             ],
             "windows": {
                 "command": "powershell.exe",
@@ -101,7 +101,7 @@
                     "-File",
                     "${workspaceFolder}\\tools\\stop-qemu-auto-debug.ps1",
                     "-Build",
-                    "build-refactor"
+                    "build"
                 ]
             },
             "options": {

@@ -76,7 +76,7 @@
 
 /* REFACTOR_P3_BOOT_SELF_TEST_OWNER: boot self-test fixtures and ownership checks. */
 
-#define halt_forever() liteos_kernel_halt_forever_at(__FILE__, __LINE__)
+#define halt_forever() kernel_halt_forever_at(__FILE__, __LINE__)
 
 static UINT32 g_canonical_started_devices;
 static UINT32 g_canonical_device_power_state;
@@ -204,7 +204,7 @@ static const device_ops_t g_canonical_pending_device_ops = {
     .set_power = canonical_test_set_power,
 };
 
-bool liteos_init_canonical_device_dma_io_self_test(void) {
+bool kernel_init_canonical_device_dma_io_self_test(void) {
     static device_t device;
     static device_t async_device;
     static device_t pending_device;
@@ -249,7 +249,7 @@ bool liteos_init_canonical_device_dma_io_self_test(void) {
         iommu_attach_pci_device(&device, 0, 0, 31U, 7U) != K_OK) goto cleanup;
     driver_object_init(&driver, "canonical-loopback",
                        canonical_test_probe, canonical_test_remove);
-    if (driver.api_version != LITEOS_DRIVER_API_VERSION ||
+    if (driver.api_version != OS_DRIVER_API_VERSION ||
         driver.struct_size != sizeof(driver)) goto cleanup;
     if (driver_register(&driver) != K_OK) goto cleanup;
     driver_registered = 1;
@@ -433,275 +433,275 @@ cleanup:
     return success;
 }
 
-bool liteos_init_pci_self_test(void) {
+bool kernel_init_pci_self_test(void) {
     const pci_host_t *host = pci_current_host();
     if (host == 0 || host->device_count == 0U) return 0;
     return pci_find_class(host, 0x01U, 0x06U, 0xFFU) != 0 ||
            pci_find_class(host, 0x03U, 0x00U, 0xFFU) != 0;
 }
 
-bool liteos_init_nvme_self_test(void) {
+bool kernel_init_nvme_self_test(void) {
     /* The canonical NVMe Owner already validates command submission and
      * controller state during init_storage. Keep this boundary as a cheap
      * repeatable ownership check instead of reviving the legacy ring model. */
     return nvme_driver_self_test();
 }
 
-BOOLEAN liteos_init_post_scheduler(const LITEOS_BOOT_INFO *info,
+BOOLEAN kernel_init_post_scheduler(const OS_BOOT_INFO *info,
                                    const nvme_controller_t *active_controller) {
     UINT64 benchmark_start;
 
-    liteos_realtest_mark("POST_NVME_IO_BEGIN");
+    realtest_mark("POST_NVME_IO_BEGIN");
     benchmark_start = telemetry_timestamp();
     if (!nvme_hardware_io_self_test()) {
-        liteos_realtest_mark("POST_NVME_IO_FAIL");
-        liteos_serial_write("LITEOS_NVME_IO_FAIL STATUS=");
-        liteos_serial_write_u32((UINT32)(-nvme_last_error()));
-        liteos_serial_write(" STAGE=");
-        liteos_serial_write_u32(nvme_last_stage());
-        liteos_serial_write(" CQ=");
-        liteos_serial_write_u32(nvme_last_completion_status());
-        liteos_serial_write("\r\n");
+        realtest_mark("POST_NVME_IO_FAIL");
+        kernel_serial_write("OS_NVME_IO_FAIL STATUS=");
+        kernel_serial_write_u32((UINT32)(-nvme_last_error()));
+        kernel_serial_write(" STAGE=");
+        kernel_serial_write_u32(nvme_last_stage());
+        kernel_serial_write(" CQ=");
+        kernel_serial_write_u32(nvme_last_completion_status());
+        kernel_serial_write("\r\n");
         halt_forever();
     }
     kernel_perf_emit_scope("io.nvme", benchmark_start);
-    if (nvme_hardware_present()) liteos_serial_write("LITEOS_NVME_IO_OK\r\n");
-    liteos_realtest_mark("POST_NVME_IO_OK");
+    if (nvme_hardware_present()) kernel_serial_write("OS_NVME_IO_OK\r\n");
+    realtest_mark("POST_NVME_IO_OK");
 
-    liteos_realtest_mark("POST_NVME_RESET_BEGIN");
+    realtest_mark("POST_NVME_RESET_BEGIN");
     benchmark_start = telemetry_timestamp();
     if (!nvme_hardware_reset_self_test()) {
-        liteos_realtest_mark("POST_NVME_RESET_FAIL");
-        liteos_serial_write("LITEOS_NVME_RESET_FAIL\r\n");
+        realtest_mark("POST_NVME_RESET_FAIL");
+        kernel_serial_write("OS_NVME_RESET_FAIL\r\n");
         halt_forever();
     }
     kernel_perf_emit_scope("io.nvme_reset", benchmark_start);
-    if (nvme_hardware_present()) liteos_serial_write("LITEOS_NVME_RESET_OK\r\n");
-    liteos_realtest_mark("POST_NVME_RESET_OK");
+    if (nvme_hardware_present()) kernel_serial_write("OS_NVME_RESET_OK\r\n");
+    realtest_mark("POST_NVME_RESET_OK");
 
-    liteos_serial_write("LITEOS_VFS_CORE_OK\r\n");
-    liteos_realtest_mark("POST_IO_CORE_BEGIN");
+    kernel_serial_write("OS_VFS_CORE_OK\r\n");
+    realtest_mark("POST_IO_CORE_BEGIN");
     benchmark_start = telemetry_timestamp();
-    if (!liteos_init_canonical_device_dma_io_self_test()) {
-        liteos_realtest_mark("POST_IO_CORE_FAIL");
-        liteos_serial_write("LITEOS_IO_TEST_FAIL\r\n");
+    if (!kernel_init_canonical_device_dma_io_self_test()) {
+        realtest_mark("POST_IO_CORE_FAIL");
+        kernel_serial_write("OS_IO_TEST_FAIL\r\n");
         halt_forever();
     }
     kernel_perf_emit_scope("io.core", benchmark_start);
-    liteos_serial_write("LITEOS_IO_OK\r\n");
-    liteos_serial_write("LITEOS_DMA_IO_CORE_OK\r\n");
-    liteos_serial_write("LITEOS_DRIVER_OK\r\n");
-    liteos_realtest_mark("POST_IO_CORE_OK");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_DRIVER,
-                       LITEOS_DEBUG_STEP_READY, 1U);
+    kernel_serial_write("OS_IO_OK\r\n");
+    kernel_serial_write("OS_DMA_IO_CORE_OK\r\n");
+    kernel_serial_write("OS_DRIVER_OK\r\n");
+    realtest_mark("POST_IO_CORE_OK");
+    kernel_debug_stage(OS_DEBUG_PHASE_DRIVER,
+                       OS_DEBUG_STEP_READY, 1U);
 
-    liteos_realtest_mark("POST_COMPLETION_BEGIN");
+    realtest_mark("POST_COMPLETION_BEGIN");
     if (!completion_port_self_test()) {
-        liteos_realtest_mark("POST_COMPLETION_FAIL");
-        liteos_serial_write("LITEOS_COMPLETION_PORT_FAIL\r\n");
+        realtest_mark("POST_COMPLETION_FAIL");
+        kernel_serial_write("OS_COMPLETION_PORT_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_COMPLETION_PORT_OK\r\n");
-    liteos_realtest_mark("POST_COMPLETION_OK");
-    liteos_realtest_mark("POST_MESSAGE_BEGIN");
+    kernel_serial_write("OS_COMPLETION_PORT_OK\r\n");
+    realtest_mark("POST_COMPLETION_OK");
+    realtest_mark("POST_MESSAGE_BEGIN");
     if (!message_port_self_test()) {
-        liteos_realtest_mark("POST_MESSAGE_FAIL");
-        liteos_serial_write("LITEOS_MESSAGE_PORT_FAIL\r\n");
+        realtest_mark("POST_MESSAGE_FAIL");
+        kernel_serial_write("OS_MESSAGE_PORT_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_MESSAGE_PORT_OK\r\n");
-    liteos_realtest_mark("POST_MESSAGE_OK");
-    liteos_realtest_mark("POST_TIMER_BEGIN");
+    kernel_serial_write("OS_MESSAGE_PORT_OK\r\n");
+    realtest_mark("POST_MESSAGE_OK");
+    realtest_mark("POST_TIMER_BEGIN");
     if (!timer_self_test()) {
-        liteos_realtest_mark("POST_TIMER_FAIL");
-        liteos_serial_write("LITEOS_TIMER_FAIL\r\n");
+        realtest_mark("POST_TIMER_FAIL");
+        kernel_serial_write("OS_TIMER_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_TIMER_OK\r\n");
-    liteos_realtest_mark("POST_TIMER_OK");
-    liteos_realtest_mark("POST_PCI_BEGIN");
-    if (!liteos_init_pci_self_test()) {
-        liteos_realtest_mark("POST_PCI_FAIL");
-        liteos_serial_write("LITEOS_PCI_TEST_FAIL\r\n");
+    kernel_serial_write("OS_TIMER_OK\r\n");
+    realtest_mark("POST_TIMER_OK");
+    realtest_mark("POST_PCI_BEGIN");
+    if (!kernel_init_pci_self_test()) {
+        realtest_mark("POST_PCI_FAIL");
+        kernel_serial_write("OS_PCI_TEST_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_PCI_OK\r\n");
-    liteos_realtest_mark("POST_PCI_OK");
+    kernel_serial_write("OS_PCI_OK\r\n");
+    realtest_mark("POST_PCI_OK");
 
-    liteos_realtest_mark("POST_NVME_CORE_BEGIN");
+    realtest_mark("POST_NVME_CORE_BEGIN");
     benchmark_start = telemetry_timestamp();
-    if (!liteos_init_nvme_self_test()) {
-        liteos_realtest_mark("POST_NVME_CORE_FAIL");
-        liteos_serial_write("LITEOS_NVME_TEST_FAIL\r\n");
+    if (!kernel_init_nvme_self_test()) {
+        realtest_mark("POST_NVME_CORE_FAIL");
+        kernel_serial_write("OS_NVME_TEST_FAIL\r\n");
         halt_forever();
     }
     kernel_perf_emit_scope("io.nvme_core", benchmark_start);
-    liteos_serial_write("LITEOS_NVME_OK\r\n");
-    liteos_realtest_mark("POST_NVME_CORE_OK");
+    kernel_serial_write("OS_NVME_OK\r\n");
+    realtest_mark("POST_NVME_CORE_OK");
     /* NVMe completion IRQ/CQ/deferred ownership is now independently locatable. */
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
-                       LITEOS_DEBUG_STEP_PROGRESS, 19U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
-                       LITEOS_DEBUG_STEP_PROGRESS, 2U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
-                       LITEOS_DEBUG_STEP_PROGRESS, 3U);
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_8,
-                       LITEOS_DEBUG_STEP_PROGRESS, 4U);
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_9);
-    liteos_debug_stage_enter(LITEOS_DEBUG_PHASE_SPEC_15);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_8,
+                       OS_DEBUG_STEP_PROGRESS, 19U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_8,
+                       OS_DEBUG_STEP_PROGRESS, 2U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_8,
+                       OS_DEBUG_STEP_PROGRESS, 3U);
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_8,
+                       OS_DEBUG_STEP_PROGRESS, 4U);
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_9);
+    kernel_debug_stage_enter(OS_DEBUG_PHASE_SPEC_15);
 
-    liteos_realtest_mark("POST_AUDIO_BEGIN");
+    realtest_mark("POST_AUDIO_BEGIN");
     if (!audio_core_init() || !audio_core_self_test()) {
-        liteos_realtest_mark("POST_AUDIO_FAIL");
-        liteos_serial_write("LITEOS_AUDIO_CORE_FAIL\r\n");
+        realtest_mark("POST_AUDIO_FAIL");
+        kernel_serial_write("OS_AUDIO_CORE_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_AUDIO_CORE_OK\r\n");
-    liteos_realtest_mark("POST_AUDIO_OK");
-    liteos_realtest_mark("POST_HDA_BEGIN");
+    kernel_serial_write("OS_AUDIO_CORE_OK\r\n");
+    realtest_mark("POST_AUDIO_OK");
+    realtest_mark("POST_HDA_BEGIN");
     if (!hda_hardware_self_test()) {
-        liteos_realtest_mark("POST_HDA_FAIL");
-        liteos_serial_write("LITEOS_HDA_FAIL=");
-        liteos_serial_write_u32(hda_last_error());
-        liteos_serial_write("\r\n");
-        liteos_serial_write("LITEOS_HDA_UNAVAILABLE\r\n");
-        liteos_realtest_mark("POST_HDA_UNAVAILABLE");
+        realtest_mark("POST_HDA_FAIL");
+        kernel_serial_write("OS_HDA_FAIL=");
+        kernel_serial_write_u32(hda_last_error());
+        kernel_serial_write("\r\n");
+        kernel_serial_write("OS_HDA_UNAVAILABLE\r\n");
+        realtest_mark("POST_HDA_UNAVAILABLE");
     } else if (hda_hardware_present()) {
-        liteos_serial_write("LITEOS_HDA_HW_OK OUT=");
-        liteos_serial_write_u32(hda_output_stream_count());
-        liteos_serial_write(" IN=");
-        liteos_serial_write_u32(hda_input_stream_count());
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_HDA_HW_OK OUT=");
+        kernel_serial_write_u32(hda_output_stream_count());
+        kernel_serial_write(" IN=");
+        kernel_serial_write_u32(hda_input_stream_count());
+        kernel_serial_write("\r\n");
         if (!hda_pcm_self_test()) {
-            liteos_realtest_mark("POST_HDA_PCM_FAIL");
-            liteos_serial_write("LITEOS_HDA_PCM_FAIL=");
-            liteos_serial_write_u32(hda_last_error());
-            liteos_serial_write("\r\nLITEOS_HDA_UNAVAILABLE\r\n");
-            liteos_realtest_mark("POST_HDA_UNAVAILABLE");
+            realtest_mark("POST_HDA_PCM_FAIL");
+            kernel_serial_write("OS_HDA_PCM_FAIL=");
+            kernel_serial_write_u32(hda_last_error());
+            kernel_serial_write("\r\nOS_HDA_UNAVAILABLE\r\n");
+            realtest_mark("POST_HDA_UNAVAILABLE");
         } else {
-            liteos_serial_write("LITEOS_HDA_PCM_OK\r\n");
-            liteos_realtest_mark("POST_HDA_OK");
+            kernel_serial_write("OS_HDA_PCM_OK\r\n");
+            realtest_mark("POST_HDA_OK");
         }
     } else {
-        liteos_serial_write("LITEOS_HDA_ABSENT\r\n");
-        liteos_realtest_mark("POST_HDA_OK");
+        kernel_serial_write("OS_HDA_ABSENT\r\n");
+        realtest_mark("POST_HDA_OK");
     }
-    liteos_realtest_mark("POST_BLUETOOTH_BEGIN");
+    realtest_mark("POST_BLUETOOTH_BEGIN");
     if (!bluetooth_core_self_test()) {
-        liteos_realtest_mark("POST_BLUETOOTH_FAIL");
-        liteos_serial_write("LITEOS_BLUETOOTH_CORE_FAIL\r\n");
-        liteos_serial_write("LITEOS_BLUETOOTH_UNAVAILABLE\r\n");
-        liteos_realtest_mark("POST_BLUETOOTH_UNAVAILABLE");
+        realtest_mark("POST_BLUETOOTH_FAIL");
+        kernel_serial_write("OS_BLUETOOTH_CORE_FAIL\r\n");
+        kernel_serial_write("OS_BLUETOOTH_UNAVAILABLE\r\n");
+        realtest_mark("POST_BLUETOOTH_UNAVAILABLE");
     } else {
-        liteos_serial_write("LITEOS_BLUETOOTH_CORE_OK\r\n");
-        liteos_realtest_mark("POST_BLUETOOTH_OK");
+        kernel_serial_write("OS_BLUETOOTH_CORE_OK\r\n");
+        realtest_mark("POST_BLUETOOTH_OK");
     }
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_15);
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_15);
 
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_8);
-    liteos_realtest_mark("POST_PACKAGE_BEGIN");
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_8);
+    realtest_mark("POST_PACKAGE_BEGIN");
     if (!package_core_self_test()) {
-        liteos_realtest_mark("POST_PACKAGE_FAIL");
-        liteos_serial_write("LITEOS_PACKAGE_CORE_FAIL\r\n");
+        realtest_mark("POST_PACKAGE_FAIL");
+        kernel_serial_write("OS_PACKAGE_CORE_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_PACKAGE_CORE_OK\r\n");
-    liteos_realtest_mark("POST_PACKAGE_OK");
-    liteos_realtest_mark("POST_FIRMWARE_BEGIN");
+    kernel_serial_write("OS_PACKAGE_CORE_OK\r\n");
+    realtest_mark("POST_PACKAGE_OK");
+    realtest_mark("POST_FIRMWARE_BEGIN");
     if (!firmware_core_self_test()) {
-        liteos_realtest_mark("POST_FIRMWARE_FAIL");
-        liteos_serial_write("LITEOS_FIRMWARE_CORE_FAIL\r\n");
+        realtest_mark("POST_FIRMWARE_FAIL");
+        kernel_serial_write("OS_FIRMWARE_CORE_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_FIRMWARE_CORE_OK\r\n");
-    liteos_realtest_mark("POST_FIRMWARE_OK");
-    liteos_realtest_mark("POST_RCU_BEGIN");
+    kernel_serial_write("OS_FIRMWARE_CORE_OK\r\n");
+    realtest_mark("POST_FIRMWARE_OK");
+    realtest_mark("POST_RCU_BEGIN");
     if (!rcu_self_test()) {
-        liteos_realtest_mark("POST_RCU_FAIL");
-        liteos_serial_write("LITEOS_RCU_FAIL\r\n");
+        realtest_mark("POST_RCU_FAIL");
+        kernel_serial_write("OS_RCU_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_RCU_OK\r\n");
-    liteos_realtest_mark("POST_RCU_OK");
-    liteos_realtest_mark("POST_TELEMETRY_BEGIN");
+    kernel_serial_write("OS_RCU_OK\r\n");
+    realtest_mark("POST_RCU_OK");
+    realtest_mark("POST_TELEMETRY_BEGIN");
     if (!telemetry_self_test()) {
-        liteos_realtest_mark("POST_TELEMETRY_FAIL");
-        liteos_serial_write("LITEOS_TELEMETRY_FAIL\r\n");
+        realtest_mark("POST_TELEMETRY_FAIL");
+        kernel_serial_write("OS_TELEMETRY_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_TELEMETRY_OK\r\n");
-    liteos_realtest_mark("POST_TELEMETRY_OK");
+    kernel_serial_write("OS_TELEMETRY_OK\r\n");
+    realtest_mark("POST_TELEMETRY_OK");
 
-    liteos_realtest_mark("POST_PERF_BEGIN");
+    realtest_mark("POST_PERF_BEGIN");
     kernel_perf_report_t perf_report;
     if (!kernel_perf_benchmark(&perf_report)) {
-        liteos_realtest_mark("POST_PERF_FAIL");
-        liteos_serial_write("LITEOS_PERF_KMALLOC_FAIL\r\n");
+        realtest_mark("POST_PERF_FAIL");
+        kernel_serial_write("OS_PERF_KMALLOC_FAIL\r\n");
         halt_forever();
     }
     kernel_perf_emit_report(&perf_report);
-    liteos_realtest_mark("POST_PERF_OK");
-    liteos_debug_stage(LITEOS_DEBUG_PHASE_REFACTOR_0,
-                       LITEOS_DEBUG_STEP_PROGRESS, 1U);
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_18);
+    realtest_mark("POST_PERF_OK");
+    kernel_debug_stage(OS_DEBUG_PHASE_REFACTOR_0,
+                       OS_DEBUG_STEP_PROGRESS, 1U);
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_18);
 
-    liteos_realtest_mark("POST_RESOURCE_BEGIN");
+    realtest_mark("POST_RESOURCE_BEGIN");
     if (!resource_core_self_test()) {
-        liteos_realtest_mark("POST_RESOURCE_FAIL");
-        liteos_serial_write("LITEOS_RESOURCE_CORE_FAIL\r\n");
+        realtest_mark("POST_RESOURCE_FAIL");
+        kernel_serial_write("OS_RESOURCE_CORE_FAIL\r\n");
         halt_forever();
     }
-    liteos_serial_write("LITEOS_RESOURCE_CORE_OK\r\n");
-    liteos_realtest_mark("POST_RESOURCE_OK");
-    liteos_debug_stage_ready(LITEOS_DEBUG_PHASE_SPEC_16);
+    kernel_serial_write("OS_RESOURCE_CORE_OK\r\n");
+    realtest_mark("POST_RESOURCE_OK");
+    kernel_debug_stage_ready(OS_DEBUG_PHASE_SPEC_16);
 
-    liteos_init_filesystem_hooks_t filesystem_hooks = {
-        .write = liteos_serial_write,
-        .write_u32 = liteos_serial_write_u32,
-        .halt = liteos_kernel_halt_forever,
+    kernel_init_filesystem_hooks_t filesystem_hooks = {
+        .write = kernel_serial_write,
+        .write_u32 = kernel_serial_write_u32,
+        .halt = kernel_halt_forever,
     };
-    liteos_realtest_mark("POST_FILESYSTEM_BEGIN");
-    if (!liteos_init_filesystem(info, active_controller, &filesystem_hooks)) {
-        liteos_realtest_mark("POST_FILESYSTEM_FAIL");
+    realtest_mark("POST_FILESYSTEM_BEGIN");
+    if (!kernel_init_filesystem(info, active_controller, &filesystem_hooks)) {
+        realtest_mark("POST_FILESYSTEM_FAIL");
         halt_forever();
     }
-    liteos_realtest_mark("POST_FILESYSTEM_OK");
-    liteos_init_network_hooks_t network_hooks = {
-        .write = liteos_serial_write,
-        .write_u32 = liteos_serial_write_u32,
-        .halt = liteos_kernel_halt_forever,
+    realtest_mark("POST_FILESYSTEM_OK");
+    kernel_init_network_hooks_t network_hooks = {
+        .write = kernel_serial_write,
+        .write_u32 = kernel_serial_write_u32,
+        .halt = kernel_halt_forever,
     };
-    liteos_realtest_mark("POST_NETWORK_BEGIN");
-    if (!liteos_init_network(&network_hooks)) {
-        liteos_realtest_mark("POST_NETWORK_FAIL");
-        liteos_serial_write("LITEOS_NETWORK_UNAVAILABLE\r\n");
-        liteos_realtest_mark("POST_NETWORK_UNAVAILABLE");
+    realtest_mark("POST_NETWORK_BEGIN");
+    if (!kernel_init_network(&network_hooks)) {
+        realtest_mark("POST_NETWORK_FAIL");
+        kernel_serial_write("OS_NETWORK_UNAVAILABLE\r\n");
+        realtest_mark("POST_NETWORK_UNAVAILABLE");
     } else {
-        liteos_realtest_mark("POST_NETWORK_OK");
+        realtest_mark("POST_NETWORK_OK");
     }
-    liteos_init_graphics_hooks_t graphics_hooks = {
-        .write = liteos_serial_write,
-        .write_u32 = liteos_serial_write_u32,
-        .halt = liteos_kernel_halt_forever,
+    kernel_init_graphics_hooks_t graphics_hooks = {
+        .write = kernel_serial_write,
+        .write_u32 = kernel_serial_write_u32,
+        .halt = kernel_halt_forever,
     };
-    liteos_realtest_mark("POST_GRAPHICS_BEGIN");
-    if (!liteos_init_graphics(info, &graphics_hooks)) {
-        liteos_realtest_mark("POST_GRAPHICS_FAIL");
-        liteos_serial_write("LITEOS_GRAPHICS_UNAVAILABLE\r\n");
-        liteos_realtest_mark("POST_GRAPHICS_UNAVAILABLE");
+    realtest_mark("POST_GRAPHICS_BEGIN");
+    if (!kernel_init_graphics(info, &graphics_hooks)) {
+        realtest_mark("POST_GRAPHICS_FAIL");
+        kernel_serial_write("OS_GRAPHICS_UNAVAILABLE\r\n");
+        realtest_mark("POST_GRAPHICS_UNAVAILABLE");
     } else {
-        liteos_realtest_mark("POST_GRAPHICS_OK");
+        realtest_mark("POST_GRAPHICS_OK");
     }
-    liteos_init_userspace_hooks_t userspace_hooks = {
-        .write = liteos_serial_write,
-        .write_u32 = liteos_serial_write_u32,
-        .halt = liteos_kernel_halt_forever,
+    kernel_init_userspace_hooks_t userspace_hooks = {
+        .write = kernel_serial_write,
+        .write_u32 = kernel_serial_write_u32,
+        .halt = kernel_halt_forever,
     };
-    liteos_realtest_mark("POST_USERSPACE_BEGIN");
-    if (!liteos_init_userspace(&userspace_hooks)) {
-        liteos_realtest_mark("POST_USERSPACE_FAIL");
+    realtest_mark("POST_USERSPACE_BEGIN");
+    if (!kernel_init_userspace(&userspace_hooks)) {
+        realtest_mark("POST_USERSPACE_FAIL");
         halt_forever();
     }
-    liteos_realtest_mark("POST_USERSPACE_OK");
+    realtest_mark("POST_USERSPACE_OK");
     return 1;
 }

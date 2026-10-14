@@ -6,22 +6,134 @@
 #include <kernel/console.h>
 #include <kernel/perf.h>
 #include <kernel/telemetry.h>
+#include "../process/internal.h"
 
-#ifndef LITEOS_DEBUG_SERIAL
-#define LITEOS_DEBUG_SERIAL 0
+#ifndef OS_DEBUG_SERIAL
+#define OS_DEBUG_SERIAL 0
 #endif
 
-#ifndef LITEOS_REALTEST
-#define LITEOS_REALTEST 0
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
 #endif
 
-#if LITEOS_DEBUG_SERIAL || LITEOS_REALTEST
+#if OS_DEBUG_SERIAL || OS_REALTEST
 #define VM_FAULT_TELEMETRY_ENABLED 1
 #else
 #define VM_FAULT_TELEMETRY_ENABLED 0
 #endif
 
 #define VM_FAULT_HISTOGRAM_BUCKETS 64U
+
+typedef struct vm_slow_fault_diagnostic {
+    uint64_t pid, tid, address, error, total_ns, fault_ns, around_ns;
+} vm_slow_fault_diagnostic_t;
+static volatile vm_slow_fault_diagnostic_t g_vm_slow_faults[32];
+static atomic_flag g_vm_slow_fault_guard = ATOMIC_FLAG_INIT;
+static volatile uint64_t g_vm_slow_fault_process;
+static void vm_record_slow_fault(uint64_t pid, uint64_t tid, uint64_t address,
+                                 uint32_t error, uint64_t started,
+                                 uint64_t resolved, uint64_t finished) {
+    uint64_t elapsed = finished - started;
+    if (x86_boot_cpu_features.tsc_hz == 0U ||
+        elapsed < x86_boot_cpu_features.tsc_hz / 100U) return;
+    if (atomic_flag_test_and_set_explicit(&g_vm_slow_fault_guard,
+                                          memory_order_acquire)) return;
+    for (size_t index = 0U; index < 32U; ++index) {
+        if (g_vm_slow_faults[index].tid != 0U &&
+            g_vm_slow_faults[index].tid != tid) continue;
+        uint64_t ns = x86_tsc_to_ns(elapsed);
+        if (ns > g_vm_slow_faults[index].total_ns)
+            g_vm_slow_faults[index] = (vm_slow_fault_diagnostic_t){
+                pid, tid, address, error, ns,
+                x86_tsc_to_ns(resolved - started),
+                x86_tsc_to_ns(finished - resolved)};
+        break;
+    }
+    atomic_flag_clear_explicit(&g_vm_slow_fault_guard, memory_order_release);
+}
+
+#define VM_FAULT_DIAG_COM1_DATA   0x3F8U
+#define VM_FAULT_DIAG_COM1_STATUS 0x3FDU
+
+static atomic_flag g_vm_fault_diag_lock = ATOMIC_FLAG_INIT;
+
+static void vm_fault_diag_write_char(char value) {
+    uint16_t status_port = VM_FAULT_DIAG_COM1_STATUS;
+    uint16_t data_port = VM_FAULT_DIAG_COM1_DATA;
+    for (uint32_t attempt = 0U; attempt < 100000U; ++attempt) {
+        uint8_t ready;
+        __asm__ volatile ("inb %w1, %0" : "=a"(ready) : "d"(status_port));
+        if ((ready & 0x20U) != 0U) break;
+        __asm__ volatile ("pause");
+    }
+    __asm__ volatile ("outb %0, %w1" : : "a"((uint8_t)value), "d"(data_port));
+}
+
+static void vm_fault_diag_write_text(const char *text) {
+    while (*text != '\0') vm_fault_diag_write_char(*text++);
+}
+
+static void vm_fault_diag_write_hex(uint64_t value) {
+    static const char digits[] = "0123456789abcdef";
+    vm_fault_diag_write_text("0x");
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        vm_fault_diag_write_char(digits[(value >> (uint32_t)shift) & 0xFU]);
+    }
+}
+
+static void vm_fault_diag_emit(thread_t *thread, const vm_fault_info_t *fault,
+                               uint32_t cpu_error, kstatus_t status,
+                               vm_area_t *area, uint64_t file_offset,
+                               uint32_t object_type) {
+    while (atomic_flag_test_and_set_explicit(&g_vm_fault_diag_lock,
+                                              memory_order_acquire)) {
+        __asm__ volatile ("pause");
+    }
+    vm_fault_diag_write_text("OS_VM_USER_FAULT pid=");
+    vm_fault_diag_write_hex(thread->process->pid);
+    vm_fault_diag_write_text(" address=");
+    vm_fault_diag_write_hex(fault->address);
+    vm_fault_diag_write_text(" access=");
+    vm_fault_diag_write_hex(fault->access);
+    vm_fault_diag_write_text(" error=");
+    vm_fault_diag_write_hex(cpu_error);
+    vm_fault_diag_write_text(" status=");
+    vm_fault_diag_write_hex((uint64_t)status);
+    vm_fault_diag_write_text(" area=");
+    vm_fault_diag_write_hex(area != 0 ? area->start : 0U);
+    vm_fault_diag_write_char('-');
+    vm_fault_diag_write_hex(area != 0 ? area->end : 0U);
+    vm_fault_diag_write_text(" prot=");
+    vm_fault_diag_write_hex(area != 0 ? area->prot : 0U);
+    vm_fault_diag_write_text(" object=");
+    vm_fault_diag_write_hex(object_type);
+    vm_fault_diag_write_text(" file_offset=");
+    vm_fault_diag_write_hex(file_offset);
+    vm_fault_diag_write_text("\r\n");
+    atomic_flag_clear_explicit(&g_vm_fault_diag_lock, memory_order_release);
+}
+
+static void vm_write_repair_diag(const char *stage, const vm_fault_info_t *fault,
+                                 const vm_area_t *area, uint64_t page_address,
+                                 uint64_t object_index, uint64_t pte_flags,
+                                 kstatus_t status) {
+    thread_t *thread = sched_current_thread();
+    process_t *process = thread != 0 ? thread->process : 0;
+    (void)kernel_serial_printf_serial_only(
+        "OS_VM_WRITE_REPAIR stage=%s pid=%llx va=%llx page=%llx "
+        "index=%llx area_flags=%llx cow=%u pte_flags=%llx cpu_error=%llx "
+        "status=%lld\r\n",
+        stage != 0 ? stage : "unknown",
+        (unsigned long long)(process != 0 ? process->pid : 0U),
+        (unsigned long long)(fault != 0 ? (uint64_t)fault->address : 0U),
+        (unsigned long long)page_address,
+        (unsigned long long)object_index,
+        (unsigned long long)(area != 0 ? area->flags : 0U),
+        area != 0 && (area->flags & VM_AREA_COW) != 0U ? 1U : 0U,
+        (unsigned long long)pte_flags,
+        (unsigned long long)(fault != 0 ? fault->cpu_error : 0U),
+        (long long)status);
+}
 
 enum vm_fault_counter {
     VM_FAULT_COUNT_TOTAL,
@@ -312,13 +424,13 @@ static void vm_fault_telemetry_record(const vm_fault_info_t *fault,
 }
 #endif
 
-#if LITEOS_DEBUG_SERIAL
+#if OS_DEBUG_SERIAL
 static void vm_fault_write_diagnostic(const char *reason,
                                       const vm_fault_info_t *fault,
                                       const vm_area_t *area,
                                       uint64_t existing_flags) {
-    liteos_serial_printf_serial_only(
-        "LITEOS_DIAG_VM_FAULT %s ADDRESS=%llx ACCESS=%x AREA_START=%llx "
+    kernel_serial_printf_serial_only(
+        "OS_DIAG_VM_FAULT %s ADDRESS=%llx ACCESS=%x AREA_START=%llx "
         "AREA_END=%llx PROT=%x FLAGS=%x PTE=%llx\r\n",
         reason,
         (unsigned long long)fault->address,
@@ -347,26 +459,68 @@ bool vm_handle_current_fault(vaddr_t address, uint32_t cpu_error,
 
     thread = sched_current_thread();
     if (thread == 0 || thread->object.type != KOBJECT_TYPE_THREAD ||
-        thread->process == 0 || thread->process->vm == 0) {
+        thread->process == 0) {
         return false;
     }
+    vm_space_t *space = process_vm_reference(thread->process);
+    if (space == 0) return false;
 
     fault.address = address;
     fault.access = (cpu_error & (1U << 4)) != 0U ? VM_PROT_EXEC :
                    (cpu_error & (1U << 1)) != 0U ? VM_PROT_WRITE :
                                                   VM_PROT_READ;
     fault.cpu_error = cpu_error;
+    uint64_t diagnostic_started = x86_read_tsc();
  #if VM_FAULT_TELEMETRY_ENABLED
     trace.start_tsc = telemetry_timestamp();
-    status = vm_handle_fault_impl(thread->process->vm, &fault, &trace);
+    status = vm_handle_fault_impl(space, &fault, &trace);
     trace.end_tsc = telemetry_timestamp();
     vm_fault_telemetry_record(&fault, from_user, &trace);
- #else
-    status = vm_handle_fault_impl(thread->process->vm, &fault, 0);
- #endif
-    if (status == K_OK && (cpu_error & 1U) == 0U) {
-        vm_fault_around(thread->process->vm, &fault);
+#else
+    status = vm_handle_fault_impl(space, &fault, 0);
+#endif
+    uint64_t diagnostic_resolved = x86_read_tsc();
+    if (status != K_OK && from_user) {
+        uint64_t area_start = 0U;
+        uint64_t area_end = 0U;
+        uint64_t object_offset = 0U;
+        uint32_t area_prot = 0U;
+        uint32_t object_type = 0U;
+        map_lock(space);
+        vm_area_t *area = find_area(space, address);
+        if (area != 0) {
+            area_start = area->start;
+            area_end = area->end;
+            area_prot = area->prot;
+            if (area->object != 0) {
+                object_type = area->object->type;
+                if (area->object->type == VM_OBJECT_FILE) {
+                    object_offset = area->object->u.file.file_offset +
+                                    area->object_offset + address - area->start;
+                }
+            }
+        }
+        map_unlock(space);
+        vm_area_t area_snapshot = {
+            .start = area_start,
+            .end = area_end,
+            .prot = area_prot,
+        };
+        vm_fault_diag_emit(thread, &fault, cpu_error, status,
+                           area != 0 ? &area_snapshot : 0,
+                           object_offset, object_type);
     }
+    if (status == K_OK && (cpu_error & 1U) == 0U) {
+        vm_fault_around(space, &fault);
+    }
+    /* Track leaders separately: a child doing executable I/O must not hide
+     * the browser UI's fault latency. No logging/allocation in this path. */
+    if (thread->tid == thread->process->linux_thread_group_leader_tid ||
+        thread->process->pid == g_vm_slow_fault_process)
+        vm_record_slow_fault(thread->process->pid, thread->tid, address,
+                              cpu_error, diagnostic_started,
+                              diagnostic_resolved, x86_read_tsc());
+    vm_space_put(space);
     return status == K_OK;
 }
 
@@ -374,6 +528,7 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
                                       const vm_fault_info_t *fault,
                                       vm_fault_trace_t *trace) {
     if (space == 0 || fault == 0 || fault->address >= VM_USER_END) return K_EINVAL;
+retry_fault:
     map_lock(space);
     vm_area_t *area = find_area(space, fault->address);
     if (area == 0 || (area->flags & VM_MAP_GUARD) != 0 || area->object == 0) {
@@ -394,8 +549,13 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
     if (((access & VM_PROT_READ) != 0 && (area->prot & VM_PROT_READ) == 0) ||
         ((access & VM_PROT_WRITE) != 0 && (area->prot & VM_PROT_WRITE) == 0) ||
         ((access & VM_PROT_EXEC) != 0 && (area->prot & VM_PROT_EXEC) == 0)) {
-#if LITEOS_DEBUG_SERIAL
-        vm_fault_write_diagnostic("DENY", fault, area, 0U);
+#if OS_DEBUG_SERIAL
+        /* A present-page write fault is also used by Chromium's
+         * ProtectedMemory read-only probe. It is an expected uaccess fixup,
+         * so do not serialize the startup path on a diagnostic UART write. */
+        if ((fault->cpu_error & 1U) == 0U) {
+            vm_fault_write_diagnostic("DENY", fault, area, 0U);
+        }
 #endif
         map_unlock(space);
         return K_EACCES;
@@ -403,7 +563,8 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
     if (area->object->type != VM_OBJECT_ANON &&
         area->object->type != VM_OBJECT_SHARED &&
         area->object->type != VM_OBJECT_FILE &&
-        area->object->type != VM_OBJECT_DEVICE) {
+        area->object->type != VM_OBJECT_DEVICE &&
+        area->object->type != VM_OBJECT_PAGE_ARRAY) {
         map_unlock(space);
         return K_ENOSYS;
     }
@@ -440,6 +601,37 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
         map_unlock(space);
         return device_status;
     }
+    if (area->object->type == VM_OBJECT_PAGE_ARRAY) {
+        uint64_t physical;
+        if (translated == K_OK) {
+            map_unlock(space);
+            return K_OK;
+        }
+        if (object_index >= area->object->u.page_array.page_count) {
+            map_unlock(space);
+            return K_EINVAL;
+        }
+        physical = area->object->u.page_array.pages[object_index];
+        if ((physical & (PAGE_SIZE - 1ULL)) != 0U ||
+            physical > UINT64_MAX - PAGE_SIZE) {
+            map_unlock(space);
+            return K_EINVAL;
+        }
+        if (trace != 0) trace->backing_ready_tsc = telemetry_timestamp();
+        kstatus_t page_array_status = x86_map_page(
+            space->root_table, (vaddr_t)page_address,
+            paddr_make(physical), hardware_flags(area->prot, false),
+            area->object->u.page_array.cache_mode);
+        if (trace != 0) trace->pte_ready_tsc = telemetry_timestamp();
+        if (page_array_status == K_OK) {
+            atomic_fetch_add_explicit(&space->rss_pages, 1U,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&space->tlb_generation, 1U,
+                                      memory_order_release);
+        }
+        map_unlock(space);
+        return page_array_status;
+    }
     page_t *page = 0;
     bool cow = (area->flags & VM_AREA_COW) != 0;
     if (trace != 0) trace->cow = cow;
@@ -453,6 +645,10 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
         }
         /* Resolve COW per page; a page already remapped writable is done. */
         if (x86_page_entry_writable(existing_flags)) {
+            /* Another CPU may have upgraded this same physical page without
+             * an IPI. Remove our stale read-only translation before retrying. */
+            __asm__ volatile ("invlpg (%0)" : :
+                              "r"(page_address) : "memory");
             map_unlock(space);
             return K_OK;
         }
@@ -474,74 +670,170 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
                 status = x86_protect_page(
                     space->root_table, (vaddr_t)page_address,
                     hardware_flags(area->prot, false), X86_CACHE_WB);
+                if (status != K_OK) {
+                    vm_write_repair_diag("PROTECT", fault, area,
+                                         page_address, object_index,
+                                         existing_flags, status);
+                }
                 map_unlock(space);
                 return status;
             }
             status = anon_page_cow(area->object, object_index, &page);
         }
         if (status != K_OK) {
+            (void)kernel_serial_printf_serial_only(
+                "OS_VM_WRITE_REPAIR_FAIL pid=%llx va=%llx "
+                "object=%llx index=%llx cow=%u private_file=%u "
+                "pte=%llx pte_flags=%llx status=%lld\r\n",
+                (unsigned long long)(sched_current_thread() != 0 &&
+                    sched_current_thread()->process != 0 ?
+                    sched_current_thread()->process->pid : 0U),
+                (unsigned long long)(uint64_t)fault->address,
+                (unsigned long long)(uintptr_t)area->object,
+                (unsigned long long)object_index, cow ? 1U : 0U,
+                private_file ? 1U : 0U,
+                (unsigned long long)existing.value,
+                (unsigned long long)existing_flags, (long long)status);
             map_unlock(space);
             return status;
         }
         if (trace != 0) trace->backing_ready_tsc = telemetry_timestamp();
+        if (page_to_phys(page).value == existing.value) {
+            /* Once the child has dropped its reference, COW needs only a
+             * permission upgrade. Do not tear down/reallocate page tables. */
+            status = x86_protect_page(space->root_table,
+                (vaddr_t)page_address, hardware_flags(area->prot, false),
+                X86_CACHE_WB);
+            if (trace != 0) trace->pte_ready_tsc = telemetry_timestamp();
+            if (status == K_OK) {
+                atomic_fetch_add_explicit(&space->tlb_generation, 1U,
+                                          memory_order_release);
+            }
+            map_unlock(space);
+            return status;
+        }
         status = x86_unmap_page(space->root_table, (vaddr_t)page_address, 0);
         if (status != K_OK) {
+            vm_write_repair_diag("UNMAP", fault, area, page_address,
+                                 object_index, existing_flags, status);
             map_unlock(space);
             return status;
         }
         status = x86_map_page(space->root_table, (vaddr_t)page_address,
                               page_to_phys(page), hardware_flags(area->prot, false),
                               X86_CACHE_WB);
+        if (status != K_OK) {
+            vm_write_repair_diag("COW_MAP", fault, area, page_address,
+                                 object_index, existing_flags, status);
+        }
         if (trace != 0) trace->pte_ready_tsc = telemetry_timestamp();
         atomic_fetch_add_explicit(&space->tlb_generation, 1U, memory_order_release);
         map_unlock(space);
         return status;
     }
 
-    kstatus_t status;
+    /*
+     * Backing-store callbacks can take vnode/backend locks and perform I/O.
+     * VFS user-copy paths can fault while holding those same locks, so never
+     * enter them while map_lock is held. Pin both objects and snapshot the VMA
+     * before dropping the lock; after the callback, revalidate before using
+     * the result because unmap/protect/split may have run in the meantime.
+     */
+    vm_area_t area_snapshot = *area;
+    uint64_t advice_generation = atomic_load_explicit(
+        &space->advice_generation, memory_order_acquire);
+    vm_object_t *object = area->object;
+    vm_object_t *private_object = area->private_object;
+    vm_object_get(object);
+    vm_object_get(private_object);
     const vm_file_ops_t *file_ops =
-        area->object->type == VM_OBJECT_FILE ? area->object->u.file.ops : 0;
+        object->type == VM_OBJECT_FILE ? object->u.file.ops : 0;
     void *file_mapping =
-        area->object->type == VM_OBJECT_FILE ? area->object->u.file.mapping : 0;
+        object->type == VM_OBJECT_FILE ? object->u.file.mapping : 0;
+    uint64_t file_page_index = object->type == VM_OBJECT_FILE ?
+        (object->u.file.file_offset >> PAGE_SHIFT) + object_index : 0U;
+    map_unlock(space);
+
+    kstatus_t status;
     if (private_file) {
-        page = anon_page_lookup(area->private_object, object_index);
+        page = anon_page_lookup(private_object, object_index);
         if (page != 0) {
             status = K_OK;
         } else {
             status = file_ops == 0 || file_ops->page_get == 0 ||
                      file_mapping == 0 ? K_EIO :
-                     file_ops->page_get(file_mapping,
-                                        (area->object->u.file.file_offset >> PAGE_SHIFT) +
-                                        object_index, &page);
+                     file_ops->page_get(file_mapping, file_page_index, &page);
+            if (status == K_OK && page == 0) status = K_EIO;
             if (status == K_OK && (access & VM_PROT_WRITE) != 0) {
-                status = private_file_shadow_page(area, object_index,
+                status = private_file_shadow_page(&area_snapshot, object_index,
                                                   page_to_phys(page), &page);
             }
         }
-    } else if (area->object->type == VM_OBJECT_FILE) {
+    } else if (object->type == VM_OBJECT_FILE) {
         status = file_ops == 0 || file_ops->page_get == 0 ||
                  file_mapping == 0 ? K_EIO :
-                 file_ops->page_get(file_mapping,
-                                    (area->object->u.file.file_offset >> PAGE_SHIFT) +
-                                    object_index, &page);
-        if (status == K_OK && (area->prot & VM_PROT_WRITE) != 0 &&
-            (area->flags & VM_MAP_SHARED) != 0 &&
-            file_ops != 0 && file_ops->page_mark_dirty != 0) {
-            file_ops->page_mark_dirty(file_mapping,
-                                      (area->object->u.file.file_offset >> PAGE_SHIFT) +
-                                      object_index);
-        }
+                 file_ops->page_get(file_mapping, file_page_index, &page);
     } else {
-        status = anon_page_get(area->object, object_index, true, &page);
+        status = anon_page_get(object, object_index, true, &page);
     }
+
+    if (status == K_OK && page == 0) status = K_EIO;
     if (status != K_OK) {
-        map_unlock(space);
+        vm_object_put(private_object);
+        vm_object_put(object);
         return status;
+    }
+
+    vm_object_t *page_owner = 0;
+    if (private_file && (access & VM_PROT_WRITE) != 0U) {
+        page_owner = private_object;
+    } else if (object->type == VM_OBJECT_ANON ||
+               object->type == VM_OBJECT_SHARED) {
+        page_owner = object;
+    }
+    bool page_pinned = page_owner != 0 &&
+                       anon_page_pin(page_owner, object_index, page);
+    if (page_owner != 0 && !page_pinned) {
+        vm_object_put(private_object);
+        vm_object_put(object);
+        goto retry_fault;
+    }
+
+    map_lock(space);
+    area = find_area(space, fault->address);
+    if (atomic_load_explicit(&space->advice_generation,
+                             memory_order_acquire) != advice_generation ||
+        area == 0 || area->object != object ||
+        area->private_object != private_object ||
+        area->start != area_snapshot.start ||
+        area->end != area_snapshot.end ||
+        area->object_offset != area_snapshot.object_offset ||
+        area->prot != area_snapshot.prot ||
+        area->flags != area_snapshot.flags) {
+        map_unlock(space);
+        if (page_pinned) anon_page_unpin(page);
+        vm_object_put(private_object);
+        vm_object_put(object);
+        goto retry_fault;
+    }
+
+    /* A parallel fault may have installed this page while backing I/O ran. */
+    if (x86_translate_page(space->root_table, (vaddr_t)page_address,
+                           &existing, &existing_flags) == K_OK) {
+        map_unlock(space);
+        if (page_pinned) anon_page_unpin(page);
+        vm_object_put(private_object);
+        vm_object_put(object);
+        goto retry_fault;
     }
     if (trace != 0) trace->backing_ready_tsc = telemetry_timestamp();
     uint32_t page_flags = vm_area_page_flags(area, page_address, area->prot);
     status = x86_map_page(space->root_table, (vaddr_t)page_address,
                           page_to_phys(page), page_flags, X86_CACHE_WB);
+    if (status != K_OK) {
+        vm_write_repair_diag("POPULATE", fault, area, page_address,
+                             object_index, existing_flags, status);
+    }
     if (trace != 0) trace->pte_ready_tsc = telemetry_timestamp();
     if (status == K_OK) {
         atomic_fetch_add_explicit(&space->rss_pages, 1U, memory_order_relaxed);
@@ -549,6 +841,16 @@ static kstatus_t vm_handle_fault_impl(vm_space_t *space,
                                   memory_order_release);
     }
     map_unlock(space);
+    if (page_pinned) anon_page_unpin(page);
+
+    if (status == K_OK && object->type == VM_OBJECT_FILE &&
+        (area_snapshot.prot & VM_PROT_WRITE) != 0 &&
+        (area_snapshot.flags & VM_MAP_SHARED) != 0 &&
+        file_ops != 0 && file_ops->page_mark_dirty != 0) {
+        file_ops->page_mark_dirty(file_mapping, file_page_index);
+    }
+    vm_object_put(private_object);
+    vm_object_put(object);
     return status;
 }
 
@@ -599,6 +901,8 @@ static kstatus_t vm_populate_range_internal(vm_space_t *space,
     if (object->type == VM_OBJECT_SHARED &&
         (object->flags & VM_OBJECT_FLAG_WINDOW_SURFACE) != 0U) {
         uint32_t page_flags = hardware_flags(area->prot, false);
+        uint64_t populated = 0;
+        kstatus_t result = K_OK;
         for (uint64_t address = (uint64_t)start; address < end;
              address += PAGE_SIZE) {
             paddr_t existing;
@@ -606,9 +910,8 @@ static kstatus_t vm_populate_range_internal(vm_space_t *space,
                 space->root_table, (vaddr_t)address, &existing, 0);
             if (lookup == K_OK) continue;
             if (lookup != K_ENOENT) {
-                map_unlock(space);
-                vm_object_put(object);
-                return lookup;
+                result = lookup;
+                break;
             }
 
             page_t *page = 0;
@@ -621,24 +924,29 @@ static kstatus_t vm_populate_range_internal(vm_space_t *space,
                                       X86_CACHE_WB);
             }
             if (status != K_OK) {
-                map_unlock(space);
-                vm_object_put(object);
-                return status;
+                result = status;
+                break;
             }
-            atomic_fetch_add_explicit(&space->rss_pages, 1U,
+            ++populated;
+        }
+        /* map_lock covers the whole population transaction. Account only
+         * installed pages, including a successful prefix on failure, and
+         * publish one generation before releasing this batch's map lock. */
+        if (populated != 0U) {
+            atomic_fetch_add_explicit(&space->rss_pages, populated,
                                       memory_order_relaxed);
             atomic_fetch_add_explicit(&space->tlb_generation, 1U,
                                       memory_order_release);
-            atomic_fetch_add_explicit(&object->prefaulted_pages, 1U,
+            atomic_fetch_add_explicit(&object->prefaulted_pages, populated,
                                       memory_order_relaxed);
             if (fault_around) {
-                atomic_fetch_add_explicit(&object->fault_around_pages, 1U,
+                atomic_fetch_add_explicit(&object->fault_around_pages, populated,
                                           memory_order_relaxed);
             }
         }
         map_unlock(space);
         vm_object_put(object);
-        return K_OK;
+        return result;
     }
     map_unlock(space);
 

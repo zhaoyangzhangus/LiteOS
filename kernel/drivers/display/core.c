@@ -1,12 +1,15 @@
 #include <kernel/display.h>
 #include <arch/x86_64/cpu.h>
+#include <kernel/console.h>
 #include <kernel/deferred.h>
 #include <kernel/kmem.h>
 #include <kernel/mm.h>
+#include <kernel/realtest.h>
 #include <kernel/sched.h>
 #include <kernel/telemetry.h>
 
 #define DISPLAY_COPY_ROW_BUDGET 32U
+#define DISPLAY_NATIVE_SELF_TEST_TIMEOUT_NS 5000000000ULL
 
 typedef struct display_state {
     spinlock_t lock;
@@ -52,11 +55,12 @@ static atomic_uint g_display_init_state;
 
 
 static bool display_initialize(void) {
+    if (atomic_load_explicit(&g_display_init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_display_init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_display.lock.state, 0U);
+        spinlock_init(&g_display.lock);
         atomic_store_explicit(&g_display_init_state, 2U, memory_order_release);
         return true;
     }
@@ -71,14 +75,11 @@ static void display_lock(void) {
      * on a single vCPU, a user syscall can spin here forever and prevent the
      * owner from resuming.  Treat it as a scheduler lock. */
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&g_display.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_display.lock);
 }
 
 static void display_unlock(void) {
-    atomic_store_explicit(&g_display.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_display.lock);
     sched_preempt_enable();
 }
 
@@ -129,7 +130,19 @@ static uint32_t display_convert_pixel(uint32_t pixel, uint32_t format,
  * Other GOP layouts preserve the existing conversion path.
  */
 #ifndef DISPLAY_GOP_MOVDIR64B
-#define DISPLAY_GOP_MOVDIR64B 1U
+#define DISPLAY_GOP_MOVDIR64B 0U
+#endif
+
+/*
+ * Keep the physical-GOP publication path conservative until a real atomic
+ * scanout backend is available.  MOVNTI/MOVDIR64B are valid CPU operations,
+ * but they expose individual write-combining transactions while the monitor
+ * is scanning the same buffer.  Ordinary volatile stores are slower and can
+ * still tear (GOP has no page flip), but they avoid relying on the
+ * non-temporal store path for correctness on firmware-owned scanout memory.
+ */
+#ifndef DISPLAY_GOP_NON_TEMPORAL
+#define DISPLAY_GOP_NON_TEMPORAL 0U
 #endif
 
 static inline void display_wc_store64(volatile uint64_t *destination,
@@ -155,8 +168,11 @@ static inline void display_wc_store64b_direct(
     volatile uint32_t *destination,
     const uint32_t *source) {
 
+    /* GNU's MOVDIR64B syntax is memory, register: the memory operand is the
+     * 64-byte framebuffer destination and the register contains the WB source
+     * address. */
     __asm__ volatile (
-        "movdir64b (%1), %0"
+        "movdir64b (%0), %1"
         :
         : "r"((uintptr_t)destination),
           "r"(source)
@@ -169,6 +185,13 @@ static void display_copy_native_xrgb8888_span(
     uint32_t pixels) {
 
     if (destination == 0 || source == 0 || pixels == 0U) {
+        return;
+    }
+
+    if (DISPLAY_GOP_NON_TEMPORAL == 0U) {
+        for (uint32_t x = 0U; x < pixels; ++x) {
+            destination[x] = source[x];
+        }
         return;
     }
 
@@ -343,8 +366,7 @@ static void display_release_pending(display_pending_commit_t *pending) {
     if (pending->signal_fence != 0) object_put(pending->signal_fence);
     if (pending->wait_fence != 0) object_put(pending->wait_fence);
     if (pending->buffer != 0) {
-        atomic_fetch_sub_explicit(&pending->buffer->pin_count, 1U,
-                                  memory_order_acq_rel);
+        (void)gpu_allocation_unpin(pending->buffer);
         object_put(pending->buffer);
     }
     kfree(pending);
@@ -374,10 +396,7 @@ static void display_release_pending(display_pending_commit_t *pending) {
 static void display_release_scanout_buffer(gpu_allocation_t *buffer) {
     if (buffer == 0) return;
 
-    atomic_fetch_sub_explicit(
-        &buffer->pin_count,
-        1U,
-        memory_order_acq_rel);
+    (void)gpu_allocation_unpin(buffer);
 
     object_put(buffer);
 }
@@ -538,8 +557,11 @@ static void display_complete_commit(void *argument) {
     display_pending_commit_t *pending = (display_pending_commit_t *)argument;
     bool copied = false;
     bool complete = false;
+    bool mapped = false;
     uint32_t first_row;
     uint32_t last_row;
+    uint64_t map_length;
+    void *source_mapping = 0;
     if (pending == 0) return;
     kstatus_t wait_status = display_wait_status(pending);
     if (wait_status == K_ETIMEDOUT) {
@@ -577,11 +599,15 @@ static void display_complete_commit(void *argument) {
     first_row = pending->next_row;
     last_row = first_row + DISPLAY_COPY_ROW_BUDGET;
     if (last_row < first_row || last_row > pending->height) last_row = pending->height;
+    map_length = (uint64_t)(pending->height - 1U) * pending->stride +
+                 (uint64_t)pending->width * sizeof(uint32_t);
+    mapped = pending->buffer != 0 &&
+             gpu_allocation_cpu_map(pending->buffer, pending->offset,
+                                    map_length, &source_mapping) == K_OK;
     display_lock();
     if (g_display.initialized && g_display.framebuffer != 0U &&
-        pending->buffer != 0 && pending->buffer->backing != 0) {
-        const uint8_t *source = (const uint8_t *)pending->buffer->backing +
-                                pending->offset;
+        pending->buffer != 0 && mapped) {
+        const uint8_t *source = (const uint8_t *)source_mapping;
         volatile uint32_t *destination =
             (volatile uint32_t *)(uintptr_t)g_display.framebuffer;
         for (uint32_t y = first_row; y < last_row; ++y) {
@@ -610,6 +636,9 @@ static void display_complete_commit(void *argument) {
         copied = true;
     }
     display_unlock();
+    if (mapped) {
+        gpu_allocation_cpu_unmap(pending->buffer, source_mapping, map_length);
+    }
     if (!copied) {
         display_clear_pending();
         (void)gpu_fence_fail(pending->signal_fence, K_EIO);
@@ -696,6 +725,111 @@ bool display_core_has_native_scanout(uint32_t output) {
 }
 
 
+bool display_core_native_self_test(void) {
+    gpu_allocation_t *buffer = 0;
+    gpu_fence_t *fence = 0;
+    uint32_t width;
+    uint32_t height;
+    uint64_t pixels;
+    uint64_t bytes;
+    uint64_t stride;
+    uint64_t start_tsc;
+    uint64_t timeout_tsc;
+    uint64_t deadline;
+    uint64_t flags;
+    kstatus_t status;
+    bool success = false;
+
+    if (!display_core_has_native_scanout(0U)) {
+        return false;
+    }
+
+    display_lock();
+    width = g_display.width;
+    height = g_display.height;
+    display_unlock();
+
+    pixels = (uint64_t)width * (uint64_t)height;
+    if (width == 0U || height == 0U || pixels == 0U ||
+        pixels > UINT64_MAX / sizeof(uint32_t)) {
+        return false;
+    }
+    bytes = pixels * sizeof(uint32_t);
+    stride = (uint64_t)width * sizeof(uint32_t);
+
+    if (gpu_allocation_create(bytes, &buffer) != K_OK || buffer == 0 ||
+        gpu_fence_create(&fence) != K_OK || fence == 0) {
+        if (fence != 0) object_put(fence);
+        if (buffer != 0) object_put(buffer);
+        return false;
+    }
+
+    {
+        void *mapped = 0;
+
+        status = gpu_allocation_cpu_map(buffer, 0U, sizeof(uint32_t),
+                                        &mapped);
+        if (status != K_OK || mapped == 0) {
+            object_put(fence);
+            object_put(buffer);
+            return false;
+        }
+        ((uint32_t *)mapped)[0] = 0x0030C0A0U;
+        gpu_allocation_cpu_unmap(buffer, mapped, sizeof(uint32_t));
+    }
+
+    /* This checkpoint is flushed before entering the native KAPI path. */
+    realtest_checkpoint("OS_NVKMS_NATIVE_COMMIT_BEGIN");
+    status = display_commit_submit(
+        0U, buffer, 0U, stride, width, height, 1U,
+        0, 0U, fence, 1U);
+    if (status != K_OK) {
+        realtest_checkpoint("OS_NVKMS_NATIVE_COMMIT_SUBMIT_FAIL");
+        object_put(fence);
+        object_put(buffer);
+        return false;
+    }
+    realtest_checkpoint("OS_NVKMS_NATIVE_COMMIT_QUEUED");
+
+    start_tsc = x86_read_tsc();
+    timeout_tsc = x86_timeout_ns_to_tsc(
+        DISPLAY_NATIVE_SELF_TEST_TIMEOUT_NS);
+    deadline = timeout_tsc == UINT64_MAX ||
+               timeout_tsc > UINT64_MAX - start_tsc ?
+               UINT64_MAX : start_tsc + timeout_tsc;
+    __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
+
+    for (;;) {
+        status = gpu_fence_wait(fence, 1U, 0U);
+        if (status == K_OK) {
+            success = true;
+            break;
+        }
+        if (status != K_ETIMEDOUT ||
+            (deadline != UINT64_MAX &&
+             (int64_t)(x86_read_tsc() - deadline) >= 0)) {
+            break;
+        }
+
+        /* Early boot has not started the persistent deferred worker yet. */
+        (void)deferred_run(64U);
+        __asm__ volatile ("sti; pause" : : : "memory");
+    }
+
+    if ((flags & (1ULL << 9)) == 0U) {
+        __asm__ volatile ("cli" : : : "memory");
+    }
+    kernel_serial_printf_serial_only(
+        "OS_NVKMS_NATIVE_FLIP_STATUS=%d\r\n", (int)status);
+    realtest_checkpoint(success ?
+                               "OS_NVKMS_NATIVE_FLIP_OK" :
+                               "OS_NVKMS_NATIVE_FLIP_FAIL");
+    object_put(fence);
+    object_put(buffer);
+    return success;
+}
+
+
 bool display_core_init(uint64_t framebuffer_virtual, uint64_t framebuffer_size,
                        uint32_t width, uint32_t height,
                        uint32_t pixels_per_scanline, uint32_t framebuffer_format,
@@ -766,6 +900,7 @@ kstatus_t display_commit_submit(uint32_t output, gpu_allocation_t *buffer,
     display_pending_commit_t *pending;
     bool valid;
     bool busy;
+    kstatus_t status;
     if (!display_initialize()) return K_EIO;
     if (output != 0U || signal_fence == 0 || signal_value == 0U ||
         (wait_fence == 0 && wait_value != 0U) ||
@@ -807,7 +942,13 @@ kstatus_t display_commit_submit(uint32_t output, gpu_allocation_t *buffer,
     pending->signal_value = signal_value;
     pending->start_tsc = telemetry_timestamp();
     object_get(buffer);
-    atomic_fetch_add_explicit(&buffer->pin_count, 1U, memory_order_acq_rel);
+    status = gpu_allocation_pin(buffer);
+    if (status != K_OK) {
+        object_put(buffer);
+        kfree(pending);
+        display_clear_pending();
+        return status;
+    }
     if (wait_fence != 0) object_get(wait_fence);
     object_get(signal_fence);
     if (!deferred_schedule(display_complete_commit, pending)) {
@@ -824,10 +965,15 @@ bool display_core_self_test(void) {
     uint32_t width;
     uint32_t height;
     uint64_t bytes;
+    uint64_t start_tsc = 0U;
+    uint64_t timeout_tsc = 0U;
+    uint64_t deadline = 0U;
+    uint64_t flags = 0U;
     volatile uint32_t *first_pixel = 0;
     uint32_t original_pixel = 0U;
     bool submitted = false;
     bool success;
+    kstatus_t fence_status = K_ETIMEDOUT;
     if (!display_initialize()) return false;
     display_lock();
     width = g_display.width;
@@ -844,15 +990,55 @@ bool display_core_self_test(void) {
     success = gpu_allocation_create(bytes, &buffer) == K_OK &&
               gpu_fence_create(&fence) == K_OK && buffer != 0 && fence != 0;
     if (success) {
-        ((uint32_t *)buffer->backing)[0] = 0x00112233U;
+        void *mapped = 0;
+        success = gpu_allocation_cpu_map(buffer, 0U, sizeof(uint32_t),
+                                         &mapped) == K_OK && mapped != 0;
+        if (success) {
+            ((uint32_t *)mapped)[0] = 0x00112233U;
+            gpu_allocation_cpu_unmap(buffer, mapped, sizeof(uint32_t));
+        }
+    }
+    if (success) {
         success = display_commit_submit(
             0U, buffer, 0U,
             (uint64_t)width * sizeof(uint32_t),
             width, height, 1U, 0, 0U, fence, 1U) == K_OK;
         submitted = success;
         if (success) {
-            success = deferred_run(64U) >= 1U &&
-                      gpu_fence_wait(fence, 1U, 0U) == K_OK;
+            start_tsc = x86_read_tsc();
+            timeout_tsc = x86_timeout_ns_to_tsc(
+                DISPLAY_NATIVE_SELF_TEST_TIMEOUT_NS);
+            deadline = timeout_tsc == UINT64_MAX ||
+                       timeout_tsc > UINT64_MAX - start_tsc ?
+                       UINT64_MAX : start_tsc + timeout_tsc;
+            __asm__ volatile ("pushfq; popq %0" : "=r"(flags) : : "memory");
+
+            success = false;
+            for (;;) {
+                fence_status = gpu_fence_wait(fence, 1U, 0U);
+                if (fence_status == K_OK) {
+                    success = true;
+                    break;
+                }
+                if (fence_status != K_ETIMEDOUT ||
+                    (deadline != UINT64_MAX &&
+                     (int64_t)(x86_read_tsc() - deadline) >= 0)) {
+                    break;
+                }
+
+                /* A full-frame GOP copy may span multiple deferred batches. */
+                (void)deferred_run(64U);
+                __asm__ volatile ("sti; pause" : : : "memory");
+            }
+
+            if ((flags & (1ULL << 9)) == 0U) {
+                __asm__ volatile ("cli" : : : "memory");
+            }
+            if (!success) {
+                kernel_serial_printf_serial_only(
+                    "OS_DISPLAY_SELF_TEST_FENCE_FAIL status=%d\r\n",
+                    (int)fence_status);
+            }
         }
     }
     if (submitted) {

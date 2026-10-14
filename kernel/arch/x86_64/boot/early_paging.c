@@ -23,7 +23,7 @@ static UINT64 g_kernel_pdpt[512] __attribute__((aligned(4096)));
 static UINT64 g_kernel_pd[512] __attribute__((aligned(4096)));
 static UINT64 g_kernel_pt[16][512] __attribute__((aligned(4096)));
 static UINT64 g_pml4_physical;
-static const LITEOS_BOOT_INFO *g_boot_info;
+static const OS_BOOT_INFO *g_boot_info;
 
 static UINT64 table_physical(const VOID *table) {
     UINT64 virtual_address = (UINT64)(uintptr_t)table;
@@ -65,7 +65,7 @@ static BOOLEAN map_kernel_image(void) {
     return 1;
 }
 
-BOOLEAN liteos_enable_kernel_paging(const LITEOS_BOOT_INFO *boot_info) {
+BOOLEAN arch_enable_kernel_paging(const OS_BOOT_INFO *boot_info) {
     if (boot_info == 0 || boot_info->KernelPhysicalBase == 0 ||
         boot_info->KernelVirtualBase == 0 || boot_info->KernelSize == 0 ||
         (boot_info->KernelSize & 0xFFFULL) != 0) return 0;
@@ -209,7 +209,7 @@ static enum x86_cache_mode ram_cache_mode(UINT64 attributes) {
     return X86_CACHE_UC;
 }
 
-BOOLEAN liteos_rebuild_ram_direct_map(const LITEOS_BOOT_INFO *boot_info) {
+BOOLEAN arch_rebuild_ram_direct_map(const OS_BOOT_INFO *boot_info) {
     static UINT64 new_roots[DIRECT_MAP_PML4_COUNT];
     if (boot_info == 0 || x86_current_root_table().value != g_pml4_physical ||
         !direct_map_prepare_ram_ranges(boot_info)) return 0;
@@ -277,11 +277,11 @@ BOOLEAN liteos_rebuild_ram_direct_map(const LITEOS_BOOT_INFO *boot_info) {
     return phys_to_direct(paddr_make(boot_physical)) != 0;
 }
 
-UINT64 liteos_identity_pml4_address(void) {
+UINT64 arch_identity_pml4_address(void) {
     return g_pml4_physical;
 }
 
-BOOLEAN liteos_drop_identity_mapping(void) {
+BOOLEAN arch_drop_identity_mapping(void) {
     if (g_pml4_physical == 0 ||
         x86_current_root_table().value != g_pml4_physical) return 0;
 

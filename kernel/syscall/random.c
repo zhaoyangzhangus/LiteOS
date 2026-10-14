@@ -1,8 +1,9 @@
-/* LiteOS kernel random stream: UEFI entropy in, ChaCha20 blocks out. */
+/* System kernel random stream: UEFI entropy in, ChaCha20 blocks out. */
 
 #include <arch/x86_64/cpu.h>
 #include <arch/x86_64/uaccess.h>
 #include <kernel/random.h>
+#include <kernel/sched.h>
 #include <uapi/syscall.h>
 
 #include "internal.h"
@@ -73,12 +74,12 @@ static bool random_hardware_seed(uint8_t seed[32]) {
     return true;
 }
 
-void liteos_random_init(const LITEOS_BOOT_INFO *boot_info) {
+void random_init(const OS_BOOT_INFO *boot_info) {
     uint8_t seed[32] = {0};
     bool strong = false;
     uint64_t clock = x86_read_tsc();
     if (boot_info != 0 &&
-        (boot_info->Flags & LITEOS_BOOTINFO_HAS_RNG) != 0U) {
+        (boot_info->Flags & OS_BOOTINFO_HAS_RNG) != 0U) {
         for (uint32_t index = 0U; index < sizeof(seed); ++index) {
             seed[index] = boot_info->RandomSeed[index];
             strong |= seed[index] != 0U;
@@ -104,11 +105,38 @@ void liteos_random_init(const LITEOS_BOOT_INFO *boot_info) {
     g_random_ready = true;
 }
 
-static void random_block(uint8_t output[64]) {
-    uint32_t working[16];
-    for (uint32_t index = 0U; index < 16U; ++index) {
-        working[index] = g_random_state[index];
+static void random_lock(void) {
+    sched_preempt_disable();
+    while (atomic_flag_test_and_set_explicit(&g_random_lock,
+                                              memory_order_acquire)) {
+        __asm__ volatile ("pause");
     }
+}
+
+static void random_unlock(void) {
+    atomic_flag_clear_explicit(&g_random_lock, memory_order_release);
+    sched_preempt_enable();
+}
+
+static void random_clear_words(uint32_t words[16]) {
+    volatile uint32_t *clear = words;
+    for (uint32_t index = 0U; index < 16U; ++index) clear[index] = 0U;
+}
+
+static void random_block(uint8_t output[64]) {
+    uint32_t state[16];
+    uint32_t working[16];
+    /* Reserve one unique stream block while pinned on this CPU. Neither
+     * the rounds nor a faultable user copy need the global stream lock. */
+    random_lock();
+    for (uint32_t index = 0U; index < 16U; ++index) {
+        state[index] = g_random_state[index];
+    }
+    ++g_random_state[12];
+    if (g_random_state[12] == 0U) ++g_random_state[13];
+    random_unlock();
+    for (uint32_t index = 0U; index < 16U; ++index)
+        working[index] = state[index];
     for (uint32_t round = 0U; round < 10U; ++round) {
         random_quarter_round(working, 0U, 4U, 8U, 12U);
         random_quarter_round(working, 1U, 5U, 9U, 13U);
@@ -120,25 +148,14 @@ static void random_block(uint8_t output[64]) {
         random_quarter_round(working, 3U, 4U, 9U, 14U);
     }
     for (uint32_t index = 0U; index < 16U; ++index) {
-        uint32_t value = working[index] + g_random_state[index];
+        uint32_t value = working[index] + state[index];
         output[index * 4U] = (uint8_t)value;
         output[index * 4U + 1U] = (uint8_t)(value >> 8U);
         output[index * 4U + 2U] = (uint8_t)(value >> 16U);
         output[index * 4U + 3U] = (uint8_t)(value >> 24U);
     }
-    ++g_random_state[12];
-    if (g_random_state[12] == 0U) ++g_random_state[13];
-}
-
-static void random_lock(void) {
-    while (atomic_flag_test_and_set_explicit(&g_random_lock,
-                                              memory_order_acquire)) {
-        __asm__ volatile ("pause");
-    }
-}
-
-static void random_unlock(void) {
-    atomic_flag_clear_explicit(&g_random_lock, memory_order_release);
+    random_clear_words(state);
+    random_clear_words(working);
 }
 
 int64_t syscall_random_get(uint64_t buffer, uint64_t length,
@@ -157,7 +174,6 @@ int64_t syscall_random_get(uint64_t buffer, uint64_t length,
         return K_EACCES;
     }
     if (!g_random_ready || !g_random_strong) return K_ENOSYS;
-    random_lock();
     while (offset < length) {
         uint8_t block[64];
         uint64_t remaining = length - offset;
@@ -166,11 +182,9 @@ int64_t syscall_random_get(uint64_t buffer, uint64_t length,
         kstatus_t status = copy_to_user(
             (void __user *)(uintptr_t)(buffer + offset), block, count);
         if (status != K_OK) {
-            random_unlock();
             return status;
         }
         offset += count;
     }
-    random_unlock();
     return (int64_t)length;
 }

@@ -3,6 +3,8 @@
 #include <kernel/kmem.h>
 #include <kernel/power.h>
 #include <kernel/telemetry.h>
+#include <kernel/string.h>
+#include <kernel/sched.h>
 #include <arch/x86_64/cpu.h>
 
 #define DRIVER_OBJECT_TYPE 0x0107U
@@ -15,25 +17,26 @@ static device_t *g_devices[DEVICE_REGISTRY_LIMIT];
 static driver_t *g_drivers[DRIVER_REGISTRY_LIMIT];
 
 static void device_lock(void) {
-    while (atomic_exchange_explicit(&g_device_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    /* Registry operations nest state locks; keep their owner on this CPU.
+     * Driver callbacks and I/O waits remain outside this critical section. */
+    sched_preempt_disable();
+    spinlock_lock(&g_device_lock);
 }
 
 static void device_unlock(void) {
-    atomic_store_explicit(&g_device_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_device_lock);
+    sched_preempt_enable();
 }
 
 static void device_state_lock(device_t *dev) {
-    while (atomic_exchange_explicit(&dev->state_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    /* Also used alone after callbacks, not only under the registry lock. */
+    sched_preempt_disable();
+    spinlock_lock(&dev->state_lock);
 }
 
 static void device_state_unlock(device_t *dev) {
-    atomic_store_explicit(&dev->state_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&dev->state_lock);
+    sched_preempt_enable();
 }
 
 static bool device_wait_io_idle(device_t *dev, uint64_t timeout_ns) {
@@ -71,11 +74,12 @@ static const object_ops_t g_driver_object_ops = {
 };
 
 static void device_initialize(void) {
+    if (atomic_load_explicit(&g_device_init_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_device_init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_device_lock.state, 0U);
+        spinlock_init(&g_device_lock);
         for (uint32_t i = 0; i < DEVICE_REGISTRY_LIMIT; ++i) g_devices[i] = 0;
         for (uint32_t i = 0; i < DRIVER_REGISTRY_LIMIT; ++i) g_drivers[i] = 0;
         atomic_store_explicit(&g_device_init_state, 2U, memory_order_release);
@@ -97,8 +101,7 @@ static void initialize_object(object_header_t *header, object_type_id_t type,
 void device_object_init(device_t *dev, uint64_t device_id, uint32_t class_id,
                         const device_ops_t *ops, void *bus_data) {
     if (dev == 0) return;
-    uint8_t *bytes = (uint8_t *)dev;
-    for (size_t i = 0; i < sizeof(*dev); ++i) bytes[i] = 0;
+    memset(dev, 0, sizeof(*dev));
     initialize_object(&dev->object, KOBJECT_TYPE_DEVICE, &g_device_object_ops);
     dev->device_id = device_id;
     atomic_init(&dev->state, DEVICE_DISCOVERED);
@@ -108,7 +111,7 @@ void device_object_init(device_t *dev, uint64_t device_id, uint32_t class_id,
     list_init(&dev->sibling_node);
     list_init(&dev->children);
     list_init(&dev->io_requests);
-    atomic_init(&dev->state_lock.state, 0U);
+    spinlock_init(&dev->state_lock);
     atomic_init(&dev->io_inflight, 0U);
     dev->power_timeout_ns = DEVICE_DEFAULT_POWER_TIMEOUT_NS;
 }
@@ -117,28 +120,43 @@ void driver_object_init(driver_t *drv, const char *name,
                         kstatus_t (*probe)(device_t *),
                         void (*remove)(device_t *)) {
     if (drv == 0) return;
-    uint8_t *bytes = (uint8_t *)drv;
-    for (size_t i = 0; i < sizeof(*drv); ++i) bytes[i] = 0;
+    memset(drv, 0, sizeof(*drv));
     initialize_object(&drv->object, DRIVER_OBJECT_TYPE, &g_driver_object_ops);
     drv->name = name;
     drv->probe = probe;
     drv->remove = remove;
-    drv->api_version = LITEOS_DRIVER_API_VERSION;
+    drv->api_version = OS_DRIVER_API_VERSION;
     drv->struct_size = sizeof(*drv);
 }
 
-static int32_t find_device_slot(device_t *dev) {
+static int32_t find_device_slot_with_free(device_t *dev, int32_t *first_free) {
+    if (first_free != 0) *first_free = -1;
     for (uint32_t i = 0; i < DEVICE_REGISTRY_LIMIT; ++i) {
         if (g_devices[i] == dev) return (int32_t)i;
+        if (first_free != 0 && *first_free < 0 && g_devices[i] == 0) {
+            *first_free = (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static int32_t find_device_slot(device_t *dev) {
+    return find_device_slot_with_free(dev, 0);
+}
+
+static int32_t find_driver_slot_with_free(driver_t *drv, int32_t *first_free) {
+    if (first_free != 0) *first_free = -1;
+    for (uint32_t i = 0; i < DRIVER_REGISTRY_LIMIT; ++i) {
+        if (g_drivers[i] == drv) return (int32_t)i;
+        if (first_free != 0 && *first_free < 0 && g_drivers[i] == 0) {
+            *first_free = (int32_t)i;
+        }
     }
     return -1;
 }
 
 static int32_t find_driver_slot(driver_t *drv) {
-    for (uint32_t i = 0; i < DRIVER_REGISTRY_LIMIT; ++i) {
-        if (g_drivers[i] == drv) return (int32_t)i;
-    }
-    return -1;
+    return find_driver_slot_with_free(drv, 0);
 }
 
 static bool bind_driver(device_t *dev, driver_t *drv) {
@@ -174,16 +192,10 @@ kstatus_t device_register(device_t *dev) {
     if (dev == 0 || dev->object.type != KOBJECT_TYPE_DEVICE) return K_EINVAL;
     device_initialize();
     device_lock();
-    if (find_device_slot(dev) >= 0) {
+    int32_t slot;
+    if (find_device_slot_with_free(dev, &slot) >= 0) {
         device_unlock();
         return K_EBUSY;
-    }
-    int32_t slot = -1;
-    for (uint32_t i = 0; i < DEVICE_REGISTRY_LIMIT; ++i) {
-        if (g_devices[i] == 0) {
-            slot = (int32_t)i;
-            break;
-        }
     }
     if (slot < 0) {
         device_unlock();
@@ -268,23 +280,37 @@ kstatus_t device_get_by_index(uint32_t index, device_t **out) {
 
 static void device_cancel_pending_io(device_t *dev) {
     for (;;) {
-        io_request_t *request;
+        io_request_t *request = 0;
         device_lock();
         if (list_empty(&dev->io_requests)) {
             device_unlock();
             return;
         }
-        request = (io_request_t *)((uint8_t *)dev->io_requests.next -
-                                   __builtin_offsetof(io_request_t, device_node));
-        /* 完成者在终态发布前释放该观察者引用，允许请求安全复用。 */
-        io_request_hold_until_terminal(request);
+        /* Claim before unlocking: a transferred reference alone cannot stop
+         * a rival finalizer from freeing/reusing the request before dispatch.
+         * The winning claim keeps execution ownership until unlocked finish. */
+        for (list_head_t *node = dev->io_requests.next;
+             node != &dev->io_requests; node = node->next) {
+            io_request_t *candidate = list_entry(node, io_request_t, device_node);
+            if (io_request_claim_device_cancel(candidate)) {
+                request = candidate;
+                break;
+            }
+        }
+        /* A slow finalizer must not block cancellation of later requests.
+         * Wait only when every remaining node already has an owner. */
+        if (request == 0) {
+            device_unlock();
+            __asm__ volatile ("pause");
+            continue;
+        }
         device_unlock();
         /*
          * 设备移除和用户 IO_CANCEL 可能同时观察到同一个请求。
-         * 必须通过 io_cancel() 的 CAS 状态机竞争取消权，不能直接调用
-         * 驱动回调，否则一个请求可能被驱动重复取消。
+         * The CAS above selected the sole owner. Driver callbacks and device
+         * reference releases must stay outside the device-list lock.
          */
-        (void)io_cancel_with_status(request, K_EDEVREMOVED);
+        io_request_finish_device_cancel(request, K_EDEVREMOVED);
     }
 }
 
@@ -519,11 +545,14 @@ bool device_io_begin(device_t *dev, io_request_t *req) {
     return accepted;
 }
 
-void device_io_end(device_t *dev, io_request_t *req) {
+bool device_io_end(device_t *dev, io_request_t *req) {
     bool linked;
-    if (dev == 0 || req == 0) return;
+    bool reference_held;
+    if (dev == 0 || req == 0) return false;
     device_initialize();
     device_lock();
+    reference_held = req->device_ref_held != 0U;
+    req->device_ref_held = 0U;
     linked = req->device_node.next != 0 && req->device_node.prev != 0 &&
              req->device_node.next != &req->device_node;
     if (linked) {
@@ -537,6 +566,7 @@ void device_io_end(device_t *dev, io_request_t *req) {
                                                       memory_order_acquire)) { }
     }
     device_unlock();
+    return reference_held;
 }
 
 kstatus_t device_reset(device_t *dev, uint32_t level) {
@@ -584,22 +614,16 @@ kstatus_t device_reset(device_t *dev, uint32_t level) {
 
 kstatus_t driver_register(driver_t *drv) {
     if (drv == 0 || drv->object.type != DRIVER_OBJECT_TYPE || drv->probe == 0 ||
-        drv->api_version != LITEOS_DRIVER_API_VERSION ||
+        drv->api_version != OS_DRIVER_API_VERSION ||
         drv->struct_size < sizeof(driver_t)) {
         return K_EINVAL;
     }
     device_initialize();
     device_lock();
-    if (find_driver_slot(drv) >= 0) {
+    int32_t slot;
+    if (find_driver_slot_with_free(drv, &slot) >= 0) {
         device_unlock();
         return K_EBUSY;
-    }
-    int32_t slot = -1;
-    for (uint32_t i = 0; i < DRIVER_REGISTRY_LIMIT; ++i) {
-        if (g_drivers[i] == 0) {
-            slot = (int32_t)i;
-            break;
-        }
     }
     if (slot < 0) {
         device_unlock();

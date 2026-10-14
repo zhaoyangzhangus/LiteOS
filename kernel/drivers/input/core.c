@@ -1,5 +1,6 @@
 #include <kernel/input.h>
 #include <kernel/sched.h>
+#include <kernel/string.h>
 
 #define INPUT_COALESCE_THRESHOLD (INPUT_CORE_CAPACITY * 3U / 4U)
 
@@ -21,14 +22,11 @@ static void input_lock(void) {
      * runs in the user syscall path.  Never let the owner be preempted on a
      * one-vCPU guest while the other path spins on this lock. */
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&g_input.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_input.lock);
 }
 
 static void input_unlock(void) {
-    atomic_store_explicit(&g_input.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_input.lock);
     sched_preempt_enable();
 }
 
@@ -39,13 +37,10 @@ static uint64_t input_timestamp(void) {
     return ((uint64_t)high << 32) | low;
 }
 
-static bool input_same_relative(const input_event_t *left,
-                                const input_event_t *right) {
-    return left != 0 && right != 0 &&
-           left->type == INPUT_EVENT_RELATIVE &&
-           right->type == INPUT_EVENT_RELATIVE &&
-           left->device_id == right->device_id &&
-           left->flags == right->flags && left->code == right->code;
+static void input_publish_pending(void) {
+    /* The ring lock serializes writers; publish its authoritative count
+     * without another locked read-modify-write on the mirror cache line. */
+    atomic_store_explicit(&g_input.pending, g_input.count, memory_order_release);
 }
 
 static int32_t input_add_delta(int32_t left, int32_t right) {
@@ -61,42 +56,31 @@ static bool input_event_is_motion(const input_event_t *event) {
             (event->type == INPUT_EVENT_POINTER && event->code == 0U));
 }
 
-static bool input_coalesce_relative(const input_event_t *incoming) {
-    uint32_t offset;
-    if (incoming == 0 || incoming->type != INPUT_EVENT_RELATIVE ||
-        g_input.count == 0U) return false;
+static bool input_coalesce_motion(const input_event_t *incoming) {
+    if (incoming == 0 || g_input.count == 0U) return false;
+    bool relative = incoming->type == INPUT_EVENT_RELATIVE;
+    if (!relative && (incoming->type != INPUT_EVENT_POINTER ||
+                      incoming->code != 0U)) return false;
     /* X and Y are emitted as separate events by boot-mouse HID.  Under queue
      * pressure, coalesce within the trailing motion run so a busy pointer
      * cannot fill the ring merely because the axes alternate.  Never cross a
      * key/button event. */
-    for (offset = 0U; offset < g_input.count; ++offset) {
-        uint32_t index = (g_input.write + INPUT_CORE_CAPACITY - 1U - offset) %
-                         INPUT_CORE_CAPACITY;
-        if (g_input.events[index].type != INPUT_EVENT_RELATIVE) break;
-        if (input_same_relative(&g_input.events[index], incoming)) {
-            g_input.events[index].value = input_add_delta(
-                g_input.events[index].value, incoming->value);
-            g_input.events[index].timestamp = incoming->timestamp;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool input_coalesce_pointer(const input_event_t *incoming) {
-    uint32_t offset;
-    if (incoming == 0 || incoming->type != INPUT_EVENT_POINTER ||
-        incoming->code != 0U || g_input.count == 0U) return false;
-    for (offset = 0U; offset < g_input.count; ++offset) {
+    for (uint32_t offset = 0U; offset < g_input.count; ++offset) {
         uint32_t index = (g_input.write + INPUT_CORE_CAPACITY - 1U - offset) %
                          INPUT_CORE_CAPACITY;
         input_event_t *queued = &g_input.events[index];
-        if (queued->type != INPUT_EVENT_POINTER || queued->code != 0U) break;
+        if (queued->type != incoming->type ||
+            (!relative && queued->code != 0U)) break;
         if (queued->device_id != incoming->device_id ||
-            queued->flags != incoming->flags) continue;
-        queued->value2 = input_add_delta(queued->value2, incoming->value2);
-        queued->value3 = input_add_delta(queued->value3, incoming->value3);
-        queued->value4 = input_add_delta(queued->value4, incoming->value4);
+            queued->flags != incoming->flags ||
+            (relative && queued->code != incoming->code)) continue;
+        if (relative) {
+            queued->value = input_add_delta(queued->value, incoming->value);
+        } else {
+            queued->value2 = input_add_delta(queued->value2, incoming->value2);
+            queued->value3 = input_add_delta(queued->value3, incoming->value3);
+            queued->value4 = input_add_delta(queued->value4, incoming->value4);
+        }
         queued->timestamp = incoming->timestamp;
         return true;
     }
@@ -118,16 +102,28 @@ static bool input_drop_oldest_motion(void) {
         }
     }
     if (!found) return false;
-    while (target != g_input.write) {
-        uint32_t next = (target + 1U) % INPUT_CORE_CAPACITY;
-        if (next == g_input.write) break;
-        g_input.events[target] = g_input.events[next];
-        target = next;
+    /* A full ring has read==write; use the event count, not that sentinel.
+     * Shift the shorter side so deleting the oldest motion needs no copy. */
+    uint32_t suffix = g_input.count - offset - 1U;
+    if (offset < suffix) {
+        while (offset-- != 0U) {
+            uint32_t previous = (target + INPUT_CORE_CAPACITY - 1U) %
+                                INPUT_CORE_CAPACITY;
+            g_input.events[target] = g_input.events[previous];
+            target = previous;
+        }
+        g_input.read = (g_input.read + 1U) % INPUT_CORE_CAPACITY;
+    } else {
+        while (suffix-- != 0U) {
+            uint32_t next = (target + 1U) % INPUT_CORE_CAPACITY;
+            g_input.events[target] = g_input.events[next];
+            target = next;
+        }
+        g_input.write = (g_input.write + INPUT_CORE_CAPACITY - 1U) %
+                        INPUT_CORE_CAPACITY;
     }
-    g_input.write = (g_input.write + INPUT_CORE_CAPACITY - 1U) %
-                    INPUT_CORE_CAPACITY;
     --g_input.count;
-    atomic_fetch_sub_explicit(&g_input.pending, 1U, memory_order_release);
+    input_publish_pending();
     atomic_fetch_add_explicit(&g_input.dropped, 1U, memory_order_relaxed);
     return true;
 }
@@ -140,7 +136,7 @@ static void input_notify_waiters(void) {
 }
 
 bool input_core_init(void) {
-    atomic_init(&g_input.lock.state, 0U);
+    spinlock_init(&g_input.lock);
     g_input.read = 0U;
     g_input.write = 0U;
     g_input.count = 0U;
@@ -164,10 +160,7 @@ kstatus_t input_core_push(const input_event_t *event) {
     if (incoming.timestamp == 0U) incoming.timestamp = input_timestamp();
     input_lock();
     if (g_input.count >= INPUT_COALESCE_THRESHOLD &&
-        ((incoming.type == INPUT_EVENT_RELATIVE &&
-          input_coalesce_relative(&incoming)) ||
-         (incoming.type == INPUT_EVENT_POINTER &&
-          input_coalesce_pointer(&incoming)))) {
+        input_coalesce_motion(&incoming)) {
         input_unlock();
         input_notify_waiters();
         return K_OK;
@@ -190,14 +183,14 @@ kstatus_t input_core_push(const input_event_t *event) {
             }
             g_input.read = (g_input.read + 1U) % INPUT_CORE_CAPACITY;
             --g_input.count;
-            atomic_fetch_sub_explicit(&g_input.pending, 1U, memory_order_release);
+            input_publish_pending();
             atomic_fetch_add_explicit(&g_input.dropped, 1U, memory_order_relaxed);
         }
     }
     g_input.events[g_input.write] = incoming;
     g_input.write = (g_input.write + 1U) % INPUT_CORE_CAPACITY;
     ++g_input.count;
-    atomic_fetch_add_explicit(&g_input.pending, 1U, memory_order_release);
+    input_publish_pending();
     input_unlock();
     input_notify_waiters();
     return K_OK;
@@ -228,9 +221,28 @@ kstatus_t input_core_pop(input_event_t *event) {
     *event = g_input.events[g_input.read];
     g_input.read = (g_input.read + 1U) % INPUT_CORE_CAPACITY;
     --g_input.count;
-    atomic_fetch_sub_explicit(&g_input.pending, 1U, memory_order_release);
+    input_publish_pending();
     input_unlock();
     return K_OK;
+}
+
+size_t input_core_pop_batch(input_event_t *events, size_t capacity) {
+    if (events == 0 || capacity == 0U || !g_input.initialized) return 0U;
+    input_lock();
+    size_t count = g_input.count < capacity ? g_input.count : capacity;
+    if (count != 0U) {
+        size_t first = INPUT_CORE_CAPACITY - g_input.read;
+        if (first > count) first = count;
+        memcpy(events, &g_input.events[g_input.read], first * sizeof(*events));
+        if (first < count)
+            memcpy(events + first, g_input.events,
+                   (count - first) * sizeof(*events));
+        g_input.read = (g_input.read + (uint32_t)count) % INPUT_CORE_CAPACITY;
+        g_input.count -= (uint32_t)count;
+        input_publish_pending();
+    }
+    input_unlock();
+    return count;
 }
 
 static bool input_has_event(void *context) {

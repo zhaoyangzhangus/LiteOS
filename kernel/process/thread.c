@@ -35,6 +35,65 @@ static const object_ops_t g_thread_ops = {
 };
 
 static volatile uint32_t g_process_thread_create_stage;
+#if OS_DEBUG_SERIAL
+static atomic_flag g_thread_cancel_diag_lock = ATOMIC_FLAG_INIT;
+
+static void thread_cancel_diag_char(char value) {
+    for (uint32_t attempt = 0U; attempt < 100000U; ++attempt) {
+        uint8_t ready;
+        __asm__ volatile ("inb %w1, %0" : "=a"(ready) : "d"(0x3FDU));
+        if ((ready & 0x20U) != 0U) break;
+        __asm__ volatile ("pause");
+    }
+    __asm__ volatile ("outb %0, %w1" : : "a"((uint8_t)value), "d"(0x3F8U));
+}
+
+static void thread_cancel_diag_hex(uint64_t value) {
+    static const char digits[] = "0123456789abcdef";
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        thread_cancel_diag_char(digits[(value >> (uint32_t)shift) & 0xFU]);
+    }
+}
+
+static void thread_cancel_diag(thread_t *target, int64_t status) {
+    thread_t *caller = sched_current_thread();
+    while (atomic_flag_test_and_set_explicit(&g_thread_cancel_diag_lock,
+                                              memory_order_acquire)) {
+        __asm__ volatile ("pause");
+    }
+    const char prefix[] = "OS_THREAD_WAIT_CANCEL target_pid=";
+    for (size_t index = 0U; prefix[index] != '\0'; ++index) {
+        thread_cancel_diag_char(prefix[index]);
+    }
+    thread_cancel_diag_hex(target != 0 && target->process != 0 ?
+                           target->process->pid : 0U);
+    const char target_tid[] = " target_tid=";
+    for (size_t index = 0U; target_tid[index] != '\0'; ++index) {
+        thread_cancel_diag_char(target_tid[index]);
+    }
+    thread_cancel_diag_hex(target != 0 ? target->tid : 0U);
+    const char caller_pid[] = " caller_pid=";
+    for (size_t index = 0U; caller_pid[index] != '\0'; ++index) {
+        thread_cancel_diag_char(caller_pid[index]);
+    }
+    thread_cancel_diag_hex(caller != 0 && caller->process != 0 ?
+                           caller->process->pid : 0U);
+    const char caller_tid[] = " caller_tid=";
+    for (size_t index = 0U; caller_tid[index] != '\0'; ++index) {
+        thread_cancel_diag_char(caller_tid[index]);
+    }
+    thread_cancel_diag_hex(caller != 0 ? caller->tid : 0U);
+    const char status_text[] = " status=";
+    for (size_t index = 0U; status_text[index] != '\0'; ++index) {
+        thread_cancel_diag_char(status_text[index]);
+    }
+    thread_cancel_diag_hex((uint64_t)status);
+    thread_cancel_diag_char('\r');
+    thread_cancel_diag_char('\n');
+    atomic_flag_clear_explicit(&g_thread_cancel_diag_lock,
+                               memory_order_release);
+}
+#endif
 
 static kstatus_t thread_create_user_frame_internal(
     process_t *process, const arch_trap_frame_t *initial_frame,
@@ -86,8 +145,6 @@ static kstatus_t thread_create_user_frame_internal(
     uintptr_t frame_address = (thread->kernel_stack_top -
                                sizeof(arch_trap_frame_t)) & ~(uintptr_t)15U;
     arch_trap_frame_t *frame = (arch_trap_frame_t *)frame_address;
-    uint8_t *frame_bytes = (uint8_t *)frame;
-    for (size_t i = 0; i < sizeof(*frame); ++i) frame_bytes[i] = 0;
     *frame = *initial_frame;
 
     uintptr_t switch_stack = frame_address - sizeof(uint64_t);
@@ -106,20 +163,25 @@ static kstatus_t thread_create_user_frame_internal(
         kfree(thread);
         return K_EBUSY;
     }
+    /* Once visible in the list, a remote terminator may reap this NEW thread.
+     * Publish its execution ownership first, in the same locked transaction. */
+    object_get(thread);
+    __atomic_fetch_or(&thread->flags, THREAD_FLAG_EXECUTION_REF,
+                      __ATOMIC_RELEASE);
     list_add_tail(&process->threads, &thread->process_node);
+    if (process->thread_count == 0U) {
+        process->linux_thread_group_leader_tid = thread->tid;
+    }
     ++process->thread_count;
     process->flags |= PROCESS_FLAG_EVER_HAD_THREAD;
     process_thread_unlock(process);
 
-    object_get(thread);
-    __atomic_fetch_or(&thread->flags, THREAD_FLAG_EXECUTION_REF,
-                      __ATOMIC_RELEASE);
     if (start) {
         (void)sched_start_thread(thread);
     }
     *out = thread;
-    liteos_debug_trace_stage(LITEOS_DEBUG_PHASE_USER_RUNTIME,
-                             LITEOS_DEBUG_STEP_CREATE,
+    debug_trace_stage(OS_DEBUG_PHASE_USER_RUNTIME,
+                             OS_DEBUG_STEP_CREATE,
                              (uint32_t)thread->tid);
     g_process_thread_create_stage = 3U;
     return K_OK;
@@ -132,7 +194,7 @@ static kstatus_t thread_create_user_internal(process_t *process, vaddr_t entry,
     if (!x86_is_canonical(entry) || !x86_is_canonical(stack_top) ||
         entry < 0x10000ULL || entry > X86_64_USER_TOP ||
         stack_top < 0x10000ULL || stack_top > X86_64_USER_TOP ||
-        (stack_top & 15U) != 0) {
+        (stack_top & 7U) != 0) {
         return K_EINVAL;
     }
     arch_trap_frame_t frame = {0};
@@ -170,14 +232,38 @@ kstatus_t thread_create_user_from_frame(process_t *process,
 kstatus_t thread_register_user_stack(thread_t *thread, vaddr_t base,
                                      size_t size) {
     if (thread == 0 || thread->process == 0 ||
-        !x86_user_range_valid((const void __user *)(uintptr_t)base, size) ||
-        !vm_range_is_mapped(thread->process->vm, base, size)) {
+        !x86_user_range_valid((const void __user *)(uintptr_t)base, size)) {
         return K_EINVAL;
     }
-    thread->user_stack_base = base;
-    thread->user_stack_size = size;
-    thread->user_stack_owned = true;
-    return K_OK;
+    process_t *process = thread->process;
+    process_thread_lock(process);
+    vm_space_t *space = process->vm;
+    if (space != 0) vm_space_get(space);
+    process_thread_unlock(process);
+    if (space == 0) return K_EINVAL;
+    bool mapped = vm_range_is_mapped(space, base, size);
+    kstatus_t status = K_EINVAL;
+    if (mapped) {
+        process_thread_lock(process);
+        uint32_t flags = __atomic_load_n(&thread->flags, __ATOMIC_ACQUIRE);
+        /* Validation may race with termination or an image replacement.
+         * Only an unreaped suspended thread can accept stack ownership. */
+        if (atomic_load_explicit(&process->state, memory_order_acquire) != PROCESS_RUNNING ||
+            atomic_load_explicit(&thread->state, memory_order_acquire) != THREAD_NEW ||
+            (flags & THREAD_FLAG_EXECUTION_REF) == 0U ||
+            (flags & THREAD_FLAG_EXECUTION_REAPING) != 0U ||
+            thread->user_stack_owned || process->vm != space) {
+            status = K_EBUSY;
+        } else {
+            thread->user_stack_base = base;
+            thread->user_stack_size = size;
+            thread->user_stack_owned = true;
+            status = K_OK;
+        }
+        process_thread_unlock(process);
+    }
+    vm_space_put(space);
+    return status;
 }
 
 kstatus_t thread_start(thread_t *thread) {
@@ -195,16 +281,28 @@ kstatus_t thread_terminate(thread_t *thread, int64_t status) {
         unsigned state = atomic_load_explicit(&thread->state,
                                               memory_order_acquire);
         if (state == THREAD_DEAD) return K_OK;
+        if (state == THREAD_READY && sched_wait_cleanup_pending(thread)) {
+            /*
+             * A wake made the waiter runnable, but its stack-local
+             * subscriptions are still linked until it resumes the wait path.
+             * Let it finish that cleanup before reclaiming its kernel stack.
+             */
+            return K_EBUSY;
+        }
         if (state == THREAD_RUNNING) return K_EBUSY;
         if (state == THREAD_BLOCKED) {
-            waiter_t *waiter = atomic_load_explicit(&thread->blocked_waiter,
-                                                    memory_order_acquire);
-            if (waiter == 0 || !wait_cancel(waiter)) return K_EBUSY;
+            if (!wait_cancel_thread(thread)) return K_EBUSY;
+#if OS_DEBUG_SERIAL
+            thread_cancel_diag(thread, status);
+#endif
             continue;
         }
         if (process_publish_thread_exit(thread, status)) break;
-        if (atomic_load_explicit(&thread->state, memory_order_acquire) ==
-            THREAD_DEAD) return K_OK;
+        unsigned observed = atomic_load_explicit(&thread->state,
+                                                  memory_order_acquire);
+        if (observed == THREAD_DEAD) return K_OK;
+        /* A READY -> BLOCKED race can happen after the initial state check. */
+        if (observed == THREAD_BLOCKED) continue;
         return K_EBUSY;
     }
     sched_remove(thread);

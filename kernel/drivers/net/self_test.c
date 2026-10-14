@@ -67,6 +67,10 @@ bool e1000_self_test(void) {
     uint32_t expected_software_queue_count = 0U;
     if (pci == 0) return true;
     e1000_self_test_begin();
+    if (!e1000_unmatched_tcp_reset_self_test()) {
+        e1000_record_error(28U);
+        return false;
+    }
     if (!e1000_self_test_initialize(state, pci) ||
         socket_create(OS_AF_INET4, OS_SOCK_DGRAM, 0, &receiver) != K_OK ||
         socket_create(OS_AF_INET6, OS_SOCK_DGRAM, 0, &receiver6) != K_OK ||

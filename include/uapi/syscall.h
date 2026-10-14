@@ -2,6 +2,15 @@
 #pragma once
 #include "abi.h"
 
+/* Raw Linux syscalls use the unmodified RAX number.  The shared System libc
+ * sets this high-bit marker for native ABI calls after a process switches to
+ * the Linux personality, where the low syscall numbers overlap. */
+#define OS_SYSCALL_NATIVE_FLAG (1ULL << 63)
+
+/* FUTEX_WAIT / FUTEX_WAKE flags: zero selects a process-private key;
+ * this flag selects a key shared by processes mapping the same physical word. */
+#define OS_FUTEX_FLAG_SHARED 0x1U
+
 enum os_syscall_number {
     OS_SYS_THREAD_EXIT       = 0x0000,
     OS_SYS_PROCESS_EXIT      = 0x0001,
@@ -14,6 +23,14 @@ enum os_syscall_number {
     OS_SYS_THREAD_CONTEXT    = 0x0008,
     OS_SYS_PROCESS_ENUMERATE = 0x0009,
     OS_SYS_THREAD_ENUMERATE  = 0x000A,
+    OS_SYS_THREAD_SIGNAL     = 0x000B,
+    /* The System ELF loader uses native syscalls until it jumps to a Linux
+     * PT_INTERP main image, then explicitly activates the Linux personality. */
+    OS_SYS_LINUX_ACTIVATE    = 0x000C,
+    OS_SYS_MEMORY_INFO       = 0x000D,
+    OS_SYS_TASK_QUERY        = 0x000E,
+    OS_SYS_PROCESS_TERMINATE = 0x000F,
+    OS_SYS_THREAD_TERMINATE  = 0x0010,
 
     OS_SYS_VM_MAP            = 0x0100,
     OS_SYS_VM_UNMAP          = 0x0101,
@@ -101,6 +118,8 @@ enum os_syscall_number {
     OS_SYS_SIGNAL_SEND       = 0x0913,
     OS_SYS_DEBUG_QUERY       = 0x0920,
     OS_SYS_DEBUG_WRITE       = 0x0921,
+    /* SYSTEM_POWER(action): 0 = reboot, 1 = shutdown. */
+    OS_SYS_SYSTEM_POWER      = 0x0930,
 
     OS_SYS_INPUT_READ        = 0x0A00,
 
@@ -118,6 +137,7 @@ enum os_syscall_number {
     OS_SYS_WINDOW_INPUT_DISPATCH   = 0x0C07,
     OS_SYS_WINDOW_EVENT_READ       = 0x0C08,
     OS_SYS_WINDOW_UPDATE           = 0x0C09,
+    OS_SYS_WINDOW_TITLE            = 0x0C0A,
 };
 
 #define OS_SYSCALL_ABI_VERSION 1u
@@ -139,6 +159,7 @@ enum os_syscall_number {
  *   THREAD_CREATE(target_process, os_thread_create_t *, os_handle_t *,
  *                 optional os_thread_stack_t *)
  *   THREAD_CONTEXT(operation, fs_base) -> current FS base for GET_FS
+ *   THREAD_SIGNAL(thread_handle, signal)
  *   PROCESS_CREATE(flags, os_handle_t *, optional name)
  *   PROCESS_FORK() -> child pid in the parent, zero in the child
  *   PROCESS_WAIT(pid, options, int32_t *status) -> child pid

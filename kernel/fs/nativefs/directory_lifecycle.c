@@ -10,24 +10,34 @@
 #define FAT32_MAX_LFN_ENTRIES 20U
 #define FAT32_MAX_CREATE_SLOTS (FAT32_MAX_LFN_ENTRIES + 1U)
 
-VOID fat32_open_files_lock(LITEOS_FAT32 *filesystem) {
-    while (__atomic_exchange_n(&filesystem->OpenFileLock, 1U,
-                               __ATOMIC_ACQUIRE) != 0U) {
-        __asm__ volatile ("pause");
+/* Keep the public UINT32 lock fields unchanged; no atomic-type alias casts.
+ * A held lock needs read polling, not a cache-line-invalidating exchange. */
+static void fat32_lock_word(UINT32 *word) {
+    for (;;) {
+        UINT32 expected = 0U;
+        if (__atomic_compare_exchange_n(word, &expected, 1U, 0,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+        while (__atomic_load_n(word, __ATOMIC_RELAXED) != 0U) {
+            __asm__ volatile ("pause");
+        }
     }
 }
 
-VOID fat32_open_files_unlock(LITEOS_FAT32 *filesystem) {
+VOID fat32_open_files_lock(OS_FAT32 *filesystem) {
+    fat32_lock_word(&filesystem->OpenFileLock);
+}
+
+VOID fat32_open_files_unlock(OS_FAT32 *filesystem) {
     __atomic_store_n(&filesystem->OpenFileLock, 0U, __ATOMIC_RELEASE);
 }
 
-VOID fat32_rebind_open_file(LITEOS_FAT32 *filesystem, UINT64 old_lba,
+VOID fat32_rebind_open_file(OS_FAT32 *filesystem, UINT64 old_lba,
                             UINT32 old_offset, UINT64 new_lba,
                             UINT32 new_offset) {
     if (filesystem == 0) return;
     fat32_open_files_lock(filesystem);
-    for (UINT32 index = 0U; index < LITEOS_FAT32_MAX_OPEN_FILES; ++index) {
-        LITEOS_FAT32_FILE *file = &filesystem->OpenFiles[index];
+    for (UINT32 index = 0U; index < OS_FAT32_MAX_OPEN_FILES; ++index) {
+        OS_FAT32_FILE *file = &filesystem->OpenFiles[index];
         if (file->Used && file->DirectoryLba == old_lba &&
             file->DirectoryOffset == old_offset) {
             file->DirectoryLba = new_lba;
@@ -43,14 +53,11 @@ VOID fat32_rebind_open_file(LITEOS_FAT32 *filesystem, UINT64 old_lba,
  * filesystem-wide mutation lock to keep two threads from allocating or
  * linking the same free cluster concurrently.
  */
-VOID fat32_mutation_lock(LITEOS_FAT32 *filesystem) {
-    while (__atomic_exchange_n(&filesystem->MutationLock, 1U,
-                               __ATOMIC_ACQUIRE) != 0U) {
-        __asm__ volatile ("pause");
-    }
+VOID fat32_mutation_lock(OS_FAT32 *filesystem) {
+    fat32_lock_word(&filesystem->MutationLock);
 }
 
-VOID fat32_mutation_unlock(LITEOS_FAT32 *filesystem) {
+VOID fat32_mutation_unlock(OS_FAT32 *filesystem) {
     __atomic_store_n(&filesystem->MutationLock, 0U, __ATOMIC_RELEASE);
 }
 
@@ -58,7 +65,7 @@ VOID fat32_mutation_unlock(LITEOS_FAT32 *filesystem) {
  * 鍒犻櫎鎿嶄綔闇€瑕佸悓鏃朵慨鏀圭洰褰曢」鍜屾墍鏈?FAT 鍓湰銆傜皣閾惧揩鐓у彧淇濆瓨灏嗚
  * 娓呯┖鐨?FAT 椤癸紝澶辫触鏃跺彲浠ユ妸宸插啓鍏ョ殑椤规仮澶嶅埌鎿嶄綔鍓嶇殑鍊硷紱杩欐瘮鍙? * 鎭㈠ FAT1 鏇村畨鍏紝涔熷吋瀹瑰彲閫夌殑绗笁浠?extent FAT銆? */
 
-BOOLEAN fat32_directory_short_name_exists(LITEOS_FAT32 *filesystem,
+BOOLEAN fat32_directory_short_name_exists(OS_FAT32 *filesystem,
                                            UINT32 directory, const UINT8 name[11]) {
     UINT8 sector[4096];
     UINT32 cluster = directory;
@@ -97,7 +104,7 @@ UINT8 fat32_short_name_checksum(const UINT8 short_name[11]) {
     return checksum;
 }
 
-BOOLEAN fat32_find_directory_entry_ex(LITEOS_FAT32 *filesystem, UINT32 directory_cluster,
+BOOLEAN fat32_find_directory_entry_ex(OS_FAT32 *filesystem, UINT32 directory_cluster,
                                        const CHAR8 *name, UINT32 name_length,
                                        UINT8 result[32], UINT64 *result_lba,
                                        UINT32 *result_offset,
@@ -113,7 +120,7 @@ BOOLEAN fat32_find_directory_entry_ex(LITEOS_FAT32 *filesystem, UINT32 directory
     UINT8 lfn_checksum = 0U;
     UINT32 found_lfn_count = 0U;
     if (lfn_count != 0) *lfn_count = 0U;
-    fat32_lfn_reset(lfn_characters, &lfn_valid, &lfn_expected, &lfn_checksum);
+    fat32_lfn_invalidate(&lfn_valid, &lfn_expected, &lfn_checksum);
     for (UINT32 chain = 0; chain < filesystem->ClusterCount; ++chain) {
         BOOLEAN fixed_root = fat32_root_directory_cluster(filesystem, cluster);
         if (!fixed_root && !fat32_cluster_valid(filesystem, cluster)) {
@@ -133,7 +140,7 @@ BOOLEAN fat32_find_directory_entry_ex(LITEOS_FAT32 *filesystem, UINT32 directory
                     return 0;
                 }
                 if (entry[0] == 0xE5U) {
-                    fat32_lfn_reset(lfn_characters, &lfn_valid, &lfn_expected,
+                    fat32_lfn_invalidate(&lfn_valid, &lfn_expected,
                               &lfn_checksum);
                     found_lfn_count = 0U;
                     continue;
@@ -171,7 +178,7 @@ BOOLEAN fat32_find_directory_entry_ex(LITEOS_FAT32 *filesystem, UINT32 directory
                     }
                     return 1;
                 }
-                fat32_lfn_reset(lfn_characters, &lfn_valid, &lfn_expected,
+                fat32_lfn_invalidate(&lfn_valid, &lfn_expected,
                           &lfn_checksum);
                 found_lfn_count = 0U;
             }
@@ -186,7 +193,7 @@ BOOLEAN fat32_find_directory_entry_ex(LITEOS_FAT32 *filesystem, UINT32 directory
     return 0;
 }
 
-BOOLEAN fat32_find_directory_entry(LITEOS_FAT32 *filesystem, UINT32 directory_cluster,
+BOOLEAN fat32_find_directory_entry(OS_FAT32 *filesystem, UINT32 directory_cluster,
                                     const CHAR8 *name, UINT32 name_length,
                                     UINT8 result[32], UINT64 *result_lba,
                                     UINT32 *result_offset) {
@@ -194,14 +201,14 @@ BOOLEAN fat32_find_directory_entry(LITEOS_FAT32 *filesystem, UINT32 directory_cl
                                    result, result_lba, result_offset, 0, 0, 0);
 }
 
-BOOLEAN fat32_resolve_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+BOOLEAN fat32_resolve_path(OS_FAT32 *filesystem, const CHAR8 *path,
                             UINT8 result[32], UINT64 *result_lba,
                             UINT32 *result_offset) {
     UINT32 directory = filesystem->RootCluster;
     UINT32 position = 0;
     UINT32 path_length = 0;
     if (path == 0 || path[0] == 0) return 0;
-    while (path_length < LITEOS_FAT32_PATH_LENGTH && path[path_length] != 0) ++path_length;
+    while (path_length < OS_FAT32_PATH_LENGTH && path[path_length] != 0) ++path_length;
     while (position < path_length) {
         UINT32 end = position;
         while (end < path_length && path[end] != '/') ++end;
@@ -217,15 +224,15 @@ BOOLEAN fat32_resolve_path(LITEOS_FAT32 *filesystem, const CHAR8 *path,
     return 0;
 }
 
-BOOLEAN fat32_resolve_directory_cluster(LITEOS_FAT32 *filesystem, const CHAR8 *path,
+BOOLEAN fat32_resolve_directory_cluster(OS_FAT32 *filesystem, const CHAR8 *path,
                                           UINT32 *cluster) {
     UINT32 directory;
     UINT32 position = 0U;
     UINT32 path_length = 0U;
     UINT8 entry[32];
     if (filesystem == 0 || !filesystem->Mounted || path == 0 || cluster == 0) return 0;
-    while (path_length < LITEOS_FAT32_PATH_LENGTH && path[path_length] != 0) ++path_length;
-    if (path_length >= LITEOS_FAT32_PATH_LENGTH) return 0;
+    while (path_length < OS_FAT32_PATH_LENGTH && path[path_length] != 0) ++path_length;
+    if (path_length >= OS_FAT32_PATH_LENGTH) return 0;
     directory = filesystem->RootCluster;
     while (position < path_length && path[position] == '/') ++position;
     while (position < path_length) {
@@ -247,16 +254,16 @@ BOOLEAN fat32_resolve_directory_cluster(LITEOS_FAT32 *filesystem, const CHAR8 *p
 }
 
 
-static BOOLEAN split_parent_path(const CHAR8 *path, CHAR8 parent[LITEOS_FAT32_PATH_LENGTH],
-                                 CHAR8 leaf[LITEOS_FAT32_PATH_LENGTH]) {
+static BOOLEAN split_parent_path(const CHAR8 *path, CHAR8 parent[OS_FAT32_PATH_LENGTH],
+                                 CHAR8 leaf[OS_FAT32_PATH_LENGTH]) {
     UINT32 length = 0U;
     UINT32 start = 0U;
     UINT32 separator = UINT32_MAX;
     UINT32 leaf_start;
     UINT32 parent_length;
     if (path == 0 || parent == 0 || leaf == 0) return 0;
-    while (length < LITEOS_FAT32_PATH_LENGTH && path[length] != 0) ++length;
-    if (length == 0U || length >= LITEOS_FAT32_PATH_LENGTH) return 0;
+    while (length < OS_FAT32_PATH_LENGTH && path[length] != 0) ++length;
+    if (length == 0U || length >= OS_FAT32_PATH_LENGTH) return 0;
     while (start < length && path[start] == '/') ++start;
     if (start == length) return 0;
     for (UINT32 i = start; i < length; ++i) {
@@ -267,8 +274,8 @@ static BOOLEAN split_parent_path(const CHAR8 *path, CHAR8 parent[LITEOS_FAT32_PA
     }
     leaf_start = separator == UINT32_MAX ? start : separator + 1U;
     parent_length = separator == UINT32_MAX ? 0U : separator - start;
-    if (length - leaf_start == 0U || length - leaf_start >= LITEOS_FAT32_PATH_LENGTH ||
-        parent_length >= LITEOS_FAT32_PATH_LENGTH) return 0;
+    if (length - leaf_start == 0U || length - leaf_start >= OS_FAT32_PATH_LENGTH ||
+        parent_length >= OS_FAT32_PATH_LENGTH) return 0;
     for (UINT32 i = 0; i < parent_length; ++i) parent[i] = path[start + i];
     parent[parent_length] = 0;
     for (UINT32 i = 0; i < length - leaf_start; ++i) leaf[i] = path[leaf_start + i];
@@ -276,10 +283,10 @@ static BOOLEAN split_parent_path(const CHAR8 *path, CHAR8 parent[LITEOS_FAT32_PA
     return 1;
 }
 
-BOOLEAN fat32_resolve_parent_directory(LITEOS_FAT32 *filesystem,
+BOOLEAN fat32_resolve_parent_directory(OS_FAT32 *filesystem,
                                          const CHAR8 *path, UINT32 *directory,
-                                         CHAR8 leaf[LITEOS_FAT32_PATH_LENGTH]) {
-    CHAR8 parent[LITEOS_FAT32_PATH_LENGTH];
+                                         CHAR8 leaf[OS_FAT32_PATH_LENGTH]) {
+    CHAR8 parent[OS_FAT32_PATH_LENGTH];
     UINT8 entry[FAT32_ENTRY_SIZE];
     if (filesystem == 0 || !filesystem->Mounted || directory == 0 || leaf == 0 ||
         !split_parent_path(path, parent, leaf)) return 0;
@@ -294,7 +301,7 @@ BOOLEAN fat32_resolve_parent_directory(LITEOS_FAT32 *filesystem,
 }
 
 /* 鍦ㄧ洰褰曢摼涓鎵捐繛缁殑鐩綍椤癸紱闀挎枃浠跺悕闇€瑕佷竴娆′繚鐣?LFN 椤瑰拰鐭悕椤广€?*/
-BOOLEAN fat32_find_directory_slots(LITEOS_FAT32 *filesystem, UINT32 directory,
+BOOLEAN fat32_find_directory_slots(OS_FAT32 *filesystem, UINT32 directory,
                                     UINT32 slot_count, UINT64 lba[21],
                                     UINT32 offset[21], UINT32 new_clusters[21],
                                     UINT32 *new_cluster_count,
@@ -395,7 +402,7 @@ BOOLEAN fat32_find_directory_slots(LITEOS_FAT32 *filesystem, UINT32 directory,
     }
 }
 
-BOOLEAN fat32_write_directory_slot(LITEOS_FAT32 *filesystem, UINT64 lba,
+BOOLEAN fat32_write_directory_slot(OS_FAT32 *filesystem, UINT64 lba,
                                      UINT32 offset, const UINT8 entry[FAT32_ENTRY_SIZE]) {
     UINT8 sector[4096];
     if (filesystem == 0 || entry == 0 || filesystem->BytesPerSector > sizeof(sector) ||
@@ -405,7 +412,7 @@ BOOLEAN fat32_write_directory_slot(LITEOS_FAT32 *filesystem, UINT64 lba,
     return fat32_write_sector(filesystem, lba, sector);
 }
 
-BOOLEAN fat32_delete_directory_slot(LITEOS_FAT32 *filesystem, UINT64 lba,
+BOOLEAN fat32_delete_directory_slot(OS_FAT32 *filesystem, UINT64 lba,
                                      UINT32 offset) {
     UINT8 sector[4096];
     if (filesystem == 0 || filesystem->BytesPerSector > sizeof(sector) ||
@@ -415,7 +422,7 @@ BOOLEAN fat32_delete_directory_slot(LITEOS_FAT32 *filesystem, UINT64 lba,
     return fat32_write_sector(filesystem, lba, sector);
 }
 
-BOOLEAN fat32_read_directory_slot(LITEOS_FAT32 *filesystem, UINT64 lba,
+BOOLEAN fat32_read_directory_slot(OS_FAT32 *filesystem, UINT64 lba,
                                    UINT32 offset, UINT8 entry[FAT32_ENTRY_SIZE]) {
     UINT8 sector[4096];
     if (filesystem == 0 || entry == 0 || filesystem->BytesPerSector > sizeof(sector) ||
@@ -425,7 +432,7 @@ BOOLEAN fat32_read_directory_slot(LITEOS_FAT32 *filesystem, UINT64 lba,
     return 1;
 }
 
-BOOLEAN fat32_allocate_zero_cluster(LITEOS_FAT32 *filesystem, UINT32 *cluster) {
+BOOLEAN fat32_allocate_zero_cluster(OS_FAT32 *filesystem, UINT32 *cluster) {
     UINT8 sector[4096];
     UINT32 value;
     if (filesystem == 0 || cluster == 0 || filesystem->BytesPerSector > sizeof(sector) ||
@@ -444,7 +451,7 @@ BOOLEAN fat32_allocate_zero_cluster(LITEOS_FAT32 *filesystem, UINT32 *cluster) {
     return 1;
 }
 
-BOOLEAN fat32_initialize_directory_cluster(LITEOS_FAT32 *filesystem, UINT32 cluster,
+BOOLEAN fat32_initialize_directory_cluster(OS_FAT32 *filesystem, UINT32 cluster,
                                              UINT32 parent) {
     UINT8 sector[4096];
     if (filesystem == 0 || !fat32_cluster_valid(filesystem, cluster) ||
@@ -469,7 +476,7 @@ BOOLEAN fat32_initialize_directory_cluster(LITEOS_FAT32 *filesystem, UINT32 clus
     return fat32_write_sector(filesystem, fat32_cluster_lba(filesystem, cluster), sector);
 }
 
-BOOLEAN fat32_directory_is_empty(LITEOS_FAT32 *filesystem, UINT32 directory) {
+BOOLEAN fat32_directory_is_empty(OS_FAT32 *filesystem, UINT32 directory) {
     UINT8 sector[4096];
     UINT32 cluster = directory;
     if (filesystem == 0 || !fat32_cluster_valid(filesystem, directory) ||
@@ -505,14 +512,14 @@ BOOLEAN fat32_directory_is_empty(LITEOS_FAT32 *filesystem, UINT32 directory) {
     return 0;
 }
 
-BOOLEAN fat32_file_is_open_at(LITEOS_FAT32 *filesystem, UINT64 lba,
+BOOLEAN fat32_file_is_open_at(OS_FAT32 *filesystem, UINT64 lba,
                                   UINT32 offset) {
     BOOLEAN found = 0;
     if (filesystem == 0) return 0;
 
     fat32_open_files_lock(filesystem);
-    for (UINT32 i = 0U; i < LITEOS_FAT32_MAX_OPEN_FILES; ++i) {
-        const LITEOS_FAT32_FILE *file = &filesystem->OpenFiles[i];
+    for (UINT32 i = 0U; i < OS_FAT32_MAX_OPEN_FILES; ++i) {
+        const OS_FAT32_FILE *file = &filesystem->OpenFiles[i];
         if (file->Used && file->DirectoryLba == lba &&
             file->DirectoryOffset == offset) {
             found = 1;

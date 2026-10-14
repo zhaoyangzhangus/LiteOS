@@ -58,8 +58,8 @@ static bool xhci_ack_root_port_changes(xhci_state_t *state, uint8_t port) {
         g_xhci_last_ack_state[controller_index][port] != portsc) {
         g_xhci_ack_state_valid[controller_index][port] = true;
         g_xhci_last_ack_state[controller_index][port] = portsc;
-        liteos_realtest_mark_number("XHCI_PORT_ACK", port);
-        liteos_realtest_mark_number("XHCI_PORT_ACK_STATE", portsc);
+        realtest_mark_number("XHCI_PORT_ACK", port);
+        realtest_mark_number("XHCI_PORT_ACK_STATE", portsc);
     }
     return xhci_controller_write32(
         state, offset, xhci_port_state_to_neutral(portsc) | changes);
@@ -85,8 +85,8 @@ static bool xhci_prepare_connected_port(xhci_state_t *state,
     if (portsc == UINT32_MAX || (portsc & XHCI_PORTSC_CCS) == 0U) {
         return false;
     }
-    liteos_realtest_mark_number("XHCI_PORT_BEGIN", port);
-    liteos_realtest_mark_number("XHCI_PORTSC_BEFORE", portsc);
+    realtest_mark_number("XHCI_PORT_BEGIN", port);
+    realtest_mark_number("XHCI_PORTSC_BEFORE", portsc);
 
     uint32_t initial_speed =
         (portsc >> XHCI_PORTSC_SPEED_SHIFT) & XHCI_PORTSC_SPEED_MASK;
@@ -99,7 +99,7 @@ static bool xhci_prepare_connected_port(xhci_state_t *state,
      * enumeration so the pending port event cannot mask the first transfer. */
     reset_change = use_warm_reset ?
                    (XHCI_PORTSC_WRC | XHCI_PORTSC_PRC) : XHCI_PORTSC_PRC;
-    liteos_realtest_mark(use_warm_reset ?
+    realtest_mark(use_warm_reset ?
                          "XHCI_PORT_RESET_WARM" :
                          "XHCI_PORT_RESET_COLD");
 
@@ -119,7 +119,7 @@ static bool xhci_prepare_connected_port(xhci_state_t *state,
     reset_value = xhci_port_state_to_neutral(portsc) |
                   reset_bit;
     if (!xhci_controller_write32(state, offset, reset_value)) {
-        liteos_realtest_mark("XHCI_PORT_RESET_WRITE_FAIL");
+        realtest_mark("XHCI_PORT_RESET_WRITE_FAIL");
         xhci_set_error(50U);
         return false;
     }
@@ -183,8 +183,8 @@ static bool xhci_prepare_connected_port(xhci_state_t *state,
         }
     }
     if (!enabled) {
-        liteos_realtest_mark_number("XHCI_PORTSC_RESET_LAST", portsc);
-        liteos_realtest_mark("XHCI_PORT_RESET_TIMEOUT");
+        realtest_mark_number("XHCI_PORTSC_RESET_LAST", portsc);
+        realtest_mark("XHCI_PORT_RESET_TIMEOUT");
         xhci_set_error(51U);
         return false;
     }
@@ -192,13 +192,13 @@ static bool xhci_prepare_connected_port(xhci_state_t *state,
         state, offset,
         xhci_port_state_to_neutral(portsc) |
             reset_change);
-    liteos_realtest_mark_number("XHCI_PORTSC_AFTER", portsc);
+    realtest_mark_number("XHCI_PORTSC_AFTER", portsc);
     xhci_controller_delay_ns(50000000ULL);
 
     uint32_t speed = (portsc >> XHCI_PORTSC_SPEED_SHIFT) &
                      XHCI_PORTSC_SPEED_MASK;
     if (speed == 0U) {
-        liteos_realtest_mark("XHCI_PORT_SPEED_INVALID");
+        realtest_mark("XHCI_PORT_SPEED_INVALID");
         xhci_set_error(52U);
         return false;
     }
@@ -332,7 +332,7 @@ bool xhci_handle_root_port_event(xhci_state_t *state, uint8_t port,
     }
     bool acknowledged = xhci_ack_root_port_changes(state, port);
     if (changed) {
-        liteos_serial_write_serial_only("LITEOS_USB_RUNTIME_ROOT_CHANGE\r\n");
+        kernel_serial_write_serial_only("OS_USB_RUNTIME_ROOT_CHANGE\r\n");
     }
     return acknowledged && (changed || (portsc & XHCI_PORTSC_CCS) != 0U);
 }
@@ -390,7 +390,7 @@ bool xhci_reenumerate_self_test(xhci_state_t *state,
         /* The root storage device is already usable.  A disconnected or
          * unsupported optional downstream port must not discard it. */
         if (xhci_usb_mass_storage_configured()) {
-            liteos_realtest_mark("XHCI_HUB_OPTIONAL_FAIL_WITH_MSC");
+            realtest_mark("XHCI_HUB_OPTIONAL_FAIL_WITH_MSC");
         } else {
             if (xhci_last_error() == 0U) xhci_set_error(67U);
             return false;
@@ -448,8 +448,8 @@ bool xhci_probe_connected_ports(xhci_state_t *state, uint8_t *selected_slot) {
         if (first_error == 0U) {
             first_error = xhci_last_error();
         }
-        liteos_serial_printf_serial_only(
-            "LITEOS_XHCI_ENUM_FAIL PORT=%u SLOT=%u PORTSC=%u SPEED=%u "
+        kernel_serial_printf_serial_only(
+            "OS_XHCI_ENUM_FAIL PORT=%u SLOT=%u PORTSC=%u SPEED=%u "
             "ERROR=%u\r\n",
             port, slot, xhci_controller_read32(state, offset), speed,
             xhci_last_error());
@@ -459,12 +459,12 @@ bool xhci_probe_connected_ports(xhci_state_t *state, uint8_t *selected_slot) {
         continue;
     }
 
-    liteos_serial_write_serial_only(
-        "LITEOS_DIAG_XHCI_ROOT_SCAN_COMPLETE\r\n");
+    kernel_serial_write_serial_only(
+        "OS_DIAG_XHCI_ROOT_SCAN_COMPLETE\r\n");
 
     if (!xhci_hub_runtime_probe_downstream(state, &g_xhci_hub_runtime_ops)) {
         if (!xhci_usb_mass_storage_configured()) return false;
-        liteos_realtest_mark("XHCI_HUB_OPTIONAL_FAIL_WITH_MSC");
+        realtest_mark("XHCI_HUB_OPTIONAL_FAIL_WITH_MSC");
     }
     xhci_recompute_topology(state);
     limit = state->max_slots;
@@ -504,33 +504,33 @@ bool xhci_probe_hid_controller(xhci_state_t *state) {
         if (portsc == UINT32_MAX || (portsc & XHCI_PORTSC_CCS) == 0U) {
             continue;
         }
-        liteos_realtest_mark_number("XHCI_AUX_PORT", port);
-        liteos_realtest_mark_number("XHCI_AUX_PORTSC", portsc);
+        realtest_mark_number("XHCI_AUX_PORT", port);
+        realtest_mark_number("XHCI_AUX_PORTSC", portsc);
         if (!xhci_prepare_connected_port(state, (uint8_t)port, &speed)) {
-            liteos_realtest_mark_number("XHCI_AUX_PREP_ERROR",
+            realtest_mark_number("XHCI_AUX_PREP_ERROR",
                                         xhci_last_error());
             continue;
         }
-        liteos_realtest_mark_number("XHCI_AUX_SPEED", speed);
+        realtest_mark_number("XHCI_AUX_SPEED", speed);
         if (!xhci_submit_command(state, XHCI_COMMAND_RING_TYPE, 0U, 0U,
                                  &slot) || slot == 0U) {
-            liteos_realtest_mark_number("XHCI_AUX_SLOT_ERROR",
+            realtest_mark_number("XHCI_AUX_SLOT_ERROR",
                                         xhci_last_error());
             continue;
         }
-        liteos_realtest_mark_number("XHCI_AUX_SLOT", slot);
+        realtest_mark_number("XHCI_AUX_SLOT", slot);
         if (xhci_enumerate_hid_device(state, slot, (uint8_t)port, speed,
                                        (uint8_t)port)) {
-            liteos_realtest_mark_number("XHCI_AUX_HID_PORT", port);
-            liteos_realtest_mark_number("XHCI_AUX_HID_SLOT", slot);
-            liteos_realtest_mark_number("XHCI_AUX_HID_PROTOCOL",
+            realtest_mark_number("XHCI_AUX_HID_PORT", port);
+            realtest_mark_number("XHCI_AUX_HID_SLOT", slot);
+            realtest_mark_number("XHCI_AUX_HID_PROTOCOL",
                                         state->device.hid_protocol);
-            liteos_serial_printf_serial_only(
-                "LITEOS_XHCI_AUX_HID_OK PORT=%u SLOT=%u PROTOCOL=%u\r\n",
+            kernel_serial_printf_serial_only(
+                "OS_XHCI_AUX_HID_OK PORT=%u SLOT=%u PROTOCOL=%u\r\n",
                 port, slot, state->device.hid_protocol);
             return true;
         }
-        liteos_realtest_mark_number("XHCI_AUX_ENUM_ERROR", xhci_last_error());
+        realtest_mark_number("XHCI_AUX_ENUM_ERROR", xhci_last_error());
 
         (void)xhci_free_hid_device_resources(state);
         xhci_zero_device_context(&state->device);

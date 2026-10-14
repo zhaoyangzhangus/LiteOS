@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-typedef struct liteos_jmp_state {
+typedef struct libc_jmp_state {
     uintptr_t rsp;
     uintptr_t rbp;
     uintptr_t rbx;
@@ -11,9 +11,9 @@ typedef struct liteos_jmp_state {
     uintptr_t r14;
     uintptr_t r15;
     uintptr_t rip;
-} liteos_jmp_state_t;
+} libc_jmp_state_t;
 
-typedef liteos_jmp_state_t jmp_buf[1];
+typedef libc_jmp_state_t jmp_buf[1];
 
 int setjmp(jmp_buf environment);
 void longjmp(jmp_buf environment, int value) __attribute__((noreturn));

@@ -1,0 +1,10 @@
+OS_VIDEO_1 {
+    global:
+        os_video_decoder_abi;
+        os_video_decoder_create_h264;
+        os_video_decoder_send;
+        os_video_decoder_receive;
+        os_video_decoder_reset;
+        os_video_decoder_destroy;
+    local: *;
+};

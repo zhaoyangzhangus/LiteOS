@@ -1,4 +1,5 @@
 #include <arch/x86_64/cpu.h>
+#include <kernel/console.h>
 #include <kernel/net_core.h>
 #include <kernel/socket.h>
 
@@ -6,6 +7,23 @@
 #include "socket_model.h"
 
 /* REFACTOR_P8_SOCKET_TRANSPORT_OWNER: TCP retransmit polling. */
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_debug_tcp_poll_logs;
+#endif
+
+static void socket_tcp_keepalive_output_failed_locked(
+    socket_private_t *private, uint64_t deadline, uint64_t now_tsc) {
+    // Local TX backpressure is not evidence of a dead peer. Do not undo a
+    // concurrent ACK/option change which has already reset this generation.
+    if (private->tcp_keep_deadline_tsc == deadline &&
+        private->tcp_keep_probes != 0U) {
+        --private->tcp_keep_probes;
+        uint64_t ticks = x86_timeout_ns_to_tsc(1000000000ULL);
+        private->tcp_keep_deadline_tsc = ticks > UINT64_MAX - now_tsc ?
+                                       UINT64_MAX : now_tsc + ticks;
+    }
+}
 
 void socket_tcp_poll(uint64_t now_tsc) {
     socket_tcp_ipv4_output_fn output4 = 0;
@@ -32,6 +50,8 @@ void socket_tcp_poll(uint64_t now_tsc) {
         uint16_t window = 0U;
         bool retransmit = false;
         bool failed = false;
+        bool keepalive = false;
+        uint64_t keep_deadline = 0U;
 
         socket_lock(socket_binding_lock());
         const socket_tcp_connection_t *connection =
@@ -113,15 +133,53 @@ void socket_tcp_poll(uint64_t now_tsc) {
                 retransmit = true;
             }
         }
+        if (!retransmit && !failed &&
+            socket_tcp_keepalive_poll_locked(private, now_tsc, &failed)) {
+            flags = NET_TCP_FLAG_ACK;
+            source_address = private->local_address;
+            source_port = private->local_port;
+            destination_address = private->peer_address;
+            destination_port = private->peer_port;
+            // An empty segment just before SND.NXT elicits an ACK without
+            // consuming sequence space or modifying an outstanding send.
+            sequence = private->tcp_send_next_sequence - 1U;
+            acknowledgement = private->tcp_next_sequence;
+            window = (uint16_t)(SOCKET_STREAM_BUFFER_SIZE -
+                atomic_load_explicit(&private->stream_count, memory_order_relaxed));
+            retransmit = true;
+            keepalive = true;
+            keep_deadline = private->tcp_keep_deadline_tsc;
+        }
         socket_unlock(&target->lock);
 
         if (failed) {
             (void)wake_all(&target->waitq);
+            object_notify_changed(target);
         } else if (retransmit && output4 != 0) {
-            (void)output4(output4_context, source_address, source_port,
-                          destination_address, destination_port, sequence,
-                          acknowledgement, flags, window, payload,
-                          payload_length);
+            kstatus_t output_status = output4(
+                output4_context, source_address, source_port,
+                destination_address, destination_port, sequence,
+                acknowledgement, flags, window, payload, payload_length);
+            if (keepalive && output_status != K_OK) {
+                socket_lock(&target->lock);
+                socket_tcp_keepalive_output_failed_locked(private, keep_deadline, now_tsc);
+                socket_unlock(&target->lock);
+            }
+#if OS_DEBUG_SERIAL
+            if (g_debug_tcp_poll_logs < 32U) {
+                kernel_serial_printf_serial_only(
+                    "OS_TCP_POLL src=%x:%u dst=%x:%u flags=%x retry=%u status=%lld\r\n",
+                    source_address, source_port, destination_address,
+                    destination_port, flags, private->tcp_send_retransmits,
+                    (long long)output_status);
+                ++g_debug_tcp_poll_logs;
+            }
+#endif
+            (void)output_status;
+        } else if (keepalive) {
+            socket_lock(&target->lock);
+            socket_tcp_keepalive_output_failed_locked(private, keep_deadline, now_tsc);
+            socket_unlock(&target->lock);
         }
         object_put(target);
     }
@@ -141,6 +199,8 @@ void socket_tcp_poll(uint64_t now_tsc) {
         uint16_t window = 0U;
         bool retransmit = false;
         bool failed = false;
+        bool keepalive = false;
+        uint64_t keep_deadline = 0U;
 
         socket_lock(socket_binding_lock());
         const socket_tcp6_connection_t *connection =
@@ -220,15 +280,41 @@ void socket_tcp_poll(uint64_t now_tsc) {
                 retransmit = true;
             }
         }
+        if (!retransmit && !failed &&
+            socket_tcp_keepalive_poll_locked(private, now_tsc, &failed)) {
+            flags = NET_TCP_FLAG_ACK;
+            socket_copy(source_address, private->local_address6, 16U);
+            socket_copy(destination_address, private->peer_address6, 16U);
+            source_port = private->local_port;
+            destination_port = private->peer_port;
+            sequence = private->tcp_send_next_sequence - 1U;
+            acknowledgement = private->tcp_next_sequence;
+            window = (uint16_t)(SOCKET_STREAM_BUFFER_SIZE -
+                atomic_load_explicit(&private->stream_count, memory_order_relaxed));
+            retransmit = true;
+            keepalive = true;
+            keep_deadline = private->tcp_keep_deadline_tsc;
+        }
         socket_unlock(&target->lock);
 
         if (failed) {
             (void)wake_all(&target->waitq);
+            object_notify_changed(target);
         } else if (retransmit && output6 != 0) {
-            (void)output6(output6_context, source_address, source_port,
+            kstatus_t output_status = output6(output6_context, source_address, source_port,
                           destination_address, destination_port, sequence,
                           acknowledgement, flags, window, payload,
                           payload_length);
+            if (keepalive && output_status != K_OK) {
+                socket_lock(&target->lock);
+                socket_tcp_keepalive_output_failed_locked(private, keep_deadline, now_tsc);
+                socket_unlock(&target->lock);
+            }
+        }
+        else if (keepalive) {
+            socket_lock(&target->lock);
+            socket_tcp_keepalive_output_failed_locked(private, keep_deadline, now_tsc);
+            socket_unlock(&target->lock);
         }
         object_put(target);
     }

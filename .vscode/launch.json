@@ -2,16 +2,16 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "LiteOS: Kernel debug (F5 auto detect)",
+            "name": "System: Kernel debug (F5 auto detect)",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build-refactor/esp/EFI/LITEOS/kernel.elf",
+            "program": "${workspaceFolder}/build/esp/EFI/OS/kernel.elf",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerPath": "gdb",
             "miDebuggerServerAddress": "127.0.0.1:1234",
-            "preLaunchTask": "LiteOS: start QEMU debug (auto)",
-            "postDebugTask": "LiteOS: stop QEMU debug (auto)",
+            "preLaunchTask": "System: start QEMU debug (auto)",
+            "postDebugTask": "System: stop QEMU debug (auto)",
             "stopAtEntry": false,
             "windows": {
                 "miDebuggerPath": "C:\\Program Files\\w64devkit\\bin\\gdb.exe"

@@ -1,8 +1,48 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
+#include <limits.h>
+#include <stdio.h>
 #include <sys/mman.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <uapi/linux_abi.h>
+#include <uapi/memory.h>
+
+#ifndef _SC_NPROCESSORS_CONF
+#define _SC_NPROCESSORS_CONF 83
+#define _SC_NPROCESSORS_ONLN 84
+#endif
+#ifndef _SC_PHYS_PAGES
+#define _SC_PHYS_PAGES 85
+#endif
+#ifndef _SC_AVPHYS_PAGES
+#define _SC_AVPHYS_PAGES 86
+#endif
 
 #define LIBC_PAGE_SIZE 4096U
+
+static bool libc_linux_personality(void) {
+    return __libc_linux_personality();
+}
+
+static long linux_processor_count(void) {
+    int saved_errno = errno;
+    FILE *cpuinfo = fopen("/proc/cpuinfo", "r");
+    if (cpuinfo == 0) {
+        errno = saved_errno;
+        return 0L;
+    }
+
+    long count = 0L;
+    char line[32];
+    while (fgets(line, sizeof(line), cpuinfo) != 0) {
+        if (strncmp(line, "processor", 9U) == 0) ++count;
+    }
+    (void)fclose(cpuinfo);
+    errno = saved_errno;
+    return count;
+}
 
 static int invalid_mapping(void) {
     errno = EINVAL;
@@ -21,6 +61,27 @@ static int round_mapping_length(size_t length, size_t *rounded) {
     return 0;
 }
 
+static int supported_madvise(int advice) {
+    switch (advice) {
+    case MADV_NORMAL:
+    case MADV_RANDOM:
+    case MADV_SEQUENTIAL:
+    case MADV_WILLNEED:
+    case MADV_DONTNEED:
+    case MADV_DONTFORK:
+    case MADV_DOFORK:
+    case MADV_MERGEABLE:
+    case MADV_UNMERGEABLE:
+    case MADV_HUGEPAGE:
+    case MADV_NOHUGEPAGE:
+    case MADV_DONTDUMP:
+    case MADV_DODUMP:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int translate_protection(int protection, uint32_t *result) {
     uint32_t translated = 0U;
     if (result == 0 ||
@@ -36,6 +97,23 @@ static int translate_protection(int protection, uint32_t *result) {
 
 void *mmap(void *address, size_t length, int protection, int flags,
            int descriptor, off_t offset) {
+    /* Linux-personality opens of compatibility paths (notably /tmp shared
+     * memory files) install Linux fd-table entries.  Route those mappings
+     * through the same ABI, while preserving native VFS descriptors used by
+     * the remaining POSIX file paths. */
+    if (libc_linux_personality() &&
+        (((flags & MAP_ANONYMOUS) != 0) ||
+         __libc_descriptor_is_linux_fd(descriptor))) {
+        int64_t status = __libc_linux_syscall6(
+            LINUX_SYS_MMAP, (uint64_t)(uintptr_t)address, length,
+            (uint64_t)(uint32_t)protection, (uint64_t)(uint32_t)flags,
+            (uint64_t)(int64_t)descriptor, (uint64_t)(int64_t)offset);
+        if (status < 0) {
+            (void)__libc_status_result(status);
+            return MAP_FAILED;
+        }
+        return (void *)(uintptr_t)status;
+    }
     const int supported_flags = MAP_SHARED | MAP_PRIVATE | MAP_FIXED |
                                 MAP_ANONYMOUS | MAP_STACK;
     os_vm_map_args_t request = {0};
@@ -85,7 +163,7 @@ void *mmap(void *address, size_t length, int protection, int flags,
     request.flags = (flags & MAP_SHARED) != 0 ? OS_VM_SHARED : OS_VM_PRIVATE;
     if ((flags & MAP_FIXED) != 0) request.flags |= OS_VM_FIXED;
     if ((flags & MAP_STACK) != 0) request.flags |= OS_VM_STACK;
-    status = liteos_syscall6(OS_SYS_VM_MAP,
+    status = __libc_native_syscall6(OS_SYS_VM_MAP,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (status < 0 || request.address == 0U) {
@@ -105,7 +183,13 @@ int munmap(void *address, size_t length) {
         errno = EINVAL;
         return -1;
     }
-    status = liteos_syscall6(OS_SYS_VM_UNMAP,
+    if (libc_linux_personality()) {
+        status = __libc_linux_syscall6(LINUX_SYS_MUNMAP,
+                                 (uint64_t)(uintptr_t)address, mapped_length,
+                                 0U, 0U, 0U, 0U);
+        return __libc_status_result(status);
+    }
+    status = __libc_native_syscall6(OS_SYS_VM_UNMAP,
                              (uint64_t)(uintptr_t)address, mapped_length,
                              0U, 0U, 0U, 0U);
     return __libc_status_result(status);
@@ -122,7 +206,13 @@ int mprotect(void *address, size_t length, int protection) {
         errno = EINVAL;
         return -1;
     }
-    status = liteos_syscall6(OS_SYS_VM_PROTECT,
+    if (libc_linux_personality()) {
+        status = __libc_linux_syscall6(LINUX_SYS_MPROTECT,
+                                 (uint64_t)(uintptr_t)address, mapped_length,
+                                 (uint64_t)(uint32_t)protection, 0U, 0U, 0U);
+        return __libc_status_result(status);
+    }
+    status = __libc_native_syscall6(OS_SYS_VM_PROTECT,
                              (uint64_t)(uintptr_t)address, mapped_length,
                              translated_protection, 0U, 0U, 0U);
     return __libc_status_result(status);
@@ -140,7 +230,7 @@ int msync(void *address, size_t length, int flags) {
         errno = EINVAL;
         return -1;
     }
-    status = liteos_syscall6(OS_SYS_VM_SYNC,
+    status = __libc_native_syscall6(OS_SYS_VM_SYNC,
                              (uint64_t)(uintptr_t)address, mapped_length,
                              (uint64_t)(uint32_t)flags, 0U, 0U, 0U);
     return __libc_status_result(status);
@@ -152,11 +242,17 @@ int madvise(void *address, size_t length, int advice) {
     if (address == MAP_FAILED ||
         ((uintptr_t)address & (LIBC_PAGE_SIZE - 1U)) != 0U ||
         round_mapping_length(length, &mapped_length) < 0 ||
-        (advice < MADV_NORMAL || advice > MADV_DONTNEED)) {
+        !supported_madvise(advice)) {
         errno = EINVAL;
         return -1;
     }
-    status = liteos_syscall6(OS_SYS_VM_ADVISE,
+    if (libc_linux_personality()) {
+        status = __libc_linux_syscall6(LINUX_SYS_MADVISE,
+                                 (uint64_t)(uintptr_t)address, mapped_length,
+                                 (uint64_t)(uint32_t)advice, 0U, 0U, 0U);
+        return __libc_status_result(status);
+    }
+    status = __libc_native_syscall6(OS_SYS_VM_ADVISE,
                              (uint64_t)(uintptr_t)address, mapped_length,
                              (uint64_t)(uint32_t)advice, 0U, 0U, 0U);
     return __libc_status_result(status);
@@ -170,6 +266,31 @@ long sysconf(int name) {
         return 256L;
     case _SC_CLK_TCK:
         return 100L;
+    case _SC_NPROCESSORS_CONF:
+    case _SC_NPROCESSORS_ONLN:
+        if (libc_linux_personality()) {
+            long count = linux_processor_count();
+            if (count > 0L) return count;
+        }
+        /* Native test images use the run-qemu.sh four-vCPU default. */
+        return 4L;
+    case _SC_PHYS_PAGES:
+    case _SC_AVPHYS_PAGES: {
+        os_memory_info_t info;
+        uint64_t pages;
+        if (__libc_query_memory_info(&info) < 0) return -1L;
+        if (info.page_size != LIBC_PAGE_SIZE ||
+            info.free_pages > info.total_pages) {
+            errno = EIO;
+            return -1L;
+        }
+        pages = name == _SC_PHYS_PAGES ? info.total_pages : info.free_pages;
+        if (pages > (uint64_t)LONG_MAX) {
+            errno = EOVERFLOW;
+            return -1L;
+        }
+        return (long)pages;
+    }
     default:
         errno = EINVAL;
         return -1L;

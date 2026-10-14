@@ -8,6 +8,8 @@
 
 static atomic_uintptr_t g_handle_waiting_lock;
 
+static void handle_table_release(handle_table_t *table, bool close_objects);
+
 static void handle_lock(spinlock_t *lock) {
     /*
      * The table lock is also held while a new chunk or backing array is
@@ -17,32 +19,21 @@ static void handle_lock(spinlock_t *lock) {
     sched_preempt_disable();
     atomic_store_explicit(&g_handle_waiting_lock, (uintptr_t)lock,
                           memory_order_release);
-    while (atomic_exchange_explicit(&lock->state, 1U,
-                                     memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(lock);
     atomic_store_explicit(&g_handle_waiting_lock, 0U, memory_order_release);
 }
 
 static void handle_unlock(spinlock_t *lock) {
-    atomic_store_explicit(&lock->state, 0U, memory_order_release);
+    spinlock_unlock(lock);
     sched_preempt_enable();
 }
 
 static void chunk_lock(handle_chunk_t *chunk) {
-    sched_preempt_disable();
-    atomic_store_explicit(&g_handle_waiting_lock, (uintptr_t)&chunk->lock,
-                          memory_order_release);
-    while (atomic_exchange_explicit(&chunk->lock.state, 1U,
-                                     memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
-    atomic_store_explicit(&g_handle_waiting_lock, 0U, memory_order_release);
+    handle_lock(&chunk->lock);
 }
 
 static void chunk_unlock(handle_chunk_t *chunk) {
-    atomic_store_explicit(&chunk->lock.state, 0U, memory_order_release);
-    sched_preempt_enable();
+    handle_unlock(&chunk->lock);
 }
 
 static handle_t make_handle(uint32_t index, uint32_t generation) {
@@ -57,6 +48,11 @@ static uint32_t handle_generation(handle_t handle) {
     return (uint32_t)(handle >> HANDLE_INDEX_BITS);
 }
 
+static uint32_t next_generation(uint32_t generation) {
+    ++generation;
+    return generation == 0U ? 1U : generation;
+}
+
 /* Handle storage does not know concrete object Owners. */
 static void handle_close_object(void *object) {
     if (object == 0) return;
@@ -69,7 +65,7 @@ static void handle_close_object(void *object) {
 static handle_chunk_t *chunk_allocate(void) {
     handle_chunk_t *chunk = (handle_chunk_t *)kzalloc(sizeof(handle_chunk_t), 0);
     if (chunk == 0) return 0;
-    atomic_init(&chunk->lock.state, 0U);
+    spinlock_init(&chunk->lock);
     for (uint32_t i = 0; i < HANDLE_CHUNK_ENTRIES; ++i) {
         chunk->entries[i].generation = 1U;
         chunk->entries[i].next_free = HANDLE_INVALID_INDEX;
@@ -84,10 +80,13 @@ static kstatus_t grow_table_locked(handle_table_t *table) {
     if (new_capacity > HANDLE_MAX_CHUNKS || new_capacity < table->chunk_capacity) {
         new_capacity = HANDLE_MAX_CHUNKS;
     }
-    handle_chunk_t **chunks = (handle_chunk_t **)kzalloc(
+    handle_chunk_t **chunks = (handle_chunk_t **)kmalloc(
         (size_t)new_capacity * sizeof(handle_chunk_t *), 0);
     if (chunks == 0) return K_ENOMEM;
-    for (uint32_t i = 0; i < table->chunk_capacity; ++i) chunks[i] = table->chunks[i];
+    /* Initialize every pointer exactly once before publishing: copy the
+     * used prefix, including holes, and clear only the unused suffix. */
+    for (uint32_t i = 0; i < table->chunk_count; ++i) chunks[i] = table->chunks[i];
+    for (uint32_t i = table->chunk_count; i < new_capacity; ++i) chunks[i] = 0;
     handle_chunk_t **old = table->chunks;
     table->chunks = chunks;
     table->chunk_capacity = new_capacity;
@@ -102,7 +101,7 @@ kstatus_t handle_table_init(handle_table_t *table) {
     table->chunk_capacity = 0;
     table->free_hint = 0;
     table->reserved = 0;
-    atomic_init(&table->grow_lock.state, 0U);
+    spinlock_init(&table->grow_lock);
     handle_lock(&table->grow_lock);
     kstatus_t status = grow_table_locked(table);
     handle_unlock(&table->grow_lock);
@@ -120,7 +119,7 @@ static kstatus_t handle_table_clone_internal(handle_table_t *source,
     destination->chunk_capacity = 0;
     destination->free_hint = 0;
     destination->reserved = 0;
-    atomic_init(&destination->grow_lock.state, 0U);
+    spinlock_init(&destination->grow_lock);
 
     /* Keep indexes and generations identical: user-space descriptor tables
      * contain the original kernel handle values after a COW fork. */
@@ -148,12 +147,16 @@ static kstatus_t handle_table_clone_internal(handle_table_t *source,
     for (uint32_t chunk_index = 0U; chunk_index < chunk_count; ++chunk_index) {
         handle_chunk_t *source_chunk = source->chunks[chunk_index];
         if (source_chunk == 0) continue;
-        handle_chunk_t *destination_chunk = chunk_allocate();
+        /* Every entry is copied below, including free-slot generations.
+         * Only the lock needs initialization; clearing entries first would
+         * write the entire block twice while holding the source table lock. */
+        handle_chunk_t *destination_chunk = (handle_chunk_t *)kmalloc(sizeof(*destination_chunk), 0);
         if (destination_chunk == 0) {
             status = K_ENOMEM;
             break;
         }
         destination->chunks[chunk_index] = destination_chunk;
+        spinlock_init(&destination_chunk->lock);
         chunk_lock(source_chunk);
         for (uint32_t entry_index = 0U;
              entry_index < HANDLE_CHUNK_ENTRIES; ++entry_index) {
@@ -167,6 +170,10 @@ static kstatus_t handle_table_clone_internal(handle_table_t *source,
                 destination_entry->object = 0;
                 destination_entry->rights = 0;
                 destination_entry->flags = 0;
+                destination_entry->generation =
+                    next_generation(destination_entry->generation);
+                uint32_t index = (chunk_index << HANDLE_CHUNK_SHIFT) | entry_index;
+                if (index < destination->free_hint) destination->free_hint = index;
                 continue;
             }
             object_get(source_entry->object);
@@ -176,7 +183,8 @@ static kstatus_t handle_table_clone_internal(handle_table_t *source,
     handle_unlock(&source->grow_lock);
 
     if (status != K_OK) {
-        handle_table_destroy(destination);
+        /* Unpublished clone entries own references, not logical handles. */
+        handle_table_release(destination, false);
         return status;
     }
     return K_OK;
@@ -192,15 +200,24 @@ kstatus_t handle_table_clone_without_type(handle_table_t *source,
     return handle_table_clone_internal(source, destination, true, excluded_type);
 }
 
-kstatus_t handle_create_with_flags(handle_table_t *table, void *object,
+/* A transferred reference is consumed only when the entry is published.
+ * On failure it remains owned by the caller, which releases it unlocked. */
+static kstatus_t handle_create_internal(handle_table_t *table, void *object,
                                    uint32_t rights, uint32_t flags,
-                                   handle_t *out) {
+                                   handle_t *out, bool transfer_reference) {
     if (table == 0 || object == 0 || out == 0 || table->chunks == 0 ||
         (flags & ~HANDLE_FLAG_MASK) != 0U) return K_EINVAL;
     handle_lock(&table->grow_lock);
+    /* Destruction may have detached the array after argument validation
+     * while this creator waited for grow_lock. Never resurrect that table. */
+    if (table->chunks == 0) {
+        handle_unlock(&table->grow_lock);
+        return K_EINVAL;
+    }
     for (;;) {
         uint64_t capacity = (uint64_t)table->chunk_capacity * HANDLE_CHUNK_ENTRIES;
-        for (uint64_t raw_index = table->free_hint; raw_index < capacity; ++raw_index) {
+        for (uint64_t raw_index = table->free_hint; raw_index < capacity;
+             raw_index = (raw_index | (HANDLE_CHUNK_ENTRIES - 1U)) + 1U) {
             uint32_t index = (uint32_t)raw_index;
             uint32_t chunk_index = index >> HANDLE_CHUNK_SHIFT;
             uint32_t entry_index = index & (HANDLE_CHUNK_ENTRIES - 1U);
@@ -215,9 +232,12 @@ kstatus_t handle_create_with_flags(handle_table_t *table, void *object,
                 if (chunk_index + 1U > table->chunk_count) table->chunk_count = chunk_index + 1U;
             }
             chunk_lock(chunk);
-            handle_entry_t *entry = &chunk->entries[entry_index];
-            if (entry->object == 0) {
-                object_get(object);
+            /* The grow lock pins the chunk; scan its occupied suffix under
+             * one acquisition instead of locking once per occupied entry. */
+            for (; entry_index < HANDLE_CHUNK_ENTRIES; ++entry_index, ++index) {
+                handle_entry_t *entry = &chunk->entries[entry_index];
+                if (entry->object != 0) continue;
+                if (!transfer_reference) object_get(object);
                 entry->object = object;
                 entry->rights = rights;
                 entry->flags = flags;
@@ -238,45 +258,67 @@ kstatus_t handle_create_with_flags(handle_table_t *table, void *object,
     }
 }
 
+kstatus_t handle_create_with_flags(handle_table_t *table, void *object,
+                                   uint32_t rights, uint32_t flags,
+                                   handle_t *out) {
+    return handle_create_internal(table, object, rights, flags, out, false);
+}
+
 kstatus_t handle_create(handle_table_t *table, void *object, uint32_t rights,
                         handle_t *out) {
     return handle_create_with_flags(table, object, rights, 0U, out);
 }
 
-/* Take a temporary object reference while reading a source entry. */
-static kstatus_t handle_reference(handle_table_t *table, handle_t handle,
-                                  uint32_t *rights, void **object) {
-    uint32_t index;
-    uint32_t chunk_index;
-    uint32_t entry_index;
-    handle_chunk_t *chunk;
-    handle_entry_t *entry;
-    kstatus_t status = K_OK;
+static void handle_entry_unlock(handle_table_t *table, handle_chunk_t *chunk) {
+    chunk_unlock(chunk);
+    handle_unlock(&table->grow_lock);
+}
 
-    if (table == 0 || rights == 0 || object == 0 || handle == 0) {
-        return K_EINVAL;
-    }
-    index = handle_index(handle);
-    chunk_index = index >> HANDLE_CHUNK_SHIFT;
-    entry_index = index & (HANDLE_CHUNK_ENTRIES - 1U);
+/* Callers validate arguments. Success keeps both locks held; failure keeps
+ * neither lock held. The grow lock pins the returned chunk and entry. */
+static handle_entry_t *handle_entry_lock(handle_table_t *table, handle_t handle,
+                                          handle_chunk_t **out_chunk) {
+    uint32_t index = handle_index(handle);
+    uint32_t chunk_index = index >> HANDLE_CHUNK_SHIFT;
+    /* Neither condition can become valid through concurrent table growth:
+     * generations skip zero and chunk storage has a fixed implementation cap. */
+    if (handle_generation(handle) == 0U || chunk_index >= HANDLE_MAX_CHUNKS)
+        return 0;
     handle_lock(&table->grow_lock);
     if (chunk_index >= table->chunk_capacity ||
         table->chunks[chunk_index] == 0) {
         handle_unlock(&table->grow_lock);
-        return K_ENOENT;
+        return 0;
     }
-    chunk = table->chunks[chunk_index];
+    handle_chunk_t *chunk = table->chunks[chunk_index];
     chunk_lock(chunk);
-    entry = &chunk->entries[entry_index];
-    if (entry->object == 0 || entry->generation != handle_generation(handle) ||
-        !object_try_get(entry->object)) {
+    handle_entry_t *entry = &chunk->entries[index & (HANDLE_CHUNK_ENTRIES - 1U)];
+    if (entry->object == 0 || entry->generation != handle_generation(handle)) {
+        handle_entry_unlock(table, chunk);
+        return 0;
+    }
+    *out_chunk = chunk;
+    return entry;
+}
+
+/* Take a temporary object reference while reading a source entry. */
+static kstatus_t handle_reference(handle_table_t *table, handle_t handle,
+                                  uint32_t required_rights,
+                                  uint32_t *granted_rights, void **object) {
+    if (table == 0 || object == 0 || handle == 0) return K_EINVAL;
+    handle_chunk_t *chunk;
+    handle_entry_t *entry = handle_entry_lock(table, handle, &chunk);
+    if (entry == 0) return K_ENOENT;
+    kstatus_t status = K_OK;
+    if ((entry->rights & required_rights) != required_rights) {
+        status = K_EACCES;
+    } else if (!object_try_get(entry->object)) {
         status = K_ENOENT;
     } else {
-        *rights = entry->rights;
+        if (granted_rights != 0) *granted_rights = entry->rights;
         *object = entry->object;
     }
-    chunk_unlock(chunk);
-    handle_unlock(&table->grow_lock);
+    handle_entry_unlock(table, chunk);
     return status;
 }
 
@@ -287,135 +329,63 @@ kstatus_t handle_duplicate(handle_table_t *table, handle_t source,
     kstatus_t status;
 
     if ((flags & ~HANDLE_FLAG_MASK) != 0U || out == 0) return K_EINVAL;
-    status = handle_reference(table, source, &rights, &object);
+    status = handle_reference(table, source, 0U, &rights, &object);
     if (status != K_OK) return status;
-    status = handle_create_with_flags(table, object, rights, flags, out);
-    object_put(object);
+    status = handle_create_internal(table, object, rights, flags, out, true);
+    if (status != K_OK) object_put(object);
     return status;
 }
 
 kstatus_t handle_lookup(handle_table_t *table, handle_t handle, uint32_t rights,
                         void **out_object) {
-    if (table == 0 || out_object == 0 || handle == 0) return K_EINVAL;
-    uint32_t index = handle_index(handle);
-    uint32_t chunk_index = index >> HANDLE_CHUNK_SHIFT;
-    uint32_t entry_index = index & (HANDLE_CHUNK_ENTRIES - 1U);
-    handle_lock(&table->grow_lock);
-    if (chunk_index >= table->chunk_capacity || table->chunks[chunk_index] == 0) {
-        handle_unlock(&table->grow_lock);
-        return K_ENOENT;
-    }
-    handle_chunk_t *chunk = table->chunks[chunk_index];
-    chunk_lock(chunk);
-    handle_entry_t *entry = &chunk->entries[entry_index];
-    kstatus_t status = K_OK;
-    if (entry->object == 0 || entry->generation != handle_generation(handle)) {
-        status = K_ENOENT;
-    } else if ((entry->rights & rights) != rights) {
-        status = K_EACCES;
-    } else if (!object_try_get(entry->object)) {
-        status = K_ENOENT;
-    } else {
-        *out_object = entry->object;
-    }
-    chunk_unlock(chunk);
-    handle_unlock(&table->grow_lock);
-    return status;
+    return handle_reference(table, handle, rights, 0, out_object);
 }
 
 kstatus_t handle_get_flags(handle_table_t *table, handle_t handle,
                            uint32_t *flags) {
-    uint32_t index;
-    uint32_t chunk_index;
-    uint32_t entry_index;
-    handle_chunk_t *chunk;
-    handle_entry_t *entry;
-    kstatus_t status = K_OK;
-
     if (table == 0 || flags == 0 || handle == 0) return K_EINVAL;
-    index = handle_index(handle);
-    chunk_index = index >> HANDLE_CHUNK_SHIFT;
-    entry_index = index & (HANDLE_CHUNK_ENTRIES - 1U);
-    handle_lock(&table->grow_lock);
-    if (chunk_index >= table->chunk_capacity ||
-        table->chunks[chunk_index] == 0) {
-        handle_unlock(&table->grow_lock);
-        return K_ENOENT;
-    }
-    chunk = table->chunks[chunk_index];
-    chunk_lock(chunk);
-    entry = &chunk->entries[entry_index];
-    if (entry->object == 0 || entry->generation != handle_generation(handle)) {
-        status = K_ENOENT;
-    } else {
-        *flags = entry->flags;
-    }
-    chunk_unlock(chunk);
-    handle_unlock(&table->grow_lock);
-    return status;
+    handle_chunk_t *chunk;
+    handle_entry_t *entry = handle_entry_lock(table, handle, &chunk);
+    if (entry == 0) return K_ENOENT;
+    *flags = entry->flags;
+    handle_entry_unlock(table, chunk);
+    return K_OK;
 }
 
 kstatus_t handle_set_flags(handle_table_t *table, handle_t handle,
                            uint32_t flags) {
-    uint32_t index;
-    uint32_t chunk_index;
-    uint32_t entry_index;
-    handle_chunk_t *chunk;
-    handle_entry_t *entry;
-    kstatus_t status = K_OK;
-
     if (table == 0 || handle == 0 || (flags & ~HANDLE_FLAG_MASK) != 0U) {
         return K_EINVAL;
     }
-    index = handle_index(handle);
-    chunk_index = index >> HANDLE_CHUNK_SHIFT;
-    entry_index = index & (HANDLE_CHUNK_ENTRIES - 1U);
-    handle_lock(&table->grow_lock);
-    if (chunk_index >= table->chunk_capacity ||
-        table->chunks[chunk_index] == 0) {
-        handle_unlock(&table->grow_lock);
-        return K_ENOENT;
-    }
-    chunk = table->chunks[chunk_index];
-    chunk_lock(chunk);
-    entry = &chunk->entries[entry_index];
-    if (entry->object == 0 || entry->generation != handle_generation(handle)) {
-        status = K_ENOENT;
-    } else {
-        entry->flags = flags;
-    }
-    chunk_unlock(chunk);
-    handle_unlock(&table->grow_lock);
-    return status;
+    handle_chunk_t *chunk;
+    handle_entry_t *entry = handle_entry_lock(table, handle, &chunk);
+    if (entry == 0) return K_ENOENT;
+    entry->flags = flags;
+    handle_entry_unlock(table, chunk);
+    return K_OK;
+}
+
+/* Caller holds both table and chunk locks; the returned reference is owned
+ * by the closer, whose callbacks must run after releasing those locks. */
+static void *handle_detach_locked(handle_table_t *table, handle_entry_t *entry,
+                                   uint32_t index) {
+    void *object = entry->object;
+    entry->object = 0;
+    entry->rights = 0;
+    entry->flags = 0;
+    entry->generation = next_generation(entry->generation);
+    if (index < table->free_hint) table->free_hint = index;
+    return object;
 }
 
 kstatus_t handle_close(handle_table_t *table, handle_t handle) {
     if (table == 0 || handle == 0) return K_EINVAL;
     uint32_t index = handle_index(handle);
-    uint32_t chunk_index = index >> HANDLE_CHUNK_SHIFT;
-    uint32_t entry_index = index & (HANDLE_CHUNK_ENTRIES - 1U);
-    handle_lock(&table->grow_lock);
-    if (chunk_index >= table->chunk_capacity || table->chunks[chunk_index] == 0) {
-        handle_unlock(&table->grow_lock);
-        return K_ENOENT;
-    }
-    handle_chunk_t *chunk = table->chunks[chunk_index];
-    chunk_lock(chunk);
-    handle_entry_t *entry = &chunk->entries[entry_index];
-    if (entry->object == 0 || entry->generation != handle_generation(handle)) {
-        chunk_unlock(chunk);
-        handle_unlock(&table->grow_lock);
-        return K_ENOENT;
-    }
-    void *object = entry->object;
-    entry->object = 0;
-    entry->rights = 0;
-    entry->flags = 0;
-    ++entry->generation;
-    if (entry->generation == 0) entry->generation = 1U;
-    if (index < table->free_hint) table->free_hint = index;
-    chunk_unlock(chunk);
-    handle_unlock(&table->grow_lock);
+    handle_chunk_t *chunk;
+    handle_entry_t *entry = handle_entry_lock(table, handle, &chunk);
+    if (entry == 0) return K_ENOENT;
+    void *object = handle_detach_locked(table, entry, index);
+    handle_entry_unlock(table, chunk);
     handle_close_object(object);
     object_put(object);
     return K_OK;
@@ -424,63 +394,83 @@ kstatus_t handle_close(handle_table_t *table, handle_t handle) {
 kstatus_t handle_table_close_on_exec(handle_table_t *table) {
     if (table == 0) return K_EINVAL;
 
-    /* Remove one matching entry at a time so object callbacks run outside the
-     * table locks and a generation change cannot invalidate a later scan. */
+    /* Continue from the detached slot instead of restarting for each handle.
+     * A completed removal pass is followed by a fresh pass: callbacks may
+     * create/mark CLOEXEC entries behind the cursor. No entry/chunk pointer
+     * survives unlocking, and flags are checked at the point of removal. */
+    uint32_t cursor = 0U;
+    bool removed = false;
     for (;;) {
-        handle_t candidate = 0;
+        void *object = 0;
         handle_lock(&table->grow_lock);
-        for (uint32_t chunk_index = 0U;
-             chunk_index < table->chunk_count && candidate == 0;
+        for (uint32_t chunk_index = cursor >> HANDLE_CHUNK_SHIFT;
+             chunk_index < table->chunk_count && object == 0;
              ++chunk_index) {
             handle_chunk_t *chunk = table->chunks[chunk_index];
             if (chunk == 0) continue;
             chunk_lock(chunk);
-            for (uint32_t entry_index = 0U;
+            uint32_t first = chunk_index == (cursor >> HANDLE_CHUNK_SHIFT) ?
+                             cursor & (HANDLE_CHUNK_ENTRIES - 1U) : 0U;
+            for (uint32_t entry_index = first;
                  entry_index < HANDLE_CHUNK_ENTRIES; ++entry_index) {
                 handle_entry_t *entry = &chunk->entries[entry_index];
                 if (entry->object != 0 &&
                     (entry->flags & HANDLE_FLAG_CLOEXEC) != 0U) {
                     uint32_t index = (chunk_index << HANDLE_CHUNK_SHIFT) |
                                      entry_index;
-                    candidate = make_handle(index, entry->generation);
+                    object = handle_detach_locked(table, entry, index);
+                    cursor = index + 1U;
                     break;
                 }
             }
             chunk_unlock(chunk);
         }
         handle_unlock(&table->grow_lock);
-        if (candidate == 0) return K_OK;
-        kstatus_t status = handle_close(table, candidate);
-        if (status != K_OK && status != K_ENOENT) return status;
+        if (object == 0) {
+            if (!removed) return K_OK;
+            cursor = 0U;
+            removed = false;
+            continue;
+        }
+        removed = true;
+        handle_close_object(object);
+        object_put(object);
     }
 }
 
-void handle_table_destroy(handle_table_t *table) {
+static void handle_table_release(handle_table_t *table, bool close_objects) {
     if (table == 0) return;
     handle_lock(&table->grow_lock);
-    for (uint32_t chunk_index = 0; chunk_index < table->chunk_capacity; ++chunk_index) {
-        handle_chunk_t *chunk = table->chunks[chunk_index];
-        if (chunk == 0) continue;
-        chunk_lock(chunk);
-        for (uint32_t i = 0; i < HANDLE_CHUNK_ENTRIES; ++i) {
-            void *object = chunk->entries[i].object;
-            chunk->entries[i].object = 0;
-            if (object != 0) {
-                handle_close_object(object);
-                object_put(object);
-            }
-        }
-        chunk_unlock(chunk);
-        kfree(chunk);
-        table->chunks[chunk_index] = 0;
-    }
+    /* Detach storage in one bounded critical section. All entry users hold
+     * grow_lock, so no chunk pointer can survive this publication. Object
+     * callbacks/destructors may take other locks or reenter this table and
+     * must run with neither the table nor any chunk lock held. */
     handle_chunk_t **chunks = table->chunks;
+    uint32_t chunk_count = table->chunk_count;
     table->chunks = 0;
     table->chunk_count = 0;
     table->chunk_capacity = 0;
     table->free_hint = 0;
     handle_unlock(&table->grow_lock);
+    /* Slots at and above the published high-water mark were never allocated. */
+    for (uint32_t chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        handle_chunk_t *chunk = chunks[chunk_index];
+        if (chunk == 0) continue;
+        for (uint32_t i = 0; i < HANDLE_CHUNK_ENTRIES; ++i) {
+            void *object = chunk->entries[i].object;
+            chunk->entries[i].object = 0;
+            if (object != 0) {
+                if (close_objects) handle_close_object(object);
+                object_put(object);
+            }
+        }
+        kfree(chunk);
+    }
     kfree(chunks);
+}
+
+void handle_table_destroy(handle_table_t *table) {
+    handle_table_release(table, true);
 }
 
 uintptr_t handle_debug_waiting_lock(void) {

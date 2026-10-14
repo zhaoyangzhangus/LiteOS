@@ -25,11 +25,34 @@ static uint64_t scheduler_vruntime_add(uint64_t vruntime,
     return vruntime > UINT64_MAX - delta ? UINT64_MAX : vruntime + delta;
 }
 
+uint64_t scheduler_account_current(run_queue_t *queue, uint64_t now_ns) {
+    if (now_ns < queue->clock_ns) now_ns = queue->clock_ns;
+    queue->clock_ns = now_ns;
+    thread_t *current = queue->current;
+    if (current == 0 || current == queue->idle) return 0U;
+    uint64_t start = current->sched.exec_start_ns;
+    uint64_t delta = start == 0U || now_ns < start ? 0U : now_ns - start;
+    __atomic_store_n(&current->sched.runtime_ns, scheduler_vruntime_add(
+        __atomic_load_n(&current->sched.runtime_ns, __ATOMIC_RELAXED), delta),
+        __ATOMIC_RELAXED);
+    current->sched.exec_start_ns = now_ns;
+    if (current->sched_class == SCHED_CLASS_FAIR) {
+        current->sched.vruntime = scheduler_vruntime_add(
+            current->sched.vruntime,
+            scheduler_fair_vruntime_delta(delta, current->sched.weight));
+        scheduler_update_min_vruntime(queue);
+    } else if (current->sched_class == SCHED_CLASS_RT) {
+        current->sched.slice_runtime_ns = scheduler_vruntime_add(
+            current->sched.slice_runtime_ns, delta);
+    }
+    return delta;
+}
+
 void sched_tick(uint64_t now_ns) {
     uint32_t cpu_id;
     if (!scheduler_current_cpu(&cpu_id)) return;
     scheduler_cpu_t *cpu = &g_cpus[cpu_id];
-    cpu->queue.clock_ns = now_ns;
+    uint64_t delta = scheduler_account_current(&cpu->queue, now_ns);
     thread_t *current = cpu->queue.current;
     if (current == 0) return;
     if (current == cpu->queue.idle) {
@@ -38,19 +61,6 @@ void sched_tick(uint64_t now_ns) {
                                   memory_order_release);
         }
         return;
-    }
-    uint64_t delta = current->sched.exec_start_ns == 0 ?
-                     0 : now_ns - current->sched.exec_start_ns;
-    current->sched.runtime_ns = scheduler_vruntime_add(
-        current->sched.runtime_ns, delta);
-    current->sched.exec_start_ns = now_ns;
-    if (current->sched_class == SCHED_CLASS_FAIR) {
-        current->sched.vruntime = scheduler_vruntime_add(
-            current->sched.vruntime,
-            scheduler_fair_vruntime_delta(delta, current->sched.weight));
-    } else if (current->sched_class == SCHED_CLASS_RT) {
-        current->sched.slice_runtime_ns = scheduler_vruntime_add(
-            current->sched.slice_runtime_ns, delta);
     }
     bool runnable = sched_runnable_count() != 0U;
     bool timeslice_expired =

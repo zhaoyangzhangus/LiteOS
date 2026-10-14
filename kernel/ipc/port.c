@@ -1,15 +1,13 @@
 #include <kernel/message_port.h>
 #include <kernel/mm.h>
+#include <kernel/string.h>
 
 static void message_port_lock(message_port_t *port) {
-    while (atomic_exchange_explicit(&port->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&port->lock);
 }
 
 static void message_port_unlock(message_port_t *port) {
-    atomic_store_explicit(&port->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&port->lock);
 }
 
 static bool message_port_ready(void *context) {
@@ -68,16 +66,20 @@ kstatus_t message_port_create(uint32_t capacity, message_port_t **out) {
     if (out == 0) return K_EINVAL;
     if (capacity == 0U) capacity = OS_PORT_DEFAULT_CAPACITY;
     if (capacity > OS_PORT_MAX_CAPACITY) return K_EINVAL;
-    message_port_t *port = (message_port_t *)kzalloc(sizeof(*port), 0);
+    /* The bounded capacity cannot overflow this size. Empty slots remain
+     * unread; send initializes size and payload before publishing count. */
+    message_port_t *port = (message_port_t *)kmalloc(
+        sizeof(*port) + (size_t)capacity * sizeof(port->messages[0]), 0);
     if (port == 0) return K_ENOMEM;
-    refcount_init(&port->object.refs, 1U);
-    port->object.type = KOBJECT_TYPE_MESSAGE_PORT;
-    port->object.flags = 0;
-    port->object.ops = &g_message_port_ops;
-    atomic_init(&port->lock.state, 0U);
+    object_header_init(&port->object, KOBJECT_TYPE_MESSAGE_PORT,
+                       &g_message_port_ops);
+    spinlock_init(&port->lock);
     wait_queue_init(&port->receive_waitq);
     atomic_init(&port->closed, false);
     port->capacity = capacity;
+    port->head = 0U;
+    port->tail = 0U;
+    port->count = 0U;
     *out = port;
     return K_OK;
 }
@@ -97,8 +99,8 @@ kstatus_t message_port_send(message_port_t *port, const void *data, size_t size)
     }
     message_port_message_t *message = &port->messages[port->tail];
     message->size = (uint32_t)size;
-    for (size_t i = 0; i < size; ++i) message->data[i] = ((const uint8_t *)data)[i];
-    port->tail = (port->tail + 1U) % port->capacity;
+    memmove(message->data, data, size);
+    if (++port->tail == port->capacity) port->tail = 0U;
     ++port->count;
     message_port_unlock(port);
     (void)wake_one(&port->receive_waitq);
@@ -110,9 +112,9 @@ kstatus_t message_port_receive(message_port_t *port, void *data, size_t capacity
                                size_t *size, uint64_t timeout_ns) {
     if (port == 0 || data == 0 || size == 0 || capacity == 0) return K_EINVAL;
     for (;;) {
-        kstatus_t status = wait_on_queue(&port->receive_waitq, message_port_ready,
-                                         port, timeout_ns);
-        if (status != K_OK) return status;
+        /* Consume ready data under one lock; subscribe only when empty.
+         * wait_on_queue rechecks readiness while arming the wait, so a send
+         * between this unlock and subscription is not lost. */
         message_port_lock(port);
         if (port->count != 0U) {
             message_port_message_t *message = &port->messages[port->head];
@@ -120,11 +122,9 @@ kstatus_t message_port_receive(message_port_t *port, void *data, size_t capacity
                 message_port_unlock(port);
                 return K_EINVAL;
             }
-            for (uint32_t i = 0; i < message->size; ++i) {
-                ((uint8_t *)data)[i] = message->data[i];
-            }
+            memmove(data, message->data, message->size);
             *size = message->size;
-            port->head = (port->head + 1U) % port->capacity;
+            if (++port->head == port->capacity) port->head = 0U;
             --port->count;
             message_port_unlock(port);
             return K_OK;
@@ -132,6 +132,10 @@ kstatus_t message_port_receive(message_port_t *port, void *data, size_t capacity
         bool closed = atomic_load_explicit(&port->closed, memory_order_acquire);
         message_port_unlock(port);
         if (closed) return K_ECANCELED;
+        if (timeout_ns == 0U) return K_ETIMEDOUT;
+        kstatus_t status = wait_on_queue(&port->receive_waitq, message_port_ready,
+                                         port, timeout_ns);
+        if (status != K_OK) return status;
     }
 }
 
@@ -139,8 +143,12 @@ kstatus_t message_port_close(message_port_t *port) {
     if (port == 0) return K_EINVAL;
     bool was_closed = atomic_exchange_explicit(&port->closed, true,
                                                memory_order_acq_rel);
-    (void)wake_all(&port->receive_waitq);
-    if (!was_closed) object_notify_signaled(port);
+    /* Closed readiness is permanent. A later waiter rechecks the predicate
+     * while subscribing; repeated closes need not rescan either wait queue. */
+    if (!was_closed) {
+        (void)wake_all(&port->receive_waitq);
+        object_notify_signaled(port);
+    }
     return K_OK;
 }
 
@@ -158,6 +166,13 @@ bool message_port_self_test(void) {
                    message_port_receive(port, received, sizeof(received), &size, 0U) == K_ETIMEDOUT &&
                    message_port_close(port) == K_OK &&
                    message_port_receive(port, received, sizeof(received), &size, 0U) == K_ECANCELED;
+    uint32_t sequence = atomic_load_explicit(&port->receive_waitq.sequence,
+                                              memory_order_acquire);
+    for (uint32_t i = 0U; success && i < 64U; ++i) {
+        success = message_port_close(port) == K_OK &&
+                  atomic_load_explicit(&port->receive_waitq.sequence,
+                                       memory_order_acquire) == sequence;
+    }
     object_put(port);
     return success;
 }

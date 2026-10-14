@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <dirent.h>
 #include <fnmatch.h>

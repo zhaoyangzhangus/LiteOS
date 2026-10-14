@@ -27,7 +27,7 @@ int main(void) {
     map[6].NumberOfPages = 512;
 
     UINTN descriptor_size = sizeof(EFI_MEMORY_DESCRIPTOR);
-    UINTN merged_size = liteos_merge_usable_memory_map(map, sizeof(map), descriptor_size);
+    UINTN merged_size = boot_merge_usable_memory_map(map, sizeof(map), descriptor_size);
     if (merged_size != 3U * descriptor_size) return 1;
     if (map[0].Type != EfiConventionalMemory || map[0].PhysicalStart != 0 ||
         map[0].NumberOfPages != 2560 || map[0].Attribute != 0) return 2;

@@ -1,5 +1,5 @@
-#ifndef LITEOS_USER_FONT_RUNTIME_H
-#define LITEOS_USER_FONT_RUNTIME_H
+#ifndef OS_USER_FONT_RUNTIME_H
+#define OS_USER_FONT_RUNTIME_H
 
 #include <stdint.h>
 #include <stdbool.h>

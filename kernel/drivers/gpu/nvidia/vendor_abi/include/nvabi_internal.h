@@ -1,11 +1,11 @@
 #pragma once
 
 /*
- * NVIDIA 595.84 -> LiteOS ABI boundary.
+ * NVIDIA 595.84 -> System ABI boundary.
  *
  * The declarations below intentionally come from the immutable NVIDIA
  * headers.  This layer is the only place where vendor symbols are translated
- * to LiteOS primitives.  The port itself remains vendor-name free and does
+ * to System primitives.  The port itself remains vendor-name free and does
  * not implement VRAM PMA, GPU VA, GMMU page tables, or GSP RPC.
  */
 
@@ -29,7 +29,7 @@
 #define NVABI_PAGE_MASK (NVABI_PAGE_SIZE - 1ULL)
 
 /* Private descriptor for system-memory allocations returned through the
- * NVIDIA nv_alloc_pages ABI.  It carries only LiteOS CPU/system pages; it is
+ * NVIDIA nv_alloc_pages ABI.  It carries only System CPU/system pages; it is
  * deliberately not a VRAM, GPU-VA, GMMU, or GSP object. */
 typedef struct nvabi_page_allocation {
     uint32_t magic;
@@ -37,9 +37,15 @@ typedef struct nvabi_page_allocation {
     uint32_t cache_type;
     NvBool contiguous;
     nv_port_mem_t memory;
+    page_t **imported_user_pages;
+    void *import_private;
 } nvabi_page_allocation_t;
 
 #define NVABI_PAGE_ALLOCATION_MAGIC 0x4E564D45U
+
+NV_STATUS NV_API_CALL nvabi_get_system_mapping_pages(
+    void *pAllocPrivate, NvU64 pageIndex, NvU64 pageCount,
+    const uint64_t **pages, NvU32 *cache_mode);
 
 static inline NV_STATUS nvabi_status_from_kstatus(kstatus_t status) {
     if (status == K_OK) return NV_OK;
@@ -105,6 +111,20 @@ static inline size_t nvabi_strlen(const char *string) {
     if (string == NULL) return 0U;
     while (string[length] != '\0') ++length;
     return length;
+}
+
+/* Preserve the adapter's historical -1/0/1 result and null-input behavior,
+ * without computing both lengths (and one of them twice) before comparing. */
+static inline int nvabi_string_compare(const char *left, const char *right) {
+    if (left == NULL || right == NULL) return left == right ? 0 : 1;
+    const uint8_t *a = (const uint8_t *)left;
+    const uint8_t *b = (const uint8_t *)right;
+    for (;;) {
+        uint8_t first = *a++;
+        uint8_t second = *b++;
+        if (first != second) return first < second ? -1 : 1;
+        if (first == 0U) return 0;
+    }
 }
 
 static inline void *nvabi_memcpy(void *destination, const void *source,

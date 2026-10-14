@@ -27,7 +27,8 @@ typedef struct completion_port {
     uint32_t head;
     uint32_t tail;
     uint32_t count;
-    os_completion_entry_t entries[COMPLETION_PORT_MAX_CAPACITY];
+    /* Allocated once with exactly capacity slots; unpublished slots are unread. */
+    os_completion_entry_t entries[];
 } completion_port_t;
 
 kstatus_t completion_port_create(uint32_t capacity, completion_port_t **out);

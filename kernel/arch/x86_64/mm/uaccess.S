@@ -98,16 +98,16 @@ x86_put_user_u32_raw:
 
 /* 显式边界符号避免依赖 PE/COFF 链接器自动生成 __start/__stop。 */
 #ifdef __ELF__
-    .section .rdata
+    .section .rdata,"a",@progbits
 #else
     .section .rdata,"dr"
 #endif
     .p2align 3
-    .globl liteos_uaccess_table_start
-liteos_uaccess_table_start:
+    .globl arch_uaccess_table_start
+arch_uaccess_table_start:
     .quad .Lcopy_from_fault, .Lcopy_from_fixup
     .quad .Lcopy_to_fault,   .Lcopy_to_fixup
     .quad .Lget_u32_fault,   .Lget_u32_fixup
     .quad .Lput_u32_fault,   .Lput_u32_fixup
-    .globl liteos_uaccess_table_end
-liteos_uaccess_table_end:
+    .globl arch_uaccess_table_end
+arch_uaccess_table_end:

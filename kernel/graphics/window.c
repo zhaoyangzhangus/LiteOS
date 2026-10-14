@@ -1,11 +1,13 @@
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/cpu.h>
 #include <kernel/console.h>
+#include <kernel/frame_trace.h>
 #include <kernel/kmem.h>
 #include <kernel/perf.h>
 #include <kernel/telemetry.h>
 #include <kernel/vm.h>
 #include "internal.h"
+#include "../process/internal.h"
 
 /* REFACTOR_P7A_WINDOW_OWNER: registry lifetime, removal, and public window API. */
 
@@ -33,10 +35,55 @@ static void window_handle_close(void *object) {
     window_server_handle_closed((window_server_window_t *)object);
 }
 
+static bool window_is_signaled(const void *raw_object) {
+    const window_server_window_t *window =
+        (const window_server_window_t *)raw_object;
+    bool signaled = false;
+    if (window == 0 || !window_server_init()) return false;
+    window_lock();
+    signaled = window->event_count != 0U;
+    signaled = signaled || atomic_load_explicit(&window->registry_removed,
+                                               memory_order_acquire);
+    window_unlock();
+    /* A removed window is a persistent HUP condition for poll/select users.
+     * The fd reference keeps the object alive while the waiter observes it. */
+    return signaled;
+}
+
 static uint64_t window_tsc_to_us(uint64_t elapsed_tsc) {
     if (x86_boot_cpu_features.tsc_hz == 0U) return 0U;
     return x86_tsc_to_ns(elapsed_tsc) / 1000U;
 }
+
+typedef struct window_present_wait_context {
+    window_server_window_t *window;
+    uint64_t sequence;
+} window_present_wait_context_t;
+
+static bool window_present_sequence_ready(void *raw_context) {
+    window_present_wait_context_t *context =
+        (window_present_wait_context_t *)raw_context;
+
+    if (context == 0 || context->window == 0) return false;
+    return atomic_load_explicit(&context->window->registry_removed,
+                                memory_order_acquire) || atomic_load_explicit(
+               &context->window->compositor_presented_sequence,
+               memory_order_acquire) >= context->sequence;
+}
+
+static kstatus_t window_present_wait_result(
+    window_server_window_t *window, kstatus_t status) {
+    if (status == K_OK && atomic_load_explicit(&window->registry_removed,
+                                               memory_order_acquire)) {
+        return K_ECANCELED;
+    }
+    return status;
+}
+
+static kstatus_t window_server_update_internal(
+    process_t *process, uint32_t identifier, int32_t x, int32_t y,
+    uint32_t width, uint32_t height, uint32_t flags,
+    uint64_t *present_sequence);
 
 uint64_t window_surface_page_span(uint32_t width, uint32_t height) {
     uint64_t pixels = (uint64_t)width * height;
@@ -49,11 +96,89 @@ uint64_t window_surface_page_span(uint32_t width, uint32_t height) {
     return (bytes + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
 }
 
+/* Window surfaces are intentionally fully backed before they are published.
+ * A client and the compositor can then touch any pixel, including pixels
+ * exposed by a later resize, without taking a first-touch page fault. */
+static kstatus_t window_surface_allocate(shared_section_t *section,
+                                         uint64_t bytes) {
+    if (section == 0 || section->vm_object == 0 || bytes == 0U ||
+        (bytes & (PAGE_SIZE - 1ULL)) != 0U) {
+        return K_EINVAL;
+    }
+
+    for (uint64_t offset = 0U; offset < bytes; offset += PAGE_SIZE) {
+        uint8_t *direct_page = 0;
+        kstatus_t status = vm_object_shared_page_direct(
+            section->vm_object, offset, true, &direct_page);
+        if (status != K_OK) return status;
+        (void)direct_page;
+    }
+    return K_OK;
+}
+
+/* One allocation owns both slots, so resize never grows either slot lazily.
+ * Failure releases all pages and must not publish a partially backed surface. */
+static kstatus_t window_surface_create_backing(uint64_t span, uint32_t slots,
+                                               shared_section_t **out) {
+    if (out == 0) return K_EINVAL;
+    *out = 0;
+    if (span == 0U || (span & (PAGE_SIZE - 1ULL)) != 0U ||
+        (slots != 1U && slots != 2U) || span > UINT64_MAX / slots)
+        return K_EINVAL;
+    uint64_t bytes = span * slots;
+    shared_section_t *section = 0;
+    kstatus_t status = shared_section_create(bytes, &section);
+    if (status != K_OK) return status;
+    vm_object_mark_window_surface(section->vm_object);
+    status = window_surface_allocate(section, bytes);
+    if (status != K_OK) {
+        object_put(section);
+        return status;
+    }
+    *out = section;
+    return K_OK;
+}
+
+/* Capture pins the exact front slot, not just the allocation's lifetime.
+ * The scene lock serializes slot publication with this reader acquisition. */
+void window_surface_snapshot_capture_locked(compositor_window_view_t *view) {
+    window_server_window_t *window = view->reference;
+    view->surface_offset = 0U;
+    view->surface_slot = 0U;
+    view->surface_lease = false;
+    if (window == 0 || !window->surface_exchange_enabled) return;
+    view->buffer_size = window->surface_span;
+    if (!window_surface_read_begin(&window->surface_exchange,
+                                   &view->surface_slot)) {
+        view->resize_pending = true;
+        return;
+    }
+    view->surface_offset = view->surface_slot * window->surface_span;
+    view->surface_lease = true;
+}
+
+/* Both occlusion pruning and normal frame completion retire leases here.
+ * Keep the reference alive through the unlocked wake to preserve queue life. */
+void window_surface_snapshot_release(compositor_window_view_t *view) {
+    window_server_window_t *window = view->reference;
+    if (window == 0 || !view->surface_lease) return;
+    window_lock();
+    bool released = window_surface_read_end(&window->surface_exchange,
+                                            view->surface_slot);
+    bool writable = released &&
+        window->surface_exchange.readers[view->surface_slot] == 0U &&
+        view->surface_slot != window->surface_exchange.front &&
+        !window->surface_exchange.closed;
+    view->surface_lease = false;
+    window_unlock();
+    if (writable) (void)wake_all(&window->surface_waitq);
+}
+
 const object_ops_t g_window_object_ops = {
     .destroy = window_object_destroy,
     .handle_close = window_handle_close,
     .type_name = "Window",
-    .is_signaled = 0,
+    .is_signaled = window_is_signaled,
     .wait_value = 0,
 };
 
@@ -83,6 +208,7 @@ bool window_registry_append_locked(window_server_window_t *window) {
 
     window->identifier = identifier;
     g_window_server.windows[g_window_server.count++] = window;
+    desktop_chrome_window_opened_locked(window->owner);
     return true;
 }
 
@@ -145,11 +271,11 @@ void window_registry_move_to_front_locked(window_server_window_t *window) {
 
 static bool window_lifecycle_test_fail(uint32_t step, kstatus_t status) {
     uint32_t code = status < 0 ? (uint32_t)(-status) : (uint32_t)status;
-    liteos_serial_write("LITEOS_WINDOW_TEST_FAIL STEP=");
-    liteos_serial_write_u32(step);
-    liteos_serial_write(" STATUS=");
-    liteos_serial_write_u32(code);
-    liteos_serial_write("\r\n");
+    kernel_serial_write("OS_WINDOW_TEST_FAIL STEP=");
+    kernel_serial_write_u32(step);
+    kernel_serial_write(" STATUS=");
+    kernel_serial_write_u32(code);
+    kernel_serial_write("\r\n");
     return false;
 }
 
@@ -162,6 +288,7 @@ bool window_lifecycle_self_test(void) {
     uint64_t first_address = 0U;
     uint64_t second_address = 0U;
     uint64_t initial_pages;
+    uint64_t expected_surface_pages;
     uint64_t resize_pages_before;
     uint64_t resize_pages_after;
     uint32_t initial_count = 0U;
@@ -240,6 +367,13 @@ bool window_lifecycle_self_test(void) {
         success = window_lifecycle_test_fail(4U, K_EIO);
         goto cleanup;
     }
+    expected_surface_pages = second->buffer_size / PAGE_SIZE;
+    if (expected_surface_pages == 0U ||
+        vm_object_populated_pages(second->section->vm_object) !=
+            expected_surface_pages) {
+        success = window_lifecycle_test_fail(4U, K_EIO);
+        goto cleanup;
+    }
     if (window_server_map(second, owner, 0U, &second_address) != K_OK ||
         window_server_set_owner_address(second, second_address) != K_OK ||
         window_server_set(second, 48, 24, 1U) != K_OK) {
@@ -296,19 +430,22 @@ bool window_lifecycle_self_test(void) {
         success = window_lifecycle_test_fail(10U, K_EIO);
         goto cleanup;
     }
-    window_surface_populate_pending();
     resize_pages_after = vm_object_populated_pages(second->section->vm_object);
-    if (resize_pages_after <= resize_pages_before ||
-        window_server_update(owner, second->identifier, 0, 0,
-                             second->width, second->height, 0U) != K_OK) {
-        success = window_lifecycle_test_fail(10U, K_EIO);
+    if (resize_pages_after != resize_pages_before) {
+        success = window_lifecycle_test_fail(10U, K_EBUSY);
+        goto cleanup;
+    }
+    status = window_server_update(owner, second->identifier, 0, 0,
+                                  second->width, second->height, 0U);
+    if (status != K_OK) {
+        success = window_lifecycle_test_fail(10U, status);
         goto cleanup;
     }
     kernel_perf_emit_value("window_test_initial_pages", initial_pages);
     kernel_perf_emit_value("window_test_resize_new_pages",
                            resize_pages_after - resize_pages_before);
-    if (window_server_snapshot(initial_count + 1U, &snapshot) != K_OK ||
-        snapshot.identifier != first->identifier ||
+    status = window_server_snapshot(initial_count + 1U, &snapshot);
+    if (status != K_OK || snapshot.identifier != first->identifier ||
         snapshot.x != 21 || snapshot.y != 17 ||
         snapshot.focused == 0U) {
         success = window_lifecycle_test_fail(10U, K_EIO);
@@ -374,6 +511,12 @@ void remove_window_locked(window_server_window_t *window) {
         return;
     }
 
+    /* Publish before the close paths wake event_waitq. A removed surface
+     * can never acquire a later display fence; cancellation is not an ACK. */
+    atomic_store_explicit(&window->registry_removed, true, memory_order_release);
+    window_surface_exchange_close(&window->surface_exchange);
+    desktop_chrome_window_closed_locked(window->owner);
+
     window_mark_window_locked(window);
 
     if (g_window_server.focused_identifier == window->identifier) {
@@ -381,7 +524,7 @@ void remove_window_locked(window_server_window_t *window) {
         for (uint32_t j = g_window_server.count; j != 0U; --j) {
             window_server_window_t *candidate =
                 g_window_server.windows[j - 1U];
-            if (!candidate->minimized &&
+            if (!candidate->minimized && !candidate->client_show_inactive &&
                 (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
                 window_scene_set_focus_identifier_locked(candidate->identifier);
                 new_focused = candidate;
@@ -421,7 +564,9 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
                                const char *title, window_server_window_t **out) {
     uint64_t pixels;
     uint64_t bytes;
+#if OS_ENABLE_FRAME_TRACE
     uint64_t create_tsc = telemetry_timestamp();
+#endif
     shared_section_t *section = 0;
     window_server_window_t *window;
     window_server_window_t *old_focused;
@@ -429,16 +574,17 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     if (out == 0 || owner == 0 || !window_server_init() || width == 0U ||
         height == 0U || width > UINT32_MAX / height ||
         (flags & ~(OS_WINDOW_VISIBLE | OS_WINDOW_RESIZABLE |
-                   OS_WINDOW_CLIENT_DECORATIONS)) != 0U) {
+                   OS_WINDOW_CLIENT_DECORATIONS |
+                   OS_WINDOW_PREMULTIPLIED_ALPHA |
+                   OS_WINDOW_STANDARD_CAPTION_CONTROLS |
+                   OS_WINDOW_SURFACE_EXCHANGE |
+                   OS_WINDOW_EXPLICIT_MOVE_RESIZE)) != 0U) {
         return K_EINVAL;
     }
 
-    /*
-     * Resizable windows get a stable virtual surface mapping large enough for
-     * any on-screen size.  VM_OBJECT_SHARED is demand-paged, so this reserves
-     * virtual capacity without eagerly allocating a full-screen physical
-     * buffer.
-     */
+    /* Resizable windows get a stable surface large enough for any on-screen
+     * size.  Allocate that complete backing now, before publishing the
+     * window, so later presents and resizes do not fault in new pages. */
     if ((flags & OS_WINDOW_RESIZABLE) != 0U) {
         if (!window_server_kernel_ready()) return K_EIO;
         if (width > g_window_server.display_width ||
@@ -457,17 +603,16 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     bytes = (bytes + PAGE_SIZE - 1U) &
             ~(uint64_t)(PAGE_SIZE - 1U);
 
-    if (shared_section_create(bytes, &section) != K_OK) return K_ENOMEM;
-    vm_object_mark_window_surface(section->vm_object);
+    uint32_t slots = (flags & OS_WINDOW_SURFACE_EXCHANGE) != 0U ? 2U : 1U;
+    kstatus_t allocation_status = window_surface_create_backing(bytes, slots, &section);
+    if (allocation_status != K_OK) return allocation_status;
     window = (window_server_window_t *)kzalloc(sizeof(*window), 0);
     if (window == 0) {
         object_put(section);
         return K_ENOMEM;
     }
-    refcount_init(&window->object.refs, 1U);
-    window->object.type = KOBJECT_TYPE_WINDOW;
-    window->object.flags = 0U;
-    window->object.ops = &g_window_object_ops;
+    object_header_init(&window->object, KOBJECT_TYPE_WINDOW,
+                       &g_window_object_ops);
     window->owner = owner;
     object_get(owner);
     window->section = section;
@@ -475,17 +620,25 @@ kstatus_t window_server_create(process_t *owner, int32_t x, int32_t y,
     window->y = y;
     window->width = width;
     window->height = height;
-    /* Publish only after the caller has mapped and populated the surface. */
+    /* Publish only after the caller has mapped the already-backed surface. */
     window->flags = flags & ~OS_WINDOW_VISIBLE;
     window->background = background;
-    window->buffer_size = bytes;
+    window->buffer_size = bytes * slots;
+    window->surface_span = bytes;
+    window->surface_exchange_enabled = slots == 2U;
+    wait_queue_init(&window->surface_waitq);
     window->owner_address = 0U;
+#if OS_ENABLE_FRAME_TRACE
     window->create_tsc = create_tsc;
     window->surface_fault_count_at_create =
         vm_object_fault_count(section->vm_object);
-    window->surface_populated_bytes = 0U;
+#endif
+    window->surface_populated_bytes = bytes * slots;
     window->surface_populate_pending_end = 0U;
     window->surface_metrics_reported = false;
+    window->present_sequence = 0U;
+    atomic_init(&window->compositor_presented_sequence, 0U);
+    atomic_init(&window->registry_removed, false);
     window->compositor_cache = 0;
     window->compositor_presented_x = x;
     window->compositor_presented_y = y;
@@ -540,6 +693,22 @@ kstatus_t window_server_lookup(uint32_t identifier, window_server_window_t **out
     return K_OK;
 }
 
+kstatus_t window_server_lookup_owner(process_t *owner,
+                                     window_server_window_t **out) {
+    if (owner == 0 || out == 0 || !window_server_init()) return K_EINVAL;
+    window_lock();
+    for (uint32_t index = 0U; index < g_window_server.count; ++index) {
+        window_server_window_t *window = g_window_server.windows[index];
+        if (window != 0 && window->owner == owner && object_try_get(window)) {
+            *out = window;
+            window_unlock();
+            return K_OK;
+        }
+    }
+    window_unlock();
+    return K_ENOENT;
+}
+
 uint32_t window_server_window_identifier(
     const window_server_window_t *window) {
     return window != 0 ? window->identifier : 0U;
@@ -564,12 +733,15 @@ void window_server_handle_closed(window_server_window_t *window) {
     window_unlock();
     window_server_notify_worker();
     (void)wake_all(&window->event_waitq);
+    (void)wake_all(&window->surface_waitq);
+    object_notify_signaled(window);
     if (referenced) object_put(window);
 }
 
 void window_server_close_process(process_t *owner) {
     window_server_window_t *removed[WINDOW_SERVER_MAX_WINDOWS];
     uint32_t removed_count = 0U;
+    bool relaunch_ready;
     if (owner == 0 || !window_server_init()) return;
     window_lock();
     for (uint32_t index = 0U; index < g_window_server.count;) {
@@ -587,9 +759,15 @@ void window_server_close_process(process_t *owner) {
             object_put(window);
         }
     }
+    /* Release only the slot owned by this PID. A late teardown callback from
+     * an older Chrome instance must not clear a newer launch's guard. */
+    relaunch_ready = desktop_chrome_process_released_locked(owner->pid);
     window_unlock();
+    if (relaunch_ready) (void)wake_one(&g_window_server.desktop_launch_waitq);
     for (uint32_t index = 0U; index < removed_count; ++index) {
         (void)wake_all(&removed[index]->event_waitq);
+        (void)wake_all(&removed[index]->surface_waitq);
+        object_notify_signaled(removed[index]);
         object_put(removed[index]);
     }
     if (removed_count != 0U) window_server_notify_worker();
@@ -605,6 +783,505 @@ kstatus_t window_server_set_owner_address(window_server_window_t *window,
     window_mark_window_locked(window);
     window_unlock();
     window_server_notify_worker();
+    return K_OK;
+}
+
+static bool window_server_owner_locked(process_t *owner,
+                                       window_server_window_t *window) {
+    return owner != 0 && window != 0 && window->owner == owner &&
+           window->identifier != 0U &&
+           window_scene_find_locked(window->identifier) == window;
+}
+
+typedef struct window_surface_wait_context {
+    process_t *owner;
+    window_server_window_t *window;
+    os_surface_frame_t frame;
+    kstatus_t status;
+    bool acquired;
+} window_surface_wait_context_t;
+
+static bool window_surface_writer_ready(void *raw) {
+    window_surface_wait_context_t *context = raw;
+    window_server_window_t *window = context->window;
+    if (context->acquired) return true;
+    window_lock();
+    if (atomic_load_explicit(&window->registry_removed, memory_order_acquire)) {
+        context->status = K_ECANCELED;
+    } else if (!window_server_owner_locked(context->owner, window)) {
+        context->status = K_EPERM;
+    } else if (!window->surface_exchange_enabled || !window->owner_address ||
+               window->surface_exchange.serial == UINT64_MAX ||
+               !window->width || !window->height ||
+               window->width > UINT32_MAX / sizeof(uint32_t) ||
+               window->surface_span > UINT64_MAX / 2U ||
+               window->buffer_size != 2U * window->surface_span ||
+               window->owner_address > UINT64_MAX - window->buffer_size ||
+               window->height > window->surface_span /
+                   ((uint64_t)window->width * sizeof(uint32_t))) {
+        context->status = K_EINVAL;
+    } else {
+        uint32_t slot;
+        uint64_t token;
+        if (window_surface_write_begin(&window->surface_exchange, &slot, &token)) {
+            window->surface_writer_width = window->width;
+            window->surface_writer_height = window->height;
+            context->frame = (os_surface_frame_t){
+                .token = token,
+                .address = window->owner_address + slot * window->surface_span,
+                .capacity = window->surface_span,
+                .width = window->width,
+                .height = window->height,
+                .stride = window->width * sizeof(uint32_t),
+            };
+            context->acquired = true;
+        }
+    }
+    bool ready = context->acquired || context->status != K_OK;
+    window_unlock();
+    return ready;
+}
+
+kstatus_t window_server_surface_begin(process_t *owner,
+    window_server_window_t *window, os_surface_frame_t *frame) {
+    if (!owner || !window || !frame) return K_EINVAL;
+    *frame = (os_surface_frame_t){0};
+    window_surface_wait_context_t context = {.owner = owner, .window = window};
+    kstatus_t status = wait_on_queue(&window->surface_waitq,
+        window_surface_writer_ready, &context, 5000000000ULL);
+    if (status == K_OK) status = context.status;
+    window_lock();
+    if (status == K_OK && window->surface_exchange.closed) status = K_ECANCELED;
+    if (status != K_OK && context.acquired) {
+        (void)window_surface_write_end(&window->surface_exchange,
+                                      context.frame.token, false);
+    }
+    if (status == K_OK) *frame = context.frame;
+    window_unlock();
+    if (status != K_OK && context.acquired)
+        (void)wake_all(&window->surface_waitq);
+    return status;
+}
+
+kstatus_t window_server_surface_end(process_t *owner,
+    window_server_window_t *window, const os_surface_frame_t *frame, bool commit) {
+    if (!owner || !window || !frame || !frame->token || frame->reserved)
+        return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if (!window->surface_exchange_enabled || !window->surface_exchange.writing ||
+        frame->token != window->surface_exchange.writer_token) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    kstatus_t status = K_OK;
+    if (commit && (frame->address != window->owner_address +
+            window->surface_exchange.writer_slot * window->surface_span ||
+        frame->capacity != window->surface_span ||
+        frame->width != window->surface_writer_width ||
+        frame->height != window->surface_writer_height ||
+        frame->stride != frame->width * sizeof(uint32_t))) {
+        window_unlock();
+        return K_EINVAL; // Invalid submit retains the lease for explicit cancel.
+    }
+    if (commit && (window->width != frame->width || window->height != frame->height))
+        status = K_EAGAIN; // Resize raced the write; retain the old complete frame.
+    if (commit && window->present_sequence == UINT64_MAX) status = K_EINVAL;
+    bool publish = commit && status == K_OK;
+    (void)window_surface_write_end(&window->surface_exchange, frame->token, publish);
+    bool show = publish && (window->flags & OS_WINDOW_VISIBLE) == 0U;
+    int32_t x = window->x, y = window->y;
+    if (publish) {
+        ++window->present_sequence;
+        window->resize_pending = false;
+        window->dirty = true;
+        window_mark_surface_locked(window, 0, 0, window->width, window->height);
+    }
+    window_unlock();
+    if (!publish) (void)wake_all(&window->surface_waitq);
+    if (publish) window_server_notify_worker();
+    if (show) status = window_server_set(window, x, y, 1U);
+    return status;
+}
+
+kstatus_t window_server_geometry_owned(process_t *owner,
+    window_server_window_t *window, int32_t *x, int32_t *y,
+    uint32_t *width, uint32_t *height, uint32_t *maximized) {
+    if (!owner || !window || !x || !y || !width || !height || !maximized ||
+        !window_server_kernel_ready()) return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    *x = window->x + (int32_t)window_client_offset_x(window->flags);
+    *y = window->y + (int32_t)window_client_offset_y(window->flags);
+    *width = window->width;
+    *height = window->height;
+    *maximized = (window->maximized ? 1U : 0U) | (window->fullscreen ? 2U : 0U);
+    window_unlock();
+    return K_OK;
+}
+
+kstatus_t window_server_set_fullscreen_owned(process_t *owner,
+    window_server_window_t *window, uint32_t fullscreen) {
+    if (!owner || !window || fullscreen > 1U || !window_server_kernel_ready())
+        return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if (window->fullscreen == (fullscreen != 0U)) {
+        window_unlock();
+        return K_OK;
+    }
+    uint32_t width = fullscreen ? g_window_server.display_width :
+        window->fullscreen_restore_width;
+    uint32_t height = fullscreen ? g_window_server.display_height :
+        window->fullscreen_restore_height;
+    if (!width || !height || (uint64_t)width * height >
+        (window->surface_exchange_enabled ? window->surface_span :
+         window->buffer_size) / sizeof(uint32_t)) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    window_mark_window_locked(window);
+    if (g_window_server.title_pressed_identifier == window->identifier)
+        window_clear_title_capture_locked();
+    if (g_window_server.dragging_identifier == window->identifier)
+        window_input_clear_drag_locked();
+    if (fullscreen) {
+        window->fullscreen_restore_x = window->x;
+        window->fullscreen_restore_y = window->y;
+        window->fullscreen_restore_width = window->width;
+        window->fullscreen_restore_height = window->height;
+        window->fullscreen_restore_flags = window->flags;
+        window->x = 0;
+        window->y = 0;
+        window->flags = (window->flags & ~OS_WINDOW_STANDARD_CAPTION_CONTROLS) |
+            OS_WINDOW_CLIENT_DECORATIONS;
+    } else {
+        window->x = window->fullscreen_restore_x;
+        window->y = window->fullscreen_restore_y;
+        window->flags = (window->fullscreen_restore_flags & ~OS_WINDOW_VISIBLE) |
+            (window->flags & OS_WINDOW_VISIBLE);
+    }
+    window->width = width;
+    window->height = height;
+    window->fullscreen = fullscreen != 0U;
+    window->dirty = true;
+    window->resize_pending = true;
+    window_mark_window_locked(window);
+    window_enqueue_resize_event_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_begin_interactive_owned(process_t *owner,
+    window_server_window_t *window, uint32_t edges) {
+    const uint32_t horizontal = WINDOW_RESIZE_LEFT | WINDOW_RESIZE_RIGHT;
+    const uint32_t vertical = WINDOW_RESIZE_TOP | WINDOW_RESIZE_BOTTOM;
+    if (!owner || !window || !window_server_kernel_ready() ||
+        (edges & ~(horizontal | vertical)) != 0U ||
+        (edges & horizontal) == horizontal || (edges & vertical) == vertical)
+        return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if ((window->flags & (OS_WINDOW_VISIBLE | OS_WINDOW_EXPLICIT_MOVE_RESIZE)) !=
+            (OS_WINDOW_VISIBLE | OS_WINDOW_EXPLICIT_MOVE_RESIZE) ||
+        !window->client_button_capture || window->client_hidden ||
+        window->minimized || window->maximized || window->fullscreen ||
+        (edges && !(window->flags & OS_WINDOW_RESIZABLE))) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    if (g_window_server.dragging_identifier != 0U) {
+        window_unlock();
+        return K_EBUSY;
+    }
+    for (uint32_t i = 0; i < g_window_server.count; ++i) {
+        window_server_window_t *other = g_window_server.windows[i];
+        if (other && other != window &&
+            (other->client_pointer_capture || other->client_button_capture)) {
+            window_unlock();
+            return K_EBUSY;
+        }
+    }
+    window_clear_title_capture_locked();
+    window->client_button_capture = false;
+    window->client_pointer_capture = false;
+    window_input_begin_drag_locked(window->identifier,
+        edges ? 0 : (int32_t)g_window_server.pointer_x - window->x,
+        edges ? 0 : (int32_t)g_window_server.pointer_y - window->y, edges);
+    window_mark_moved_cursor_locked(g_window_server.pointer_x,
+        g_window_server.pointer_y, g_window_server.pointer_x, g_window_server.pointer_y);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_set_decorations_owned(process_t *owner,
+    window_server_window_t *window, uint32_t server_frame) {
+    if (!owner || !window || server_frame > 1U || !window_server_kernel_ready())
+        return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    uint32_t old_flags = window->flags;
+    if (window->fullscreen) { window_unlock(); return K_EINVAL; }
+    uint32_t flags = old_flags & ~(OS_WINDOW_CLIENT_DECORATIONS |
+                                   OS_WINDOW_STANDARD_CAPTION_CONTROLS);
+    flags |= server_frame ? OS_WINDOW_STANDARD_CAPTION_CONTROLS : OS_WINDOW_CLIENT_DECORATIONS;
+    if (flags == old_flags) { window_unlock(); return K_OK; }
+    uint32_t outer_width = window_outer_width(window->width, old_flags);
+    uint32_t outer_height = window_outer_height(window->height, old_flags);
+    uint32_t extra_x = window_frame_extra(flags);
+    uint32_t extra_y = extra_x + window_titlebar_height(flags);
+    uint32_t restore_width = window->restore_width;
+    uint32_t restore_height = window->restore_height;
+    if (outer_width <= extra_x || outer_height <= extra_y ||
+        (server_frame && (outer_width - extra_x < WINDOW_MIN_WIDTH ||
+                          outer_height - extra_y < WINDOW_MIN_HEIGHT)) ||
+        (uint64_t)(outer_width - extra_x) * (outer_height - extra_y) >
+            (window->surface_exchange_enabled ? window->surface_span :
+             window->buffer_size) / sizeof(uint32_t)) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    if (window->maximized) {
+        uint32_t rw = window_outer_width(restore_width, old_flags);
+        uint32_t rh = window_outer_height(restore_height, old_flags);
+        if (rw <= extra_x || rh <= extra_y ||
+            (server_frame && (rw - extra_x < WINDOW_MIN_WIDTH ||
+                              rh - extra_y < WINDOW_MIN_HEIGHT))) {
+            window_unlock();
+            return K_EINVAL;
+        }
+        restore_width = rw - extra_x;
+        restore_height = rh - extra_y;
+    }
+    window_mark_window_locked(window);
+    if (g_window_server.title_pressed_identifier == window->identifier)
+        window_clear_title_capture_locked();
+    if (g_window_server.dragging_identifier == window->identifier)
+        window_input_clear_drag_locked();
+    window->flags = flags;
+    window->width = outer_width - extra_x;
+    window->height = outer_height - extra_y;
+    window->restore_width = restore_width;
+    window->restore_height = restore_height;
+    window->dirty = true;
+    window->resize_pending = true;
+    window_mark_window_locked(window);
+    window_enqueue_resize_event_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_present(process_t *owner,
+                                window_server_window_t *window,
+                                uint64_t address, uint64_t length,
+                                uint32_t stride, int32_t damage_x,
+                                int32_t damage_y, uint32_t damage_width,
+                                uint32_t damage_height) {
+    uint64_t row_bytes;
+    uint64_t required_bytes;
+    uint64_t end_address;
+    uint32_t identifier;
+    uint32_t surface_width;
+    uint32_t surface_height;
+    int32_t x;
+    int32_t y;
+    bool show;
+#if OS_ENABLE_FRAME_TRACE
+    bool report_geometry;
+#endif
+    uint64_t present_sequence;
+    kstatus_t status;
+
+    if (owner == 0 || window == 0 || address == 0U || length == 0U ||
+        stride == 0U || damage_x < 0 || damage_y < 0 ||
+        damage_width == 0U || damage_height == 0U ||
+        address > UINT64_MAX - length) return K_EINVAL;
+
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    surface_width = window->width;
+    surface_height = window->height;
+    if (window->surface_exchange_enabled) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    if (surface_width == 0U || surface_height == 0U ||
+        surface_width > UINT32_MAX / sizeof(uint32_t) ||
+        (uint64_t)(uint32_t)damage_x + damage_width > surface_width ||
+        (uint64_t)(uint32_t)damage_y + damage_height > surface_height) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    row_bytes = (uint64_t)surface_width * sizeof(uint32_t);
+    if ((uint64_t)stride < row_bytes ||
+        (uint64_t)stride > UINT64_MAX / surface_height) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    required_bytes = (uint64_t)stride * surface_height;
+    end_address = window->owner_address > UINT64_MAX - window->buffer_size ?
+                  UINT64_MAX : window->owner_address + window->buffer_size;
+    if (address != window->owner_address || window->owner_address == 0U ||
+        length > window->buffer_size || required_bytes > window->buffer_size ||
+        required_bytes > length ||
+        end_address < address || address + length > end_address) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    identifier = window->identifier;
+    x = window->x;
+    y = window->y;
+    show = (window->flags & OS_WINDOW_VISIBLE) == 0U;
+#if OS_ENABLE_FRAME_TRACE
+    report_geometry = !window->compositor_presented_valid;
+#endif
+    window_unlock();
+
+    status = window_server_update_internal(
+        owner, identifier, damage_x, damage_y, damage_width, damage_height,
+        0U, &present_sequence);
+    if (status == K_OK && show) status = window_server_set(window, x, y, 1U);
+    if (status != K_OK) return status;
+
+#if OS_ENABLE_FRAME_TRACE
+    if (report_geometry) {
+        kernel_serial_printf_serial_only(
+            "OS_WINDOW_PRESENT_GEOMETRY x=%d y=%d width=%u height=%u stride=%u display=%ux%u\r\n",
+            (int)x, (int)y, surface_width, surface_height, stride,
+            g_window_server.display_width, g_window_server.display_height);
+    }
+#endif
+
+    window_present_wait_context_t wait_context = {
+        .window = window,
+        .sequence = present_sequence,
+    };
+    status = wait_on_queue(&window->event_waitq,
+                         window_present_sequence_ready,
+                         &wait_context,
+                         5000000000ULL);
+    return window_present_wait_result(window, status);
+}
+
+kstatus_t window_server_move(process_t *owner,
+                             window_server_window_t *window,
+                             int32_t x, int32_t y) {
+    uint32_t width;
+    uint32_t height;
+    uint32_t flags;
+    if (owner == 0 || window == 0 || x < 0 || y < 0 ||
+        !window_server_kernel_ready()) return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    width = window->width;
+    height = window->height;
+    flags = window->flags;
+    if (window->fullscreen && (x != window->x || y != window->y)) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    if ((uint64_t)(uint32_t)x + window_outer_width(width, flags) >
+            g_window_server.display_width ||
+        (uint64_t)(uint32_t)y + window_outer_height(height, flags) >
+            g_window_server.display_height) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    window_unlock();
+    return window_server_set(window, x, y,
+                             (flags & OS_WINDOW_VISIBLE) != 0U ? 1U : 0U);
+}
+
+kstatus_t window_server_resize(process_t *owner,
+                               window_server_window_t *window,
+                               uint32_t width, uint32_t height) {
+    uint32_t old_width;
+    uint32_t old_height;
+    uint32_t flags;
+    if (owner == 0 || window == 0 || width == 0U || height == 0U ||
+        !window_server_kernel_ready()) return K_EINVAL;
+
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    flags = window->flags;
+    /* Client decorations also cover Chromium's small popups/tooltips.
+     * Native drag minima protect server decorations, not these surfaces. */
+    if ((window->fullscreen && (width != window->width || height != window->height)) ||
+        ((flags & OS_WINDOW_CLIENT_DECORATIONS) == 0U &&
+         (width < WINDOW_MIN_WIDTH || height < WINDOW_MIN_HEIGHT)) ||
+        (flags & OS_WINDOW_RESIZABLE) == 0U ||
+        width > g_window_server.display_width ||
+        height > g_window_server.display_height ||
+        (uint64_t)(uint32_t)window->x + window_outer_width(width, flags) >
+            g_window_server.display_width ||
+        (uint64_t)(uint32_t)window->y + window_outer_height(height, flags) >
+            g_window_server.display_height) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    old_width = window->width;
+    old_height = window->height;
+    if (old_width == width && old_height == height) {
+        window_unlock();
+        return K_OK;
+    }
+    window_mark_rect_locked(window->x, window->y,
+                            window_outer_width(old_width, flags),
+                            window_outer_height(old_height, flags));
+    window->width = width;
+    window->height = height;
+    window->dirty = true;
+    window->resize_pending = true;
+    window_mark_window_locked(window);
+    window_enqueue_resize_event_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_close_owned(process_t *owner,
+                                    window_server_window_t *window) {
+    if (owner == 0 || window == 0 || !window_server_init()) return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    object_get(window);
+    remove_window_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    (void)wake_all(&window->event_waitq);
+    (void)wake_all(&window->surface_waitq);
+    object_notify_signaled(window);
+    object_put(window);
     return K_OK;
 }
 
@@ -632,13 +1309,38 @@ kstatus_t window_server_snapshot(uint32_t index, window_server_snapshot_t *out) 
     return K_OK;
 }
 
-kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y,
-                            uint32_t visible) {
+static kstatus_t window_server_set_internal(process_t *owner,
+    window_server_window_t *window, int32_t x, int32_t y,
+    uint32_t visible, bool move, bool client_visibility) {
     window_server_window_t *old_focused;
     int32_t old_x;
     int32_t old_y;
-    if (window == 0 || (visible & ~1U) != 0U) return K_EINVAL;
+    bool defer_first_surface = false;
+    if (window == 0 || (visible & ~(client_visibility ? 3U : 1U)) != 0U ||
+        visible == WINDOW_SERVER_SHOW_INACTIVE) return K_EINVAL;
     window_lock();
+    if (owner != 0 && !window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if (!move) { x = window->x; y = window->y; }
+    if (client_visibility) {
+        window->client_show_inactive =
+            (visible & WINDOW_SERVER_SHOW_INACTIVE) != 0U;
+        visible &= 1U;
+        window->client_hidden = visible == 0U;
+        /* Do not expose an uninitialized first surface. */
+        defer_first_surface = visible != 0U && window->present_sequence == 0U;
+        if (defer_first_surface) visible = 0U;
+    } else if (visible != 0U && window->client_hidden) {
+        window_unlock();
+        return K_OK;
+    }
+    /* Every hide path relinquishes both kinds of pointer capture. */
+    if (visible == 0U && !defer_first_surface) {
+        window->client_pointer_capture = false;
+        window->client_button_capture = false;
+    }
     old_x = window->x;
     old_y = window->y;
     old_focused = window_scene_find_locked(g_window_server.focused_identifier);
@@ -650,7 +1352,8 @@ kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y
     window->y = y;
     if (visible != 0U) {
         window->flags |= OS_WINDOW_VISIBLE;
-        window_scene_set_focus_identifier_locked(window->identifier);
+        if (!window->client_show_inactive)
+            window_scene_set_focus_identifier_locked(window->identifier);
     } else {
         window->flags &= ~OS_WINDOW_VISIBLE;
     }
@@ -658,7 +1361,8 @@ kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y
         window_scene_set_focus_identifier_locked(0U);
         for (uint32_t i = g_window_server.count; i != 0U; --i) {
             window_server_window_t *candidate = g_window_server.windows[i - 1U];
-            if ((candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
+            if (!candidate->client_show_inactive &&
+                (candidate->flags & OS_WINDOW_VISIBLE) != 0U) {
                 window_scene_set_focus_identifier_locked(candidate->identifier);
                 break;
             }
@@ -666,6 +1370,89 @@ kstatus_t window_server_set(window_server_window_t *window, int32_t x, int32_t y
     }
     window_mark_window_locked(old_focused);
     window_mark_window_locked(window);
+    window_unlock();
+    window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_set(window_server_window_t *window, int32_t x,
+                            int32_t y, uint32_t visible) {
+    return window_server_set_internal(0, window, x, y, visible, true, false);
+}
+
+kstatus_t window_server_set_visibility_owned(process_t *owner,
+    window_server_window_t *window, uint32_t visible) {
+    if (owner == 0) return K_EINVAL;
+    return window_server_set_internal(owner, window, 0, 0, visible, false, true);
+}
+
+kstatus_t window_server_capture_owned(process_t *owner,
+    window_server_window_t *window, uint32_t capture) {
+    if (owner == 0 || window == 0 || capture > 1U ||
+        !window_server_kernel_ready()) return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if (capture != 0U) {
+        /* A shown popup reserves capture before its first frame. Keeping an
+         * uninitialized surface off screen must not reject its input capture. */
+        if (window->client_hidden || window->minimized ||
+            ((window->flags & OS_WINDOW_VISIBLE) == 0U &&
+             window->present_sequence != 0U)) {
+            window_unlock();
+            return K_EINVAL;
+        }
+        for (uint32_t i = 0; i < g_window_server.count; ++i) {
+            window_server_window_t *other = g_window_server.windows[i];
+            if (other != 0 && other != window &&
+                (other->client_pointer_capture ||
+                 (other->client_button_capture && other->owner != owner))) {
+                window_unlock();
+                return K_EBUSY;
+            }
+        }
+        /* A menu opens during its parent's button press. Its explicit grab
+         * supersedes that same-process implicit grab, but never steals an
+         * explicit grab or any other process's input. Validate every conflict
+         * before changing state so a later conflict cannot leave a half-grab. */
+        for (uint32_t i = 0; i < g_window_server.count; ++i) {
+            window_server_window_t *other = g_window_server.windows[i];
+            if (other != 0 && other != window && other->owner == owner)
+                other->client_button_capture = false;
+        }
+    }
+    window->client_pointer_capture = capture != 0U;
+    window_unlock();
+    return K_OK;
+}
+
+kstatus_t window_server_set_minimized_owned(process_t *owner,
+    window_server_window_t *window, uint32_t minimized) {
+    if (owner == 0 || window == 0 || minimized > 1U ||
+        !window_server_kernel_ready()) return K_EINVAL;
+    window_lock();
+    if (!window_server_owner_locked(owner, window)) {
+        window_unlock();
+        return K_EPERM;
+    }
+    if (minimized != 0U && (window->flags & OS_WINDOW_VISIBLE) == 0U) {
+        window_unlock();
+        return K_EINVAL;
+    }
+    if (window->minimized != (minimized != 0U)) {
+        if (minimized != 0U) {
+            (void)window_minimize_locked(window);
+        } else {
+            window->minimized = false;
+            window->dirty = true;
+            window_mark_window_locked(window);
+            if ((window->flags & OS_WINDOW_VISIBLE) != 0U)
+                window_scene_focus_locked(window);
+            window_enqueue_minimized_event_locked(window);
+        }
+    }
     window_unlock();
     window_server_notify_worker();
     return K_OK;
@@ -686,106 +1473,59 @@ kstatus_t window_server_focus(uint32_t identifier) {
     return K_OK;
 }
 
-kstatus_t window_server_map(window_server_window_t *window, process_t *process,
+kstatus_t window_server_map_space(window_server_window_t *window, vm_space_t *space,
                             uint64_t requested_address, uint64_t *mapped_address) {
     vm_object_t *object;
     vaddr_t address;
     kstatus_t status;
-    uint64_t populate_start;
-    uint64_t populate_length;
+#if OS_ENABLE_FRAME_TRACE
     uint64_t populate_tsc;
-    if (window == 0 || process == 0 || mapped_address == 0 ||
-        window->section == 0 || process->vm == 0) return K_EINVAL;
+#endif
+    if (window == 0 || space == 0 || mapped_address == 0 ||
+        window->section == 0) return K_EINVAL;
     object = window->section->vm_object;
-    if (object == 0) return K_EIO;
+    if (object == 0) {
+        return K_EIO;
+    }
     vm_object_get(object);
     address = (vaddr_t)requested_address;
-    status = vm_map_object(process->vm, object, &address, 0U,
+    status = vm_map_object(space, object, &address, 0U,
                            (size_t)window->buffer_size,
                            VM_PROT_USER | VM_PROT_READ | VM_PROT_WRITE,
                            VM_MAP_SHARED);
     vm_object_put(object);
-    if (status != K_OK) return status;
-
-    populate_start = window_surface_page_span(window->width, window->height);
-    if (populate_start == 0U || populate_start > window->buffer_size) {
-        (void)vm_unmap(process->vm, address, (size_t)window->buffer_size);
-        return K_EINVAL;
-    }
-    populate_tsc = telemetry_timestamp();
-    status = vm_populate_range(process->vm, address,
-                               (size_t)populate_start);
     if (status != K_OK) {
-        (void)vm_unmap(process->vm, address, (size_t)window->buffer_size);
         return status;
     }
-    populate_length = populate_start;
-    window_lock();
-    if (populate_length > window->surface_populated_bytes) {
-        window->surface_populated_bytes = populate_length;
+
+#if OS_ENABLE_FRAME_TRACE
+    populate_tsc = telemetry_timestamp();
+#endif
+    status = vm_populate_range(space, address,
+                               (size_t)window->buffer_size);
+    if (status != K_OK) {
+        (void)vm_unmap(space, address, (size_t)window->buffer_size);
+        return status;
     }
-    window_unlock();
-    kernel_perf_emit_scope("window.surface_populate", populate_tsc);
-    kernel_perf_emit_value(
+#if OS_ENABLE_FRAME_TRACE
+    kernel_frame_trace_emit_scope("window.surface_populate", populate_tsc);
+    kernel_frame_trace_emit_value(
         "surface_populate_us",
         window_tsc_to_us(telemetry_timestamp() - populate_tsc));
+#endif
     *mapped_address = (uint64_t)address;
     return K_OK;
 }
 
-void window_surface_populate_pending(void) {
-    typedef struct window_surface_request {
-        window_server_window_t *window;
-        uint64_t address;
-        uint64_t start;
-        uint64_t end;
-    } window_surface_request_t;
-    window_surface_request_t requests[WINDOW_SERVER_MAX_WINDOWS];
-    uint32_t request_count = 0U;
-
-    window_lock();
-    for (uint32_t index = 0U;
-         index < g_window_server.count &&
-             request_count < WINDOW_SERVER_MAX_WINDOWS;
-         ++index) {
-        window_server_window_t *window = g_window_server.windows[index];
-        if (window == 0 || window->owner_address == 0U ||
-            window->surface_populate_pending_end <=
-                window->surface_populated_bytes) {
-            continue;
-        }
-        object_get(window);
-        requests[request_count++] = (window_surface_request_t){
-            .window = window,
-            .address = window->owner_address,
-            .start = window->surface_populated_bytes,
-            .end = window->surface_populate_pending_end,
-        };
-    }
-    window_unlock();
-
-    for (uint32_t index = 0U; index < request_count; ++index) {
-        window_surface_request_t *request = &requests[index];
-        uint64_t start_tsc = telemetry_timestamp();
-        process_t *owner = request->window->owner;
-        kstatus_t status = owner == 0 || owner->vm == 0 ? K_EINVAL :
-            vm_populate_range(owner->vm,
-                              (vaddr_t)(request->address + request->start),
-                              (size_t)(request->end - request->start));
-        if (status == K_OK) {
-            window_lock();
-            if (request->end > request->window->surface_populated_bytes) {
-                request->window->surface_populated_bytes = request->end;
-            }
-            if (request->window->surface_populate_pending_end <=
-                    request->window->surface_populated_bytes) {
-                request->window->surface_populate_pending_end = 0U;
-            }
-            window_unlock();
-            kernel_perf_emit_scope("window.resize_populate", start_tsc);
-        }
-        object_put(request->window);
-    }
+kstatus_t window_server_map(window_server_window_t *window, process_t *process,
+                            uint64_t requested_address, uint64_t *mapped_address) {
+    if (window == 0 || process == 0 || mapped_address == 0 ||
+        window->section == 0) return K_EINVAL;
+    vm_space_t *space = process_vm_reference(process);
+    kstatus_t status = window_server_map_space(window, space, requested_address,
+                                               mapped_address);
+    vm_space_put(space);
+    return status;
 }
 
 kstatus_t window_server_dispatch(uint32_t identifier, const os_input_event_t *event) {
@@ -797,16 +1537,7 @@ kstatus_t window_server_dispatch(uint32_t identifier, const os_input_event_t *ev
         window_unlock();
         return K_ENOENT;
     }
-    if (window->event_count >= WINDOW_EVENT_CAPACITY) {
-        window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
-        --window->event_count;
-    }
-    window->events[window->event_write].identifier = identifier;
-    window->events[window->event_write].type = OS_WINDOW_EVENT_INPUT;
-    window->events[window->event_write].input = *event;
-    window->event_write = (window->event_write + 1U) % WINDOW_EVENT_CAPACITY;
-    ++window->event_count;
-    window_event_schedule_wake_locked(window);
+    window_enqueue_client_input_locked(window, event);
     window_unlock();
 
     if (window_flush_event_wakes()) {
@@ -821,22 +1552,40 @@ typedef struct window_event_wait_context {
     process_t *process;
     uint32_t identifier;
     os_window_event_t *event;
+    window_server_window_t *window;
+    bool cancelled;
 } window_event_wait_context_t;
+
+static bool window_event_pop_locked(window_server_window_t *window,
+                                    os_window_event_t *event) {
+    if (window->event_count == 0U) return false;
+    *event = window->events[window->event_read];
+    window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
+    --window->event_count;
+    return true;
+}
 
 static bool window_event_available(void *raw_context) {
     window_event_wait_context_t *context =
         (window_event_wait_context_t *)raw_context;
     bool available = false;
     window_lock();
+    if (context->window != 0) {
+        /* The blocking read owns this reference. Close wakes the embedded
+         * queue after publishing registry_removed, even with no input left. */
+        context->cancelled = atomic_load_explicit(
+            &context->window->registry_removed, memory_order_acquire);
+        available = context->cancelled ||
+                    window_event_pop_locked(context->window, context->event);
+        window_unlock();
+        return available;
+    }
     for (uint32_t i = 0U; i < g_window_server.count; ++i) {
         window_server_window_t *window = g_window_server.windows[i];
         if (window->owner != context->process ||
             (context->identifier != 0U && window->identifier != context->identifier) ||
             window->event_count == 0U) continue;
-        *context->event = window->events[window->event_read];
-        window->event_read = (window->event_read + 1U) % WINDOW_EVENT_CAPACITY;
-        --window->event_count;
-        available = true;
+        available = window_event_pop_locked(window, context->event);
         break;
     }
     window_unlock();
@@ -853,6 +1602,8 @@ kstatus_t window_server_event_read(process_t *process, uint32_t identifier,
     context.process = process;
     context.identifier = identifier;
     context.event = event;
+    context.window = 0;
+    context.cancelled = false;
     if (window_event_available(&context)) return K_OK;
     if (timeout_ns == 0U) return K_EAGAIN;
     if (identifier != 0U) {
@@ -864,17 +1615,21 @@ kstatus_t window_server_event_read(process_t *process, uint32_t identifier,
             return K_EPERM;
         }
         wait_queue = &wait_window->event_waitq;
+        context.window = wait_window;
     }
     status = wait_on_queue(wait_queue, window_event_available,
                            &context, timeout_ns);
     if (wait_window != 0) window_server_put(wait_window);
+    if (status == K_OK && context.cancelled) return K_ECANCELED;
     return status;
 }
 
-kstatus_t window_server_update(process_t *process, uint32_t identifier,
-                               int32_t x, int32_t y, uint32_t width,
-                               uint32_t height, uint32_t flags) {
+static kstatus_t window_server_update_internal(
+    process_t *process, uint32_t identifier, int32_t x, int32_t y,
+    uint32_t width, uint32_t height, uint32_t flags,
+    uint64_t *present_sequence) {
     window_server_window_t *window;
+#if OS_ENABLE_FRAME_TRACE
     bool report_surface = false;
     uint64_t first_present_tsc = 0U;
     uint64_t first_present_faults = 0U;
@@ -883,7 +1638,11 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
     uint64_t fault_around_pages = 0U;
     uint64_t create_tsc = 0U;
     uint64_t create_begin_faults = 0U;
-    if (process == 0 || identifier == 0U || flags != 0U ||
+#endif
+    uint32_t caption = (flags & OS_WINDOW_CAPTION_HEIGHT_MASK) >> 16U;
+    if (process == 0 || identifier == 0U ||
+        (flags & ~OS_WINDOW_CAPTION_HEIGHT_MASK) != 0U ||
+        (flags != 0U && (caption < 40U || caption > 128U)) ||
         (width == 0U) != (height == 0U)) return K_EINVAL;
     if (!window_server_kernel_ready()) return K_EIO;
     window_lock();
@@ -893,6 +1652,19 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
         return K_EPERM;
     }
 
+    if (flags != 0U) {
+        if (!window_standard_caption(window->flags) || caption > window->height) {
+            window_unlock();
+            return K_EINVAL;
+        }
+        uint32_t next_flags = (window->flags & ~OS_WINDOW_CAPTION_HEIGHT_MASK) | flags;
+        if (next_flags != window->flags) {
+            window->flags = next_flags;
+            window_mark_window_locked(window);
+        }
+    }
+
+#if OS_ENABLE_FRAME_TRACE
     if (width != 0U && !window->surface_metrics_reported &&
         window->section != 0 && window->section->vm_object != 0) {
         window->surface_metrics_reported = true;
@@ -909,6 +1681,7 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
         fault_around_pages = vm_object_fault_around_pages(
             window->section->vm_object);
     }
+#endif
 
     /*
      * A resizable client acknowledges the current row stride by submitting a
@@ -926,39 +1699,87 @@ kstatus_t window_server_update(process_t *process, uint32_t identifier,
     } else {
         window_mark_surface_locked(window, x, y, width, height);
     }
+    /* Publish the fence and its damage in one registry transaction. A
+     * snapshot for unrelated cursor/window damage must never acknowledge
+     * this sequence before the submitted surface damage becomes visible. */
+    if (present_sequence != 0) {
+        if (window->present_sequence == UINT64_MAX) {
+            window->present_sequence = 1U;
+        } else {
+            ++window->present_sequence;
+        }
+        *present_sequence = window->present_sequence;
+    }
     window_unlock();
+#if OS_ENABLE_FRAME_TRACE
     if (report_surface) {
-        kernel_perf_emit_value(
+        kernel_frame_trace_emit_value(
             "window_create_begin_fault_count",
             create_begin_faults);
-        kernel_perf_emit_value(
+        kernel_frame_trace_emit_value(
             "window_first_present_fault_count", first_present_faults);
-        kernel_perf_emit_value(
+        kernel_frame_trace_emit_value(
             "window_surface_faults",
             first_present_faults - create_begin_faults);
-        kernel_perf_emit_value("window_pages_allocated", populated_pages);
-        kernel_perf_emit_value("window_pages_prefaulted", prefaulted_pages);
-        kernel_perf_emit_value("window_pages_fault_around", fault_around_pages);
-        kernel_perf_emit_value("fault_count",
+        kernel_frame_trace_emit_value("window_pages_allocated", populated_pages);
+        kernel_frame_trace_emit_value("window_pages_prefaulted", prefaulted_pages);
+        kernel_frame_trace_emit_value("window_pages_fault_around", fault_around_pages);
+        kernel_frame_trace_emit_value("fault_count",
                                first_present_faults - create_begin_faults);
-        kernel_perf_emit_value("shared_fault_count",
+        kernel_frame_trace_emit_value("shared_fault_count",
                                first_present_faults - create_begin_faults);
-        kernel_perf_emit_value("pages_allocated", populated_pages);
-        kernel_perf_emit_value("pages_prefaulted", prefaulted_pages);
-        kernel_perf_emit_value("pages_fault_around", fault_around_pages);
-        kernel_perf_emit_value(
+        kernel_frame_trace_emit_value("pages_allocated", populated_pages);
+        kernel_frame_trace_emit_value("pages_prefaulted", prefaulted_pages);
+        kernel_frame_trace_emit_value("pages_fault_around", fault_around_pages);
+        kernel_frame_trace_emit_value(
             "window_first_present_latency_tsc",
             first_present_tsc >= create_tsc ?
                 first_present_tsc - create_tsc : 0U);
-        kernel_perf_emit_value(
+        kernel_frame_trace_emit_value(
             "first_present_us",
             first_present_tsc >= create_tsc ?
                 window_tsc_to_us(first_present_tsc - create_tsc) : 0U);
         vm_fault_telemetry_report();
     }
+#endif
     /* A client update is independent of input.  Wake the compositor even
      * when the input queue is empty; otherwise the worker can sleep until the
      * next mouse report and every redraw appears one event late. */
     window_server_notify_worker();
     return K_OK;
+}
+
+kstatus_t window_server_title_owned(process_t *owner, uint32_t identifier,
+                                     const char title[32]) {
+    if (owner == 0 || identifier == 0U || title == 0) return K_EINVAL;
+    size_t length = 0U;
+    while (length < 32U && title[length] != '\0') ++length;
+    if (length == 32U) return K_EINVAL;
+    if (!window_server_kernel_ready()) return K_EIO;
+    window_lock();
+    window_server_window_t *window = window_scene_find_locked(identifier);
+    if (window == 0 || window->owner != owner) {
+        window_unlock();
+        return K_EPERM;
+    }
+    bool changed = false;
+    for (size_t index = 0U; index < sizeof(window->title); ++index) {
+        char character = index < length ? title[index] : '\0';
+        changed |= window->title[index] != character;
+        window->title[index] = character;
+    }
+    if (changed) window_mark_rect_locked(window->x, window->y,
+        window_outer_width(window->width, window->flags),
+        window_client_decorations(window->flags) ? os_window_caption_height(window->flags) :
+        window_client_offset_y(window->flags));
+    window_unlock();
+    if (changed) window_server_notify_worker();
+    return K_OK;
+}
+
+kstatus_t window_server_update(process_t *process, uint32_t identifier,
+                               int32_t x, int32_t y, uint32_t width,
+                               uint32_t height, uint32_t flags) {
+    return window_server_update_internal(process, identifier, x, y,
+                                         width, height, flags, 0);
 }

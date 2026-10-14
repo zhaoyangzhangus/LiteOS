@@ -1,10 +1,16 @@
 #include <arch/x86_64/cpu.h>
+#include <kernel/console.h>
 #include <kernel/net_core.h>
 #include <kernel/object.h>
 #include <kernel/socket.h>
 #include <kernel/wait.h>
 
 #include "socket_model.h"
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_debug_udp_inject_logs;
+static uint32_t g_debug_tcp_proxy_rx_logs;
+#endif
 
 /* REFACTOR_P8_SOCKET_PROTOCOL_OWNER: packet injection and TCP state transitions. */
 
@@ -24,7 +30,17 @@ kstatus_t socket_inject_udp(uint32_t source_address, uint16_t source_port,
         if (!object_try_get(target)) target = 0;
     }
     socket_unlock(socket_binding_lock());
-    if (target == 0) return K_ENOENT;
+    if (target == 0) {
+#if OS_DEBUG_SERIAL
+        if (g_debug_udp_inject_logs < 128U) {
+            kernel_serial_printf_serial_only(
+                "OS_UDP_INJECT dst=%x:%u status=%d\r\n",
+                destination_address, destination_port, K_ENOENT);
+            ++g_debug_udp_inject_logs;
+        }
+#endif
+        return K_ENOENT;
+    }
     private = socket_private(target);
     if (private == 0) {
         object_put(target);
@@ -56,6 +72,14 @@ kstatus_t socket_inject_udp(uint32_t source_address, uint16_t source_port,
     socket_unlock(&target->lock);
     (void)wake_all(&target->waitq);
     object_notify_signaled(target);
+#if OS_DEBUG_SERIAL
+    if (g_debug_udp_inject_logs < 128U) {
+        kernel_serial_printf_serial_only(
+            "OS_UDP_INJECT dst=%x:%u status=%d count=%u\r\n",
+            destination_address, destination_port, K_OK, count + 1U);
+        ++g_debug_udp_inject_logs;
+    }
+#endif
     object_put(target);
     return K_OK;
 }
@@ -138,7 +162,19 @@ kstatus_t socket_inject_tcp_ipv4_reply(uint32_t source_address, uint16_t source_
         if (!object_try_get(target)) target = 0;
     }
     socket_unlock(socket_binding_lock());
-    if (target == 0) return K_ENOENT;
+    if (target == 0) {
+#if OS_DEBUG_SERIAL
+        if (source_port == 7890U && g_debug_tcp_proxy_rx_logs < 128U) {
+            kernel_serial_printf_serial_only(
+                "OS_TCP_PROXY_RX unmatched src=%x:%u dst=%x:%u "
+                "seq=%u flags=%x len=%u\r\n",
+                source_address, source_port, destination_address,
+                destination_port, sequence, flags, (unsigned)length);
+            ++g_debug_tcp_proxy_rx_logs;
+        }
+#endif
+        return K_ENOENT;
+    }
     private = socket_private(target);
     if (private == 0) {
         object_put(target);
@@ -157,7 +193,7 @@ kstatus_t socket_inject_tcp_ipv4_reply(uint32_t source_address, uint16_t source_
     if (reply != 0) {
         reply->valid = true;
         reply->flags = NET_TCP_FLAG_ACK;
-        reply->sequence = private->tcp_next_sequence;
+        reply->sequence = private->tcp_send_next_sequence;
         reply->acknowledgement = expected;
         reply->window = (uint16_t)(SOCKET_STREAM_BUFFER_SIZE - count);
     }
@@ -167,6 +203,17 @@ kstatus_t socket_inject_tcp_ipv4_reply(uint32_t source_address, uint16_t source_
         return K_EDEVREMOVED;
     }
     if (sequence != expected) {
+#if OS_DEBUG_SERIAL
+        if (source_port == 7890U && g_debug_tcp_proxy_rx_logs < 128U) {
+            kernel_serial_printf_serial_only(
+                "OS_TCP_PROXY_RX sequence src=%x:%u dst=%x:%u "
+                "seq=%u expected=%u flags=%x len=%u buffered=%u\r\n",
+                source_address, source_port, destination_address,
+                destination_port, sequence, expected, flags,
+                (unsigned)length, count);
+            ++g_debug_tcp_proxy_rx_logs;
+        }
+#endif
         /* 瑜版挸澧?RX 缁愭褰涢崣顏呭复閸欐ぞ绗呮稉鈧稉顏囩箾缂侇厼绨崣鍑ょ幢闁插秴顦?娑斿崬绨崠鍛暠娑撳﹤鐪伴柌宥勭炊閺堝搫鍩楁径鍕倞閵?*/
         socket_unlock(&target->lock);
         object_put(target);
@@ -179,10 +226,7 @@ kstatus_t socket_inject_tcp_ipv4_reply(uint32_t source_address, uint16_t source_
         return K_EAGAIN;
     }
     if (!discard_receive) {
-        for (size_t index = 0U; index < length; ++index) {
-            private->stream_buffer[private->stream_write] = ((const uint8_t *)buffer)[index];
-            private->stream_write = (private->stream_write + 1U) % SOCKET_STREAM_BUFFER_SIZE;
-        }
+        private->stream_write = socket_stream_write_locked(private, buffer, length);
         atomic_store_explicit(&private->stream_count,
                               count + (uint32_t)length,
                               memory_order_release);
@@ -198,10 +242,24 @@ kstatus_t socket_inject_tcp_ipv4_reply(uint32_t source_address, uint16_t source_
         reply->window = discard_receive ? SOCKET_STREAM_BUFFER_SIZE :
             (uint16_t)(SOCKET_STREAM_BUFFER_SIZE - count - length);
     }
+#if OS_DEBUG_SERIAL
+    if (source_port == 7890U && g_debug_tcp_proxy_rx_logs < 128U) {
+        kernel_serial_printf_serial_only(
+            "OS_TCP_PROXY_RX accepted src=%x:%u dst=%x:%u "
+            "seq=%u flags=%x len=%u buffered=%u->%u\r\n",
+            source_address, source_port, destination_address,
+            destination_port, sequence, flags, (unsigned)length, count,
+            discard_receive ? count : count + (uint32_t)length);
+        ++g_debug_tcp_proxy_rx_logs;
+    }
+#endif
     notify = (!discard_receive && length != 0U) ||
              (flags & NET_TCP_FLAG_FIN) != 0U;
     socket_unlock(&target->lock);
-    if (notify) (void)wake_all(&target->waitq);
+    if (notify) {
+        (void)wake_all(&target->waitq);
+        object_notify_changed(target);
+    }
     object_put(target);
     return K_OK;
 }
@@ -252,7 +310,7 @@ kstatus_t socket_inject_tcp_ipv6_reply(const uint8_t source_address[16],
     if (reply != 0) {
         reply->valid = true;
         reply->flags = NET_TCP_FLAG_ACK;
-        reply->sequence = private->tcp_next_sequence;
+        reply->sequence = private->tcp_send_next_sequence;
         reply->acknowledgement = expected;
         reply->window = (uint16_t)(SOCKET_STREAM_BUFFER_SIZE - count);
     }
@@ -273,10 +331,7 @@ kstatus_t socket_inject_tcp_ipv6_reply(const uint8_t source_address[16],
         return K_EAGAIN;
     }
     if (!discard_receive) {
-        for (size_t index = 0U; index < length; ++index) {
-            private->stream_buffer[private->stream_write] = ((const uint8_t *)buffer)[index];
-            private->stream_write = (private->stream_write + 1U) % SOCKET_STREAM_BUFFER_SIZE;
-        }
+        private->stream_write = socket_stream_write_locked(private, buffer, length);
         atomic_store_explicit(&private->stream_count,
                               count + (uint32_t)length,
                               memory_order_release);
@@ -295,7 +350,10 @@ kstatus_t socket_inject_tcp_ipv6_reply(const uint8_t source_address[16],
     notify = (!discard_receive && length != 0U) ||
              (flags & NET_TCP_FLAG_FIN) != 0U;
     socket_unlock(&target->lock);
-    if (notify) (void)wake_all(&target->waitq);
+    if (notify) {
+        (void)wake_all(&target->waitq);
+        object_notify_signaled(target);
+    }
     object_put(target);
     return K_OK;
 }
@@ -378,6 +436,12 @@ kstatus_t socket_inject_tcp_syn_ipv4(uint32_t source_address, uint16_t source_po
         return K_ENOMEM;
     }
     child_private = socket_private(child);
+    socket_lock(&listener->lock);
+    child_private->tcp_keepalive = listener_private->tcp_keepalive;
+    child_private->tcp_keepidle = listener_private->tcp_keepidle;
+    child_private->tcp_keepintvl = listener_private->tcp_keepintvl;
+    child_private->tcp_keepcnt = listener_private->tcp_keepcnt;
+    socket_unlock(&listener->lock);
     child_private->bound = true;
     child_private->connected = true;
     child_private->local_address = destination_address;
@@ -415,6 +479,7 @@ kstatus_t socket_inject_tcp_syn_ipv4(uint32_t source_address, uint16_t source_po
     atomic_fetch_add_explicit(&listener_private->accept_count, 1U, memory_order_release);
     socket_unlock(&listener->lock);
     (void)wake_all(&listener->waitq);
+    object_notify_signaled(listener);
     object_put(listener);
 
     socket_lock(socket_binding_lock());
@@ -503,6 +568,12 @@ kstatus_t socket_inject_tcp_syn_ipv6(const uint8_t source_address[16],
         return K_ENOMEM;
     }
     child_private = socket_private(child);
+    socket_lock(&listener->lock);
+    child_private->tcp_keepalive = listener_private->tcp_keepalive;
+    child_private->tcp_keepidle = listener_private->tcp_keepidle;
+    child_private->tcp_keepintvl = listener_private->tcp_keepintvl;
+    child_private->tcp_keepcnt = listener_private->tcp_keepcnt;
+    socket_unlock(&listener->lock);
     child_private->bound = true;
     child_private->connected = true;
     socket_copy(child_private->local_address6, destination_address, 16U);
@@ -540,6 +611,7 @@ kstatus_t socket_inject_tcp_syn_ipv6(const uint8_t source_address[16],
     atomic_fetch_add_explicit(&listener_private->accept_count, 1U, memory_order_release);
     socket_unlock(&listener->lock);
     (void)wake_all(&listener->waitq);
+    object_notify_signaled(listener);
     object_put(listener);
 
     socket_lock(socket_binding_lock());
@@ -597,7 +669,10 @@ kstatus_t socket_inject_tcp_ack_ipv4_reply(uint32_t source_address,
         return K_EIO;
     }
     socket_lock(&target->lock);
-    if (window != UINT16_MAX) private->tcp_peer_window = window;
+    if (window != UINT16_MAX) {
+        if (private->tcp_peer_window == 0U && window != 0U) notify = true;
+        private->tcp_peer_window = window;
+    }
     if (private->tcp_state == SOCKET_TCP_SYN_RECEIVED &&
         acknowledgement == private->tcp_initial_sequence + 1U &&
         sequence == private->tcp_peer_initial_sequence + 1U) {
@@ -612,9 +687,11 @@ kstatus_t socket_inject_tcp_ack_ipv4_reply(uint32_t source_address,
         if (window == UINT16_MAX) private->tcp_peer_window = SOCKET_STREAM_BUFFER_SIZE;
         socket_t *listener = private->listener;
         private->listener = 0;
+        socket_tcp_keepalive_activity_locked(private, x86_read_tsc());
         socket_unlock(&target->lock);
         if (listener != 0) {
             (void)wake_all(&listener->waitq);
+            object_notify_signaled(listener);
             object_put(listener);
         }
         object_put(target);
@@ -641,14 +718,18 @@ kstatus_t socket_inject_tcp_ack_ipv4_reply(uint32_t source_address,
             reply->window = (uint16_t)(SOCKET_STREAM_BUFFER_SIZE -
                 atomic_load_explicit(&private->stream_count, memory_order_relaxed));
         }
+        socket_tcp_keepalive_activity_locked(private, x86_read_tsc());
         socket_unlock(&target->lock);
         (void)wake_all(&target->waitq);
+        object_notify_changed(target);
         object_put(target);
         return K_OK;
     }
+    /* One outstanding send: only SND.NXT confirms it completely. Equality
+     * rejects future ACKs and remains valid when sequence numbers wrap. */
     if (private->tcp_state == SOCKET_TCP_ESTABLISHED &&
         private->tcp_send_pending &&
-        acknowledgement >= private->tcp_send_next_sequence) {
+        acknowledgement == private->tcp_send_next_sequence) {
         private->tcp_send_pending = false;
         private->tcp_send_length = 0U;
         private->tcp_send_flags = 0U;
@@ -658,8 +739,15 @@ kstatus_t socket_inject_tcp_ack_ipv4_reply(uint32_t source_address,
         notify = true;
     }
     bool established = private->tcp_state == SOCKET_TCP_ESTABLISHED;
+    if (established && sequence == private->tcp_next_sequence &&
+        acknowledgement == private->tcp_send_next_sequence) {
+        socket_tcp_keepalive_activity_locked(private, x86_read_tsc());
+    }
     socket_unlock(&target->lock);
-    if (notify) (void)wake_all(&target->waitq);
+    if (notify) {
+        (void)wake_all(&target->waitq);
+        object_notify_changed(target);
+    }
     object_put(target);
     return established ? K_OK : K_EAGAIN;
 }
@@ -696,7 +784,10 @@ kstatus_t socket_inject_tcp_ack_ipv6_reply(const uint8_t source_address[16],
         return K_EIO;
     }
     socket_lock(&target->lock);
-    if (window != UINT16_MAX) private->tcp_peer_window = window;
+    if (window != UINT16_MAX) {
+        if (private->tcp_peer_window == 0U && window != 0U) notify = true;
+        private->tcp_peer_window = window;
+    }
     if (private->tcp_state == SOCKET_TCP_SYN_RECEIVED &&
         acknowledgement == private->tcp_initial_sequence + 1U &&
         sequence == private->tcp_peer_initial_sequence + 1U) {
@@ -711,9 +802,11 @@ kstatus_t socket_inject_tcp_ack_ipv6_reply(const uint8_t source_address[16],
         if (window == UINT16_MAX) private->tcp_peer_window = SOCKET_STREAM_BUFFER_SIZE;
         socket_t *listener = private->listener;
         private->listener = 0;
+        socket_tcp_keepalive_activity_locked(private, x86_read_tsc());
         socket_unlock(&target->lock);
         if (listener != 0) {
             (void)wake_all(&listener->waitq);
+            object_notify_signaled(listener);
             object_put(listener);
         }
         object_put(target);
@@ -740,14 +833,17 @@ kstatus_t socket_inject_tcp_ack_ipv6_reply(const uint8_t source_address[16],
             reply->window = (uint16_t)(SOCKET_STREAM_BUFFER_SIZE -
                 atomic_load_explicit(&private->stream_count, memory_order_relaxed));
         }
+        socket_tcp_keepalive_activity_locked(private, x86_read_tsc());
         socket_unlock(&target->lock);
         (void)wake_all(&target->waitq);
+        object_notify_changed(target);
         object_put(target);
         return K_OK;
     }
+    /* Match the sole outstanding send, including sequence-number wrap. */
     if (private->tcp_state == SOCKET_TCP_ESTABLISHED &&
         private->tcp_send_pending &&
-        acknowledgement >= private->tcp_send_next_sequence) {
+        acknowledgement == private->tcp_send_next_sequence) {
         private->tcp_send_pending = false;
         private->tcp_send_length = 0U;
         private->tcp_send_flags = 0U;
@@ -757,8 +853,15 @@ kstatus_t socket_inject_tcp_ack_ipv6_reply(const uint8_t source_address[16],
         notify = true;
     }
     bool established = private->tcp_state == SOCKET_TCP_ESTABLISHED;
+    if (established && sequence == private->tcp_next_sequence &&
+        acknowledgement == private->tcp_send_next_sequence) {
+        socket_tcp_keepalive_activity_locked(private, x86_read_tsc());
+    }
     socket_unlock(&target->lock);
-    if (notify) (void)wake_all(&target->waitq);
+    if (notify) {
+        (void)wake_all(&target->waitq);
+        object_notify_changed(target);
+    }
     object_put(target);
     return established ? K_OK : K_EAGAIN;
 }

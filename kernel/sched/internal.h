@@ -24,11 +24,19 @@
 #define SCHED_CMD_CLASS_SHIFT 8U
 #define SCHED_CMD_REMOVE_ACK   1U
 #define SCHED_CMD_STATE_ACK    2U
+#define SCHED_CMD_STATE_CHANGED (1U << 2)
 #define SCHED_CMD_REMOVE_NO_REF (1U << 31)
 #define SCHED_NICE_0_WEIGHT 1024U
 #define SCHED_RT_TIMESLICE_NS 4000000ULL
 #define SCHED_LIKELY(value) __builtin_expect(!!(value), 1)
 #define SCHED_UNLIKELY(value) __builtin_expect(!!(value), 0)
+
+void scheduler_update_min_vruntime(run_queue_t *queue);
+uint64_t scheduler_account_current(run_queue_t *queue, uint64_t now_ns);
+void scheduler_trace_reschedule_interrupt(uint32_t cpu_id);
+void scheduler_trace_reschedule_request(uint32_t cpu_id, bool send);
+void scheduler_trace_reschedule_send(uint32_t cpu_id, uint64_t started,
+                                      bool accepted, uint32_t attempts);
 
 _Static_assert((SCHED_CMD_SLOTS & (SCHED_CMD_SLOTS - 1U)) == 0U,
                "scheduler command ring size must be a power of two");
@@ -88,6 +96,7 @@ typedef struct scheduler_cpu {
 
     /* Published by producers when any incoming command becomes visible. */
     atomic_bool command_pending;
+    thread_t * _Atomic remote_wake_head;
     /* Timer and local wake paths publish a local reschedule request. */
     atomic_bool need_resched;
     /*
@@ -124,6 +133,19 @@ typedef struct scheduler_cpu {
 
 extern scheduler_cpu_t g_cpus[MAX_CPUS];
 extern uint32_t g_cpu_count;
+
+static inline bool scheduler_affinity_mask_allows(const cpumask_t *mask,
+                                                 uint32_t cpu_id) {
+    return mask != 0 && cpu_id < MAX_CPUS &&
+           (mask->bits[cpu_id >> 6] &
+            (1ULL << (cpu_id & 63U))) != 0;
+}
+
+static inline bool scheduler_affinity_allows(const thread_t *thread,
+                                            uint32_t cpu_id) {
+    return scheduler_affinity_mask_allows(thread != 0 ? &thread->affinity : 0,
+                                         cpu_id);
+}
 
 static inline uint64_t scheduler_make_queue_snapshot(
     const scheduler_cpu_t *cpu) {
@@ -168,6 +190,9 @@ uint64_t scheduler_lock(spinlock_t *lock);
 void scheduler_unlock(spinlock_t *lock, uint64_t flags);
 bool scheduler_cpu_available(uint32_t cpu_id);
 uint32_t scheduler_choose_cpu(thread_t *thread, uint32_t current_cpu);
+bool scheduler_select_cpu_mask(const cpumask_t *mask, uint32_t current_cpu,
+                               uint32_t *selected_cpu);
+uint32_t scheduler_choose_start_cpu(thread_t *thread, uint32_t current_cpu);
 
 void initialize_thread(thread_t *thread, uint64_t tid, uint8_t class_id,
                        uint8_t priority);

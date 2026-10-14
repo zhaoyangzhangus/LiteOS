@@ -64,6 +64,13 @@ typedef struct socket_private {
     bool tcp_fin_sent;
     uint8_t tcp_send_flags;
     uint8_t tcp_send_payload[SOCKET_MAX_PAYLOAD];
+    bool tcp_keepalive;
+    uint32_t tcp_keepidle;
+    uint32_t tcp_keepintvl;
+    uint32_t tcp_keepcnt;
+    uint32_t tcp_keep_probes;
+    uint64_t tcp_keep_deadline_tsc;
+    atomic_bool tcp_keep_failed;
     socket_t *peer;
     socket_t *listener;
 
@@ -136,6 +143,12 @@ socket_private_t *socket_private(socket_t *socket);
 const socket_private_t *socket_private_const(const socket_t *socket);
 void socket_zero(void *memory, size_t length);
 void socket_copy(void *destination, const void *source, size_t length);
+/* Caller holds the socket lock, bounds length by available data/space, and
+ * provides an external buffer that does not alias private stream storage. */
+uint32_t socket_stream_write_locked(socket_private_t *private,
+                                    const void *buffer, size_t length);
+uint32_t socket_stream_read_locked(const socket_private_t *private,
+                                   void *buffer, size_t length);
 bool socket_address6_equal(const uint8_t left[16], const uint8_t right[16]);
 bool socket_address6_zero(const uint8_t address[16]);
 void socket_lock(spinlock_t *lock);
@@ -144,6 +157,10 @@ void socket_initialize_globals(void);
 void socket_udp4_output_get(socket_udp_ipv4_output_fn *output, void **context);
 void socket_udp6_output_get(socket_udp_ipv6_output_fn *output, void **context);
 uint64_t socket_tcp_retransmit_deadline(uint64_t now_tsc);
+void socket_tcp_keepalive_activity_locked(socket_private_t *private,
+                                          uint64_t now_tsc);
+bool socket_tcp_keepalive_poll_locked(socket_private_t *private,
+                                      uint64_t now_tsc, bool *failed);
 bool socket_register_tcp_locked(socket_t *socket, socket_private_t *private);
 bool socket_tcp_slots_available_locked(uint32_t required);
 bool socket_tcp6_slots_available_locked(uint32_t required);

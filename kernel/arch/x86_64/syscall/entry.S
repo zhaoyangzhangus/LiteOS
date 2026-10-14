@@ -1,8 +1,8 @@
     .text
     .p2align 4
-    .globl liteos_syscall_entry
+    .globl syscall_entry
     .globl x86_return_to_user
-    .extern liteos_syscall_dispatch
+    .extern syscall_dispatch
     .extern x86_syscall_return_mode
     .extern x86_validate_user_frame
     .extern x86_syscall_bad_frame
@@ -42,7 +42,7 @@
  * 原始 x86_64 ABI：RAX 为编号，RDI/RSI/RDX/R10/R8/R9 为六个参数。
  * SYSCALL 不会切换 RSP，所以先借助 swapgs 取得当前线程的内核栈。
  */
-liteos_syscall_entry:
+syscall_entry:
     swapgs
     movq %rsp, %gs:0
     movq %gs:8, %rsp
@@ -106,7 +106,7 @@ liteos_syscall_entry:
     movl $1, %gs:80
     sti
     movq %rsp, %rdi
-    call liteos_syscall_dispatch
+    call syscall_dispatch
     cli
     movq %rax, FRAME_RAX(%rsp)
     movl %gs:48, %eax

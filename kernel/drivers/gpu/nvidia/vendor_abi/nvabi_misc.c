@@ -14,13 +14,13 @@ NvBool os_cc_tdx_enabled = NV_FALSE;
 NvBool os_dma_buf_enabled = NV_FALSE;
 NvBool os_imex_channel_is_supported = NV_FALSE;
 
-/* The capability filesystem is not part of the Phase 3 LiteOS surface.  A
+/* The capability filesystem is not part of the Phase 3 System surface.  A
  * null root is intentional: the capability entry points fail closed until a
  * later phase supplies their owning subsystem. */
 nv_cap_t *nvidia_caps_root = NULL;
 
 void NV_API_CALL out_string(const char *string) {
-    liteos_serial_write(string == NULL ? "<null>" : string);
+    kernel_serial_write(string == NULL ? "<null>" : string);
 }
 
 int NV_API_CALL nv_printf(NvU32 debuglevel, const char *format, ...) {
@@ -35,6 +35,6 @@ int NV_API_CALL nv_printf(NvU32 debuglevel, const char *format, ...) {
     va_start(arguments, format);
     result = os_vsnprintf(buffer, sizeof(buffer), format, arguments);
     va_end(arguments);
-    if (result >= 0) liteos_serial_write(buffer);
+    if (result >= 0) kernel_serial_write(buffer);
     return result;
 }

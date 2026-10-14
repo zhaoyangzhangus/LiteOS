@@ -70,12 +70,17 @@ typedef struct page_section {
 
 page_t *page_alloc(uint8_t order, page_alloc_flags_t flags);
 void page_free(page_t *head);
+kstatus_t page_memory_get_stats(uint64_t *total_pages, uint64_t *free_pages);
 page_t *phys_to_page(paddr_t pa);
 paddr_t page_to_phys(const page_t *page);
 void *phys_to_direct(paddr_t pa);
 paddr_t direct_to_phys(const void *va);
 
 void *kmalloc(size_t size, uint32_t flags);
+/* Best-effort interrupt-safe small allocation from existing global slabs.
+ * Never initializes, waits for a lock, touches CPU magazines or allocates pages.
+ * NULL also means cache contention/exhaustion. Release in thread context. */
+void *kmalloc_try_cached(size_t size, uint32_t flags);
 void *kzalloc(size_t size, uint32_t flags);
 void kfree(void *ptr);
 void *vmalloc(size_t size);

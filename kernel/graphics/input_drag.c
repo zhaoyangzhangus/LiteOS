@@ -111,9 +111,59 @@ bool window_drag_reuse_safe_locked(
 #endif
 }
 
+void window_drag_move_locked(window_server_window_t *window,
+                             int32_t new_x, int32_t new_y) {
+    if (window == 0 || (window->x == new_x && window->y == new_y)) return;
+
+    uint32_t width = window_outer_width(window->width, window->flags);
+    uint32_t height = window_outer_height(window->height, window->flags);
+    int32_t old_x = window->x;
+    int32_t old_y = window->y;
+    bool reuse = window_drag_reuse_safe_locked(
+        window, window->compositor_presented_x, window->compositor_presented_y,
+        new_x, new_y, width, height);
+    if (reuse) {
+        old_x = window->compositor_presented_x;
+        old_y = window->compositor_presented_y;
+    }
+    window_input_record_drag_frame_locked(reuse, old_x, old_y,
+                                          new_x, new_y, width, height);
+    window->x = new_x;
+    window->y = new_y;
+    window_enqueue_moved_event_locked(window);
+    window_mark_moved_rect_locked(old_x, old_y, new_x, new_y,
+                                  width, height, !reuse);
+    if (reuse) {
+        window_mark_drag_corner_repair_locked(new_x, new_y,
+                                              width, height, window->flags);
+    }
+    window->dirty = true;
+}
+
 uint32_t window_resize_edges_locked(const window_server_window_t *window,
                                     uint32_t x, uint32_t y) {
     return window_input_resize_edges_locked(window, x, y);
+}
+
+static void window_resize_axis(int64_t *start, int64_t *end,
+                               int32_t delta, bool move_start, bool move_end,
+                               int64_t minimum_size, int64_t maximum_size) {
+    int64_t value, minimum, maximum;
+    if (move_start) {
+        value = *start + delta;
+        minimum = *end - maximum_size;
+        maximum = *end - minimum_size;
+    } else if (move_end) {
+        value = *end + delta;
+        minimum = *start + minimum_size;
+        maximum = *start + maximum_size;
+    } else {
+        return;
+    }
+    if (value < minimum) value = minimum;
+    if (value > maximum) value = maximum;
+    if (move_start) *start = value;
+    else *end = value;
 }
 
 bool window_resize_locked(window_server_window_t *window,
@@ -130,8 +180,8 @@ bool window_resize_locked(window_server_window_t *window,
     int64_t top;
     int64_t right;
     int64_t bottom;
-    int64_t minimum;
-    int64_t maximum;
+    int64_t extra_width;
+    int64_t extra_height;
     uint32_t new_width;
     uint32_t new_height;
 
@@ -159,62 +209,21 @@ bool window_resize_locked(window_server_window_t *window,
         top +
         (int64_t)window_outer_height(window->height, window->flags);
 
-    if ((g_window_server.resize_edges & WINDOW_RESIZE_LEFT) != 0U) {
-        left += delta_x;
-        minimum = right - (int64_t)max_width -
-                  (int64_t)window_frame_extra(window->flags);
-        maximum = right - (int64_t)min_width -
-                  (int64_t)window_frame_extra(window->flags);
-        if (left < minimum) left = minimum;
-        if (left > maximum) left = maximum;
-    } else if ((g_window_server.resize_edges & WINDOW_RESIZE_RIGHT) != 0U) {
-        right += delta_x;
-        minimum = left + (int64_t)min_width +
-                  (int64_t)window_frame_extra(window->flags);
-        maximum = left + (int64_t)max_width +
-                  (int64_t)window_frame_extra(window->flags);
-        if (right < minimum) right = minimum;
-        if (right > maximum) right = maximum;
-    }
+    extra_width = window_frame_extra(window->flags);
+    extra_height = extra_width + window_titlebar_height(window->flags);
+    window_resize_axis(&left, &right, delta_x,
+                       (g_window_server.resize_edges & WINDOW_RESIZE_LEFT) != 0U,
+                       (g_window_server.resize_edges & WINDOW_RESIZE_RIGHT) != 0U,
+                       (int64_t)min_width + extra_width,
+                       (int64_t)max_width + extra_width);
+    window_resize_axis(&top, &bottom, delta_y,
+                       (g_window_server.resize_edges & WINDOW_RESIZE_TOP) != 0U,
+                       (g_window_server.resize_edges & WINDOW_RESIZE_BOTTOM) != 0U,
+                       (int64_t)min_height + extra_height,
+                       (int64_t)max_height + extra_height);
 
-    if ((g_window_server.resize_edges & WINDOW_RESIZE_TOP) != 0U) {
-        top += delta_y;
-        minimum =
-            bottom -
-            (int64_t)max_height -
-            (int64_t)window_frame_extra(window->flags) -
-            (int64_t)window_titlebar_height(window->flags);
-        maximum =
-            bottom -
-            (int64_t)min_height -
-            (int64_t)window_frame_extra(window->flags) -
-            (int64_t)window_titlebar_height(window->flags);
-        if (top < minimum) top = minimum;
-        if (top > maximum) top = maximum;
-    } else if ((g_window_server.resize_edges & WINDOW_RESIZE_BOTTOM) != 0U) {
-        bottom += delta_y;
-        minimum =
-            top +
-            (int64_t)min_height +
-            (int64_t)window_frame_extra(window->flags) +
-            (int64_t)window_titlebar_height(window->flags);
-        maximum =
-            top +
-            (int64_t)max_height +
-            (int64_t)window_frame_extra(window->flags) +
-            (int64_t)window_titlebar_height(window->flags);
-        if (bottom < minimum) bottom = minimum;
-        if (bottom > maximum) bottom = maximum;
-    }
-
-    new_width = (uint32_t)(right - left -
-                           (int64_t)window_frame_extra(window->flags));
-    new_height =
-        (uint32_t)(
-            bottom -
-            top -
-            (int64_t)window_frame_extra(window->flags) -
-            (int64_t)window_titlebar_height(window->flags));
+    new_width = (uint32_t)(right - left - extra_width);
+    new_height = (uint32_t)(bottom - top - extra_height);
     if (left == old_x && top == old_y &&
         new_width == old_width && new_height == old_height) {
         return false;
@@ -229,11 +238,6 @@ bool window_resize_locked(window_server_window_t *window,
     window->height = new_height;
     window->dirty = true;
     window->resize_pending = true;
-    uint64_t new_surface_span = window_surface_page_span(new_width, new_height);
-    if (new_surface_span > window->surface_populated_bytes &&
-        new_surface_span > window->surface_populate_pending_end) {
-        window->surface_populate_pending_end = new_surface_span;
-    }
     window_mark_window_locked(window);
     window_enqueue_resize_event_locked(window);
     return true;
@@ -298,42 +302,12 @@ bool window_route_drag_motion_batch_locked(
             (void)window_resize_locked(dragged, actual_delta_x, actual_delta_y);
         }
     } else {
-        int32_t old_x = dragged->x;
-        int32_t old_y = dragged->y;
         int32_t new_x = (int32_t)g_window_server.pointer_x -
                         g_window_server.drag_offset_x;
         int32_t new_y = (int32_t)g_window_server.pointer_y -
                         g_window_server.drag_offset_y;
 
-        if (old_x != new_x || old_y != new_y) {
-            uint32_t outer_width =
-                window_outer_width(dragged->width, dragged->flags);
-            uint32_t outer_height =
-                window_outer_height(dragged->height, dragged->flags);
-            int32_t retained_old_x = dragged->compositor_presented_x;
-            int32_t retained_old_y = dragged->compositor_presented_y;
-            bool reuse_retained = window_drag_reuse_safe_locked(
-                dragged, retained_old_x, retained_old_y,
-                new_x, new_y, outer_width, outer_height);
-            int32_t damage_old_x = reuse_retained ? retained_old_x : old_x;
-            int32_t damage_old_y = reuse_retained ? retained_old_y : old_y;
-
-            window_input_record_drag_frame_locked(
-                reuse_retained,
-                damage_old_x, damage_old_y,
-                new_x, new_y,
-                outer_width, outer_height);
-            dragged->x = new_x;
-            dragged->y = new_y;
-            window_mark_moved_rect_locked(
-                damage_old_x, damage_old_y, new_x, new_y,
-                outer_width, outer_height, !reuse_retained);
-            if (reuse_retained) {
-                window_mark_drag_corner_repair_locked(
-                    new_x, new_y, outer_width, outer_height, dragged->flags);
-            }
-            dragged->dirty = true;
-        }
+        window_drag_move_locked(dragged, new_x, new_y);
     }
 
     if (old_pointer_x != g_window_server.pointer_x ||

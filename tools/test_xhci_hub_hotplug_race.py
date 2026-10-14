@@ -119,7 +119,7 @@ def run_case(name, settle_seconds):
         os.environ.get(
             "QEMU_MONITOR_SOCKET",
             str(Path(tempfile.gettempdir()) /
-                f"liteos-xhci-hub-race-{name}.sock"),
+                f"system-xhci-hub-race-{name}.sock"),
         )
     )
     out_path = BUILD / f"hub-race-{name}.stdout"
@@ -163,14 +163,14 @@ def run_case(name, settle_seconds):
             return False
 
         if not wait_until(
-            lambda: "LITEOS_XHCI_HUB_RUNTIME_OK" in serial_text(canonical_serial),
+            lambda: "OS_XHCI_HUB_RUNTIME_OK" in serial_text(canonical_serial),
             BOOT_READY_TIMEOUT,
             "Hub runtime ready",
         ):
             return False
 
         if not wait_until(
-            lambda: "LITEOS_USB_DEVICE_COUNT=3" in serial_text(canonical_serial),
+            lambda: "OS_USB_DEVICE_COUNT=3" in serial_text(canonical_serial),
             BOOT_READY_TIMEOUT,
             "nested topology ready",
         ):
@@ -181,13 +181,13 @@ def run_case(name, settle_seconds):
         # removal, instead of letting HID traffic perturb the unrelated
         # process/VM teardown deadline.
         if not wait_until(
-            lambda: "LITEOS_USER_RUNTIME_SUBTESTS_OK" in
+            lambda: "OS_USER_RUNTIME_SUBTESTS_OK" in
                     serial_text(canonical_serial),
             BOOT_READY_TIMEOUT,
             "boot runtime self-tests ready",
         ):
             return False
-        if "LITEOS_STAGE_FAIL" in serial_text(canonical_serial):
+        if "OS_STAGE_FAIL" in serial_text(canonical_serial):
             return False
 
         # Delay the HMP client until the boot-critical runtime self-test is
@@ -208,7 +208,7 @@ def run_case(name, settle_seconds):
         # Match the original test behavior: this marker may already exist, but
         # the eight HMP commands themselves have completed before we continue.
         wait_until(
-            lambda: "LITEOS_USB_MOUSE_EVENT_OK" in serial_text(canonical_serial),
+            lambda: "OS_USB_MOUSE_EVENT_OK" in serial_text(canonical_serial),
             MOUSE_READY_TIMEOUT,
             "mouse path alive",
         )
@@ -218,14 +218,13 @@ def run_case(name, settle_seconds):
             time.sleep(settle_seconds)
 
         before = serial_text(canonical_serial)
-        base_transfer = before.count("LITEOS_DIAG_HUB_TRANSFER_EVENT")
-        base_change = before.count("LITEOS_USB_RUNTIME_HUB_CHANGE")
+        base_change = before.count("OS_USB_RUNTIME_HUB_CHANGE")
 
         print()
         print("BEFORE DELETE:")
         hmp.cmd("info usb")
 
-        hmp.cmd("device_del liteos-nested-mouse")
+        hmp.cmd("device_del vm-nested-mouse")
 
         time.sleep(0.2)
         print()
@@ -233,29 +232,27 @@ def run_case(name, settle_seconds):
         hmp.cmd("info usb")
 
         removed = wait_until(
-            lambda: serial_text(canonical_serial).count("LITEOS_USB_RUNTIME_HUB_CHANGE") > base_change,
+            lambda: serial_text(canonical_serial).count("OS_USB_RUNTIME_HUB_CHANGE") > base_change,
             10.0,
             "runtime Hub-change after delete",
         )
 
         after = serial_text(canonical_serial)
-        got_transfer = after.count("LITEOS_DIAG_HUB_TRANSFER_EVENT") > base_transfer
-        stage_failed = "LITEOS_STAGE_FAIL" in after
+        stage_failed = "OS_STAGE_FAIL" in after
 
         print()
         print("NEW DIAGNOSTICS:")
         for line in after[len(before):].splitlines():
             if (
-                "LITEOS_DIAG_" in line
-                or "LITEOS_USB_RUNTIME_HUB_CHANGE" in line
-                or "LITEOS_XHCI_FAIL" in line
+                "OS_DIAG_" in line
+                or "OS_USB_RUNTIME_HUB_CHANGE" in line
+                or "OS_XHCI_FAIL" in line
             ):
                 print(line)
 
         print()
         print("RESULT",
               name,
-              "transfer=", "YES" if got_transfer else "NO",
               "hub_change=", "YES" if removed else "NO",
               "stage_fail=", "YES" if stage_failed else "NO")
 

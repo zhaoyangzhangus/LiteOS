@@ -15,6 +15,14 @@ bool qemu_stdvga_flip_init(uint64_t framebuffer_physical,
 bool qemu_stdvga_hardware_present(void);
 bool qemu_stdvga_flip_available(void);
 
+/*
+ * Y_OFFSET is an immediate Bochs VBE register write; it is not a vblank
+ * synchronized page-flip primitive.  Keep the backend available for the
+ * fixed scanout mapping, but let the compositor select the tear-prone page
+ * flip path only for controlled experiments.
+ */
+bool qemu_stdvga_page_flip_active(void);
+
 volatile uint32_t *qemu_stdvga_front_buffer(void);
 volatile uint32_t *qemu_stdvga_back_buffer(void);
 

@@ -2,25 +2,29 @@
 #include <stdbool.h>
 
 #include <uapi/all.h>
+#include <uapi/window_theme.h>
 
-#include "../../runtime/liteos_text.h"
-#include "../../client_chrome.h"
+#include "../../runtime/text.h"
+#include "../../runtime/caption.h"
 
 #define SHELL_LINE_CAPACITY 256U
-#define SHELL_OUTPUT_LINES 24U
+#define SHELL_OUTPUT_LINES 128U
 #define SHELL_MAP_BASE     0x06000000ULL
 #define SHELL_EVENT_WAIT OS_WAIT_INFINITE
-#define SHELL_CHILD_STACK_TOP 0x00007FFFFFEF0000ULL
-#define SHELL_LAUNCH_SLOTS 16U
+#define SHELL_FOREGROUND_WAIT_NS 20000000ULL
+#define SHELL_OUTPUT_EVENT_BUDGET 32U
+#define SHELL_BACKGROUND_WAIT_NS 100000000ULL
+#define SHELL_BACKGROUND_REAP_BUDGET 32U
 #define SHELL_HISTORY_LINES 16U
 #define SHELL_MAX_ARGUMENTS 8U
 #define SHELL_PATH_CAPACITY 256U
-#define SHELL_WINDOW_BACKGROUND 0x00F7F8FAU
-#define SHELL_INPUT_BACKGROUND  0x00E9EDF1U
-#define SHELL_INPUT_BORDER      0x00D2D8DFU
-#define SHELL_OUTPUT_TEXT       0x003A4752U
-#define SHELL_INPUT_TEXT        0x00506D9FU
-#define SHELL_CURSOR             0x005B86D6U
+#define SHELL_DISPLAY_CAPACITY (SHELL_LINE_CAPACITY + SHELL_PATH_CAPACITY + 16U)
+#define SHELL_WINDOW_BACKGROUND OS_THEME_SURFACE
+#define SHELL_INPUT_BACKGROUND  OS_THEME_FIELD
+#define SHELL_INPUT_BORDER      OS_THEME_BORDER
+#define SHELL_OUTPUT_TEXT       OS_THEME_TEXT
+#define SHELL_INPUT_TEXT        OS_THEME_TEXT
+#define SHELL_CURSOR            OS_THEME_ACCENT
 
 typedef struct shell_window {
     os_handle_t handle;
@@ -49,14 +53,21 @@ static size_t g_command_length;
 static size_t g_command_cursor;
 static char g_output[SHELL_OUTPUT_LINES][SHELL_LINE_CAPACITY];
 static uint32_t g_output_count;
-static shell_launch_context_t g_launch_contexts[SHELL_LAUNCH_SLOTS];
-static uint32_t g_launch_slot_count;
+static uint32_t g_output_head;
+static uint32_t g_output_scroll;
+static uint32_t g_view_first, g_view_lines, g_input_y, g_input_view_start, g_prompt_length;
+static size_t g_input_anchor = SIZE_MAX;
+static size_t g_output_anchor = SIZE_MAX, g_output_selection_end;
+static uint32_t g_mouse_selecting;
+static uint32_t g_background_children;
 static char g_history[SHELL_HISTORY_LINES][SHELL_LINE_CAPACITY];
 static uint32_t g_history_count;
 static int32_t g_history_cursor = -1;
 static char g_cwd[SHELL_PATH_CAPACITY] = "/";
 static bool g_shift;
 static bool g_ctrl;
+static bool g_foreground_wait;
+static bool handle_event(const os_window_event_t *event);
 static os_exec_fd_map_t g_exec_fd_map;
 static uint32_t g_display_width;
 static uint32_t g_display_height;
@@ -69,7 +80,7 @@ static uint32_t g_damage_y;
 static uint32_t g_damage_width;
 static uint32_t g_damage_height;
 static uint8_t g_file_buffer[128];
-static char g_display_line[SHELL_LINE_CAPACITY];
+static char g_display_line[SHELL_DISPLAY_CAPACITY];
 
 static void shell_damage_all(void) {
     g_damage_full = true;
@@ -115,8 +126,7 @@ static void shell_damage_reset(void) {
 }
 
 static void shell_damage_input_line(void) {
-    uint32_t y = g_shell.height > LITEOS_TEXT_HEIGHT + 4U ?
-        g_shell.height - LITEOS_TEXT_HEIGHT - 4U : 0U;
+    uint32_t y = g_input_y;
     shell_damage_rect(0U, y, g_shell.width,
                       g_shell.height - y);
 }
@@ -223,19 +233,23 @@ static void append_character(char *destination, uint32_t capacity, char characte
     destination[length] = '\0';
 }
 
+static char *shell_output_line(uint32_t index) {
+    return g_output[(g_output_head + index) % SHELL_OUTPUT_LINES];
+}
+
 static void append_output(const char *text) {
-    if (g_output_count < SHELL_OUTPUT_LINES) {
-        copy_text(g_output[g_output_count++], text);
-        return;
-    }
-    for (uint32_t index = 1U; index < SHELL_OUTPUT_LINES; ++index) {
-        copy_text(g_output[index - 1U], g_output[index]);
-    }
-    copy_text(g_output[SHELL_OUTPUT_LINES - 1U], text);
+    g_output_scroll = 0U;
+    g_output_anchor = SIZE_MAX;
+    copy_text(shell_output_line(g_output_count), text);
+    if (g_output_count < SHELL_OUTPUT_LINES) ++g_output_count;
+    else g_output_head = (g_output_head + 1U) % SHELL_OUTPUT_LINES;
 }
 
 static void clear_output(void) {
     g_output_count = 0U;
+    g_output_head = 0U;
+    g_output_scroll = 0U;
+    g_output_anchor = SIZE_MAX;
 }
 
 static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
@@ -251,16 +265,23 @@ static void fill_rect(uint32_t x, uint32_t y, uint32_t width, uint32_t height,
 }
 
 static void draw_text(uint32_t x, uint32_t y, const char *text, uint32_t color) {
-    liteos_text_draw(g_target, g_target_width, g_target_width, g_target_height,
+    ui_text_draw(g_target, g_target_width, g_target_width, g_target_height,
                      (int32_t)x, (int32_t)y, text, color);
 }
 
 static void build_prompt(char *buffer) {
     if (buffer == 0) return;
     buffer[0] = '\0';
-    append_text(buffer, SHELL_LINE_CAPACITY, "LITEOS:");
-    append_text(buffer, SHELL_LINE_CAPACITY, g_cwd);
-    append_text(buffer, SHELL_LINE_CAPACITY, "# ");
+    append_text(buffer, SHELL_DISPLAY_CAPACITY, g_cwd);
+    append_text(buffer, SHELL_DISPLAY_CAPACITY, "# ");
+}
+
+/* The input display includes both a path and a command, unlike output rows. */
+static uint32_t shell_display_length(const char *text) {
+    uint32_t length = 0U;
+    if (text == 0) return 0U;
+    while (length + 1U < SHELL_DISPLAY_CAPACITY && text[length] != '\0') ++length;
+    return length;
 }
 
 static uint32_t shell_text_width(const char *text, size_t length) {
@@ -268,9 +289,9 @@ static uint32_t shell_text_width(const char *text, size_t length) {
     uint64_t fallback;
 
     if (text == 0 || length == 0U) return 0U;
-    measured = liteos_text_measure_range(text, length);
+    measured = ui_text_measure_range(text, length);
     if (measured != 0U) return measured;
-    fallback = (uint64_t)length * LITEOS_TEXT_WIDTH;
+    fallback = (uint64_t)length * OS_TEXT_WIDTH;
     return fallback > UINT32_MAX ? UINT32_MAX : (uint32_t)fallback;
 }
 
@@ -286,15 +307,15 @@ static void draw_input_line(void) {
     uint32_t prefix_width;
     uint32_t cursor_width;
     uint32_t input_y;
-    uint32_t input_height;
     uint32_t low;
     uint32_t high;
     uint32_t middle;
 
     build_prompt(g_display_line);
-    prompt_length = text_length(g_display_line);
-    append_text(g_display_line, SHELL_LINE_CAPACITY, g_command);
-    line_length = text_length(g_display_line);
+    prompt_length = shell_display_length(g_display_line);
+    g_prompt_length = prompt_length;
+    append_text(g_display_line, SHELL_DISPLAY_CAPACITY, g_command);
+    line_length = shell_display_length(g_display_line);
     cursor_position = prompt_length + (uint32_t)g_command_cursor;
     if (cursor_position > line_length) cursor_position = line_length;
     input_right = g_target_width > input_x ? g_target_width - input_x : 0U;
@@ -318,68 +339,94 @@ static void draw_input_line(void) {
         }
         view_start = low;
     }
+    g_input_view_start = view_start;
     cursor_width = shell_text_width(g_display_line + view_start,
                                     cursor_position - view_start);
-    input_y = g_target_height > LITEOS_TEXT_HEIGHT + 4U ?
-        g_target_height - LITEOS_TEXT_HEIGHT - 4U : 0U;
-    input_height = LITEOS_TEXT_HEIGHT + 8U;
-    if (input_y >= 4U) {
-        fill_rect(6U, input_y - 4U,
-                  g_target_width > 12U ? g_target_width - 12U : g_target_width,
-                  input_height, SHELL_INPUT_BACKGROUND);
-        fill_rect(6U, input_y - 4U,
-                  g_target_width > 12U ? g_target_width - 12U : g_target_width,
-                  1U, SHELL_INPUT_BORDER);
+    input_y = g_input_y;
+    if (g_input_anchor != SIZE_MAX && g_input_anchor != g_command_cursor) {
+        size_t first = g_input_anchor < g_command_cursor ? g_input_anchor : g_command_cursor;
+        size_t last = g_input_anchor > g_command_cursor ? g_input_anchor : g_command_cursor;
+        first += prompt_length; last += prompt_length;
+        if (last > view_start) {
+            if (first < view_start) first = view_start;
+            uint32_t left = shell_text_width(g_display_line + view_start, first - view_start);
+            uint32_t right = shell_text_width(g_display_line + view_start, last - view_start);
+            if (left < available_width) {
+                if (right > available_width) right = available_width;
+                fill_rect(input_x + left, input_y, right - left, OS_TEXT_HEIGHT, OS_THEME_SELECTED);
+            }
+        }
     }
-    liteos_text_draw_clipped(g_target, g_target_width, g_target_width,
+    ui_text_draw_clipped(g_target, g_target_width, g_target_width,
                              g_target_height, (int32_t)input_x,
                              (int32_t)input_y, input_right,
                              g_display_line + view_start, SHELL_INPUT_TEXT);
     if (cursor_width < available_width) {
-        fill_rect(input_x + cursor_width, input_y, 2U, LITEOS_TEXT_HEIGHT,
+        fill_rect(input_x + cursor_width, input_y, 2U, OS_TEXT_HEIGHT,
                   SHELL_CURSOR);
     }
 }
 
+static uint32_t shell_scroll_maximum(uint32_t visible) {
+    /* No input row exists when the viewport cannot display even one line. */
+    uint32_t rows = g_output_count +
+                    (visible != 0U && !g_foreground_wait ? 1U : 0U);
+    return rows > visible ? rows - visible : 0U;
+}
+
+static bool shell_scroll_output(int32_t direction) {
+    uint32_t previous = g_output_scroll;
+    uint32_t maximum = shell_scroll_maximum(g_view_lines);
+    if (g_output_scroll > maximum) g_output_scroll = maximum;
+    if (direction > 0)
+        g_output_scroll = maximum - g_output_scroll > 3U ?
+                          g_output_scroll + 3U : maximum;
+    else if (direction < 0)
+        g_output_scroll = g_output_scroll > 3U ? g_output_scroll - 3U : 0U;
+    return previous != g_output_scroll;
+}
+
 static void draw_terminal(void) {
-    uint32_t input_height = LITEOS_TEXT_HEIGHT + 8U;
-    uint32_t visible =
-        g_target_height > USER_CLIENT_CHROME_HEIGHT + input_height ?
-        (g_target_height - USER_CLIENT_CHROME_HEIGHT - input_height) /
-        LITEOS_TEXT_HEIGHT : 0U;
-    uint32_t first = g_output_count > visible ? g_output_count - visible : 0U;
-    uint32_t y = USER_CLIENT_CHROME_HEIGHT;
+    uint32_t caption_height = 0U; /* coordinates are client-area only */
+    uint32_t line_height = OS_TEXT_HEIGHT;
+    uint32_t visible = line_height != 0U && g_target_height > caption_height ?
+                       (g_target_height - caption_height) / line_height : 0U;
+    uint32_t maximum = shell_scroll_maximum(visible);
+    if (g_output_scroll > maximum) g_output_scroll = maximum;
+    uint32_t first = maximum - g_output_scroll;
+    g_view_first = first;
+    g_view_lines = visible;
+    if (visible == 0U) g_mouse_selecting = 0U;
+    uint32_t y = caption_height;
 
     fill_rect(0U, 0U, g_target_width, g_target_height, g_shell.color);
-    fill_rect(0U, 0U, g_target_width, USER_CLIENT_CHROME_HEIGHT,
-              USER_CLIENT_CHROME_BACKGROUND);
-    fill_rect(0U, USER_CLIENT_CHROME_HEIGHT - 1U, g_target_width, 1U,
-              USER_CLIENT_CHROME_SEPARATOR);
-    user_client_chrome_app_icon(g_target, g_target_width,
-                                g_target_width, g_target_height,
-                                16U, USER_CLIENT_CHROME_TITLE_Y,
-                                USER_CLIENT_CHROME_ICON_TERMINAL);
-    draw_text(50U, USER_CLIENT_CHROME_TITLE_Y, "SHELL",
-              USER_CLIENT_CHROME_TEXT);
-    for (uint32_t index = first;
-         index < g_output_count &&
-         y + LITEOS_TEXT_HEIGHT + input_height <= g_target_height;
-         ++index, y += LITEOS_TEXT_HEIGHT) {
-        draw_text(10U, y, g_output[index], SHELL_OUTPUT_TEXT);
+    for (uint32_t index = first, row = 0U;
+         index < g_output_count && row < visible;
+         ++index, ++row, y += line_height) {
+        const char *line = shell_output_line(index);
+        if (g_output_anchor != SIZE_MAX) {
+            size_t first_selected = g_output_anchor < g_output_selection_end ? g_output_anchor : g_output_selection_end;
+            size_t last_selected = g_output_anchor > g_output_selection_end ? g_output_anchor : g_output_selection_end;
+            size_t base = (size_t)index * SHELL_LINE_CAPACITY;
+            size_t length = text_length(line);
+            if (last_selected > base && first_selected < base + length) {
+                size_t left = first_selected > base ? first_selected - base : 0U;
+                size_t right = last_selected < base + length ? last_selected - base : length;
+                uint32_t left_x = shell_text_width(line, left);
+                uint32_t right_x = shell_text_width(line, right);
+                fill_rect(10U + left_x, y, right_x - left_x, OS_TEXT_HEIGHT, OS_THEME_SELECTED);
+            }
+        }
+        draw_text(10U, y, line, SHELL_OUTPUT_TEXT);
     }
-    if (g_target_height >= LITEOS_TEXT_HEIGHT + 4U) draw_input_line();
-    user_client_chrome_close(g_target, g_target_width,
-                             g_target_width, g_target_height,
-                             USER_CLIENT_CHROME_HEIGHT,
-                             USER_CLIENT_CHROME_CLOSE_BG,
-                             USER_CLIENT_CHROME_CLOSE_FG);
-    user_client_chrome_frame(g_target, g_target_width,
-                             g_target_width, g_target_height,
-                             USER_CLIENT_CHROME_HEIGHT);
+    g_input_y = y;
+    if (!g_foreground_wait && g_output_count >= first &&
+        g_output_count - first < visible) draw_input_line();
 }
 
 static void update_window(void) {
     os_window_update_t request = {0};
+    request.flags = OS_WINDOW_CAPTION_HEIGHT(user_caption_height());
     if (g_shell.identifier == 0U) return;
     if (!g_damage_full && (g_damage_width == 0U || g_damage_height == 0U)) {
         return;
@@ -423,7 +470,7 @@ static bool create_window(int32_t x, int32_t y, uint32_t width,
     request.height = height;
     request.flags = OS_WINDOW_VISIBLE |
                     OS_WINDOW_RESIZABLE |
-                    OS_WINDOW_CLIENT_DECORATIONS;
+                    OS_WINDOW_STANDARD_CAPTION_CONTROLS;
     request.background = g_shell.color;
     for (uint32_t i = 0U; i < 31U && g_shell.title[i] != '\0'; ++i) {
         request.title[i] = g_shell.title[i];
@@ -687,28 +734,32 @@ static bool make_program_path(const char *argument, char *path) {
     return false;
 }
 
-static void append_text_chunk(const uint8_t *buffer, uint64_t count,
+static bool append_text_chunk(const uint8_t *buffer, uint64_t count,
                               char *line, uint32_t *line_length) {
-    if (buffer == 0 || line == 0 || line_length == 0) return;
+    bool published = false;
+    if (buffer == 0 || line == 0 || line_length == 0) return false;
     for (uint64_t index = 0U; index < count; ++index) {
         uint8_t value = buffer[index];
         if (value == '\r') continue;
         if (value == '\n' || *line_length + 1U >= SHELL_LINE_CAPACITY) {
             line[*line_length] = '\0';
             append_output(line);
+            published = true;
             *line_length = 0U;
             if (value == '\n') continue;
         }
         if (value < 0x20U || value > 0x7EU) value = '.';
         line[(*line_length)++] = (char)value;
     }
+    return published;
 }
 
-static void finish_text_line(char *line, uint32_t *line_length) {
-    if (line == 0 || line_length == 0 || *line_length == 0U) return;
+static bool finish_text_line(char *line, uint32_t *line_length) {
+    if (line == 0 || line_length == 0 || *line_length == 0U) return false;
     line[*line_length] = '\0';
     append_output(line);
     *line_length = 0U;
+    return true;
 }
 
 static void command_cat(const char *argument) {
@@ -901,26 +952,66 @@ static void append_status_line(const char *prefix, int64_t value) {
     append_output(g_display_line);
 }
 
-static bool read_program_output(os_handle_t handle) {
+static void foreground_window_event(uint64_t timeout_ns) {
+    os_window_event_read_t request = {0};
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.identifier = g_shell.identifier;
+    request.timeout_ns = timeout_ns;
+    if (gshell_syscall_one(OS_SYS_WINDOW_EVENT_READ, (uint64_t)&request) == 0)
+        (void)handle_event(&request.event);
+}
+
+static bool read_program_output(os_handle_t handle, bool mirror_serial) {
     char line[SHELL_LINE_CAPACITY] = {0};
     uint32_t line_length = 0U;
     bool success = true;
+    bool dirty = false;
+    uint32_t chunks = 0U;
     for (;;) {
         uint64_t bytes = 0U;
         int64_t status = gshell_syscall_five(
             OS_SYS_PIPE_READ, handle, (uint64_t)(uintptr_t)g_file_buffer,
-            sizeof(g_file_buffer), OS_WAIT_INFINITE,
+            sizeof(g_file_buffer), SHELL_FOREGROUND_WAIT_NS,
             (uint64_t)(uintptr_t)&bytes);
+        if (status == -110 || status == -11) {
+            if (dirty) {
+                shell_damage_all();
+                render_window();
+                dirty = false;
+            }
+            chunks = 0U;
+            foreground_window_event(0U);
+            continue;
+        }
         if (status < 0) {
             append_output("PROGRAM OUTPUT READ FAILED");
+            dirty = true;
             success = false;
             break;
         }
         if (bytes == 0U) break;
         if (bytes > sizeof(g_file_buffer)) bytes = sizeof(g_file_buffer);
-        append_text_chunk(g_file_buffer, bytes, line, &line_length);
+        if (mirror_serial) {
+            (void)gshell_syscall_two(OS_SYS_DEBUG_WRITE,
+                                    (uint64_t)(uintptr_t)g_file_buffer, bytes);
+        }
+        if (append_text_chunk(g_file_buffer, bytes, line, &line_length)) dirty = true;
+        if (++chunks == SHELL_OUTPUT_EVENT_BUDGET) {
+            if (dirty) {
+                shell_damage_all();
+                render_window();
+                dirty = false;
+            }
+            chunks = 0U;
+            foreground_window_event(0U);
+        }
     }
-    finish_text_line(line, &line_length);
+    if (finish_text_line(line, &line_length)) dirty = true;
+    if (dirty) {
+        shell_damage_all();
+        render_window();
+    }
     return success;
 }
 
@@ -951,59 +1042,72 @@ static bool launch_program_foreground(shell_launch_context_t *context) {
         return false;
     }
     if (child_pid == 0) launch_program_entry((uint64_t)(uintptr_t)context);
-    ++g_launch_slot_count;
     (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, pipe.write_handle);
     context->output_read = OS_INVALID_HANDLE;
     context->output_write = OS_INVALID_HANDLE;
     context->redirect_output = false;
-    output_success = read_program_output(pipe.read_handle);
+    g_foreground_wait = true;
+    shell_damage_all();
+    render_window();
+    output_success = read_program_output(
+        pipe.read_handle,
+        text_equals_ignore_case(context->path, "/sbin/chrome-start") ||
+        text_equals_ignore_case(context->path, "/sbin/chrome"));
     (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, pipe.read_handle);
-    if (gshell_syscall_three(OS_SYS_PROCESS_WAIT, (uint64_t)child_pid, 0U,
-                             (uint64_t)(uintptr_t)&wait_status) < 0) {
-        append_output("PROGRAM WAIT FAILED");
-        return false;
+    for (;;) {
+        int64_t result = gshell_syscall_three(
+            OS_SYS_PROCESS_WAIT, (uint64_t)child_pid, OS_PROCESS_WAIT_NOHANG,
+            (uint64_t)(uintptr_t)&wait_status);
+        if (result != 0) {
+            g_foreground_wait = false;
+            if (result < 0) {
+                append_output("PROGRAM WAIT FAILED");
+                return false;
+            }
+            break;
+        }
+        foreground_window_event(SHELL_FOREGROUND_WAIT_NS);
     }
     append_status_line("PROGRAM EXIT STATUS ", process_wait_status(wait_status));
     return output_success;
 }
 
 static bool launch_program_background(shell_launch_context_t *context) {
-    os_handle_t process_handle = OS_INVALID_HANDLE;
-    os_handle_t thread_handle = OS_INVALID_HANDLE;
-    os_thread_create_t arguments = {0};
-    int64_t status;
-    arguments.hdr.size = sizeof(arguments);
-    arguments.hdr.version = OS_SYSCALL_ABI_VERSION;
-    arguments.entry = (uint64_t)(uintptr_t)launch_program_entry;
-    arguments.stack_top = SHELL_CHILD_STACK_TOP;
-    arguments.argument = (uint64_t)(uintptr_t)context;
-    status = gshell_syscall_two(OS_SYS_PROCESS_CREATE, 0U,
-                                (uint64_t)&process_handle);
-    if (status < 0 || process_handle == OS_INVALID_HANDLE) return false;
-    status = gshell_syscall_three(OS_SYS_THREAD_CREATE, process_handle,
-                                  (uint64_t)&arguments,
-                                  (uint64_t)&thread_handle);
-    if (status < 0 || thread_handle == OS_INVALID_HANDLE) {
-        (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, process_handle);
-        return false;
-    }
-    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, thread_handle);
-    ++g_launch_slot_count;
-    (void)gshell_syscall_one(OS_SYS_HANDLE_CLOSE, process_handle);
+    if (g_background_children == UINT32_MAX) return false;
+    int64_t child_pid = gshell_syscall_one(OS_SYS_PROCESS_FORK, 0U);
+    if (child_pid < 0) return false;
+    if (child_pid == 0) launch_program_entry((uint64_t)(uintptr_t)context);
+    ++g_background_children;
     return true;
+}
+
+static void reap_background_children(void) {
+    /* Foreground waits own their PID: a GUI callback must never reap it. */
+    if (g_foreground_wait) return;
+    for (uint32_t n = 0; n < SHELL_BACKGROUND_REAP_BUDGET &&
+                         g_background_children != 0U; ++n) {
+        int32_t status = 0;
+        int64_t result = gshell_syscall_three(
+            OS_SYS_PROCESS_WAIT, (uint64_t)-1, OS_PROCESS_WAIT_NOHANG,
+            (uint64_t)(uintptr_t)&status);
+        if (result > 0) --g_background_children;
+        else {
+            if (result == -10) g_background_children = 0U;
+            break;
+        }
+    }
 }
 
 static bool launch_program(const char *path, char **program_arguments,
                            uint32_t argument_count, bool background) {
-    shell_launch_context_t *context;
-    uint32_t slot;
+    shell_launch_context_t launch_context;
+    shell_launch_context_t *context = &launch_context;
     if (path == 0 || path[0] == '\0' || program_arguments == 0 ||
-        argument_count == 0U || argument_count > SHELL_MAX_ARGUMENTS ||
-        g_launch_slot_count >= SHELL_LAUNCH_SLOTS) {
+        argument_count == 0U || argument_count > SHELL_MAX_ARGUMENTS) {
         return false;
     }
-    slot = g_launch_slot_count;
-    context = &g_launch_contexts[slot];
+    /* Both launch paths snapshot this stack through fork. No permanent
+     * context array, artificial launch limit or shared child stack is needed. */
     copy_text(context->path, path);
     for (uint32_t index = 0U; index < argument_count; ++index) {
         copy_text(context->argument_storage[index], program_arguments[index]);
@@ -1032,9 +1136,39 @@ static void remember_history(void) {
 }
 
 static void append_command_echo(void) {
+    char row[SHELL_LINE_CAPACITY];
+    uint32_t offset = 0U;
+    uint32_t available = g_target_width > 20U ? g_target_width - 20U : 0U;
     build_prompt(g_display_line);
-    append_text(g_display_line, SHELL_LINE_CAPACITY, g_command);
-    append_output(g_display_line);
+    append_text(g_display_line, SHELL_DISPLAY_CAPACITY, g_command);
+    uint32_t length = shell_display_length(g_display_line);
+    while (offset < length) {
+        uint32_t count = length - offset;
+        if (count >= SHELL_LINE_CAPACITY) count = SHELL_LINE_CAPACITY - 1U;
+        if (shell_text_width(g_display_line + offset, count) > available) {
+            uint32_t low = 0U;
+            uint32_t high = count;
+            while (low < high) {
+                uint32_t middle = low + (high - low + 1U) / 2U;
+                if (shell_text_width(g_display_line + offset, middle) <= available)
+                    low = middle;
+                else high = middle - 1U;
+            }
+            count = low;
+        }
+        /* Keep a UTF-8 codepoint together, even in a one-glyph-wide viewport. */
+        while (count != 0U && offset + count < length &&
+               ((uint8_t)g_display_line[offset + count] & 0xC0U) == 0x80U) --count;
+        if (count == 0U) {
+            count = 1U;
+            while (offset + count < length && count < 4U &&
+                   ((uint8_t)g_display_line[offset + count] & 0xC0U) == 0x80U) ++count;
+        }
+        __builtin_memcpy(row, g_display_line + offset, count);
+        row[count] = '\0';
+        append_output(row);
+        offset += count;
+    }
 }
 
 static void append_history_line(uint32_t index) {
@@ -1155,7 +1289,7 @@ static bool is_builtin_command(const char *name) {
         "help", "about", "status", "version", "clear", "echo", "pwd",
         "cd", "ls", "dir", "cat", "stat", "mkdir", "touch", "rm",
         "history", "which", "type", "open", "run", "fileman", "fm",
-        "notepad", "exit", "true", "false",
+        "notepad", "exit", "true", "false", "reboot", "shutdown",
     };
     for (uint32_t index = 0U; index < sizeof(names) / sizeof(names[0]); ++index) {
         if (text_equals_ignore_case(name, names[index])) return true;
@@ -1194,6 +1328,17 @@ static void command_external(char **arguments, uint32_t count, bool background) 
     if (background) append_output("PROGRAM STARTED IN BACKGROUND");
 }
 
+static void command_power(char **arguments, uint32_t count, bool background) {
+    if (count != 1U || background) {
+        append_output("USAGE: REBOOT | SHUTDOWN (NO ARGUMENTS OR &)");
+        return;
+    }
+    int64_t status = gshell_syscall_one(OS_SYS_SYSTEM_POWER,
+        text_equals_ignore_case(arguments[0], "shutdown") ? 1U : 0U);
+    (void)status;
+    append_output("POWER REQUEST FAILED; SYSTEM LEFT RUNNING");
+}
+
 static void execute_command(void) {
     char *arguments[SHELL_MAX_ARGUMENTS];
     uint32_t count = 0U;
@@ -1215,18 +1360,22 @@ static void execute_command(void) {
         append_output("TYPE HELP FOR COMMANDS");
     } else if (text_equals_ignore_case(arguments[0], "help")) {
         append_output("HELP ABOUT STATUS VERSION");
+        append_output("REBOOT SHUTDOWN");
         append_output("CLEAR ECHO PWD CD LS CAT STAT MKDIR TOUCH RM");
         append_output("WHICH TYPE OPEN RUN NOTEPAD FILEMAN FM [ARGS]");
         append_output("QUOTES AND BACKSLASH ESCAPES ARE SUPPORTED");
+    } else if (text_equals_ignore_case(arguments[0], "reboot") ||
+               text_equals_ignore_case(arguments[0], "shutdown")) {
+        command_power(arguments, count, background);
     } else if (text_equals_ignore_case(arguments[0], "about")) {
-        append_output("LITEOS GRAPHICAL SHELL");
+        append_output("GRAPHICAL SHELL");
         append_output("ONE WINDOW CLIENT COMPOSED BY KERNEL");
     } else if (text_equals_ignore_case(arguments[0], "status")) {
         append_output("WINDOW SERVER: KERNEL");
         append_output("WINDOW COUNT: ONE SHELL");
         append_output(g_cwd);
     } else if (text_equals_ignore_case(arguments[0], "version")) {
-        append_output("LITEOS VERSION 1 ABI 1");
+        append_output("VERSION 1 ABI 1");
     } else if (text_equals_ignore_case(arguments[0], "clear")) {
         clear_output();
     } else if (text_equals_ignore_case(arguments[0], "echo")) {
@@ -1284,6 +1433,8 @@ static void execute_command(void) {
     }
 
 reset_command:
+    g_input_anchor = SIZE_MAX;
+    g_mouse_selecting = 0U;
     g_command_length = 0U;
     g_command_cursor = 0U;
     g_history_cursor = -1;
@@ -1291,12 +1442,14 @@ reset_command:
 }
 
 static void clear_command_line(void) {
+    g_input_anchor = SIZE_MAX;
     g_command_length = 0U;
     g_command_cursor = 0U;
     g_command[0] = '\0';
 }
 
 static void load_history_entry(int32_t index) {
+    g_input_anchor = SIZE_MAX;
     if (index < 0 || (uint32_t)index >= g_history_count) return;
     copy_text(g_command, g_history[(uint32_t)index]);
     g_command_length = text_length(g_command);
@@ -1332,9 +1485,27 @@ static bool text_has_prefix_ignore_case(const char *text, const char *prefix) {
     return true;
 }
 
+static bool shell_has_selection(void) {
+    return g_input_anchor != SIZE_MAX && g_input_anchor != g_command_cursor;
+}
+
+static void shell_erase_selection(void) {
+    if (!shell_has_selection()) { g_input_anchor = SIZE_MAX; return; }
+    size_t first = g_input_anchor < g_command_cursor ? g_input_anchor : g_command_cursor;
+    size_t last = g_input_anchor > g_command_cursor ? g_input_anchor : g_command_cursor;
+    for (size_t index = last; index <= g_command_length; ++index)
+        g_command[first + index - last] = g_command[index];
+    g_command_length -= last - first;
+    g_command_cursor = first;
+    g_input_anchor = SIZE_MAX;
+}
+
 static void insert_command_text(const char *text) {
     uint32_t length = text_length(text);
-    if (text == 0 || length == 0U || g_command_length + length >= SHELL_LINE_CAPACITY) return;
+    size_t selected = shell_has_selection() ?
+        (g_input_anchor > g_command_cursor ? g_input_anchor - g_command_cursor : g_command_cursor - g_input_anchor) : 0U;
+    if (text == 0 || length == 0U || g_command_length - selected + length >= SHELL_LINE_CAPACITY) return;
+    shell_erase_selection();
     for (uint32_t index = (uint32_t)g_command_length + length;
          index >= g_command_cursor + length; --index) {
         g_command[index] = g_command[index - length];
@@ -1353,6 +1524,8 @@ static void insert_command_character(char character) {
 }
 
 static void backspace_command_character(void) {
+    if (shell_has_selection()) { shell_erase_selection(); return; }
+    g_input_anchor = SIZE_MAX;
     if (g_command_cursor == 0U) return;
     for (uint32_t index = (uint32_t)g_command_cursor; index <= g_command_length; ++index) {
         g_command[index - 1U] = g_command[index];
@@ -1362,6 +1535,8 @@ static void backspace_command_character(void) {
 }
 
 static void delete_command_character(void) {
+    if (shell_has_selection()) { shell_erase_selection(); return; }
+    g_input_anchor = SIZE_MAX;
     if (g_command_cursor >= g_command_length) return;
     for (uint32_t index = (uint32_t)g_command_cursor; index < g_command_length; ++index) {
         g_command[index] = g_command[index + 1U];
@@ -1419,11 +1594,25 @@ static bool handle_key(const os_window_event_t *event) {
         return false;
     }
     if (input->value == OS_INPUT_VALUE_RELEASE) return false;
+    /* A foreground child still owns command execution. Keep window/font
+     * controls responsive without recursively launching another command. */
+    if (g_foreground_wait &&
+        !(g_ctrl && (input->code == 0x2EU || input->code == 0x2DU ||
+                     input->code == 0x14U || input->code == (uint32_t)'Q')))
+        return false;
+    if (g_output_scroll) { g_output_scroll = 0U; full_damage = true; }
+    if (g_output_anchor != SIZE_MAX) { g_output_anchor = SIZE_MAX; full_damage = true; }
+    bool navigation = input->code == 0x4AU || input->code == 0x4DU ||
+        input->code == 0x4FU || input->code == 0x50U || input->code == 0x51U || input->code == 0x52U;
+    if (navigation) {
+        if (g_shift && g_input_anchor == SIZE_MAX) g_input_anchor = g_command_cursor;
+        else if (!g_shift) g_input_anchor = SIZE_MAX;
+    }
     if (g_ctrl && input->code == 0x2EU) {
-        (void)liteos_text_adjust(1);
+        (void)ui_text_adjust(1);
         full_damage = true;
     } else if (g_ctrl && input->code == 0x2DU) {
-        (void)liteos_text_adjust(-1);
+        (void)ui_text_adjust(-1);
         full_damage = true;
     } else if (g_ctrl && (input->code == 0x14U || input->code == (uint32_t)'Q')) {
         gshell_exit(0U);
@@ -1478,10 +1667,93 @@ static bool handle_key(const os_window_event_t *event) {
     return true;
 }
 
+static size_t shell_mouse_text_offset(const char *text, size_t length, int32_t x) {
+    uint32_t position = x > 10 ? (uint32_t)(x - 10) : 0U;
+    size_t low = 0, high = length;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2U;
+        uint32_t left = shell_text_width(text, middle);
+        uint32_t right = shell_text_width(text, middle + 1U);
+        if (position > left + (right - left) / 2U) low = middle + 1U;
+        else high = middle;
+    }
+    return low;
+}
+
+static size_t shell_mouse_command_offset(int32_t x) {
+    size_t length = shell_display_length(g_display_line);
+    size_t offset = g_input_view_start + shell_mouse_text_offset(
+        g_display_line + g_input_view_start, length - g_input_view_start, x);
+    if (offset <= g_prompt_length) return 0U;
+    offset -= g_prompt_length;
+    return offset > g_command_length ? g_command_length : offset;
+}
+
+static size_t shell_mouse_output_offset(int32_t x, int32_t y) {
+    if (!g_output_count || !g_view_lines) return 0U;
+    uint32_t row = y > 0 ? (uint32_t)y / OS_TEXT_HEIGHT : 0U;
+    if (g_view_lines && row >= g_view_lines) row = g_view_lines - 1U;
+    uint32_t index = g_view_first + row;
+    if (index >= g_output_count) return (size_t)(g_output_count - 1U) *
+        SHELL_LINE_CAPACITY + text_length(shell_output_line(g_output_count - 1U));
+    return (size_t)index * SHELL_LINE_CAPACITY +
+        shell_mouse_text_offset(shell_output_line(index),
+                                text_length(shell_output_line(index)), x);
+}
+
+static bool handle_shell_mouse(const os_window_event_t *event) {
+    const os_input_event_t *input = &event->input;
+    if (input->type == OS_INPUT_EVENT_RELATIVE && input->code == OS_INPUT_REL_WHEEL &&
+        input->value && !g_ctrl) {
+        if (!shell_scroll_output(input->value) || g_view_lines == 0U) return true;
+    } else if (input->type == OS_INPUT_EVENT_BUTTON && input->code == OS_INPUT_BUTTON_LEFT) {
+        if (input->value == OS_INPUT_VALUE_RELEASE) {
+            if (!g_mouse_selecting) return false;
+            if (g_mouse_selecting == 1U) g_command_cursor = shell_mouse_command_offset(event->pointer_x);
+            else g_output_selection_end = shell_mouse_output_offset(event->pointer_x, event->pointer_y);
+            g_mouse_selecting = 0U;
+        } else if (input->value == OS_INPUT_VALUE_PRESS && g_view_lines != 0U &&
+                   event->pointer_y >= 0) {
+            if (!g_foreground_wait && g_output_count - g_view_first < g_view_lines &&
+                event->pointer_y >= (int32_t)g_input_y &&
+                event->pointer_y < (int32_t)(g_input_y + OS_TEXT_HEIGHT)) {
+                g_output_anchor = SIZE_MAX;
+                size_t next = shell_mouse_command_offset(event->pointer_x);
+                if (!g_shift || g_input_anchor == SIZE_MAX) g_input_anchor = g_shift ? g_command_cursor : next;
+                g_command_cursor = next;
+                g_mouse_selecting = 1U;
+            } else if ((int64_t)event->pointer_y < (int64_t)g_shell.height && g_output_count) {
+                g_input_anchor = SIZE_MAX;
+                g_output_anchor = shell_mouse_output_offset(event->pointer_x, event->pointer_y);
+                g_output_selection_end = g_output_anchor;
+                g_mouse_selecting = 2U;
+            } else return false;
+        } else return false;
+    } else if (input->type == OS_INPUT_EVENT_RELATIVE && g_mouse_selecting &&
+               (input->code == OS_INPUT_REL_X || input->code == OS_INPUT_REL_Y)) {
+        if (g_mouse_selecting == 1U) {
+            size_t next = shell_mouse_command_offset(event->pointer_x);
+            if (next == g_command_cursor) return true;
+            g_command_cursor = next;
+        } else {
+            size_t next = shell_mouse_output_offset(event->pointer_x, event->pointer_y);
+            if (next == g_output_selection_end) return true;
+            g_output_selection_end = next;
+        }
+    } else return false;
+    shell_damage_all();
+    render_window();
+    return true;
+}
+
 static bool handle_event(const os_window_event_t *event) {
     uint64_t pixels;
 
     if (event == 0) return false;
+    if (event->type == OS_WINDOW_EVENT_MINIMIZED) {
+        g_mouse_selecting = 0U;
+        return true;
+    }
 
     /* V2.3 cooperative close */
     if (event->type ==
@@ -1496,47 +1768,42 @@ static bool handle_event(const os_window_event_t *event) {
         if (pixels > event->resize.buffer_size / sizeof(uint32_t)) return false;
         g_shell.width = event->resize.width;
         g_shell.height = event->resize.height;
+        g_mouse_selecting = 0U;
         shell_damage_all();
         render_window();
         return true;
     }
+    if (event->type == OS_WINDOW_EVENT_INPUT && handle_shell_mouse(event)) return true;
     if (event->type == OS_WINDOW_EVENT_INPUT &&
         event->input.type == OS_INPUT_EVENT_RELATIVE &&
         event->input.code == OS_INPUT_REL_WHEEL &&
         event->input.value != 0 && g_ctrl) {
-        (void)liteos_text_adjust(event->input.value > 0 ? 1 : -1);
+        (void)ui_text_adjust(event->input.value > 0 ? 1 : -1);
         shell_damage_all();
         render_window();
         return true;
-    }
-    if (event->type == OS_WINDOW_EVENT_INPUT &&
-        event->input.type == OS_INPUT_EVENT_BUTTON &&
-        event->input.code == OS_INPUT_BUTTON_LEFT &&
-        event->input.value == OS_INPUT_VALUE_PRESS &&
-        user_client_chrome_close_hit(event->pointer_x, event->pointer_y,
-                                     g_shell.width,
-                                     USER_CLIENT_CHROME_HEIGHT)) {
-        gshell_exit(0U);
     }
     return handle_key(event);
 }
 
 __attribute__((noreturn)) void gshell_entry(void) {
-    if (!liteos_text_init(LITEOS_TEXT_DEFAULT_SIZE) ||
+    if (!ui_text_init(OS_TEXT_DEFAULT_SIZE) ||
         !setup_windows()) gshell_exit(1U);
-    append_output("LITEOS GRAPHICAL SHELL READY");
+    append_output("GRAPHICAL SHELL READY");
     append_output("WINDOW CONTENT IS COMPOSITED BY KERNEL");
     append_output("TYPE HELP FOR COMMANDS");
     append_output("CTRL +/- FONT  CTRL+WHEEL FONT");
     shell_damage_all();
     render_window();
     for (;;) {
+        reap_background_children();
         os_window_event_read_t request = {0};
         int64_t status;
         request.hdr.size = sizeof(request);
         request.hdr.version = OS_SYSCALL_ABI_VERSION;
         request.identifier = g_shell.identifier;
-        request.timeout_ns = SHELL_EVENT_WAIT;
+        request.timeout_ns = g_background_children != 0U ?
+                             SHELL_BACKGROUND_WAIT_NS : SHELL_EVENT_WAIT;
         status = gshell_syscall_one(OS_SYS_WINDOW_EVENT_READ, (uint64_t)&request);
         if (status == 0) {
             (void)handle_event(&request.event);

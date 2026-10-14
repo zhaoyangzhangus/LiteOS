@@ -16,29 +16,21 @@ PAGE_NOINLINE page_t *page_alloc_slow(uint8_t order, page_alloc_flags_t flags) {
         uint64_t irq_flags = page_pool_irq_save();
         x86_preempt_disable_fast();
         uint32_t cpu = x86_current_cpu_index_fast();
-        if ((flags & PAGE_ALLOC_DMA32) != 0) {
-            page = pool_alloc_small(PAGE_ZONE_DMA32, order, cpu);
-        } else {
-            page = pool_alloc_small(PAGE_ZONE_NORMAL, order, cpu);
-            if (page == 0) page = pool_alloc_small(PAGE_ZONE_DMA32, order, cpu);
+        for (unsigned attempt = 0; attempt < 2U; ++attempt) {
+            if ((flags & PAGE_ALLOC_DMA32) != 0) {
+                page = pool_alloc_small(PAGE_ZONE_DMA32, order, cpu);
+            } else {
+                page = pool_alloc_small(PAGE_ZONE_NORMAL, order, cpu);
+                if (page == 0) page = pool_alloc_small(PAGE_ZONE_DMA32, order, cpu);
+            }
+            if (page != 0 || attempt != 0) break;
+            /* Reclaim once on exhaustion, with the local pool protected. */
+            pool_drain_cpu(cpu);
         }
         x86_preempt_enable_fast();
         page_pool_irq_restore(irq_flags);
     } else {
-        lock_pages();
-        if ((flags & PAGE_ALLOC_DMA32) != 0) {
-            page = take_from_zone_locked(PAGE_ZONE_DMA32, order);
-        } else {
-            page = take_from_zone_locked(PAGE_ZONE_NORMAL, order);
-            if (page == 0) page = take_from_zone_locked(PAGE_ZONE_DMA32, order);
-        }
-        unlock_pages();
-
-        if (page == 0) {
-            x86_preempt_disable_fast();
-            uint32_t cpu = x86_current_cpu_index_fast();
-            pool_drain_cpu(cpu);
-            x86_preempt_enable_fast();
+        for (unsigned attempt = 0; attempt < 2U; ++attempt) {
             lock_pages();
             if ((flags & PAGE_ALLOC_DMA32) != 0) {
                 page = take_from_zone_locked(PAGE_ZONE_DMA32, order);
@@ -47,9 +39,15 @@ PAGE_NOINLINE page_t *page_alloc_slow(uint8_t order, page_alloc_flags_t flags) {
                 if (page == 0) page = take_from_zone_locked(PAGE_ZONE_DMA32, order);
             }
             unlock_pages();
+            if (page != 0 || attempt != 0) break;
+            x86_preempt_disable_fast();
+            uint32_t cpu = x86_current_cpu_index_fast();
+            pool_drain_cpu(cpu);
+            x86_preempt_enable_fast();
         }
     }
 
+    if (page != 0) page_stats_note_alloc(order);
     if (page != 0 && (flags & PAGE_ALLOC_ZERO) != 0) {
         void *memory = phys_to_direct(page_to_phys(page));
         if (memory == 0) {
@@ -63,10 +61,12 @@ PAGE_NOINLINE page_t *page_alloc_slow(uint8_t order, page_alloc_flags_t flags) {
 
 PAGE_NOINLINE void page_free_non_o0(page_t *head, uint8_t order) {
     if (order <= PAGE_POOL_SMALL_MAX_ORDER) {
+        uint64_t irq_flags = page_pool_irq_save();
         x86_preempt_disable_fast();
         uint32_t cpu = x86_current_cpu_index_fast();
         bool pooled = pool_free_small(head, order, cpu);
         x86_preempt_enable_fast();
+        page_pool_irq_restore(irq_flags);
         if (pooled) return;
     }
     free_legacy_slow(head, order);

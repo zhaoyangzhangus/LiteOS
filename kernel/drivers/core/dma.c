@@ -2,6 +2,7 @@
 #include <kernel/device.h>
 #include <kernel/iommu.h>
 #include <kernel/kmem.h>
+#include <kernel/sched.h>
 
 #define DMA_MAPPING_ACTIVE_FLAG (1U << 0)
 #define DMA_MAPPING_IOMMU_FLAG  (1U << 1)
@@ -13,26 +14,29 @@
 static spinlock_t g_dma_lock;
 static atomic_uint g_dma_init_state;
 static dma_mapping_t *g_dma_mappings[DMA_MAPPING_LIMIT];
+static uint32_t g_dma_next_free_slot;
 static uint64_t g_dma_next_iova = DMA_IOVA_BASE;
 
 static void dma_lock(void) {
-    while (atomic_exchange_explicit(&g_dma_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    /* Keep the registry owner runnable while other CPUs spin. */
+    sched_preempt_disable();
+    spinlock_lock(&g_dma_lock);
 }
 
 static void dma_unlock(void) {
-    atomic_store_explicit(&g_dma_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_dma_lock);
+    sched_preempt_enable();
 }
 
 static void dma_initialize(void) {
+    if (atomic_load_explicit(&g_dma_init_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_dma_init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_dma_lock.state, 0U);
+        spinlock_init(&g_dma_lock);
         for (uint32_t i = 0; i < DMA_MAPPING_LIMIT; ++i) g_dma_mappings[i] = 0;
+        g_dma_next_free_slot = 0U;
         g_dma_next_iova = DMA_IOVA_BASE;
         atomic_store_explicit(&g_dma_init_state, 2U, memory_order_release);
         return;
@@ -61,16 +65,29 @@ static bool dma_choose_iova(uint64_t length, uint64_t *out) {
     uint64_t candidate = (g_dma_next_iova + PAGE_SIZE - 1ULL) &
                          ~(PAGE_SIZE - 1ULL);
     for (uint32_t pass = 0; pass < DMA_MAPPING_LIMIT + 1U; ++pass) {
-        bool moved = false;
+        bool restart = false;
+        uint64_t scanned_end = 0U;
         for (uint32_t i = 0; i < DMA_MAPPING_LIMIT; ++i) {
             dma_mapping_t *mapping = g_dma_mappings[i];
-            if (!dma_range_overlaps(candidate, length, mapping)) continue;
+            if (mapping == 0 || mapping->segment_count == 0U) continue;
+            if (mapping->mapped_length == 0U ||
+                mapping->segments[0].addr.value > UINT64_MAX - mapping->mapped_length) {
+                return false;
+            }
             uint64_t end = mapping->segments[0].addr.value + mapping->mapped_length;
-            candidate = (end + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
-            moved = true;
-            break;
+            if (dma_range_overlaps(candidate, length, mapping)) {
+                if (end > UINT64_MAX - (PAGE_SIZE - 1ULL)) return false;
+                candidate = (end + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
+                /* Earlier ranges are safe only when the new candidate lies
+                 * beyond every end already scanned. Otherwise restart now. */
+                if (scanned_end > candidate) {
+                    restart = true;
+                    break;
+                }
+            }
+            if (end > scanned_end) scanned_end = end;
         }
-        if (moved) continue;
+        if (restart) continue;
         if (candidate <= DMA_IOVA_LIMIT && length <= DMA_IOVA_LIMIT - candidate) {
             *out = candidate;
             g_dma_next_iova = candidate + length;
@@ -84,10 +101,24 @@ static bool dma_choose_iova(uint64_t length, uint64_t *out) {
 }
 
 static int32_t dma_find_slot(void) {
-    for (uint32_t i = 0; i < DMA_MAPPING_LIMIT; ++i) {
-        if (g_dma_mappings[i] == 0) return (int32_t)i;
+    for (uint32_t i = g_dma_next_free_slot; i < DMA_MAPPING_LIMIT; ++i) {
+        if (g_dma_mappings[i] == 0) {
+            g_dma_next_free_slot = i;
+            return (int32_t)i;
+        }
     }
+    g_dma_next_free_slot = DMA_MAPPING_LIMIT;
     return -1;
+}
+
+static void dma_publish_slot(uint32_t slot, dma_mapping_t *mapping) {
+    g_dma_mappings[slot] = mapping;
+    g_dma_next_free_slot = slot + 1U;
+}
+
+static void dma_clear_slot(uint32_t slot) {
+    g_dma_mappings[slot] = 0;
+    if (slot < g_dma_next_free_slot) g_dma_next_free_slot = slot;
 }
 
 static void dma_unpin_pages(page_t **pages, uint32_t page_count) {
@@ -150,14 +181,29 @@ kstatus_t dma_map_pages(struct device *dev, page_t **pages, uint32_t page_count,
     if (mapped_length == 0 || mapped_length > DMA_IOVA_LIMIT - DMA_IOVA_BASE) {
         return K_EINVAL;
     }
+    uintptr_t highest_page_address = 0U;
+    uint32_t segment_capacity = 0U;
+    uint64_t previous_physical = 0U;
     for (uint32_t i = 0; i < page_count; ++i) {
         page_t *page = pages[i];
         if (page == 0 || (page->flags & PAGE_FREE) != 0 ||
             ((page->flags & PAGE_COMPOUND_HEAD) == 0 &&
-             (page->flags & PAGE_COMPOUND_TAIL) == 0 && page->order != 0) ||
-            page_to_phys(page).value == UINT64_MAX) return K_EINVAL;
-        for (uint32_t j = 0; j < i; ++j) {
-            if (pages[j] == page) return K_EINVAL;
+             (page->flags & PAGE_COMPOUND_TAIL) == 0 && page->order != 0)) return K_EINVAL;
+        uint64_t physical = page_to_phys(page).value;
+        if (physical == UINT64_MAX) return K_EINVAL;
+        if (i == 0U || physical != previous_physical + PAGE_SIZE) {
+            ++segment_capacity;
+        }
+        previous_physical = physical;
+        uintptr_t page_address = (uintptr_t)page;
+        /* New maxima cannot equal earlier pointers. Unordered lists still
+         * use the full check, without scratch allocations or reordering. */
+        if (page_address > highest_page_address) {
+            highest_page_address = page_address;
+        } else {
+            for (uint32_t j = 0; j < i; ++j) {
+                if (pages[j] == page) return K_EINVAL;
+            }
         }
     }
 
@@ -167,33 +213,36 @@ kstatus_t dma_map_pages(struct device *dev, page_t **pages, uint32_t page_count,
         pages[i]->flags |= PAGE_PINNED;
     }
 
-    dma_segment_t *segments = (dma_segment_t *)kzalloc(
-        (size_t)page_count * sizeof(*segments), 0);
+    /* All page pointers and active segment fields are assigned before the
+     * mapping is published; unused segment capacity is never exposed. */
+    dma_segment_t *segments = (dma_segment_t *)kmalloc(
+        (size_t)segment_capacity * sizeof(*segments), 0);
     if (segments == 0) {
         dma_unpin_pages(pages, page_count);
         return K_ENOMEM;
     }
 
-    page_t **mapped_pages = (page_t **)kzalloc(
+    page_t **mapped_pages = (page_t **)kmalloc(
         (size_t)page_count * sizeof(*mapped_pages), 0);
     if (mapped_pages == 0) {
         kfree(segments);
         dma_unpin_pages(pages, page_count);
         return K_ENOMEM;
     }
-    for (uint32_t i = 0; i < page_count; ++i) mapped_pages[i] = pages[i];
-
     uint32_t physical_segment_count = 0;
+    previous_physical = 0U;
     for (uint32_t i = 0; i < page_count; ++i) {
         uint64_t physical = page_to_phys(pages[i]).value;
+        mapped_pages[i] = pages[i];
         if (physical_segment_count == 0 ||
-            physical != page_to_phys(pages[i - 1U]).value + PAGE_SIZE) {
+            physical != previous_physical + PAGE_SIZE) {
             segments[physical_segment_count].addr = iova_make(physical);
             segments[physical_segment_count].length = PAGE_SIZE;
             ++physical_segment_count;
         } else {
             segments[physical_segment_count - 1U].length += PAGE_SIZE;
         }
+        previous_physical = physical;
     }
 
     dma_mapping_t candidate = {0};
@@ -217,17 +266,17 @@ kstatus_t dma_map_pages(struct device *dev, page_t **pages, uint32_t page_count,
         candidate.segment_count = 1U;
         candidate.flags = DMA_MAPPING_ACTIVE_FLAG | DMA_MAPPING_IOMMU_FLAG;
         *out = candidate;
-        g_dma_mappings[slot] = out;
+        dma_publish_slot((uint32_t)slot, out);
         if (iommu_map_pages(dev, iova_make(iova), pages, page_count,
                             iommu_access_for_direction(direction)) != K_OK) {
-            g_dma_mappings[slot] = 0;
+            dma_clear_slot((uint32_t)slot);
             *out = (dma_mapping_t){0};
             address_ok = false;
         }
     } else if (address_ok) {
         candidate.flags = DMA_MAPPING_ACTIVE_FLAG;
         *out = candidate;
-        g_dma_mappings[slot] = out;
+        dma_publish_slot((uint32_t)slot, out);
     }
     dma_unlock();
 
@@ -258,135 +307,41 @@ kstatus_t dma_map_pages(struct device *dev, page_t **pages, uint32_t page_count,
  *
  * No DMA remap occurs here.
  */
-kstatus_t dma_mapping_move(
-    dma_mapping_t *destination,
-    dma_mapping_t *source)
-{
-    if(destination == 0 ||
-       source == 0)
-    {
-        return K_EINVAL;
-    }
-
-    if(destination == source)
-    {
-        return K_OK;
-    }
-
-    /*
-     * Destination must not already own storage.
-     */
-    if(destination->device != 0 ||
-       destination->pages != 0 ||
-       destination->page_count != 0U ||
-       destination->segments != 0 ||
-       destination->segment_count != 0U ||
-       destination->mapped_length != 0U ||
-       destination->flags != 0U)
-    {
-        return K_EBUSY;
-    }
+kstatus_t dma_mapping_move(dma_mapping_t *destination, dma_mapping_t *source) {
+    if (destination == 0 || source == 0) return K_EINVAL;
+    if (destination == source) return K_OK;
+    if (destination->device != 0 || destination->pages != 0 ||
+        destination->page_count != 0U || destination->segments != 0 ||
+        destination->segment_count != 0U || destination->mapped_length != 0U ||
+        destination->flags != 0U) return K_EBUSY;
 
     dma_initialize();
-
     dma_lock();
-
-    int32_t source_slot =
-        -1;
-
-    bool destination_registered =
-        false;
-
-    for(uint32_t i = 0U;
-        i < DMA_MAPPING_LIMIT;
-        ++i)
-    {
-        if(g_dma_mappings[i] ==
-           destination)
-        {
-            destination_registered =
-                true;
-        }
-
-        if(g_dma_mappings[i] ==
-           source)
-        {
-            source_slot =
-                (int32_t)i;
-        }
+    int32_t source_slot = -1;
+    bool destination_registered = false;
+    for (uint32_t i = 0U; i < DMA_MAPPING_LIMIT; ++i) {
+        if (g_dma_mappings[i] == destination) destination_registered = true;
+        if (g_dma_mappings[i] == source) source_slot = (int32_t)i;
     }
 
-    if(destination_registered)
-    {
-        dma_unlock();
-        return K_EBUSY;
+    bool active = (source->flags & DMA_MAPPING_ACTIVE_FLAG) != 0U;
+    kstatus_t status = K_OK;
+    if (destination_registered ||
+        (active && (source->flags & DMA_MAPPING_UNMAPPING_FLAG) != 0U)) {
+        status = K_EBUSY;
+    } else if (active != (source_slot >= 0)) {
+        /* Active ownership requires registration; inactive values must not
+         * occupy a registry slot. */
+        status = K_EINVAL;
+    } else {
+        /* Relocate address identity without remapping, repinning or changing
+         * the device reference. Inactive aggregate values use the same copy. */
+        *destination = *source;
+        if (active) g_dma_mappings[(uint32_t)source_slot] = destination;
+        *source = (dma_mapping_t){0};
     }
-
-    bool active =
-        (source->flags &
-         DMA_MAPPING_ACTIVE_FLAG) !=
-        0U;
-
-    /*
-     * An inactive mapping has no DMA-Core ownership to relocate.
-     * Moving the zero/inactive value is still useful to callers
-     * moving aggregate objects.
-     */
-    if(!active)
-    {
-        if(source_slot >= 0)
-        {
-            dma_unlock();
-            return K_EINVAL;
-        }
-
-        *destination =
-            *source;
-
-        *source =
-            (dma_mapping_t){0};
-
-        dma_unlock();
-
-        return K_OK;
-    }
-
-    if((source->flags &
-        DMA_MAPPING_UNMAPPING_FLAG) !=
-       0U)
-    {
-        dma_unlock();
-        return K_EBUSY;
-    }
-
-    /*
-     * An active mapping MUST be registered by its exact address.
-     */
-    if(source_slot < 0)
-    {
-        dma_unlock();
-        return K_EINVAL;
-    }
-
-    /*
-     * Commit the ownership move while registry readers are excluded.
-     *
-     * No object_get/object_put and no pin count changes are needed:
-     * this is the same live mapping with a new container address.
-     */
-    *destination =
-        *source;
-
-    g_dma_mappings[
-        (uint32_t)source_slot] =
-        destination;
-
-    *source =
-        (dma_mapping_t){0};
-
     dma_unlock();
-
-    return K_OK;
+    return status;
 }
 
 
@@ -395,7 +350,7 @@ kstatus_t dma_unmap_checked(dma_mapping_t *mapping) {
         return K_OK;
     }
     dma_initialize();
-    bool registered = false;
+    int32_t slot = -1;
     bool iommu_mapping = (mapping->flags & DMA_MAPPING_IOMMU_FLAG) != 0;
     dma_lock();
     for (uint32_t i = 0; i < DMA_MAPPING_LIMIT; ++i) {
@@ -406,12 +361,12 @@ kstatus_t dma_unmap_checked(dma_mapping_t *mapping) {
             }
             /* 解除期间仍保留登记，但访问校验会拒绝新的 DMA。 */
             mapping->flags |= DMA_MAPPING_UNMAPPING_FLAG;
-            registered = true;
+            slot = (int32_t)i;
             break;
         }
     }
     dma_unlock();
-    if (!registered) return K_EINVAL;
+    if (slot < 0) return K_EINVAL;
 
     if (iommu_mapping) {
         kstatus_t status = iommu_unmap_pages(mapping->device,
@@ -427,9 +382,8 @@ kstatus_t dma_unmap_checked(dma_mapping_t *mapping) {
         }
     }
     dma_lock();
-    for (uint32_t i = 0; i < DMA_MAPPING_LIMIT; ++i) {
-        if (g_dma_mappings[i] == mapping) g_dma_mappings[i] = 0;
-    }
+    /* UNMAPPING prevents ownership moves until this registered slot is freed. */
+    if (g_dma_mappings[slot] == mapping) dma_clear_slot((uint32_t)slot);
     dma_unlock();
     dma_unpin_pages(mapping->pages, mapping->page_count);
     object_put(mapping->device);

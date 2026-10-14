@@ -1,5 +1,6 @@
 #include <kernel/rcu.h>
 #include <kernel/sched.h>
+#include <kernel/string.h>
 
 typedef struct rcu_callback {
     rcu_callback_fn callback;
@@ -19,38 +20,33 @@ static struct {
 
 static void rcu_lock(void) {
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&g_rcu.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_rcu.lock);
 }
 
 static void rcu_gate_lock(void) {
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&g_rcu.gate.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_rcu.gate);
 }
 
 static void rcu_gate_unlock(void) {
-    atomic_store_explicit(&g_rcu.gate.state, 0U, memory_order_release);
+    spinlock_unlock(&g_rcu.gate);
     sched_preempt_enable();
 }
 
 static void rcu_unlock(void) {
-    atomic_store_explicit(&g_rcu.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_rcu.lock);
     sched_preempt_enable();
 }
 
 bool rcu_init(void) {
+    if (atomic_load_explicit(&g_rcu.init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     sched_preempt_disable();
     if (atomic_compare_exchange_strong_explicit(&g_rcu.init_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_rcu.gate.state, 0U);
-        atomic_init(&g_rcu.lock.state, 0U);
+        spinlock_init(&g_rcu.gate);
+        spinlock_init(&g_rcu.lock);
         atomic_init(&g_rcu.reader_count, 0U);
         g_rcu.head = 0U;
         g_rcu.tail = 0U;
@@ -102,6 +98,22 @@ kstatus_t rcu_call(rcu_callback_fn callback, void *argument) {
     return K_OK;
 }
 
+/* Caller holds the callback queue lock and supplies a non-aliasing buffer
+ * with room for the selected batch. Copy in at most two contiguous spans
+ * and publish its indices once, rather than after every callback. */
+static uint32_t rcu_take_callbacks_locked(rcu_callback_t *out, uint32_t budget) {
+    uint32_t count = g_rcu.count < budget ? g_rcu.count : budget;
+    if (count == 0U) return 0U;
+    uint32_t first = RCU_CALLBACK_CAPACITY - g_rcu.head;
+    if (first > count) first = count;
+    memcpy(out, g_rcu.callbacks + g_rcu.head, first * sizeof(*out));
+    if (count > first)
+        memcpy(out + first, g_rcu.callbacks, (count - first) * sizeof(*out));
+    g_rcu.head = (g_rcu.head + count) % RCU_CALLBACK_CAPACITY;
+    g_rcu.count -= count;
+    return count;
+}
+
 uint32_t rcu_poll(uint32_t budget) {
     rcu_callback_t callbacks[RCU_CALLBACK_CAPACITY];
     uint32_t count = 0U;
@@ -114,11 +126,7 @@ uint32_t rcu_poll(uint32_t budget) {
         return 0U;
     }
     rcu_lock();
-    while (count < budget && g_rcu.count != 0U) {
-        callbacks[count++] = g_rcu.callbacks[g_rcu.head];
-        g_rcu.head = (g_rcu.head + 1U) % RCU_CALLBACK_CAPACITY;
-        --g_rcu.count;
-    }
+    count = rcu_take_callbacks_locked(callbacks, budget);
     rcu_unlock();
     rcu_gate_unlock();
     for (uint32_t i = 0; i < count; ++i) {
@@ -141,11 +149,7 @@ kstatus_t rcu_synchronize(void) {
         /* gate 锁住新读者后摘下队列，确保本次 grace period 不会被新读者
          * 插入窗口打断；回调在释放 gate 后执行，避免回调重入 RCU 锁。 */
         rcu_lock();
-        while (count < RCU_CALLBACK_CAPACITY && g_rcu.count != 0U) {
-            callbacks[count++] = g_rcu.callbacks[g_rcu.head];
-            g_rcu.head = (g_rcu.head + 1U) % RCU_CALLBACK_CAPACITY;
-            --g_rcu.count;
-        }
+        count = rcu_take_callbacks_locked(callbacks, RCU_CALLBACK_CAPACITY);
         rcu_unlock();
         rcu_gate_unlock();
         break;

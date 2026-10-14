@@ -274,7 +274,7 @@ compositor_surface_cache_get(
     }
 
     page_count64 =
-        (view->buffer_size + PAGE_SIZE - 1U) >>
+        (reference->buffer_size + PAGE_SIZE - 1U) >>
         PAGE_SHIFT;
 
     if (page_count64 == 0U ||

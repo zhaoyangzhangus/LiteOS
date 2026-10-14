@@ -21,9 +21,26 @@ static inline void bitmap_clear_bit(uint64_t *words, size_t bit) {
 
 static inline void bitmap_set_range(uint64_t *words, size_t start,
                                     size_t count, bool value) {
-    for (size_t index = 0U; index < count; ++index) {
-        if (value) bitmap_set_bit(words, start + index);
-        else bitmap_clear_bit(words, start + index);
+    if (count == 0U) return;
+    size_t word = start / 64U;
+    unsigned offset = (unsigned)(start % 64U);
+    if (offset != 0U) {
+        unsigned length = count < 64U - offset ? (unsigned)count : 64U - offset;
+        uint64_t mask = (UINT64_MAX >> (64U - length)) << offset;
+        if (value) words[word] |= mask;
+        else words[word] &= ~mask;
+        count -= length;
+        ++word;
+    }
+    uint64_t fill = value ? UINT64_MAX : 0U;
+    while (count >= 64U) {
+        words[word++] = fill;
+        count -= 64U;
+    }
+    if (count != 0U) {
+        uint64_t mask = (1ULL << count) - 1ULL;
+        if (value) words[word] |= mask;
+        else words[word] &= ~mask;
     }
 }
 

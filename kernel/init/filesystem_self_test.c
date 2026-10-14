@@ -15,6 +15,7 @@
 #include <kernel/block_device.h>
 #include <kernel/fat32.h>
 #include <kernel/console.h>
+#include "../fs/vfs/internal.h"
 #include "filesystem_internal.h"
 
 /* REFACTOR_P3_FILESYSTEM_SELF_TEST_OWNER: FAT32, VFS, and file-map tests. */
@@ -59,27 +60,145 @@ static BOOLEAN filesystem_vfs_fat_delete_self_test(void) {
     static const CHAR8 path[] = "/vfsdel.asm";
     static const CHAR8 fileman_path[] = "/VFSDEL.ASM";
     static const CHAR8 source[] = "bits 64\n";
+    static const CHAR8 replacement_source[] = "bits 32\n";
+    static const CHAR8 retained_tail[] = "tail";
     file_t *file = 0;
+    file_t *replacement = 0;
+    file_t *reader = 0;
+    file_t *pressure_open = 0;
+    static OS_FAT32_FILE *pressure[OS_FAT32_MAX_OPEN_FILES];
+    UINT32 pressure_count = 0U;
     os_file_info_t info = {0};
     UINT64 bytes = 0U;
     CHAR8 result[sizeof(source)] = {0};
     BOOLEAN success = 0;
 
+    char relative[VFS_PATH_LIMIT];
+    vfs_fat32_mount_t *mount = vfs_fat32_mount_for_path(path, relative);
+    UINT32 seeded = 0U;
+    if (mount == 0 || !fat32_create_path(mount->filesystem, relative, 0) ||
+        !fat32_write_path(mount->filesystem, relative, 0U, source,
+                                 sizeof(source) - 1U, &seeded) ||
+        seeded != sizeof(source) - 1U ||
+        vfs_open_kernel(path, VFS_OPEN_READ, 0U, &reader) != K_OK || reader == 0) {
+        goto cleanup;
+    }
+    vfs_backend_node_t *shared = (vfs_backend_node_t *)reader->vnode->fs_private;
+    if (shared == 0 || shared->fat_file == 0) goto cleanup;
+    OS_FAT32_FILE *retained_inode = shared->fat_file;
+    if (!fat32_create_path(mount->filesystem, "/vfspress.asm", 0)) goto cleanup;
+    /* A cached VFS open needs no spare native FAT slot. Saturate the raw
+     * table, then verify both read and write opens retain the same inode. */
+    while (pressure_count < OS_FAT32_MAX_OPEN_FILES &&
+           fat32_open(mount->filesystem, relative, &pressure[pressure_count])) {
+        ++pressure_count;
+    }
+    for (UINT32 index = 0U; index < OS_FAT32_MAX_OPEN_FILES; ++index) {
+        if (!mount->filesystem->OpenFiles[index].Used) goto cleanup;
+    }
+    if (pressure_count == OS_FAT32_MAX_OPEN_FILES ||
+        vfs_open_kernel(path, VFS_OPEN_READ | VFS_OPEN_WRITE, 0U,
+                         &pressure_open) != K_OK || pressure_open == 0 ||
+        pressure_open->vnode != reader->vnode || shared->fat_file != retained_inode) {
+        goto cleanup;
+    }
+    vfs_close(pressure_open);
+    pressure_open = 0;
+    if (vfs_open_kernel(path, VFS_OPEN_READ, 0U, &pressure_open) != K_OK ||
+        pressure_open == 0 || pressure_open->vnode != reader->vnode ||
+        shared->fat_file != retained_inode) goto cleanup;
+    vfs_close(pressure_open);
+    pressure_open = 0;
+    /* /sample.txt is an idle canonical inode from the preceding test. A
+     * cache miss must reclaim that spare handle while retaining this live
+     * reader's inode, even with every native slot currently occupied. */
+    if (vfs_open_kernel("/vfspress.asm", VFS_OPEN_READ, 0U, &pressure_open) != K_OK ||
+        pressure_open == 0 || shared->fat_file != retained_inode ||
+        ((vfs_backend_node_t *)pressure_open->vnode->fs_private)->fat_file == 0) goto cleanup;
+    vfs_close(pressure_open);
+    pressure_open = 0;
+    while (pressure_count != 0U) (void)fat32_close(pressure[--pressure_count]);
+    if (vfs_remove_kernel("/vfspress.asm") != K_OK) goto cleanup;
+    if (vfs_open_kernel("/sample.txt", VFS_OPEN_READ, 0U, &pressure_open) != K_OK ||
+        pressure_open == 0 ||
+        ((vfs_backend_node_t *)pressure_open->vnode->fs_private)->fat_file != 0 ||
+        vfs_read_kernel(pressure_open, result, 5U, &bytes) != K_OK || bytes != 5U ||
+        __builtin_memcmp(result, "world", 5U) != 0) goto cleanup;
+    vfs_close(pressure_open);
+    pressure_open = 0;
     if (vfs_open_kernel(path,
                         VFS_OPEN_READ | VFS_OPEN_WRITE | VFS_OPEN_CREATE |
                             VFS_OPEN_TRUNCATE,
                         0666U, &file) != K_OK || file == 0 ||
+        file->vnode != reader->vnode || shared->fat_file != retained_inode ||
         vfs_write_kernel(file, source, sizeof(source) - 1U, &bytes) != K_OK ||
-        bytes != sizeof(source) - 1U || vfs_remove_kernel(fileman_path) != K_OK ||
+        bytes != sizeof(source) - 1U ||
+        vfs_rename_kernel(fileman_path, "/vfsren.asm") != K_OK ||
+        vfs_stat_kernel(path, &info) != K_ENOENT ||
+        vfs_file_stat(file, &info) != K_OK ||
+        __builtin_memcmp(info.name, "vfsren.asm", sizeof("vfsren.asm")) != 0 ||
+        vfs_seek(file, 0, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_write_kernel(file, source, sizeof(source) - 1U, &bytes) != K_OK ||
+        bytes != sizeof(source) - 1U ||
         vfs_seek(file, 0, OS_FILE_SEEK_SET, &bytes) != K_OK ||
         vfs_read_kernel(file, result, sizeof(source) - 1U, &bytes) != K_OK ||
-        bytes != sizeof(source) - 1U || result[0] != 'b') {
+        bytes != sizeof(source) - 1U) {
         goto cleanup;
     }
+    for (UINT32 index = 0U; index < sizeof(source) - 1U; ++index) {
+        if (result[index] != source[index]) goto cleanup;
+    }
+    if (vfs_rename_kernel("/VFSREN.ASM", path) != K_OK ||
+        vfs_remove_kernel(fileman_path) != K_OK ||
+        vfs_seek(file, 0, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_read_kernel(file, result, sizeof(source) - 1U, &bytes) != K_OK ||
+        bytes != sizeof(source) - 1U) {
+        goto cleanup;
+    }
+    for (UINT32 index = 0U; index < sizeof(source) - 1U; ++index) {
+        if (result[index] != source[index]) goto cleanup;
+    }
+    /* Reusing the pathname must not redirect an already-open old version. */
+    if (vfs_open_kernel(path,
+                        VFS_OPEN_READ | VFS_OPEN_WRITE | VFS_OPEN_CREATE |
+                            VFS_OPEN_TRUNCATE,
+                        0666U, &replacement) != K_OK || replacement == 0 ||
+        vfs_write_kernel(replacement, replacement_source,
+                          sizeof(replacement_source) - 1U, &bytes) != K_OK ||
+        bytes != sizeof(replacement_source) - 1U ||
+        vfs_seek(file, 0, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_read_kernel(file, result, sizeof(source) - 1U, &bytes) != K_OK ||
+        bytes != sizeof(source) - 1U) goto cleanup;
+    for (UINT32 index = 0U; index < sizeof(source) - 1U; ++index) {
+        if (result[index] != source[index]) goto cleanup;
+    }
+    if (vfs_seek(replacement, 0, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_rename_kernel(path, path) != K_OK ||
+        vfs_read_kernel(replacement, result,
+                         sizeof(replacement_source) - 1U, &bytes) != K_OK ||
+        bytes != sizeof(replacement_source) - 1U) goto cleanup;
+    for (UINT32 index = 0U; index < sizeof(replacement_source) - 1U; ++index) {
+        if (result[index] != replacement_source[index]) goto cleanup;
+    }
+    vfs_close(replacement);
+    replacement = 0;
+    if (vfs_remove_kernel(fileman_path) != K_OK) goto cleanup;
+    if (vfs_seek(file, sizeof(source) - 1U, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_write_kernel(file, retained_tail, sizeof(retained_tail) - 1U,
+                           &bytes) != K_OK ||
+        bytes != sizeof(retained_tail) - 1U ||
+        vfs_seek(file, sizeof(source) - 1U, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_read_kernel(file, result, sizeof(retained_tail) - 1U, &bytes) != K_OK ||
+        bytes != sizeof(retained_tail) - 1U) goto cleanup;
+    for (UINT32 index = 0U; index < sizeof(retained_tail) - 1U; ++index) {
+        if (result[index] != retained_tail[index]) goto cleanup;
+    }
+    if (vfs_truncate_kernel(file, sizeof(source) - 1U) != K_OK) goto cleanup;
     vfs_close(file);
     file = 0;
 
     if (vfs_stat_kernel(path, &info) != K_ENOENT ||
+        vfs_rename_kernel(path, path) != K_ENOENT ||
         vfs_open_kernel(path, VFS_OPEN_READ, 0U, &file) != K_ENOENT) {
         goto cleanup;
     }
@@ -97,8 +216,266 @@ static BOOLEAN filesystem_vfs_fat_delete_self_test(void) {
     success = 1;
 
 cleanup:
+    if (pressure_open != 0) vfs_close(pressure_open);
+    while (pressure_count != 0U) (void)fat32_close(pressure[--pressure_count]);
+    if (reader != 0) vfs_close(reader);
+    if (replacement != 0) vfs_close(replacement);
     if (file != 0) vfs_close(file);
     if (!success) (void)vfs_remove_kernel(path);
+    if (!success) (void)vfs_remove_kernel("/vfsren.asm");
+    if (!success) (void)vfs_remove_kernel("/vfspress.asm");
+    return success;
+}
+
+static BOOLEAN filesystem_vfs_fat_rename_limit_self_test(void) {
+    static const CHAR8 parent[] = "/vfslimit";
+    static const CHAR8 child[] = "/vfslimit/child";
+    CHAR8 destination[251];
+    file_t *file = 0;
+    os_file_info_t info = {0};
+    UINT64 bytes = 0U;
+    CHAR8 result = 0;
+    BOOLEAN success = 0;
+    destination[0] = '/';
+    for (UINT32 i = 1U; i < 250U; ++i) destination[i] = 'x';
+    destination[250] = 0;
+    if (vfs_mkdir_kernel(parent, 0755U) != K_OK ||
+        vfs_open_kernel(child, VFS_OPEN_CREATE | VFS_OPEN_READ | VFS_OPEN_WRITE,
+                         0600U, &file) != K_OK || file == 0 ||
+        vfs_write_kernel(file, "x", 1U, &bytes) != K_OK || bytes != 1U ||
+        vfs_rename_kernel(parent, destination) != K_ENAMETOOLONG ||
+        vfs_stat_kernel(parent, &info) != K_OK ||
+        vfs_stat_kernel(child, &info) != K_OK || info.size != 1U ||
+        vfs_stat_kernel(destination, &info) != K_ENOENT ||
+        vfs_seek(file, 0, OS_FILE_SEEK_SET, &bytes) != K_OK ||
+        vfs_read_kernel(file, &result, 1U, &bytes) != K_OK || bytes != 1U || result != 'x') {
+        goto cleanup;
+    }
+    success = 1;
+cleanup:
+    if (file != 0) vfs_close(file);
+    if (vfs_remove_kernel(child) != K_OK) success = 0;
+    if (vfs_remove_kernel(parent) != K_OK) success = 0;
+    return success;
+}
+
+/* Chrome's startup profile is deliberately an in-memory namespace during the
+ * compatibility smoke run.  Keep the namespace contract (mkdir/open/write/
+ * stat/rename/remove) covered independently from the FAT backend. */
+static BOOLEAN filesystem_vfs_chrome_profile_overlay_self_test(void) {
+    /* Never place test Preferences under Chrome's live user-data directory:
+     * desktop launch can overlap late filesystem checks, and Chromium treats
+     * the intentionally minimal fixture below as a corrupt real profile. */
+    static const CHAR8 root[] = "/tmp/vfs-chrome-profile-test";
+    static const CHAR8 profile[] = "/tmp/vfs-chrome-profile-test/Default";
+    static const CHAR8 preferences[] =
+        "/tmp/vfs-chrome-profile-test/Default/Preferences";
+    static const CHAR8 local_state[] = "/tmp/vfs-chrome-profile-test/Local State";
+    static const CHAR8 data[] = "{\"profile_test\":true}";
+    file_t *file = 0;
+    os_file_info_t info = {0};
+    char relative[VFS_PATH_LIMIT];
+    UINT64 bytes = 0U;
+    UINT32 failure_stage = 0U;
+    kstatus_t status = K_OK;
+    BOOLEAN success = 0;
+
+    failure_stage = 1U;
+    if (vfs_fat32_relative_path(root, relative)) {
+        status = K_EEXIST;
+        goto cleanup;
+    }
+    failure_stage = 2U;
+    status = vfs_mkdir_kernel(root, 0700U);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 3U;
+    status = vfs_mkdir_kernel(profile, 0700U);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 4U;
+    status = vfs_open_kernel(preferences,
+                             VFS_OPEN_READ | VFS_OPEN_WRITE |
+                                 VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE,
+                             0600U, &file);
+    if (status != K_OK || file == 0) goto cleanup;
+    failure_stage = 5U;
+    status = vfs_write_kernel(file, data, sizeof(data) - 1U, &bytes);
+    if (status != K_OK || bytes != sizeof(data) - 1U) {
+        if (status == K_OK) status = K_EIO;
+        goto cleanup;
+    }
+    failure_stage = 6U;
+    status = vfs_stat_kernel(preferences, &info);
+    if (status != K_OK || info.size != sizeof(data) - 1U) {
+        if (status == K_OK) status = K_EIO;
+        goto cleanup;
+    }
+    vfs_close(file);
+    file = 0;
+    failure_stage = 7U;
+    status = vfs_rename_kernel(local_state, local_state);
+    if (status != K_ENOENT) goto cleanup;
+    status = vfs_rename_kernel(preferences, preferences);
+    if (status != K_OK) goto cleanup;
+    status = vfs_rename_kernel(preferences, local_state);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 8U;
+    status = vfs_stat_kernel(preferences, &info);
+    if (status != K_ENOENT) goto cleanup;
+    failure_stage = 9U;
+    status = vfs_stat_kernel(local_state, &info);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 10U;
+    status = vfs_remove_kernel(local_state);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 11U;
+    status = vfs_remove_kernel(profile);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 12U;
+    status = vfs_remove_kernel(root);
+    if (status != K_OK) goto cleanup;
+    success = 1;
+
+cleanup:
+    if (file != 0) vfs_close(file);
+    if (!success) {
+        kernel_serial_write("OS_CHROME_OVERLAY_TEST_FAIL STAGE=");
+        kernel_serial_write_u32(failure_stage);
+        kernel_serial_write(" STATUS=");
+        kernel_serial_write_u32((UINT32)(-status));
+        kernel_serial_write("\r\n");
+        (void)vfs_remove_kernel(local_state);
+        (void)vfs_remove_kernel(preferences);
+        (void)vfs_remove_kernel(profile);
+        (void)vfs_remove_kernel(root);
+    }
+    return success;
+}
+
+/* Chromium also creates large anonymous/shared-memory backing files directly
+ * in /tmp (for example .org.chromium.Chromium.*).  Ensure these use the
+ * volatile memory backend rather than FAT before the browser starts. */
+static BOOLEAN filesystem_vfs_tmp_shared_file_self_test(void) {
+    static const CHAR8 path[] = "/tmp/.org.chromium.Chromium.000000";
+    static const UINT64 shared_size = 4198400U;
+    file_t *file = 0;
+    os_file_info_t info = {0};
+    vfs_backend_node_t *backend;
+    UINT32 failure_stage = 0U;
+    kstatus_t status = K_OK;
+    BOOLEAN success = 0;
+    char relative[VFS_PATH_LIMIT];
+
+    failure_stage = 1U;
+    if (vfs_fat32_relative_path(path, relative)) {
+        status = K_EIO;
+        goto cleanup;
+    }
+    failure_stage = 2U;
+    status = vfs_open_kernel(path,
+                             VFS_OPEN_READ | VFS_OPEN_WRITE |
+                                 VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE,
+                             0600U, &file);
+    if (status != K_OK || file == 0) goto cleanup;
+    backend = (vfs_backend_node_t *)file->vnode->fs_private;
+    failure_stage = 3U;
+    if (backend == 0 || backend->fat32_node ||
+        backend->truncate != vfs_memory_backend_truncate) {
+        status = K_EIO;
+        goto cleanup;
+    }
+    failure_stage = 4U;
+    status = vfs_truncate_kernel(file, shared_size);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 5U;
+    status = vfs_stat_kernel(path, &info);
+    if (status != K_OK || info.size != shared_size) {
+        if (status == K_OK) status = K_EIO;
+        goto cleanup;
+    }
+    vfs_close(file);
+    file = 0;
+    failure_stage = 6U;
+    status = vfs_remove_kernel(path);
+    if (status != K_OK) goto cleanup;
+    success = 1;
+
+cleanup:
+    if (file != 0) vfs_close(file);
+    if (!success) {
+        kernel_serial_write("OS_TMP_SHARED_FILE_TEST_FAIL STAGE=");
+        kernel_serial_write_u32(failure_stage);
+        kernel_serial_write(" STATUS=");
+        kernel_serial_write_u32((UINT32)(-status));
+        kernel_serial_write("\r\n");
+        (void)vfs_remove_kernel(path);
+    }
+    return success;
+}
+
+static VOID filesystem_test_numbered_path(const CHAR8 *prefix, UINT32 index,
+                                          CHAR8 output[VFS_PATH_LIMIT]) {
+    size_t length = vfs_string_length(prefix);
+    if (length >= VFS_PATH_LIMIT - 3U) return;
+    for (size_t position = 0U; position < length; ++position) {
+        output[position] = prefix[position];
+    }
+    output[length] = (CHAR8)('0' + (index / 10U));
+    output[length + 1U] = (CHAR8)('0' + (index % 10U));
+    output[length + 2U] = '\0';
+}
+
+/* Chrome's first profile creates more than the old fixed 64-node VFS cache.
+ * Keep that capacity requirement executable so a small namespace regression
+ * cannot silently return K_ENOMEM during browser startup. */
+static BOOLEAN filesystem_vfs_chrome_profile_capacity_self_test(void) {
+    static const CHAR8 root[] = "/tmp/vfs-chrome-profile-test";
+    static const CHAR8 capacity_root[] =
+        "/tmp/vfs-chrome-profile-test/capacity";
+    static const CHAR8 node_prefix[] =
+        "/tmp/vfs-chrome-profile-test/capacity/node-";
+    static const UINT32 node_count = 80U;
+    file_t *file = 0;
+    CHAR8 path[VFS_PATH_LIMIT];
+    UINT32 created = 0U;
+    UINT32 failure_stage = 0U;
+    kstatus_t status = K_OK;
+    BOOLEAN success = 0;
+
+    failure_stage = 1U;
+    status = vfs_mkdir_kernel(root, 0700U);
+    if (status != K_OK) goto cleanup;
+    failure_stage = 2U;
+    status = vfs_mkdir_kernel(capacity_root, 0700U);
+    if (status != K_OK) goto cleanup;
+    for (UINT32 index = 0U; index < node_count; ++index) {
+        filesystem_test_numbered_path(node_prefix, index, path);
+        failure_stage = 3U + index;
+        status = vfs_open_kernel(path,
+                                 VFS_OPEN_READ | VFS_OPEN_WRITE |
+                                     VFS_OPEN_CREATE | VFS_OPEN_TRUNCATE,
+                                 0600U, &file);
+        if (status != K_OK || file == 0) goto cleanup;
+        vfs_close(file);
+        file = 0;
+        ++created;
+    }
+    success = 1;
+
+cleanup:
+    if (file != 0) vfs_close(file);
+    for (UINT32 index = 0U; index < created; ++index) {
+        filesystem_test_numbered_path(node_prefix, index, path);
+        (void)vfs_remove_kernel(path);
+    }
+    (void)vfs_remove_kernel(capacity_root);
+    (void)vfs_remove_kernel(root);
+    if (!success) {
+        kernel_serial_write("OS_CHROME_CAPACITY_TEST_FAIL STAGE=");
+        kernel_serial_write_u32(failure_stage);
+        kernel_serial_write(" STATUS=");
+        kernel_serial_write_u32((UINT32)(-status));
+        kernel_serial_write("\r\n");
+    }
     return success;
 }
 
@@ -109,11 +486,14 @@ BOOLEAN filesystem_vfs_file_api_self_test(void) {
     uint64_t position = 0U;
     char result[4] = {0};
     bool success = false;
+    if (!filesystem_vfs_chrome_profile_overlay_self_test()) return false;
+    if (!filesystem_vfs_tmp_shared_file_self_test()) return false;
+    if (!filesystem_vfs_chrome_profile_capacity_self_test()) return false;
     kstatus_t status = vfs_mkdir_kernel("/vfs-api", 0755U);
     if (status != K_OK) {
-        liteos_serial_write("LITEOS_VFS_API_FAIL_STAGE=1 STATUS=");
-        liteos_serial_write_u32((uint32_t)(-status));
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_VFS_API_FAIL_STAGE=1 STATUS=");
+        kernel_serial_write_u32((uint32_t)(-status));
+        kernel_serial_write("\r\n");
         goto cleanup;
     }
     if (
@@ -152,16 +532,17 @@ cleanup:
 }
 
 BOOLEAN filesystem_fat32_self_test(void) {
-    static LITEOS_BLOCK_MANAGER block_manager;
-    static LITEOS_BLOCK_DEVICE *device;
-    static LITEOS_FAT32 filesystem;
+    static OS_BLOCK_MANAGER block_manager;
+    static OS_BLOCK_DEVICE *device;
+    static OS_FAT32 filesystem;
     CHAR8 buffer[6] = {0};
     UINT32 size = 0;
-    LITEOS_FAT32_FILE *held_file = 0;
+    OS_FAT32_FILE *held_file = 0;
     UINT8 *fat1;
     UINT8 *fat2;
     UINT8 *root;
     UINT8 *data;
+    file_t *mounted_file = 0;
     for (UINT32 i = 0; i < sizeof(g_fat32_test_disk); ++i) g_fat32_test_disk[i] = 0;
     g_fat32_test_disk[510] = 0x55U;
     g_fat32_test_disk[511] = 0xAAU;
@@ -186,38 +567,38 @@ BOOLEAN filesystem_fat32_self_test(void) {
     store_u32(root + 28U, 5U);
     data = g_fat32_test_disk + 4U * 512U;
     data[0] = 'h'; data[1] = 'e'; data[2] = 'l'; data[3] = 'l'; data[4] = 'o';
-    if (!liteos_block_manager_init(&block_manager)) return 0;
-    if (!liteos_block_register(&block_manager, "mem0", 512U, FAT32_TEST_SECTOR_COUNT,
+    if (!block_manager_init(&block_manager)) return 0;
+    if (!block_register(&block_manager, "mem0", 512U, FAT32_TEST_SECTOR_COUNT,
                                fat32_test_read, fat32_test_write, 0,
                                g_fat32_test_disk, &device)) return 0;
-    if (!liteos_fat32_init(&filesystem, device)) return 0;
-    if (!liteos_fat32_read_path(&filesystem, "sample.txt", 0U, buffer, 5U, &size) ||
+    if (!fat32_init(&filesystem, device)) return 0;
+    if (!fat32_read_path(&filesystem, "sample.txt", 0U, buffer, 5U, &size) ||
         size != 5U ||
         buffer[0] != 'h' || buffer[4] != 'o') return 0;
-    if (!liteos_fat32_write_path(&filesystem, "sample.txt", 0U,
+    if (!fat32_write_path(&filesystem, "sample.txt", 0U,
                                  "world", 5U, &size) || size != 5U ||
-        !liteos_fat32_create_path(&filesystem, "new.txt", 0) ||
-        liteos_fat32_create_path(&filesystem, "new.txt", 0) ||
-        !liteos_fat32_create_path(&filesystem, "Long Created File.txt", 0) ||
-        !liteos_fat32_write_path(&filesystem, "Long Created File.txt", 0U,
+        !fat32_create_path(&filesystem, "new.txt", 0) ||
+        fat32_create_path(&filesystem, "new.txt", 0) ||
+        !fat32_create_path(&filesystem, "Long Created File.txt", 0) ||
+        !fat32_write_path(&filesystem, "Long Created File.txt", 0U,
                                  "lfn", 3U, &size) || size != 3U ||
-        !liteos_fat32_remove_path(&filesystem, "Long Created File.txt") ||
-        !liteos_fat32_create_path(&filesystem, "Long Created File.txt", 0) ||
-        !liteos_fat32_open(&filesystem, "Long Created File.txt", &held_file) ||
-        liteos_fat32_remove_path(&filesystem, "Long Created File.txt") ||
-        !liteos_fat32_close(held_file) ||
-        !liteos_fat32_remove_path(&filesystem, "Long Created File.txt") ||
-        !liteos_fat32_create_path(&filesystem, "Long Folder Name", 1) ||
-        !liteos_fat32_create_path(&filesystem, "Long Folder Name/Long Child Name.txt", 0) ||
-        !liteos_fat32_remove_path(&filesystem, "Long Folder Name/Long Child Name.txt") ||
-        !liteos_fat32_remove_path(&filesystem, "Long Folder Name") ||
-        !liteos_fat32_create_path(&filesystem, "subdir", 1) ||
-        !liteos_fat32_create_path(&filesystem, "subdir/inner.txt", 0) ||
-        liteos_fat32_remove_path(&filesystem, "subdir") ||
-        !liteos_fat32_remove_path(&filesystem, "subdir/inner.txt") ||
-        !liteos_fat32_remove_path(&filesystem, "subdir") ||
-        !liteos_fat32_remove_path(&filesystem, "new.txt") ||
-        !liteos_fat32_sync(&filesystem) ||
+        !fat32_remove_path(&filesystem, "Long Created File.txt") ||
+        !fat32_create_path(&filesystem, "Long Created File.txt", 0) ||
+        !fat32_open(&filesystem, "Long Created File.txt", &held_file) ||
+        fat32_remove_path(&filesystem, "Long Created File.txt") ||
+        !fat32_close(held_file) ||
+        !fat32_remove_path(&filesystem, "Long Created File.txt") ||
+        !fat32_create_path(&filesystem, "Long Folder Name", 1) ||
+        !fat32_create_path(&filesystem, "Long Folder Name/Long Child Name.txt", 0) ||
+        !fat32_remove_path(&filesystem, "Long Folder Name/Long Child Name.txt") ||
+        !fat32_remove_path(&filesystem, "Long Folder Name") ||
+        !fat32_create_path(&filesystem, "subdir", 1) ||
+        !fat32_create_path(&filesystem, "subdir/inner.txt", 0) ||
+        fat32_remove_path(&filesystem, "subdir") ||
+        !fat32_remove_path(&filesystem, "subdir/inner.txt") ||
+        !fat32_remove_path(&filesystem, "subdir") ||
+        !fat32_remove_path(&filesystem, "new.txt") ||
+        !fat32_sync(&filesystem) ||
         g_fat32_test_disk[4U * 512U] != 'w' ||
         g_fat32_test_disk[4U * 512U + 4U] != 'd' ||
         vfs_mount_fat32("/", &filesystem) != K_OK) return 0;
@@ -229,12 +610,112 @@ BOOLEAN filesystem_fat32_self_test(void) {
         (void)vfs_unmount_fat32();
         return 0;
     }
-    if (!filesystem_vfs_fat_delete_self_test()) {
+    kernel_serial_write("OS_FAT32_PERSIST_BEGIN\r\n");
+    if (vfs_open_kernel("/sample.txt", VFS_OPEN_READ, 0U, &mounted_file) != K_OK ||
+        mounted_file == 0 ||
+        ((vfs_backend_node_t *)mounted_file->vnode->fs_private)->fat_file == 0) {
+        kernel_serial_write("OS_FAT32_PERSIST_FAIL\r\n");
+        if (mounted_file != 0) vfs_close(mounted_file);
+        (void)vfs_unmount_fat32();
+        return 0;
+    }
+    vfs_close(mounted_file);
+    mounted_file = 0;
+    kernel_serial_write("OS_FAT32_PERSIST_OK\r\n");
+    if (!filesystem_vfs_fat_delete_self_test() ||
+        !filesystem_vfs_fat_rename_limit_self_test()) {
         (void)vfs_unmount_fat32();
         return 0;
     }
     if (vfs_unmount_fat32() != K_OK) return 0;
     return 1;
+}
+
+typedef struct vm_fault_lock_test_context {
+    vm_space_t *space;
+    page_t *page;
+    BOOLEAN callback_called;
+    BOOLEAN observed_unlocked;
+} vm_fault_lock_test_context_t;
+
+static void vm_fault_lock_test_retain(void *mapping) {
+    (void)mapping;
+}
+
+static void vm_fault_lock_test_release(void *mapping) {
+    (void)mapping;
+}
+
+static kstatus_t vm_fault_lock_test_page_get(void *mapping,
+                                             uint64_t page_index,
+                                             page_t **out) {
+    vm_fault_lock_test_context_t *context =
+        (vm_fault_lock_test_context_t *)mapping;
+    if (context == 0 || out == 0 || page_index != 0U) return K_EINVAL;
+    context->callback_called = 1;
+    context->observed_unlocked =
+        atomic_load_explicit(&context->space->map_lock.state,
+                             memory_order_acquire) == 0U;
+    if (!context->observed_unlocked) return K_EBUSY;
+    if (context->page == 0) {
+        context->page = page_alloc(0U, PAGE_ALLOC_ZERO);
+        if (context->page == 0) return K_ENOMEM;
+    }
+    *out = context->page;
+    return K_OK;
+}
+
+static const vm_file_ops_t g_vm_fault_lock_test_file_ops = {
+    .retain = vm_fault_lock_test_retain,
+    .release = vm_fault_lock_test_release,
+    .page_get = vm_fault_lock_test_page_get,
+};
+
+static BOOLEAN filesystem_vfs_lock_preemption_self_test(void) {
+    vnode_t vnode = {0};
+    vfs_backend_node_t backend = {0};
+    if (sched_preempt_disabled()) return 0;
+    atomic_init(&vnode.lock.state, 0U);
+    atomic_init(&backend.io_lock.state, 0U);
+
+    vfs_vnode_lock(&vnode);
+    BOOLEAN vnode_nonpreemptible = sched_preempt_disabled();
+    vfs_vnode_unlock(&vnode);
+    if (!vnode_nonpreemptible || sched_preempt_disabled()) return 0;
+
+    vfs_backend_lock(&backend);
+    BOOLEAN backend_nonpreemptible = sched_preempt_disabled();
+    vfs_backend_unlock(&backend);
+    return backend_nonpreemptible && !sched_preempt_disabled();
+}
+
+/* File-backed fault callbacks must never run while the address-space lock is held. */
+static BOOLEAN filesystem_vm_fault_lock_self_test(void) {
+    vm_fault_lock_test_context_t context = {0};
+    vm_object_t *object = 0;
+    vm_space_t *space = 0;
+    vaddr_t address = 0x0000000040000000ULL;
+    BOOLEAN success = 0;
+
+    if (vm_space_create(&space) != K_OK) goto cleanup;
+    context.space = space;
+    if (vm_object_create_file(&context, &g_vm_fault_lock_test_file_ops,
+                              PAGE_SIZE, 0U, PAGE_SIZE, &object) != K_OK ||
+        vm_map_object(space, object, &address, 0U, PAGE_SIZE,
+                      VM_PROT_READ | VM_PROT_USER,
+                      VM_MAP_PRIVATE | VM_MAP_FIXED) != K_OK ||
+        vm_handle_fault(space,
+                        &(vm_fault_info_t){address, VM_PROT_READ, 0U}) != K_OK ||
+        !context.callback_called || !context.observed_unlocked) {
+        goto cleanup;
+    }
+    success = 1;
+
+cleanup:
+    if (space != 0) vm_space_put(space);
+    if (object != 0) vm_object_put(object);
+    if (context.page != 0) page_free(context.page);
+    return success;
 }
 
 /* 验证同一个 vnode 的文件页在多个地址空间之间共享统一页缓存。 */
@@ -266,6 +747,14 @@ BOOLEAN filesystem_file_mapping_self_test(void) {
     UINT32 failure_stage = 0;
     UINT64 initial_written = 0;
     BOOLEAN success = 0;
+    if (!filesystem_vfs_lock_preemption_self_test()) {
+        failure_stage = 20;
+        goto cleanup;
+    }
+    if (!filesystem_vm_fault_lock_self_test()) {
+        failure_stage = 19;
+        goto cleanup;
+    }
     if (vfs_open_kernel(test_path,
                         VFS_OPEN_READ | VFS_OPEN_WRITE, 0U, &file) != K_OK ||
         file == 0) {
@@ -402,9 +891,9 @@ BOOLEAN filesystem_file_mapping_self_test(void) {
                 kstatus_t sync_status = vfs_fsync(write_file);
                 if (sync_status != K_OK) {
                     failure_stage = 11;
-                    liteos_serial_write("LITEOS_VFS_FILEMAP_DEBUG_STATUS=");
-                    liteos_serial_write_u32((UINT32)(-sync_status));
-                    liteos_serial_write("\r\n");
+                    kernel_serial_write("OS_VFS_FILEMAP_DEBUG_STATUS=");
+                    kernel_serial_write_u32((UINT32)(-sync_status));
+                    kernel_serial_write("\r\n");
                     success = false;
                 } else {
                     write_file->position = 0;
@@ -420,9 +909,9 @@ BOOLEAN filesystem_file_mapping_self_test(void) {
 
 cleanup:
     if (!success && failure_stage != 0) {
-        liteos_serial_write("LITEOS_VFS_FILEMAP_DEBUG_STAGE=");
-        liteos_serial_write_u32(failure_stage);
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_VFS_FILEMAP_DEBUG_STAGE=");
+        kernel_serial_write_u32(failure_stage);
+        kernel_serial_write("\r\n");
     }
     if (write_file != 0) vfs_close(write_file);
     if (private_child != 0) vm_space_put(private_child);

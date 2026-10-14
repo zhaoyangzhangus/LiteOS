@@ -34,7 +34,7 @@ bool e1000_recovery_bind(e1000_recovery_context_t *context,
 void e1000_recovery_unbind(e1000_recovery_context_t *context);
 
 #define E1000_SOFTWARE_QUEUE_COUNT 4U
-#define E1000_SOFTWARE_QUEUE_DEPTH 8U
+#define E1000_SOFTWARE_QUEUE_DEPTH 32U
 
 typedef struct e1000_rx_packet {
     uint16_t family;

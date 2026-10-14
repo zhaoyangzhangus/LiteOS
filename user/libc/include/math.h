@@ -13,6 +13,45 @@
 #define NAN       (__builtin_nanf(""))
 #endif
 
+/* The ISO C headers do not require the historical BSD math constants, but
+ * Chromium's bundled DSP code uses these names when building as C11. */
+#ifndef M_E
+#define M_E 2.71828182845904523536028747135266250
+#endif
+#ifndef M_PI
+#define M_PI 3.14159265358979323846264338327950288
+#endif
+#ifndef M_PI_2
+#define M_PI_2 1.57079632679489661923132169163975144
+#endif
+#ifndef M_PI_4
+#define M_PI_4 0.78539816339744830961566084581987572
+#endif
+#ifndef M_SQRT2
+#define M_SQRT2 1.41421356237309504880168872420969808
+#endif
+#ifndef M_LOG2E
+#define M_LOG2E 1.44269504088896340735992468100189214
+#endif
+#ifndef M_LOG10E
+#define M_LOG10E 0.43429448190325182765112891891660508
+#endif
+#ifndef M_LN2
+#define M_LN2 0.69314718055994530941723212145817657
+#endif
+#ifndef M_LN10
+#define M_LN10 2.30258509299404568401799145468436421
+#endif
+#ifndef M_2PI
+#define M_2PI 6.28318530717958647692528676655900576
+#endif
+#ifndef M_2_SQRTPI
+#define M_2_SQRTPI 1.12837916709551257389615890312154517
+#endif
+#ifndef M_SQRT1_2
+#define M_SQRT1_2 0.70710678118654752440084436210484903
+#endif
+
 #define MATH_ERRNO     1
 #define MATH_ERREXCEPT 2
 #define math_errhandling MATH_ERRNO
@@ -51,62 +90,69 @@ typedef long double double_t;
 #define islessgreater(left, right) __builtin_islessgreater((left), (right))
 #define isunordered(left, right) __builtin_isunordered((left), (right))
 
-#define LITEOS_MATH_UNARY(name) \
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define LIBC_MATH_UNARY(name) \
     float name##f(float value); \
     double name(double value); \
     long double name##l(long double value)
-#define LITEOS_MATH_BINARY(name) \
+#define LIBC_MATH_BINARY(name) \
     float name##f(float left, float right); \
     double name(double left, double right); \
     long double name##l(long double left, long double right)
-#define LITEOS_MATH_TERNARY(name) \
+#define LIBC_MATH_TERNARY(name) \
     float name##f(float first, float second, float third); \
     double name(double first, double second, double third); \
     long double name##l(long double first, long double second, long double third)
 
-LITEOS_MATH_UNARY(fabs);
-LITEOS_MATH_UNARY(sqrt);
-LITEOS_MATH_UNARY(cbrt);
-LITEOS_MATH_UNARY(sin);
-LITEOS_MATH_UNARY(cos);
-LITEOS_MATH_UNARY(tan);
-LITEOS_MATH_UNARY(asin);
-LITEOS_MATH_UNARY(acos);
-LITEOS_MATH_UNARY(atan);
-LITEOS_MATH_BINARY(atan2);
-LITEOS_MATH_UNARY(sinh);
-LITEOS_MATH_UNARY(cosh);
-LITEOS_MATH_UNARY(tanh);
-LITEOS_MATH_UNARY(asinh);
-LITEOS_MATH_UNARY(acosh);
-LITEOS_MATH_UNARY(atanh);
-LITEOS_MATH_UNARY(exp);
-LITEOS_MATH_UNARY(exp2);
-LITEOS_MATH_UNARY(expm1);
-LITEOS_MATH_UNARY(log);
-LITEOS_MATH_UNARY(log2);
-LITEOS_MATH_UNARY(log10);
-LITEOS_MATH_UNARY(log1p);
-LITEOS_MATH_BINARY(pow);
-LITEOS_MATH_TERNARY(fma);
-LITEOS_MATH_UNARY(erf);
-LITEOS_MATH_UNARY(erfc);
-LITEOS_MATH_UNARY(lgamma);
-LITEOS_MATH_UNARY(tgamma);
-LITEOS_MATH_BINARY(hypot);
-LITEOS_MATH_UNARY(ceil);
-LITEOS_MATH_UNARY(floor);
-LITEOS_MATH_UNARY(trunc);
-LITEOS_MATH_UNARY(round);
-LITEOS_MATH_UNARY(rint);
-LITEOS_MATH_UNARY(nearbyint);
-LITEOS_MATH_UNARY(logb);
-LITEOS_MATH_BINARY(fmod);
-LITEOS_MATH_BINARY(remainder);
-LITEOS_MATH_BINARY(copysign);
-LITEOS_MATH_BINARY(fdim);
-LITEOS_MATH_BINARY(fmax);
-LITEOS_MATH_BINARY(fmin);
+LIBC_MATH_UNARY(fabs);
+LIBC_MATH_UNARY(sqrt);
+LIBC_MATH_UNARY(cbrt);
+LIBC_MATH_UNARY(sin);
+LIBC_MATH_UNARY(cos);
+void sincosf(float value, float *sine, float *cosine);
+void sincos(double value, double *sine, double *cosine);
+void sincosl(long double value, long double *sine, long double *cosine);
+LIBC_MATH_UNARY(tan);
+LIBC_MATH_UNARY(asin);
+LIBC_MATH_UNARY(acos);
+LIBC_MATH_UNARY(atan);
+LIBC_MATH_BINARY(atan2);
+LIBC_MATH_UNARY(sinh);
+LIBC_MATH_UNARY(cosh);
+LIBC_MATH_UNARY(tanh);
+LIBC_MATH_UNARY(asinh);
+LIBC_MATH_UNARY(acosh);
+LIBC_MATH_UNARY(atanh);
+LIBC_MATH_UNARY(exp);
+LIBC_MATH_UNARY(exp2);
+LIBC_MATH_UNARY(expm1);
+LIBC_MATH_UNARY(log);
+LIBC_MATH_UNARY(log2);
+LIBC_MATH_UNARY(log10);
+LIBC_MATH_UNARY(log1p);
+LIBC_MATH_BINARY(pow);
+LIBC_MATH_TERNARY(fma);
+LIBC_MATH_UNARY(erf);
+LIBC_MATH_UNARY(erfc);
+LIBC_MATH_UNARY(lgamma);
+LIBC_MATH_UNARY(tgamma);
+LIBC_MATH_BINARY(hypot);
+LIBC_MATH_UNARY(ceil);
+LIBC_MATH_UNARY(floor);
+LIBC_MATH_UNARY(trunc);
+LIBC_MATH_UNARY(round);
+LIBC_MATH_UNARY(rint);
+LIBC_MATH_UNARY(nearbyint);
+LIBC_MATH_UNARY(logb);
+LIBC_MATH_BINARY(fmod);
+LIBC_MATH_BINARY(remainder);
+LIBC_MATH_BINARY(copysign);
+LIBC_MATH_BINARY(fdim);
+LIBC_MATH_BINARY(fmax);
+LIBC_MATH_BINARY(fmin);
 
 float frexpf(float value, int *exponent);
 double frexp(double value, int *exponent);
@@ -154,6 +200,10 @@ double nan(const char *tag);
 long double nanl(const char *tag);
 extern int signgam;
 
-#undef LITEOS_MATH_UNARY
-#undef LITEOS_MATH_BINARY
-#undef LITEOS_MATH_TERNARY
+#undef LIBC_MATH_UNARY
+#undef LIBC_MATH_BINARY
+#undef LIBC_MATH_TERNARY
+
+#ifdef __cplusplus
+}
+#endif

@@ -21,28 +21,28 @@ static BOOLEAN write_disk(VOID *context, UINT64 lba, UINT32 count, const VOID *b
 }
 
 int main(void) {
-    LITEOS_BLOCK_MANAGER blocks = {0};
-    LITEOS_BLOCK_DEVICE *device = 0;
-    LITEOS_BLOCK_CACHE cache = {0};
+    OS_BLOCK_MANAGER blocks = {0};
+    OS_BLOCK_DEVICE *device = 0;
+    OS_BLOCK_CACHE cache = {0};
     UINT8 buffer[512] = {0};
-    if (!liteos_block_manager_init(&blocks) ||
-        !liteos_block_register(&blocks, "mem0", 512U, TEST_BLOCKS,
+    if (!block_manager_init(&blocks) ||
+        !block_register(&blocks, "mem0", 512U, TEST_BLOCKS,
                                read_disk, write_disk, 0, disk, &device) ||
-        !liteos_block_cache_init(&cache, device) ||
-        !liteos_block_cache_read(&cache, 0, buffer)) return 1;
+        !block_cache_init(&cache, device) ||
+        !block_cache_read(&cache, 0, buffer)) return 1;
     memcpy(buffer, "cached", 6U);
-    if (!liteos_block_cache_write(&cache, 0, buffer)) return 2;
+    if (!block_cache_write(&cache, 0, buffer)) return 2;
     /* A complete-block write miss must not issue a read before becoming dirty. */
-    if (!liteos_block_cache_write(&cache, TEST_BLOCKS - 1U, buffer) ||
+    if (!block_cache_write(&cache, TEST_BLOCKS - 1U, buffer) ||
         read_count != 1U) return 5;
-    for (UINT64 lba = 1; lba <= LITEOS_BLOCK_CACHE_ENTRY_COUNT; ++lba) {
-        if (!liteos_block_cache_read(&cache, lba, buffer)) return 3;
+    for (UINT64 lba = 1; lba <= OS_BLOCK_CACHE_ENTRY_COUNT; ++lba) {
+        if (!block_cache_read(&cache, lba, buffer)) return 3;
     }
     if (memcmp(disk, "cached", 6U) != 0 ||
-        !liteos_block_cache_invalidate(&cache, 1U) ||
-        !liteos_block_cache_destroy(&cache) ||
-        !liteos_block_unregister(&blocks, device) ||
-        !liteos_block_manager_destroy(&blocks)) return 4;
+        !block_cache_invalidate(&cache, 1U) ||
+        !block_cache_destroy(&cache) ||
+        !block_unregister(&blocks, device) ||
+        !block_manager_destroy(&blocks)) return 4;
     puts("cache: ok");
     return 0;
 }

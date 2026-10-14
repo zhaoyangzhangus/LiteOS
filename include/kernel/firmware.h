@@ -1,8 +1,7 @@
-#ifndef LITEOS_KERNEL_FIRMWARE_H
-#define LITEOS_KERNEL_FIRMWARE_H
+#ifndef OS_KERNEL_FIRMWARE_H
+#define OS_KERNEL_FIRMWARE_H
 
 #include <kernel/base.h>
-#include <kernel/spinlock.h>
 
 #define FIRMWARE_NAME_CAP 96U
 #define FIRMWARE_PACKAGE_ID_SIZE 16U
@@ -26,8 +25,8 @@ typedef kstatus_t (*firmware_resolve_fn)(const char *logical_name,
 typedef void (*firmware_release_fn)(firmware_blob_t *blob, void *context);
 
 typedef struct firmware_manager {
-    spinlock_t lock;
     atomic_uint init_state;
+    /* Immutable after init_state is release-published as ready (2). */
     firmware_resolve_fn resolve;
     firmware_release_fn release;
     void *context;

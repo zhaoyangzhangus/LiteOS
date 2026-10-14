@@ -24,7 +24,7 @@ typedef struct handle_entry {
 } handle_entry_t;
 
 typedef struct handle_chunk {
-    rwlock_t lock;
+    spinlock_t lock;
     handle_entry_t entries[HANDLE_CHUNK_ENTRIES];
 } handle_chunk_t;
 

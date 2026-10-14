@@ -22,6 +22,11 @@ struct completion_port;
 #define SOCKET_TCP_RETRANSMIT_TIMEOUT_NS 200000000ULL
 #define SOCKET_TCP_MAX_RETRANSMITS 5U
 
+#define SOCKET_POLL_READ  (1U << 0)
+#define SOCKET_POLL_WRITE (1U << 1)
+#define SOCKET_POLL_ERROR (1U << 2)
+#define SOCKET_POLL_HUP   (1U << 3)
+
 typedef struct socket_ipv4_endpoint {
     uint32_t address;
     uint16_t port;
@@ -80,6 +85,9 @@ kstatus_t socket_send(socket_t *socket, const void *buffer, size_t length,
 kstatus_t socket_recv(socket_t *socket, void *buffer, size_t length,
                       socket_ipv4_endpoint_t *source, uint64_t timeout_ns,
                       uint64_t *bytes);
+kstatus_t socket_recv_peek(socket_t *socket, void *buffer, size_t length,
+                           socket_ipv4_endpoint_t *source,
+                           uint64_t timeout_ns, uint64_t *bytes);
 kstatus_t socket_send_async(socket_t *socket, const void *buffer, size_t length,
                             uint32_t address, uint16_t port,
                             struct completion_port *completion_port,
@@ -92,10 +100,16 @@ kstatus_t socket_send_ipv6(socket_t *socket, const void *buffer, size_t length,
 kstatus_t socket_recv_ipv6(socket_t *socket, void *buffer, size_t length,
                            socket_ipv6_endpoint_t *source, uint64_t timeout_ns,
                            uint64_t *bytes);
+kstatus_t socket_recv_ipv6_peek(socket_t *socket, void *buffer, size_t length,
+                                socket_ipv6_endpoint_t *source,
+                                uint64_t timeout_ns, uint64_t *bytes);
 kstatus_t socket_shutdown(socket_t *socket, uint32_t how);
 kstatus_t socket_get_info(socket_t *socket, os_socket_info_t *info);
 kstatus_t socket_get_option(socket_t *socket, uint32_t option, int32_t *value);
 kstatus_t socket_set_option(socket_t *socket, uint32_t option, int32_t value);
+/* K_EAGAIN means an outbound TCP handshake is still in progress. */
+kstatus_t socket_connect_status(socket_t *socket);
+uint32_t socket_poll_state(socket_t *socket);
 kstatus_t socket_send_async_ipv6(socket_t *socket, const void *buffer, size_t length,
                                  const uint8_t address[16], uint16_t port,
                                  struct completion_port *completion_port,

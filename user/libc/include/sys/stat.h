@@ -1,6 +1,7 @@
 #pragma once
 
 #include <sys/types.h>
+#include <time.h>
 
 struct stat {
     dev_t st_dev;
@@ -13,10 +14,20 @@ struct stat {
     off_t st_size;
     blksize_t st_blksize;
     blkcnt_t st_blocks;
-    time_t st_atime;
-    time_t st_mtime;
-    time_t st_ctime;
+    struct timespec st_atim;
+    struct timespec st_mtim;
+    struct timespec st_ctim;
 };
+
+#ifndef st_atime
+#define st_atime st_atim.tv_sec
+#endif
+#ifndef st_mtime
+#define st_mtime st_mtim.tv_sec
+#endif
+#ifndef st_ctime
+#define st_ctime st_ctim.tv_sec
+#endif
 
 #define S_IFMT   0170000
 #define S_IFREG  0100000
@@ -58,6 +69,12 @@ struct stat {
 #define AT_SYMLINK_NOFOLLOW 0x100
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int fstatat(int directory_descriptor, const char *path,
             struct stat *status, int flags);
 int lstat(const char *path, struct stat *status);
+#ifdef __cplusplus
+}
+#endif

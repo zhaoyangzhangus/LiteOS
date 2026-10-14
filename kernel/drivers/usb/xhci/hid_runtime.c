@@ -5,8 +5,8 @@
 
 #include <stdatomic.h>
 
-#ifndef LITEOS_REALTEST
-#define LITEOS_REALTEST 0
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
 #endif
 
 /* REFACTOR_P8_XHCI_HID_RUNTIME_OWNER: HID report state transfer, interrupt
@@ -53,7 +53,7 @@ void xhci_hid_runtime_reset_completion_counters(void) {
                           memory_order_release);
 }
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 static bool xhci_hid_report_diag_once(uint32_t protocol) {
     uint32_t bit;
     uint32_t observed;
@@ -158,13 +158,13 @@ bool xhci_queue_hid_report(xhci_state_t *state,
     __asm__ volatile ("mfence" : : : "memory");
     if (!atomic_exchange_explicit(&g_xhci_hid_arm_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_realtest_mark_number("XHCI_HID_ARM_SLOT",
+        realtest_mark_number("XHCI_HID_ARM_SLOT",
                                     device->device_slot);
-        liteos_realtest_mark_number("XHCI_HID_ARM_ENDPOINT", endpoint_id);
-        liteos_realtest_mark_number("XHCI_HID_ARM_PROTOCOL",
+        realtest_mark_number("XHCI_HID_ARM_ENDPOINT", endpoint_id);
+        realtest_mark_number("XHCI_HID_ARM_PROTOCOL",
                                     device->hid_protocol);
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_HID_ARM_SLOT=%u EP=%u MAX=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_HID_ARM_SLOT=%u EP=%u MAX=%u\r\n",
             device->device_slot, endpoint_id, device->hid_max_packet);
     }
     return true;
@@ -209,8 +209,8 @@ bool xhci_queue_hid_report_secondary(xhci_state_t *state,
     __asm__ volatile ("mfence" : : : "memory");
     if (!atomic_exchange_explicit(&g_xhci_hid_secondary_arm_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_HID2_ARM_SLOT=%u EP=%u MAX=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_HID2_ARM_SLOT=%u EP=%u MAX=%u\r\n",
             device->device_slot, endpoint_id, hid->max_packet);
     }
     return true;
@@ -382,8 +382,8 @@ bool xhci_handle_hid_transfer_event(xhci_state_t *state,
              xhci_topology_slot(slot)->context.hid_secondary.endpoint != 0U) &&
             !atomic_exchange_explicit(&g_xhci_hid_lookup_failure_seen, true,
                                       memory_order_acq_rel)) {
-            liteos_serial_printf_serial_only(
-                "LITEOS_DIAG_HID_LOOKUP_FAIL_SLOT=%u EP=%u EXPECT=%u\r\n",
+            kernel_serial_printf_serial_only(
+                "OS_DIAG_HID_LOOKUP_FAIL_SLOT=%u EP=%u EXPECT=%u\r\n",
                 slot, endpoint_id,
                 (uint32_t)xhci_topology_slot(slot)->context.hid_endpoint *
                     2U + 1U);
@@ -406,13 +406,13 @@ bool xhci_handle_hid_transfer_event(xhci_state_t *state,
     if (secondary &&
         !atomic_exchange_explicit(&g_xhci_hid_secondary_transfer_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_DIAG_HID2_TRANSFER_SLOT=%u EP=%u CC=%u RESIDUAL=%u\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_DIAG_HID2_TRANSFER_SLOT=%u EP=%u CC=%u RESIDUAL=%u\r\n",
             slot, endpoint_id, completion, residual);
     }
     if (!atomic_exchange_explicit(&g_xhci_hid_transfer_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_write_serial_only("LITEOS_XHCI_HID_TRANSFER_OK\r\n");
+        kernel_serial_write_serial_only("OS_XHCI_HID_TRANSFER_OK\r\n");
     }
     (void)atomic_fetch_add_explicit(&g_xhci_hid_completion_count, 1U,
                                     memory_order_relaxed);
@@ -421,18 +421,18 @@ bool xhci_handle_hid_transfer_event(xhci_state_t *state,
     if ((completion == XHCI_COMPLETION_SUCCESS ||
          completion == XHCI_COMPLETION_SHORT_PACKET) &&
         residual <= max_packet) {
-#if LITEOS_REALTEST
+#if OS_REALTEST
         const uint8_t *report;
 #endif
         report_length = max_packet - residual;
         dma_sync_for_cpu(&report_page->mapping);
-#if LITEOS_REALTEST
+#if OS_REALTEST
         report = (const uint8_t *)report_page->cpu;
         uint32_t protocol = secondary ? device->hid_secondary.protocol :
                                         device->hid_protocol;
         if (xhci_hid_report_diag_once(protocol)) {
-            liteos_serial_printf_serial_only(
-                "LITEOS_DIAG_HID_REPORT SLOT=%u EP=%u PROTO=%u LEN=%u "
+            kernel_serial_printf_serial_only(
+                "OS_DIAG_HID_REPORT SLOT=%u EP=%u PROTO=%u LEN=%u "
                 "B0=%u B1=%u B2=%u B3=%u\r\n",
                 slot, endpoint_id, protocol, report_length,
                 report_length > 0U ? report[0] : 0U,
@@ -478,9 +478,9 @@ void xhci_report_hid_completion_milestones(void) {
             continue;
         }
         if (next == 1U) {
-            liteos_serial_write_serial_only("LITEOS_XHCI_HID_EVENTS_256\r\n");
+            kernel_serial_write_serial_only("OS_XHCI_HID_EVENTS_256\r\n");
         } else if (next == 2U) {
-            liteos_serial_write_serial_only("LITEOS_XHCI_HID_EVENTS_512\r\n");
+            kernel_serial_write_serial_only("OS_XHCI_HID_EVENTS_512\r\n");
         }
     }
 }

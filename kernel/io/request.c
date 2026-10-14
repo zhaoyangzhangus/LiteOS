@@ -5,21 +5,28 @@
 #include <kernel/spinlock.h>
 #include <kernel/kmem.h>
 #include <kernel/process.h>
+#include <kernel/string.h>
 
 #define IO_REQUEST_OBJECT_TYPE 0x0106U
+#define IO_REGISTRY_BUCKETS 64U
+
+_Static_assert((IO_REGISTRY_BUCKETS & (IO_REGISTRY_BUCKETS - 1U)) == 0,
+               "I/O registry bucket count must be a power of two");
 
 static atomic_uint_fast64_t g_next_io_request_id;
 static atomic_uint g_io_registry_state;
 static spinlock_t g_io_registry_lock;
-static list_head_t g_io_registry;
+static list_head_t g_io_registry[IO_REGISTRY_BUCKETS];
 
 static void io_registry_initialize(void) {
+    if (atomic_load_explicit(&g_io_registry_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_io_registry_state, &expected, 1U,
                                                 memory_order_acq_rel,
                                                 memory_order_acquire)) {
-        atomic_init(&g_io_registry_lock.state, 0U);
-        list_init(&g_io_registry);
+        spinlock_init(&g_io_registry_lock);
+        for (unsigned i = 0; i < IO_REGISTRY_BUCKETS; ++i)
+            list_init(&g_io_registry[i]);
         atomic_store_explicit(&g_io_registry_state, 2U, memory_order_release);
         return;
     }
@@ -29,14 +36,11 @@ static void io_registry_initialize(void) {
 }
 
 static void io_registry_lock(void) {
-    while (atomic_exchange_explicit(&g_io_registry_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_io_registry_lock);
 }
 
 static void io_registry_unlock(void) {
-    atomic_store_explicit(&g_io_registry_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_io_registry_lock);
 }
 
 static void io_registry_insert_tail(list_head_t *head, list_head_t *node) {
@@ -44,6 +48,10 @@ static void io_registry_insert_tail(list_head_t *head, list_head_t *node) {
     node->prev = head->prev;
     head->prev->next = node;
     head->prev = node;
+}
+
+static list_head_t *io_registry_bucket(uint64_t request_id) {
+    return &g_io_registry[request_id & (IO_REGISTRY_BUCKETS - 1U)];
 }
 
 static void io_object_destroy(void *object) {
@@ -74,20 +82,12 @@ static const object_ops_t g_io_object_ops = {
     .wait_value = 0,
 };
 
-static void io_zero(void *memory, size_t size) {
-    uint8_t *bytes = (uint8_t *)memory;
-    while (size-- != 0) *bytes++ = 0;
-}
-
 void io_request_init(io_request_t *req, uint32_t opcode, struct device *device,
                      struct process *process, io_vec_t *vecs, uint32_t vec_count) {
     if (req == 0) return;
-    io_zero(req, sizeof(*req));
-    refcount_init(&req->object.refs, 1U);
-    req->object.type = IO_REQUEST_OBJECT_TYPE;
-    req->object.ops = &g_io_object_ops;
+    memset(req, 0, sizeof(*req));
+    object_header_init(&req->object, IO_REQUEST_OBJECT_TYPE, &g_io_object_ops);
     atomic_init(&req->state, IOREQ_NEW);
-    atomic_init(&req->terminal_holds, 0U);
     req->opcode = opcode;
     req->device = device;
     req->process = process;
@@ -109,18 +109,6 @@ static bool io_vectors_valid(const io_request_t *req) {
         total += vec->length;
     }
     return total != 0 || req->opcode == IO_FLUSH || req->opcode == IO_IOCTL;
-}
-
-void io_request_hold_until_terminal(io_request_t *req) {
-    if (req == 0) return;
-    object_get(req);
-    atomic_fetch_add_explicit(&req->terminal_holds, 1U, memory_order_release);
-}
-
-static void io_release_terminal_holds(io_request_t *req) {
-    unsigned holds = atomic_exchange_explicit(&req->terminal_holds, 0U,
-                                               memory_order_acq_rel);
-    while (holds-- != 0U) object_put(req);
 }
 
 static bool io_state_is_inflight(unsigned state) {
@@ -162,7 +150,7 @@ static void io_request_unregister_user(io_request_t *req) {
         removed = true;
     }
     io_registry_unlock();
-    if (removed) object_put(req); /* 登记表持有的初始引用。 */
+    if (removed) object_put(req); /* 登记表持有的独立引用。 */
 }
 
 static void io_finalize_owned(io_request_t *req, kstatus_t status,
@@ -182,16 +170,17 @@ static void io_finalize_owned(io_request_t *req, kstatus_t status,
                                        req->request_id, req->submit_tsc);
         req->submit_tsc = 0U;
     }
-    if (req->device_ref_held != 0U) {
-        device_io_end(req->device, req);
+    /* QUEUED is already cancellable while device_io_begin may still own
+     * the device lock. End must synchronize with that registration rather
+     * than reading device_ref_held before taking the same lock. */
+    if (execution_ref && device_io_end(req->device, req)) {
         object_put(req->device);
-        req->device_ref_held = 0U;
     }
-    /* User callbacks copy data or release private context before publication. */
+    /* Finalize user-visible results before publication. Private staging
+     * memory follows the request references, not its terminal state. */
     if (complete != 0) complete(req);
     io_request_unregister_user(req);
     io_publish_completion(req);
-    io_release_terminal_holds(req);
     /*
      * Publish the terminal state only after every owner-visible link has
      * been removed.  Synchronous callers reuse stack requests as soon as
@@ -223,15 +212,23 @@ void io_complete(io_request_t *req, kstatus_t status, uint64_t bytes_done) {
 kstatus_t io_submit(io_request_t *req) {
     if (req == 0 || req->object.type != IO_REQUEST_OBJECT_TYPE ||
         req->device == 0 || !io_vectors_valid(req)) return K_EINVAL;
+    /* A QUEUED request is cancellable, and its finalizer releases the
+     * execution reference. Establish that reference before publishing QUEUED. */
+    object_get(req);
     unsigned expected = IOREQ_NEW;
     if (!atomic_compare_exchange_strong_explicit(&req->state, &expected,
-                                                  IOREQ_QUEUED,
+                                                  IOREQ_PREPARING,
                                                   memory_order_acq_rel,
                                                   memory_order_acquire)) {
-        return io_request_state_is_terminal(expected) ? req->status : K_EBUSY;
+        kstatus_t status = io_request_state_is_terminal(expected) ? req->status : K_EBUSY;
+        object_put(req);
+        return status;
     }
-    object_get(req);
     req->submit_tsc = telemetry_timestamp();
+    /* Finish private setup before exposing a cancellable request. Completion
+     * acquires this publication before consuming/clearing submit_tsc. Only
+     * the NEW -> PREPARING winner may initialize it. */
+    atomic_store_explicit(&req->state, IOREQ_QUEUED, memory_order_release);
     if (!device_io_begin(req->device, req)) {
         unsigned current = atomic_load_explicit(&req->state, memory_order_acquire);
         if (current == IOREQ_QUEUED) {
@@ -262,6 +259,31 @@ kstatus_t io_submit(io_request_t *req) {
     return status;
 }
 
+static void io_finalize_cancel_owned(io_request_t *req, kstatus_t status,
+                                     bool execution_ref) {
+    req->status = status;
+    if (execution_ref && req->cancel != 0) req->cancel(req);
+    /* The winning owner alone runs callbacks and publishes terminal state. */
+    io_finalize_owned(req, status, req->bytes_done, execution_ref, IOREQ_COMPLETED);
+}
+
+bool io_request_claim_device_cancel(io_request_t *req) {
+    if (req == 0) return false;
+    unsigned state = atomic_load_explicit(&req->state, memory_order_acquire);
+    while (io_state_is_inflight(state)) {
+        if (atomic_compare_exchange_weak_explicit(&req->state, &state,
+                IOREQ_COMPLETING, memory_order_acq_rel, memory_order_acquire))
+            return true;
+    }
+    return false;
+}
+
+void io_request_finish_device_cancel(io_request_t *req, kstatus_t status) {
+    /* A successful in-lock claim transfers the existing execution reference.
+     * No rival can finalize or reuse the request before this owner finishes. */
+    io_finalize_cancel_owned(req, status, true);
+}
+
 kstatus_t io_cancel_with_status(io_request_t *req, kstatus_t completion_status) {
     if (req == 0 || req->object.type != IO_REQUEST_OBJECT_TYPE) return K_EINVAL;
     if (completion_status >= 0) return K_EINVAL;
@@ -278,13 +300,7 @@ kstatus_t io_cancel_with_status(io_request_t *req, kstatus_t completion_status) 
             break;
         }
     }
-    req->status = completion_status;
-    if (state != IOREQ_NEW && req->cancel != 0) {
-        req->cancel(req);
-    }
-    /* 取消者拥有最终完成权；驱动回调中的 io_complete 此时会被忽略。 */
-    io_finalize_owned(req, completion_status, req->bytes_done,
-                      state != IOREQ_NEW, IOREQ_COMPLETED);
+    io_finalize_cancel_owned(req, completion_status, state != IOREQ_NEW);
     return K_OK;
 }
 
@@ -325,7 +341,10 @@ kstatus_t io_request_register_user(io_request_t *req) {
     }
     io_registry_initialize();
     io_registry_lock();
-    io_registry_insert_tail(&g_io_registry, &req->queue_node);
+    /* The caller keeps its initial reference across publication and submit.
+     * Teardown may remove the registry reference before registration returns. */
+    object_get(req);
+    io_registry_insert_tail(io_registry_bucket(req->request_id), &req->queue_node);
     req->internal_flags |= IOREQ_INTERNAL_USER_REQUEST;
     io_registry_unlock();
     return K_OK;
@@ -337,11 +356,10 @@ kstatus_t io_request_lookup_user(struct process *process, uint64_t request_id,
     *out = 0;
     io_registry_initialize();
     io_registry_lock();
-    for (list_head_t *node = g_io_registry.next; node != &g_io_registry;
+    list_head_t *bucket = io_registry_bucket(request_id);
+    for (list_head_t *node = bucket->next; node != bucket;
          node = node->next) {
-        io_request_t *request = (io_request_t *)((uint8_t *)node -
-                                                  __builtin_offsetof(io_request_t,
-                                                                     queue_node));
+        io_request_t *request = list_entry(node, io_request_t, queue_node);
         if (request->process == process && request->request_id == request_id &&
             object_try_get(request)) {
             *out = request;
@@ -355,26 +373,50 @@ kstatus_t io_request_lookup_user(struct process *process, uint64_t request_id,
 
 void io_cancel_process(struct process *process) {
     if (process == 0) return;
+    io_registry_initialize();
+    /* Resume at the last selected bucket instead of rescanning drained
+     * prefixes. Wrap around under one lock before declaring the owner empty:
+     * a completion callback may register another request in an earlier bucket.
+     * Cancellation remains outside the lock with an observer reference held. */
+    unsigned bucket_index = 0;
     for (;;) {
         io_request_t *request = 0;
-        io_registry_initialize();
+        bool busy = false;
         io_registry_lock();
-        for (list_head_t *node = g_io_registry.next; node != &g_io_registry;
-             node = node->next) {
-            io_request_t *candidate = (io_request_t *)((uint8_t *)node -
-                                                        __builtin_offsetof(io_request_t,
-                                                                           queue_node));
-            if (candidate->process == process && object_try_get(candidate)) {
-                request = candidate;
-                break;
+        for (unsigned scanned = 0; scanned < IO_REGISTRY_BUCKETS &&
+                                   request == 0; ++scanned) {
+            unsigned index = (bucket_index + scanned) & (IO_REGISTRY_BUCKETS - 1U);
+            list_head_t *bucket = &g_io_registry[index];
+            for (list_head_t *node = bucket->next; node != bucket;
+                 node = node->next) {
+                io_request_t *candidate = list_entry(node, io_request_t, queue_node);
+                if (candidate->process != process) continue;
+                unsigned state = atomic_load_explicit(&candidate->state, memory_order_acquire);
+                if (state == IOREQ_PREPARING || state == IOREQ_COMPLETING) {
+                    busy = true;
+                    continue;
+                }
+                if (object_try_get(candidate)) {
+                    request = candidate;
+                    bucket_index = index;
+                    break;
+                }
             }
         }
         io_registry_unlock();
-        if (request == 0) return;
-        (void)io_cancel(request);
-        if (!io_request_is_terminal(request)) {
-            io_complete(request, K_ECANCELED, request->bytes_done);
+        if (request == 0) {
+            if (!busy) return;
+            /* Other owners must publish setup/completion before we retry.
+             * Do not churn references or starve cancellable requests behind
+             * them; the complete locked scan above distinguishes an empty
+             * registry from one containing only temporarily busy requests. */
+            __asm__ volatile ("pause");
+            continue;
         }
+        (void)io_cancel(request);
+        /* Successful cancellation finalizes synchronously. EBUSY means setup
+         * or another finalizer owns the request: do not read bytes_done or
+         * attempt completion on that owner's behalf. Retry the registry. */
         object_put(request);
     }
 }

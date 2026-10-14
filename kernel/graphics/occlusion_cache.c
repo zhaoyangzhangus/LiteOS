@@ -146,7 +146,8 @@ void compositor_build_occlusion_floor_cache(
         uint32_t first_y;
         uint32_t last_y;
 
-        if ((window->flags & OS_WINDOW_VISIBLE) == 0U ||
+        if ((window->flags & OS_WINDOW_PREMULTIPLIED_ALPHA) != 0U ||
+            (window->flags & OS_WINDOW_VISIBLE) == 0U ||
             z >= WINDOW_OCCLUSION_NO_FLOOR) {
             continue;
         }

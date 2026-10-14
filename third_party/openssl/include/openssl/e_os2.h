@@ -48,8 +48,8 @@ extern "C" {
  * UEFI lives here because it might be built with a Microsoft toolchain and
  * we need to avoid the false positive match on Windows.
  */
-#if defined(OPENSSL_SYS_LITEOS)
-/* LiteOS uses the freestanding C ABI even when the PE toolchain is used. */
+#if defined(OPENSSL_SYS_FREESTANDING)
+/* The guest uses the freestanding C ABI even when the PE toolchain is used. */
 #elif defined(OPENSSL_SYS_UEFI)
 #undef OPENSSL_SYS_UNIX
 #elif defined(OPENSSL_SYS_UWIN)
@@ -222,7 +222,7 @@ extern "C" {
 /* Standard integer types */
 #define OPENSSL_NO_INTTYPES_H
 #define OPENSSL_NO_STDINT_H
-#if defined(OPENSSL_SYS_LITEOS)
+#if defined(OPENSSL_SYS_FREESTANDING)
 #include <stdint.h>
 #undef OPENSSL_NO_STDINT_H
 #elif defined(OPENSSL_SYS_UEFI)

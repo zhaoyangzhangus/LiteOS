@@ -1,12 +1,15 @@
 #ifdef __ELF__
-    .section .rdata
+    .section .rdata,"a",@progbits
 #else
     .section .rdata,"dr"
 #endif
+#ifndef OS_AUTOSTART_CHROME
+#define OS_AUTOSTART_CHROME 0
+#endif
     .p2align 4
-    .globl liteos_init_blob_start
-    .globl liteos_init_blob_end
-    .globl liteos_init_service
+    .globl user_init_blob_start
+    .globl user_init_blob_end
+    .globl user_init_service
 
 /*
  * 这是随内核编译的最小用户态 /init 映像。
@@ -50,6 +53,7 @@
     .set INIT_DEVICED_PATH,    0x00401500
     .set INIT_LOGD_PATH,       0x00401520
     .set INIT_CRASHD_PATH,     0x00401540
+    .set INIT_CHROME_PATH,     0x00401560
     .set INIT_AUDIO_OPEN,       0x00401180
     .set INIT_AUDIO_OPEN_HANDLE, 0x004011A8
     .set INIT_AUDIO_CONTROL,   0x004011C0
@@ -67,13 +71,14 @@
     .set SERVICE_STACK_4,      0x00007FFFFFEB0000
     .set SERVICE_STACK_5,      0x00007FFFFFEA0000
     .set SERVICE_STACK_6,      0x00007FFFFFE90000
+    .set SERVICE_STACK_7,      0x00007FFFFFE80000
 
 /*
  * 父进程使用展开后的直线代码，不在创建第一个子进程后再通过 CALL
  * 写父进程的 COW 栈。这样服务管理器本身不会把调度器的 COW 栈路径和
  * 服务启动路径耦合在一起；服务线程仍然使用正常的独立用户栈。
  */
-    .macro LITEOS_RUN_SERVICE stage, stack, id, name
+    .macro INIT_RUN_SERVICE stage, stack, id, name
     movl $\stage, %edi
     movb %dil, INIT_STAGE
     movabsq $\stack, %rax
@@ -214,33 +219,42 @@
     jmp .Linit_failure
     .endm
 
-liteos_init_blob_start:
+user_init_blob_start:
     movb $1, INIT_STAGE
     cmpb $0, INIT_PERSISTENT
     je .Linit_bootstrap_services
-    LITEOS_RUN_SERVICE 0x10, SERVICE_STACK_0, 1, INIT_DEVICED_PATH
+    INIT_RUN_SERVICE 0x10, SERVICE_STACK_0, 1, INIT_DEVICED_PATH
 
 .Linit_bootstrap_services:
 
     /* 第一个服务：deviced，负责未来的设备枚举和设备策略。 */
-    LITEOS_RUN_SERVICE 0x10, SERVICE_STACK_0, 1, INIT_DEVICED_PATH
+    INIT_RUN_SERVICE 0x10, SERVICE_STACK_0, 1, INIT_DEVICED_PATH
 .Linit_service_done_0:
 
     /* 第二个服务：logd，负责日志汇聚和崩溃记录。 */
-    LITEOS_RUN_SERVICE 0x20, SERVICE_STACK_1, 2, INIT_LOGD_PATH
+    INIT_RUN_SERVICE 0x20, SERVICE_STACK_1, 2, INIT_LOGD_PATH
 .Linit_service_done_1:
 
     /* 第三个服务：crashd，负责故障转储和恢复策略。 */
-    LITEOS_RUN_SERVICE 0x30, SERVICE_STACK_2, 3, INIT_CRASHD_PATH
+    INIT_RUN_SERVICE 0x30, SERVICE_STACK_2, 3, INIT_CRASHD_PATH
 .Linit_service_done_2:
-    LITEOS_RUN_SERVICE 0x40, SERVICE_STACK_3, 4, INIT_AUDIO_PATH
+    INIT_RUN_SERVICE 0x40, SERVICE_STACK_3, 4, INIT_AUDIO_PATH
 .Linit_service_done_3:
     /* 第五个服务：用户态图形 Shell；窗口服务器已经属于内核。 */
-    LITEOS_RUN_SERVICE 0x60, SERVICE_STACK_5, 6, INIT_SHELL_PATH
+#if OS_AUTOSTART_CHROME
+    INIT_RUN_SERVICE 0x60, SERVICE_STACK_5, 6, INIT_SHELL_PATH
+#else
+    /*
+     * 交互式桌面由 Ring0 launcher 提供。关闭 Chrome 自启动时不能再
+     * 创建 chrome-start 进程，否则它仍会在进入桌面后占满缺页加载路径。
+     * 保留阶段标签，让后续网络服务和 /init 的服务计数保持不变。
+     */
+    jmp .Linit_service_done_5
+#endif
 .Linit_service_done_4:
 .Linit_service_done_5:
     /* 第六个服务：用户态网络管理器。 */
-    LITEOS_RUN_SERVICE 0x70, SERVICE_STACK_6, 7, INIT_NETMGR_PATH
+    INIT_RUN_SERVICE 0x70, SERVICE_STACK_6, 7, INIT_NETMGR_PATH
 .Linit_service_done_6:
 
     movl $6, INIT_SERVICE_OK
@@ -274,7 +288,7 @@ liteos_init_blob_start:
     ud2
 
 /* 所有服务线程共享这个只读入口，RDI 保留服务编号供后续服务扩展。 */
-liteos_init_service:
+user_init_service:
     /* deviced 验证设备句柄、查询快照并关闭句柄。 */
     cmpq $1, %rdi
     je .Linit_service_device
@@ -286,6 +300,8 @@ liteos_init_service:
     je .Linit_service_shell_exec
     cmpq $7, %rdi
     je .Linit_service_netmgr_exec
+    cmpq $8, %rdi
+    je .Linit_service_chrome_exec
     jmp .Linit_service_exit
 
 .Linit_service_device:
@@ -358,17 +374,41 @@ liteos_init_service:
 .Linit_service_shell_exec:
     cmpb $0, INIT_PERSISTENT
     je .Linit_service_exit
+#if OS_AUTOSTART_CHROME
+    /* Chrome 复用 Shell 服务槽位，保持 /init 的六服务计数不变。 */
+    movl $SYS_PROCESS_EXEC, %eax
+    movq $INIT_CHROME_PATH, %rdi
+    xorl %esi, %esi
+    xorl %edx, %edx
+    syscall
+    testq %rax, %rax
+    js .Linit_service_fail_direct
+    ud2
+#else
     /*
      * Ring0 desktop owns interactive application launch. Keep this service
      * slot blocked so init's six-service accounting remains unchanged.
      */
     jmp .Linit_service_block
+#endif
 
 .Linit_service_netmgr_exec:
     cmpb $0, INIT_PERSISTENT
     je .Linit_service_exit
     movl $SYS_PROCESS_EXEC, %eax
     movq $INIT_NETMGR_PATH, %rdi
+    xorl %esi, %esi
+    xorl %edx, %edx
+    syscall
+    testq %rax, %rax
+    js .Linit_service_fail_direct
+    ud2
+
+.Linit_service_chrome_exec:
+    cmpb $0, INIT_PERSISTENT
+    je .Linit_service_exit
+    movl $SYS_PROCESS_EXEC, %eax
+    movq $INIT_CHROME_PATH, %rdi
     xorl %esi, %esi
     xorl %edx, %edx
     syscall
@@ -405,4 +445,4 @@ liteos_init_service:
     syscall
     ud2
 
-liteos_init_blob_end:
+user_init_blob_end:

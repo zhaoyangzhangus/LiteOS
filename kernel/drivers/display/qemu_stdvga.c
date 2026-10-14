@@ -7,12 +7,24 @@
 #define QEMU_STDVGA_DEVICE_ID 0x1111U
 
 /*
+ * Bochs VBE Y_OFFSET has no guest-visible vblank handshake.  Flipping it for
+ * every uncapped cube frame lets the host sample two different cursor states.
+ * The QEMU display path therefore uses one stable scanout page by default;
+ * the macro remains an explicit opt-in for controlled page-flip experiments.
+ */
+#ifndef QEMU_STDVGA_PAGE_FLIP
+#define QEMU_STDVGA_PAGE_FLIP 0U
+#endif
+
+/*
  * Used only when the firmware GOP alias does not cover two complete frames.
- * Existing LiteOS MMIO windows are near the beginning of X86_64_MMIO_BASE;
- * keep this alias 4 GiB away from those fixed slots.
+ * The NVIDIA port owns the X86_64_MMIO_BASE slot allocator, so placing this
+ * fixed QEMU VRAM alias in its range would collide with a later BAR1 mapping.
+ * The vmalloc implementation currently manages only its first 1 GiB; keep
+ * this alias at +4 GiB as a private, stable kernel mapping outside that area.
  */
 #define QEMU_STDVGA_VRAM_VA \
-    (X86_64_MMIO_BASE + 0x100000000ULL)
+    (X86_64_VMALLOC_BASE + 0x100000000ULL)
 
 /* Legacy Bochs VBE index/data ports used by QEMU's primary PCI VGA device. */
 #define QEMU_VBE_INDEX_PORT 0x01CEU
@@ -227,7 +239,7 @@ bool qemu_stdvga_flip_init(uint64_t framebuffer_physical,
 
     /*
      * QEMU/Bochs x8r8g8b8 is little-endian B,G,R,X in memory, matching
-     * UEFI PixelBlueGreenRedReserved8BitPerColor (LiteOS format 1).
+     * UEFI PixelBlueGreenRedReserved8BitPerColor (System format 1).
      */
     if (format != 1U) {
         g_qemu_stdvga.last_error = QEMU_STDVGA_ERROR_PIXEL_FORMAT;
@@ -293,6 +305,21 @@ bool qemu_stdvga_flip_init(uint64_t framebuffer_physical,
         return false;
     }
 
+    /*
+     * OVMF may leave the Bochs scanout on the second virtual page after its
+     * GOP setup.  System deliberately uses page zero as the stable scanout
+     * when the optional page-flip mode is disabled.  Writing the same value
+     * also forces QEMU's display backend to refresh after KVM has written the
+     * WC-mapped BAR through the guest alias; otherwise the VRAM contains the
+     * desktop while the GTK surface remains black until a later device event.
+     */
+    qemu_vbe_write(QEMU_VBE_INDEX_Y_OFFSET, 0U);
+    if (qemu_vbe_read(QEMU_VBE_INDEX_Y_OFFSET) != 0U) {
+        g_qemu_stdvga.last_error = QEMU_STDVGA_ERROR_OFFSET;
+        return false;
+    }
+    y_offset = 0U;
+
     frame_pixels = (uint64_t)stride * height;
     if (frame_pixels > UINT64_MAX / sizeof(uint32_t)) {
         g_qemu_stdvga.last_error = QEMU_STDVGA_ERROR_VRAM_SMALL;
@@ -335,6 +362,10 @@ bool qemu_stdvga_flip_init(uint64_t framebuffer_physical,
 
 bool qemu_stdvga_flip_available(void) {
     return g_qemu_stdvga.available;
+}
+
+bool qemu_stdvga_page_flip_active(void) {
+    return g_qemu_stdvga.available && QEMU_STDVGA_PAGE_FLIP != 0U;
 }
 
 static volatile uint32_t *qemu_stdvga_page(uint32_t page) {

@@ -50,7 +50,7 @@ static void xhci_hid_emit_event(const xhci_hid_report_context_t *context,
     };
     if (!atomic_exchange_explicit(&g_xhci_input_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_write_serial_only("LITEOS_USB_INPUT_EVENT_OK\r\n");
+        kernel_serial_write_serial_only("OS_USB_INPUT_EVENT_OK\r\n");
     }
     (void)input_core_push(&event);
 }
@@ -70,7 +70,7 @@ static void xhci_hid_emit_pointer(const xhci_hid_report_context_t *context,
     };
     if (!atomic_exchange_explicit(&g_xhci_input_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_write_serial_only("LITEOS_USB_INPUT_EVENT_OK\r\n");
+        kernel_serial_write_serial_only("OS_USB_INPUT_EVENT_OK\r\n");
     }
     (void)input_core_push_pointer(&motion);
 }
@@ -97,7 +97,7 @@ static void xhci_hid_consume_keyboard_report(xhci_hid_report_context_t *state,
     }
     if (changed && !atomic_exchange_explicit(&g_xhci_keyboard_input_seen, true,
                                              memory_order_acq_rel)) {
-        liteos_serial_write_serial_only("LITEOS_USB_KEYBOARD_EVENT_OK\r\n");
+        kernel_serial_write_serial_only("OS_USB_KEYBOARD_EVENT_OK\r\n");
     }
     for (uint8_t bit = 0U; bit < 8U; ++bit) {
         uint8_t mask = (uint8_t)(1U << bit);
@@ -118,6 +118,12 @@ static void xhci_hid_consume_keyboard_report(xhci_hid_report_context_t *state,
         if (current >= 4U && !xhci_hid_previous_contains(state, current)) {
             xhci_hid_emit_key(state, current, INPUT_VALUE_PRESS);
         }
+    }
+    /* All membership checks must use the same previous report. Updating a
+     * slot while examining the next one can synthesize presses when held
+     * keys are merely reordered or compacted by the keyboard. */
+    for (uint32_t i = 2U; i < 8U; ++i) {
+        uint8_t current = report[i];
         state->previous_keys[i - 2U] = current;
     }
     state->previous_modifier = modifier;
@@ -131,7 +137,7 @@ static void xhci_hid_consume_mouse_report(xhci_hid_report_context_t *state,
     if (state == 0 || report == 0 || report_length < 3U) return;
     if (!atomic_exchange_explicit(&g_xhci_mouse_input_seen, true,
                                   memory_order_acq_rel)) {
-        liteos_serial_write_serial_only("LITEOS_USB_MOUSE_EVENT_OK\r\n");
+        kernel_serial_write_serial_only("OS_USB_MOUSE_EVENT_OK\r\n");
     }
     current_buttons = report[0] & 0x07U;
     changed_buttons = (uint16_t)(current_buttons ^ state->previous_buttons);

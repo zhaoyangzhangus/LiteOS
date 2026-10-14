@@ -6,16 +6,11 @@
 #include <kernel/rcu.h>
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
+#include <kernel/string.h>
 
 #define DEFERRED_QUEUE_CAPACITY 128U
+#define DEFERRED_CRITICAL_BURST_LIMIT 4U
 #define DEFERRED_WORKER_STACK_SIZE (64U * 1024U)
-
-enum {
-    DEFERRED_CRITICAL_EMPTY = 0U,
-    DEFERRED_CRITICAL_WRITING = 1U,
-    DEFERRED_CRITICAL_READY = 2U,
-    DEFERRED_CRITICAL_RUNNING = 3U,
-};
 
 typedef struct deferred_item {
     deferred_work_fn_t function;
@@ -28,8 +23,10 @@ static struct {
     uint32_t head;
     uint32_t tail;
     uint32_t count;
+    /* Protected by lock; persists across short batches and all consumers. */
+    uint32_t critical_burst;
     deferred_item_t critical_item;
-    atomic_uint critical_state;
+    bool critical_ready; /* protected by lock, including the sleep handshake */
     atomic_uint init_state;
 
     /*
@@ -123,10 +120,7 @@ static uint64_t deferred_lock(void) {
         __atomic_store_n(&g_deferred_waiting[cpu_index], 1U,
                          __ATOMIC_RELEASE);
     }
-    while (atomic_exchange_explicit(&g_deferred.lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_deferred.lock);
     __atomic_store_n(&g_deferred_lock_owner, cpu_index, __ATOMIC_RELEASE);
     if (cpu_index < MAX_CPUS) {
         __atomic_store_n(&g_deferred_waiting[cpu_index], 0U,
@@ -137,7 +131,7 @@ static uint64_t deferred_lock(void) {
 
 static void deferred_unlock(uint64_t flags) {
     __atomic_store_n(&g_deferred_lock_owner, UINT32_MAX, __ATOMIC_RELEASE);
-    atomic_store_explicit(&g_deferred.lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_deferred.lock);
     sched_preempt_enable();
     deferred_irq_restore(flags);
 }
@@ -173,13 +167,7 @@ static void deferred_wake_worker(void) {
 }
 
 static bool deferred_worker_has_work_locked(void) {
-    unsigned critical =
-        atomic_load_explicit(&g_deferred.critical_state,
-                             memory_order_acquire);
-
-    return g_deferred.count != 0U ||
-           critical == DEFERRED_CRITICAL_WRITING ||
-           critical == DEFERRED_CRITICAL_READY;
+    return g_deferred.count != 0U || g_deferred.critical_ready;
 }
 
 static bool deferred_worker_prepare_sleep(void) {
@@ -243,6 +231,9 @@ deferred_worker_main(void *argument) {
 }
 
 bool deferred_init(void) {
+    /* After initial publication, queue operations use their own locks.
+     * Observe readiness without rewriting the shared init cache line. */
+    if (atomic_load_explicit(&g_deferred.init_state, memory_order_acquire) == 2U) return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_deferred.init_state, &expected, 1U,
                                                 memory_order_acq_rel,
@@ -251,9 +242,10 @@ bool deferred_init(void) {
         g_deferred.head = 0;
         g_deferred.tail = 0;
         g_deferred.count = 0;
+        g_deferred.critical_burst = 0;
         g_deferred.critical_item.function = 0;
         g_deferred.critical_item.argument = 0;
-        atomic_init(&g_deferred.critical_state, DEFERRED_CRITICAL_EMPTY);
+        g_deferred.critical_ready = false;
         atomic_init(&g_deferred.worker_started, false);
         for (uint32_t cpu_index = 0U; cpu_index < MAX_CPUS; ++cpu_index) {
             __atomic_store_n(&g_deferred_progress[cpu_index], 0U,
@@ -289,10 +281,7 @@ bool deferred_start_worker(void) {
     if (current == 0 || cpu_id >= MAX_CPUS) return false;
 
     thread_t *worker = &g_deferred.worker;
-    uint8_t *worker_bytes = (uint8_t *)worker;
-    for (size_t i = 0U; i < sizeof(*worker); ++i) {
-        worker_bytes[i] = 0U;
-    }
+    memset(worker, 0, sizeof(*worker));
 
     refcount_init(&worker->object.refs, 1U);
     worker->object.type = KOBJECT_TYPE_THREAD;
@@ -386,6 +375,17 @@ bool deferred_worker_started(void) {
                                 memory_order_acquire);
 }
 
+/* Caller holds the IRQ-safe queue lock. Keep both producer entry points on
+ * one ring publication path, with their existing diagnostics and wakeups. */
+static bool deferred_enqueue_locked(deferred_work_fn_t function, void *argument) {
+    if (g_deferred.count == DEFERRED_QUEUE_CAPACITY) return false;
+    g_deferred.items[g_deferred.tail].function = function;
+    g_deferred.items[g_deferred.tail].argument = argument;
+    g_deferred.tail = (g_deferred.tail + 1U) % DEFERRED_QUEUE_CAPACITY;
+    ++g_deferred.count;
+    return true;
+}
+
 bool deferred_schedule(deferred_work_fn_t function, void *argument) {
     uint64_t flags;
     deferred_debug_set(1U);
@@ -393,14 +393,10 @@ bool deferred_schedule(deferred_work_fn_t function, void *argument) {
     deferred_debug_set(2U);
     flags = deferred_lock();
     deferred_debug_set(4U);
-    if (g_deferred.count == DEFERRED_QUEUE_CAPACITY) {
+    if (!deferred_enqueue_locked(function, argument)) {
         deferred_unlock(flags);
         return false;
     }
-    g_deferred.items[g_deferred.tail].function = function;
-    g_deferred.items[g_deferred.tail].argument = argument;
-    g_deferred.tail = (g_deferred.tail + 1U) % DEFERRED_QUEUE_CAPACITY;
-    ++g_deferred.count;
     deferred_debug_set(5U);
     deferred_unlock(flags);
     deferred_debug_set(6U);
@@ -413,28 +409,23 @@ bool deferred_try_schedule(deferred_work_fn_t function, void *argument) {
     uint64_t flags;
     if (function == 0 || !deferred_init()) return false;
     flags = deferred_lock();
-    if (g_deferred.count == DEFERRED_QUEUE_CAPACITY) {
+    if (!deferred_enqueue_locked(function, argument)) {
         deferred_unlock(flags);
         return false;
     }
-    g_deferred.items[g_deferred.tail].function = function;
-    g_deferred.items[g_deferred.tail].argument = argument;
-    g_deferred.tail = (g_deferred.tail + 1U) % DEFERRED_QUEUE_CAPACITY;
-    ++g_deferred.count;
     deferred_unlock(flags);
     deferred_wake_worker();
     return true;
 }
 
 bool deferred_schedule_critical(deferred_work_fn_t function, void *argument) {
-    unsigned expected = DEFERRED_CRITICAL_EMPTY;
     uint64_t flags;
 
     /*
      * This single slot is deliberately reserved for the xHCI MSI-X worker.
-     * Its caller owns a coalescing queued bit, so a READY/RUNNING item is
-     * already sufficient to cover every later interrupt.  Do not turn this
-     * into a shared fallback queue without adding per-source ownership.
+     * Its caller owns a coalescing queued bit covering pending and executing
+     * device work. Do not turn this into a shared fallback queue without
+     * adding per-source ownership.
      *
      * Publication now shares deferred_lock with the worker's sleep handshake.
      * That is what closes the EMPTY->BLOCKED lost-wakeup window for the
@@ -444,11 +435,7 @@ bool deferred_schedule_critical(deferred_work_fn_t function, void *argument) {
 
     flags = deferred_lock();
 
-    if (!atomic_compare_exchange_strong_explicit(&g_deferred.critical_state,
-                                                 &expected,
-                                                 DEFERRED_CRITICAL_WRITING,
-                                                 memory_order_acq_rel,
-                                                 memory_order_acquire)) {
+    if (g_deferred.critical_ready) {
         deferred_unlock(flags);
         return false;
     }
@@ -456,28 +443,21 @@ bool deferred_schedule_critical(deferred_work_fn_t function, void *argument) {
     g_deferred.critical_item.function = function;
     g_deferred.critical_item.argument = argument;
 
-    atomic_store_explicit(&g_deferred.critical_state,
-                          DEFERRED_CRITICAL_READY,
-                          memory_order_release);
+    g_deferred.critical_ready = true;
 
     deferred_unlock(flags);
     deferred_wake_worker();
     return true;
 }
 
+/* Caller holds the queue lock. Empty the slot before callback execution,
+ * preserving the existing ability to enqueue follow-up work from a callback. */
 static bool deferred_take_critical(deferred_item_t *item) {
-    unsigned expected = DEFERRED_CRITICAL_READY;
-    if (item == 0 ||
-        !atomic_compare_exchange_strong_explicit(&g_deferred.critical_state,
-                                                 &expected,
-                                                 DEFERRED_CRITICAL_RUNNING,
-                                                 memory_order_acq_rel,
-                                                 memory_order_acquire)) {
+    if (item == 0 || !g_deferred.critical_ready) {
         return false;
     }
     *item = g_deferred.critical_item;
-    atomic_store_explicit(&g_deferred.critical_state, DEFERRED_CRITICAL_EMPTY,
-                          memory_order_release);
+    g_deferred.critical_ready = false;
     return item->function != 0;
 }
 
@@ -486,17 +466,28 @@ uint32_t deferred_run(uint32_t budget) {
     if (budget == 0U || !deferred_init()) return 0;
     while (completed < budget) {
         deferred_item_t item = {0};
-        bool have_item = deferred_take_critical(&item);
-        if (!have_item) {
-            uint64_t flags = deferred_lock();
-            if (g_deferred.count != 0U) {
-                item = g_deferred.items[g_deferred.head];
-                g_deferred.head = (g_deferred.head + 1U) % DEFERRED_QUEUE_CAPACITY;
-                --g_deferred.count;
-                have_item = item.function != 0;
-            }
-            deferred_unlock(flags);
+        /* Serialize selection, not execution. A shared burst count prevents
+         * short syscall batches (and concurrent consumers) from resetting
+         * HID priority before a waiting network task gets its turn. */
+        uint64_t flags = deferred_lock();
+        bool have_item = false;
+        if (g_deferred.critical_burst < DEFERRED_CRITICAL_BURST_LIMIT ||
+            g_deferred.count == 0U) {
+            have_item = deferred_take_critical(&item);
         }
+        if (have_item) {
+            if (g_deferred.critical_burst < DEFERRED_CRITICAL_BURST_LIMIT)
+                ++g_deferred.critical_burst;
+        } else if (g_deferred.count != 0U) {
+            item = g_deferred.items[g_deferred.head];
+            g_deferred.head = (g_deferred.head + 1U) % DEFERRED_QUEUE_CAPACITY;
+            --g_deferred.count;
+            have_item = item.function != 0;
+            g_deferred.critical_burst = 0;
+        } else {
+            g_deferred.critical_burst = 0;
+        }
+        deferred_unlock(flags);
         if (!have_item) break;
         item.function(item.argument);
         ++completed;

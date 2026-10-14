@@ -19,10 +19,10 @@ int main(void) {
     device_t *device = 0;
     gpu_context_t *gpu = 0;
     socket_t *socket = 0;
-    LITEOS_FAT32 *filesystem = 0;
+    OS_FAT32 *filesystem = 0;
     const x86_acpi_platform_t *acpi = 0;
     os_vm_map_args_t args = {0};
-    LITEOS_BOOT_INFO boot_info = {0};
+    OS_BOOT_INFO boot_info = {0};
     (void)page;
     (void)process;
     (void)thread;

@@ -59,11 +59,11 @@ bool xhci_submit_control_transfer_device(
                                ((uint32_t)setup[5] << 8) |
                                ((uint32_t)setup[6] << 16) |
                                ((uint32_t)setup[7] << 24);
-        liteos_realtest_mark_number("XHCI_AUX_CONTROL_INDEX",
+        realtest_mark_number("XHCI_AUX_CONTROL_INDEX",
                                     device->ep0_enqueue);
-        liteos_realtest_mark_number("XHCI_AUX_CONTROL_LENGTH", length);
-        liteos_realtest_mark_number("XHCI_AUX_CONTROL_SETUP_LO", setup_low);
-        liteos_realtest_mark_number("XHCI_AUX_CONTROL_SETUP_HI", setup_high);
+        realtest_mark_number("XHCI_AUX_CONTROL_LENGTH", length);
+        realtest_mark_number("XHCI_AUX_CONTROL_SETUP_LO", setup_low);
+        realtest_mark_number("XHCI_AUX_CONTROL_SETUP_HI", setup_high);
     }
     xhci_trb_t *ring = (xhci_trb_t *)device->ep0_ring.cpu;
     uint32_t index = device->ep0_enqueue;
@@ -153,30 +153,30 @@ bool xhci_submit_control_transfer_device(
             completion != XHCI_COMPLETION_SHORT_PACKET) {
             xhci_set_error(54U + completion);
             if (auxiliary) {
-                liteos_realtest_mark_number("XHCI_AUX_CONTROL_EVENT_PARAM_LO",
+                realtest_mark_number("XHCI_AUX_CONTROL_EVENT_PARAM_LO",
                                             (uint32_t)event.parameter);
-                liteos_realtest_mark_number("XHCI_AUX_CONTROL_EVENT_STATUS",
+                realtest_mark_number("XHCI_AUX_CONTROL_EVENT_STATUS",
                                             event.status);
-                liteos_realtest_mark_number("XHCI_AUX_CONTROL_EVENT_CONTROL",
+                realtest_mark_number("XHCI_AUX_CONTROL_EVENT_CONTROL",
                                             event.control);
-                liteos_realtest_mark_number("XHCI_AUX_CONTROL_EVENT_INDEX",
+                realtest_mark_number("XHCI_AUX_CONTROL_EVENT_INDEX",
                                             state->event_index);
             }
-            liteos_realtest_mark_xhci_control(
+            realtest_mark_xhci_control(
                 "COMPLETION", 54U + completion, device->device_slot,
                 device->device_port, length, state->event_index,
                 state->event_cycle);
-            liteos_serial_write("LITEOS_XHCI_EP0_COMPLETION SLOT=");
-            liteos_serial_write_u32(device->device_slot);
-            liteos_serial_write(" PORT=");
-            liteos_serial_write_u32(device->device_port);
-            liteos_serial_write(" LEN=");
-            liteos_serial_write_u32(length);
-            liteos_serial_write(" CODE=");
-            liteos_serial_write_u32(completion);
-            liteos_serial_write(" EVENT_STATUS=");
-            liteos_serial_write_u32(event.status);
-            liteos_serial_write("\r\n");
+            kernel_serial_write("OS_XHCI_EP0_COMPLETION SLOT=");
+            kernel_serial_write_u32(device->device_slot);
+            kernel_serial_write(" PORT=");
+            kernel_serial_write_u32(device->device_port);
+            kernel_serial_write(" LEN=");
+            kernel_serial_write_u32(length);
+            kernel_serial_write(" CODE=");
+            kernel_serial_write_u32(completion);
+            kernel_serial_write(" EVENT_STATUS=");
+            kernel_serial_write_u32(event.status);
+            kernel_serial_write("\r\n");
             xhci_event_handler_complete(state);
             return false;
         }
@@ -196,66 +196,66 @@ bool xhci_submit_control_transfer_device(
         pending_event = (const xhci_trb_t *)state->event_ring.cpu +
                         state->event_index;
     }
-    liteos_realtest_mark_number("XHCI_EP0_USBSTS", usbsts);
-    liteos_realtest_mark_number("XHCI_EP0_IMAN", iman);
-    liteos_realtest_mark_number("XHCI_EP0_RING_CTRL", ring[index].control);
-    liteos_realtest_mark_number("XHCI_EP0_RING_ADDR_LO",
+    realtest_mark_number("XHCI_EP0_USBSTS", usbsts);
+    realtest_mark_number("XHCI_EP0_IMAN", iman);
+    realtest_mark_number("XHCI_EP0_RING_CTRL", ring[index].control);
+    realtest_mark_number("XHCI_EP0_RING_ADDR_LO",
         (uint32_t)xhci_dma_address(&device->ep0_ring.mapping));
-    liteos_realtest_mark_number("XHCI_EP0_DATA_ADDR_LO",
+    realtest_mark_number("XHCI_EP0_DATA_ADDR_LO",
         (uint32_t)xhci_dma_address(&device->descriptor_buffer.mapping));
     if (input_context != 0) {
         uint32_t input_ep0 = state->context_size * 2U / sizeof(uint32_t);
-        liteos_realtest_mark_number("XHCI_EP0_IN_DW1",
+        realtest_mark_number("XHCI_EP0_IN_DW1",
                                     input_context[input_ep0 + 1U]);
-        liteos_realtest_mark_number("XHCI_EP0_IN_DW2",
+        realtest_mark_number("XHCI_EP0_IN_DW2",
                                     input_context[input_ep0 + 2U]);
-        liteos_realtest_mark_number("XHCI_EP0_IN_DW3",
+        realtest_mark_number("XHCI_EP0_IN_DW3",
                                     input_context[input_ep0 + 3U]);
     }
-    liteos_realtest_mark_number("XHCI_EP0_DEFERRED",
+    realtest_mark_number("XHCI_EP0_DEFERRED",
                                 state->deferred_event_count);
     for (uint32_t deferred = 0U;
          deferred < state->deferred_event_count && deferred < 8U;
          ++deferred) {
         uint32_t event_index =
             (state->deferred_event_head + deferred) % XHCI_DEFERRED_EVENT_COUNT;
-        liteos_realtest_mark_number("XHCI_EP0_DEFERRED_CTRL",
+        realtest_mark_number("XHCI_EP0_DEFERRED_CTRL",
                                     state->deferred_events[event_index].control);
     }
     if (pending_event != 0) {
-        liteos_realtest_mark_number("XHCI_EP0_EVENT_CTRL",
+        realtest_mark_number("XHCI_EP0_EVENT_CTRL",
                                     pending_event->control);
-        liteos_realtest_mark_number("XHCI_EP0_EVENT_STATUS",
+        realtest_mark_number("XHCI_EP0_EVENT_STATUS",
                                     pending_event->status);
     }
-    liteos_realtest_mark_number("XHCI_EP0_PORTSC",
+    realtest_mark_number("XHCI_EP0_PORTSC",
         xhci_controller_read32(state, state->operational_offset + 0x400U +
                                 (uint32_t)(device->device_port - 1U) * 0x10U));
     if (output_context != 0) {
-        liteos_realtest_mark_number("XHCI_EP0_OUT_DW0", output_context[8U]);
-        liteos_realtest_mark_number("XHCI_EP0_OUT_DW1", output_context[9U]);
-        liteos_realtest_mark_number("XHCI_EP0_OUT_DW2", output_context[10U]);
-        liteos_realtest_mark_number("XHCI_EP0_OUT_DW3", output_context[11U]);
+        realtest_mark_number("XHCI_EP0_OUT_DW0", output_context[8U]);
+        realtest_mark_number("XHCI_EP0_OUT_DW1", output_context[9U]);
+        realtest_mark_number("XHCI_EP0_OUT_DW2", output_context[10U]);
+        realtest_mark_number("XHCI_EP0_OUT_DW3", output_context[11U]);
     }
     xhci_set_error(54U);
-    liteos_realtest_mark_xhci_control(
+    realtest_mark_xhci_control(
         "TIMEOUT", 54U, device->device_slot, device->device_port, length,
         state->event_index, state->event_cycle);
-    liteos_serial_write("LITEOS_XHCI_EP0_TIMEOUT SLOT=");
-    liteos_serial_write_u32(device->device_slot);
-    liteos_serial_write(" PORT=");
-    liteos_serial_write_u32(device->device_port);
-    liteos_serial_write(" LEN=");
-    liteos_serial_write_u32(length);
-    liteos_serial_write(" EVENT_INDEX=");
-    liteos_serial_write_u32(state->event_index);
-    liteos_serial_write(" EVENT_CYCLE=");
-    liteos_serial_write_u32(state->event_cycle);
-    liteos_serial_write(" USBSTS=");
-    liteos_serial_write_u32(usbsts);
-    liteos_serial_write(" IMAN=");
-    liteos_serial_write_u32(iman);
-    liteos_serial_write("\r\n");
+    kernel_serial_write("OS_XHCI_EP0_TIMEOUT SLOT=");
+    kernel_serial_write_u32(device->device_slot);
+    kernel_serial_write(" PORT=");
+    kernel_serial_write_u32(device->device_port);
+    kernel_serial_write(" LEN=");
+    kernel_serial_write_u32(length);
+    kernel_serial_write(" EVENT_INDEX=");
+    kernel_serial_write_u32(state->event_index);
+    kernel_serial_write(" EVENT_CYCLE=");
+    kernel_serial_write_u32(state->event_cycle);
+    kernel_serial_write(" USBSTS=");
+    kernel_serial_write_u32(usbsts);
+    kernel_serial_write(" IMAN=");
+    kernel_serial_write_u32(iman);
+    kernel_serial_write("\r\n");
     xhci_event_handler_complete(state);
     return false;
 }

@@ -1,5 +1,5 @@
-#ifndef LITEOS_WGET_TLS_H
-#define LITEOS_WGET_TLS_H
+#ifndef OS_WGET_TLS_H
+#define OS_WGET_TLS_H
 
 #include <stdint.h>
 #include <stdbool.h>

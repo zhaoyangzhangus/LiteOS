@@ -78,7 +78,7 @@ bool xhci_process_events(uint32_t budget) {
     if (!g_xhci_runtime_ready) return false;
     ++g_xhci_runtime_event_batches;
     if (g_xhci_runtime_event_batches == 1U) {
-        liteos_serial_write_serial_only("LITEOS_USB_RUNTIME_IRQ_OK\r\n");
+        kernel_serial_write_serial_only("OS_USB_RUNTIME_IRQ_OK\r\n");
     }
     /* Both independent xHCI event rings are drained by the same coalesced
      * worker, but each ring keeps its own lock and ERDP state. */

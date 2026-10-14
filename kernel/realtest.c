@@ -3,19 +3,21 @@
 #include <kernel/bootinfo.h>
 #include <kernel/realtest.h>
 #include <kernel/vfs.h>
+#include <arch/x86_64/cpu.h>
 #include <arch/x86_64/reboot.h>
 
 #include <stdatomic.h>
 
-#ifndef LITEOS_REALTEST
-#define LITEOS_REALTEST 0
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
 #endif
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 
 #define REALTEST_LOG_CAPACITY (256U * 1024U)
 #define REALTEST_WRITE_CHUNK  4096U
 #define REALTEST_STATE_CAPACITY 8192U
+#define REALTEST_HARD_TIMEOUT_NS 300000000000ULL
 
 static char g_realtest_log[REALTEST_LOG_CAPACITY];
 static char g_realtest_chunk[REALTEST_WRITE_CHUNK];
@@ -25,8 +27,8 @@ static bool g_realtest_overflow;
 static bool g_realtest_flush_busy;
 static bool g_realtest_sealed;
 static file_t *g_realtest_file;
-static LITEOS_FAT32_FILE *g_realtest_raw_file;
-static LITEOS_FAT32 *g_realtest_raw_filesystem;
+static OS_FAT32_FILE *g_realtest_raw_file;
+static OS_FAT32 *g_realtest_raw_filesystem;
 static uint64_t g_realtest_raw_file_offset;
 static EFI_SET_VARIABLE g_realtest_set_variable;
 static bool g_realtest_runtime_services_enabled;
@@ -35,6 +37,11 @@ static uint32_t g_realtest_flush_count;
 static atomic_flag g_realtest_lock = ATOMIC_FLAG_INIT;
 static char g_realtest_state[REALTEST_STATE_CAPACITY];
 static size_t g_realtest_state_length;
+/* Static-storage atomics are zero-initialized by the freestanding image; this
+ * toolchain exposes ATOMIC_FLAG_INIT but not ATOMIC_VAR_INIT. */
+static atomic_bool g_realtest_timeout_active;
+static atomic_bool g_realtest_timeout_rebooting;
+static _Atomic uint64_t g_realtest_timeout_deadline_tsc;
 
 static const EFI_GUID g_realtest_variable_guid = {
     0x4C495445U, 0x4F53U, 0x5254U,
@@ -65,8 +72,9 @@ static void realtest_unlock(uint64_t flags) {
 
 static void append_text(char *buffer, size_t *length, size_t capacity,
                         const char *text) {
-    if (buffer == 0 || length == 0 || text == 0) return;
-    while (*text != '\0' && *length + 1U < capacity) {
+    if (buffer == 0 || length == 0 || text == 0 ||
+        capacity == 0U || *length >= capacity) return;
+    while (*text != '\0' && *length < capacity - 1U) {
         buffer[(*length)++] = *text++;
     }
     buffer[*length] = '\0';
@@ -74,9 +82,11 @@ static void append_text(char *buffer, size_t *length, size_t capacity,
 
 static void append_hex(char *buffer, size_t *length, size_t capacity,
                        uint64_t value) {
+    if (buffer == 0 || length == 0 || capacity == 0U ||
+        *length >= capacity) return;
     static const char digits[] = "0123456789ABCDEF";
     append_text(buffer, length, capacity, "0x");
-    for (int shift = 60; shift >= 0 && *length + 1U < capacity;
+    for (int shift = 60; shift >= 0 && *length < capacity - 1U;
          shift -= 4) {
         buffer[(*length)++] = digits[(value >> (uint32_t)shift) & 0xFU];
     }
@@ -85,24 +95,89 @@ static void append_hex(char *buffer, size_t *length, size_t capacity,
 
 static void append_u32(char *buffer, size_t *length, size_t capacity,
                        uint32_t value) {
+    if (buffer == 0 || length == 0 || capacity == 0U ||
+        *length >= capacity) return;
     char digits[10];
     uint32_t count = 0U;
     do {
         digits[count++] = (char)('0' + value % 10U);
         value /= 10U;
     } while (value != 0U && count < sizeof(digits));
-    while (count != 0U && *length + 1U < capacity) {
+    while (count != 0U && *length < capacity - 1U) {
         buffer[(*length)++] = digits[--count];
     }
     buffer[*length] = '\0';
 }
 
-bool liteos_realtest_enabled(void) {
+bool realtest_enabled(void) {
     return true;
 }
 
-void liteos_realtest_boot_info(const struct liteos_boot_info *info) {
-    const LITEOS_BOOT_INFO *boot_info = (const LITEOS_BOOT_INFO *)info;
+void realtest_timeout_start(void) {
+    uint64_t now_tsc;
+    uint64_t timeout_tsc;
+
+    /* x86_timeout_ns_to_tsc() requires the CPU frequency to be initialized.
+     * CPU detection runs before the high-half runtime continuation, but keep
+     * this guard so an unusually early failure cannot turn the watchdog into
+     * a divide-by-zero fault. */
+    if (x86_boot_cpu_features.tsc_hz == 0U) {
+        atomic_store_explicit(&g_realtest_timeout_active, false,
+                              memory_order_release);
+        return;
+    }
+    now_tsc = x86_read_tsc();
+    timeout_tsc = x86_timeout_ns_to_tsc(REALTEST_HARD_TIMEOUT_NS);
+    if (timeout_tsc == 0U || timeout_tsc == UINT64_MAX ||
+        timeout_tsc > UINT64_MAX - now_tsc) {
+        atomic_store_explicit(&g_realtest_timeout_active, false,
+                              memory_order_release);
+        return;
+    }
+    atomic_store_explicit(&g_realtest_timeout_rebooting, false,
+                          memory_order_release);
+    atomic_store_explicit(&g_realtest_timeout_deadline_tsc,
+                          now_tsc + timeout_tsc, memory_order_release);
+    atomic_store_explicit(&g_realtest_timeout_active, true,
+                          memory_order_release);
+}
+
+void realtest_timeout_stop(void) {
+    atomic_store_explicit(&g_realtest_timeout_active, false,
+                          memory_order_release);
+}
+
+bool realtest_timeout_poll(uint64_t now_tsc) {
+    uint64_t deadline;
+
+    if (!atomic_load_explicit(&g_realtest_timeout_active,
+                              memory_order_acquire) ||
+        atomic_load_explicit(&g_realtest_timeout_rebooting,
+                             memory_order_acquire)) {
+        return false;
+    }
+    deadline = atomic_load_explicit(&g_realtest_timeout_deadline_tsc,
+                                    memory_order_acquire);
+    if ((int64_t)(now_tsc - deadline) < 0) return false;
+    return atomic_exchange_explicit(&g_realtest_timeout_rebooting, true,
+                                    memory_order_acq_rel) == false;
+}
+
+__attribute__((noreturn)) void realtest_timeout_reboot(void) {
+    /* This function can run from the LAPIC hard IRQ.  Do not call
+     * kernel_serial_write_serial_only(): it captures into the FAT log and
+     * takes the real-test lock, which may be owned by the interrupted thread.
+     * The guarded primitive is the raw COM1 path when debug serial is built. */
+    atomic_store_explicit(&g_realtest_timeout_active, false,
+                          memory_order_release);
+    kernel_serial_write_guarded(
+        "OS_REALTEST_TIMEOUT_FAIL\r\n"
+        "OS_REALTEST_TIMEOUT_REBOOTING\r\n");
+    x86_system_reboot();
+}
+
+void realtest_boot_info(const struct os_boot_info *info) {
+    const OS_BOOT_INFO *boot_info = (const OS_BOOT_INFO *)info;
     EFI_RUNTIME_SERVICES *services;
     if (boot_info == 0 || boot_info->RuntimeServices == 0 ||
         boot_info->RuntimeServices > UINT32_MAX) return;
@@ -113,7 +188,7 @@ void liteos_realtest_boot_info(const struct liteos_boot_info *info) {
     g_realtest_runtime_services_enabled = true;
 }
 
-void liteos_realtest_mark(const char *state) {
+void realtest_mark(const char *state) {
     char data[REALTEST_STATE_CAPACITY];
     size_t state_length = 0U;
     if (!g_realtest_runtime_services_enabled || g_realtest_set_variable == 0 ||
@@ -139,28 +214,38 @@ void liteos_realtest_mark(const char *state) {
         (UINTN)g_realtest_state_length, data);
 }
 
-void liteos_realtest_checkpoint(const char *state) {
+void realtest_checkpoint(const char *state) {
     if (state == 0) return;
-    liteos_realtest_mark(state);
-    liteos_realtest_capture(state);
-    liteos_realtest_capture("\r\n");
-    (void)liteos_realtest_flush();
+    realtest_mark(state);
+    realtest_capture(state);
+    realtest_capture("\r\n");
+    (void)realtest_flush();
 }
 
-void liteos_realtest_mark_number(const char *prefix, uint32_t value) {
+void realtest_checkpoint_deferred(const char *state) {
+    if (state == 0) return;
+    /* RM/GSP initialization can run with device interrupts enabled and with
+     * vendor locks held.  Keep this path memory-only: UEFI SetVariable and
+     * FAT/VFS sync are performed later by the runtime checkpoint after the
+     * vendor call has returned. */
+    realtest_capture(state);
+    realtest_capture("\r\n");
+}
+
+void realtest_mark_number(const char *prefix, uint32_t value) {
     char state[128] = {0};
     size_t length = 0U;
     append_text(state, &length, sizeof(state), prefix != 0 ? prefix : "STATE");
     append_text(state, &length, sizeof(state), "=");
     append_u32(state, &length, sizeof(state), value);
-    liteos_realtest_mark(state);
+    realtest_mark(state);
 }
 
-void liteos_realtest_clear_failure_state(void) {
+void realtest_clear_failure_state(void) {
     g_realtest_specific_failure_state = false;
 }
 
-void liteos_realtest_mark_value(const char *prefix, uint32_t value) {
+void realtest_mark_value(const char *prefix, uint32_t value) {
     char state[128] = {0};
     size_t length = 0U;
     if (g_realtest_specific_failure_state) return;
@@ -168,10 +253,10 @@ void liteos_realtest_mark_value(const char *prefix, uint32_t value) {
     append_text(state, &length, sizeof(state), "=");
     append_u32(state, &length, sizeof(state), value);
     g_realtest_specific_failure_state = true;
-    liteos_realtest_mark(state);
+    realtest_mark(state);
 }
 
-void liteos_realtest_mark_xhci_control(const char *kind, uint32_t error,
+void realtest_mark_xhci_control(const char *kind, uint32_t error,
                                        uint32_t slot, uint32_t port,
                                        uint32_t length, uint32_t event_index,
                                        uint32_t event_cycle) {
@@ -193,22 +278,22 @@ void liteos_realtest_mark_xhci_control(const char *kind, uint32_t error,
     append_text(state, &state_length, sizeof(state), " event_cycle=");
     append_u32(state, &state_length, sizeof(state), event_cycle);
     g_realtest_specific_failure_state = true;
-    liteos_realtest_mark(state);
+    realtest_mark(state);
 }
 
-void liteos_realtest_disable_runtime_services(void) {
+void realtest_disable_runtime_services(void) {
     g_realtest_runtime_services_enabled = false;
     g_realtest_set_variable = 0;
 }
 
-static bool raw_file_ready(LITEOS_FAT32 *filesystem) {
+static bool raw_file_ready(OS_FAT32 *filesystem) {
     os_file_info_t info = {0};
     if (filesystem == 0 || g_realtest_file != 0 || g_realtest_raw_file != 0 ||
-        !liteos_fat32_stat_path(filesystem, "EFI/LITEOS/realtest.log", &info) ||
+        !fat32_stat_path(filesystem, "EFI/OS/realtest.log", &info) ||
         info.type != OS_FILE_TYPE_REGULAR) {
         return false;
     }
-    if (!liteos_fat32_open(filesystem, "EFI/LITEOS/realtest.log",
+    if (!fat32_open(filesystem, "EFI/OS/realtest.log",
                            &g_realtest_raw_file)) {
         return false;
     }
@@ -217,7 +302,7 @@ static bool raw_file_ready(LITEOS_FAT32 *filesystem) {
     return true;
 }
 
-void liteos_realtest_capture(const char *text) {
+void realtest_capture(const char *text) {
     uint64_t flags;
     if (text == 0) return;
     flags = realtest_lock();
@@ -238,7 +323,7 @@ void liteos_realtest_capture(const char *text) {
 
 static bool open_realtest_file(void) {
     static const char *const paths[] = {
-        "/EFI/LITEOS/realtest.log",
+        "/EFI/OS/realtest.log",
         "/realtest.log",
     };
     /* The early FAT handle remains the least dependent logging path once
@@ -259,7 +344,7 @@ static bool open_realtest_file(void) {
     return false;
 }
 
-bool liteos_realtest_flush(void) {
+bool realtest_flush(void) {
     bool success = true;
     uint64_t flags;
     if (g_realtest_file == 0 && g_realtest_raw_filesystem == 0) return false;
@@ -271,7 +356,7 @@ bool liteos_realtest_flush(void) {
     g_realtest_flush_busy = true;
     realtest_unlock(flags);
     ++g_realtest_flush_count;
-    liteos_realtest_mark_number("REALTEST_FLUSH_BEGIN", g_realtest_flush_count);
+    realtest_mark_number("REALTEST_FLUSH_BEGIN", g_realtest_flush_count);
 
     for (;;) {
         size_t offset;
@@ -296,21 +381,21 @@ bool liteos_realtest_flush(void) {
                                         &written) == K_OK;
         } else if (g_realtest_raw_file != 0) {
             uint32_t raw_written = 0U;
-            write_ok = liteos_fat32_write_file(
+            write_ok = fat32_write_file(
                 g_realtest_raw_file, g_realtest_raw_file_offset + offset,
                 g_realtest_chunk, (uint32_t)count, &raw_written);
             written = raw_written;
         } else {
             uint32_t raw_written = 0U;
-            write_ok = liteos_fat32_write_path(
-                g_realtest_raw_filesystem, "EFI/LITEOS/realtest.log",
+            write_ok = fat32_write_path(
+                g_realtest_raw_filesystem, "EFI/OS/realtest.log",
                 g_realtest_raw_file_offset + offset, g_realtest_chunk,
                 (uint32_t)count, &raw_written);
             written = raw_written;
         }
         if (!write_ok || written != count) {
-            liteos_serial_write_serial_only(
-                "LITEOS_REALTEST_FLUSH_WRITE_FAIL\r\n");
+            kernel_serial_write_serial_only(
+                "OS_REALTEST_FLUSH_WRITE_FAIL\r\n");
             success = false;
             break;
         }
@@ -319,19 +404,19 @@ bool liteos_realtest_flush(void) {
         realtest_unlock(flags);
     }
     if (success) {
-        liteos_realtest_mark_number("REALTEST_FLUSH_WRITE_OK",
+        realtest_mark_number("REALTEST_FLUSH_WRITE_OK",
                                     g_realtest_flush_count);
-        liteos_realtest_mark_number("REALTEST_FLUSH_SYNC_BEGIN",
+        realtest_mark_number("REALTEST_FLUSH_SYNC_BEGIN",
                                     g_realtest_flush_count);
         bool sync_ok = g_realtest_file != 0 ?
             vfs_fsync(g_realtest_file) == K_OK :
-            liteos_fat32_sync(g_realtest_raw_filesystem);
+            fat32_sync(g_realtest_raw_filesystem);
         if (!sync_ok) {
-            liteos_serial_write_serial_only(
-                "LITEOS_REALTEST_FLUSH_SYNC_FAIL\r\n");
+            kernel_serial_write_serial_only(
+                "OS_REALTEST_FLUSH_SYNC_FAIL\r\n");
             success = false;
         } else {
-            liteos_realtest_mark_number("REALTEST_FLUSH_DONE",
+            realtest_mark_number("REALTEST_FLUSH_DONE",
                                         g_realtest_flush_count);
         }
     }
@@ -347,58 +432,60 @@ static void seal_realtest_capture(void) {
     realtest_unlock(flags);
 }
 
-void liteos_realtest_fat_ready(struct LITEOS_FAT32 *filesystem) {
-    LITEOS_FAT32 *fat = (LITEOS_FAT32 *)filesystem;
+void realtest_fat_ready(struct OS_FAT32 *filesystem) {
+    OS_FAT32 *fat = (OS_FAT32 *)filesystem;
     /* The Windows test harness removes the previous log before copying the
      * ESP.  Create the file while FAT is still the only storage owner so the
      * runtime logger never falls back to the VFS/page-cache path. */
     if (!raw_file_ready(fat)) {
-        if (!liteos_fat32_create_path(fat, "EFI/LITEOS/realtest.log", 0) ||
+        if (!fat32_create_path(fat, "EFI/OS/realtest.log", 0) ||
             !raw_file_ready(fat)) {
-            liteos_realtest_mark("LITEOS_REALTEST_FAT_LOG_CREATE_FAIL");
+            realtest_mark("OS_REALTEST_FAT_LOG_CREATE_FAIL");
             return;
         }
-        liteos_realtest_mark("LITEOS_REALTEST_FAT_LOG_CREATED");
+        realtest_mark("OS_REALTEST_FAT_LOG_CREATED");
     }
-    liteos_realtest_capture("LITEOS_REALTEST_FAT_READY\r\n");
-    (void)liteos_realtest_flush();
+    realtest_capture("OS_REALTEST_FAT_READY\r\n");
+    (void)realtest_flush();
 }
 
-void liteos_realtest_fat_lost(const char *reason) {
+void realtest_fat_lost(const char *reason) {
     if (g_realtest_raw_filesystem == 0 || g_realtest_file != 0) return;
-    liteos_realtest_capture("LITEOS_REALTEST_FAT_LOST ");
-    liteos_realtest_capture(reason != 0 ? reason : "unknown");
-    liteos_realtest_capture("\r\n");
-    (void)liteos_realtest_flush();
+    realtest_capture("OS_REALTEST_FAT_LOST ");
+    realtest_capture(reason != 0 ? reason : "unknown");
+    realtest_capture("\r\n");
+    (void)realtest_flush();
     if (g_realtest_raw_file != 0) {
-        (void)liteos_fat32_close(g_realtest_raw_file);
+        (void)fat32_close(g_realtest_raw_file);
         g_realtest_raw_file = 0;
     }
     g_realtest_raw_filesystem = 0;
     g_realtest_raw_file_offset = 0U;
 }
 
-void liteos_realtest_filesystem_ready(void) {
+void realtest_filesystem_ready(void) {
     bool flushed;
     if (g_realtest_file != 0 || g_realtest_raw_file != 0 ||
         g_realtest_raw_filesystem != 0) {
-        liteos_realtest_capture("LITEOS_REALTEST_LOG_READY\r\n");
-        flushed = liteos_realtest_flush();
-        if (flushed) liteos_realtest_disable_runtime_services();
+        realtest_capture("OS_REALTEST_LOG_READY\r\n");
+        flushed = realtest_flush();
+        if (flushed) realtest_disable_runtime_services();
+        realtest_timeout_start();
         return;
     }
     if (!open_realtest_file()) return;
-    liteos_realtest_capture("LITEOS_REALTEST_LOG_READY\r\n");
-    flushed = liteos_realtest_flush();
-    if (flushed) liteos_realtest_disable_runtime_services();
+    realtest_capture("OS_REALTEST_LOG_READY\r\n");
+    flushed = realtest_flush();
+    if (flushed) realtest_disable_runtime_services();
+    realtest_timeout_start();
 }
 
-void liteos_realtest_record_failure(const char *file, uint32_t line) {
+void realtest_record_failure(const char *file, uint32_t line) {
     char record[256] = {0};
     char state[256] = {0};
     size_t length = 0U;
     size_t state_length = 0U;
-    append_text(record, &length, sizeof(record), "LITEOS_REALTEST_FAIL");
+    append_text(record, &length, sizeof(record), "OS_REALTEST_FAIL");
     append_text(state, &state_length, sizeof(state), "FAILURE");
     if (file != 0) {
         append_text(record, &length, sizeof(record), " loc=");
@@ -411,17 +498,17 @@ void liteos_realtest_record_failure(const char *file, uint32_t line) {
         append_u32(state, &state_length, sizeof(state), line);
     }
     append_text(record, &length, sizeof(record), "\r\n");
-    if (!g_realtest_specific_failure_state) liteos_realtest_mark(state);
-    liteos_realtest_capture(record);
+    if (!g_realtest_specific_failure_state) realtest_mark(state);
+    realtest_capture(record);
 }
 
-void liteos_realtest_record_exception(uint64_t vector, uint64_t error_code,
+void realtest_record_exception(uint64_t vector, uint64_t error_code,
                                       uint64_t rip, uint64_t fault_address,
                                       bool has_fault_address) {
     char record[256] = {0};
     size_t length = 0U;
     append_text(record, &length, sizeof(record),
-                "LITEOS_REALTEST_EXCEPTION vector=");
+                "OS_REALTEST_EXCEPTION vector=");
     append_hex(record, &length, sizeof(record), vector);
     append_text(record, &length, sizeof(record), " error=");
     append_hex(record, &length, sizeof(record), error_code);
@@ -432,51 +519,54 @@ void liteos_realtest_record_exception(uint64_t vector, uint64_t error_code,
         append_hex(record, &length, sizeof(record), fault_address);
     }
     append_text(record, &length, sizeof(record), "\r\n");
-    liteos_realtest_capture(record);
+    realtest_capture(record);
 }
 
-void liteos_realtest_finish_success(void) {
+void realtest_finish_success(void) {
     /* The real-hardware deployment is a boot-and-return probe.  Persist the
      * terminal result before resetting so the host collector can prove both
      * the hardware outcome and the return to Windows without entering the
      * desktop. */
-    liteos_realtest_mark("LITEOS_REALTEST_PASS");
-    liteos_realtest_capture("LITEOS_REALTEST_PASS\r\n");
-    (void)liteos_realtest_flush();
-    liteos_serial_write_serial_only("LITEOS_REALTEST_PASS\r\n");
-    liteos_realtest_capture("LITEOS_REALTEST_REBOOTING\r\n");
-    (void)liteos_realtest_flush();
-    liteos_serial_write_serial_only("LITEOS_REALTEST_REBOOTING\r\n");
+    realtest_timeout_stop();
+    realtest_mark("OS_REALTEST_PASS");
+    realtest_capture("OS_REALTEST_PASS\r\n");
+    (void)realtest_flush();
+    kernel_serial_write_serial_only("OS_REALTEST_PASS\r\n");
+    realtest_capture("OS_REALTEST_REBOOTING\r\n");
+    (void)realtest_flush();
+    kernel_serial_write_serial_only("OS_REALTEST_REBOOTING\r\n");
     x86_system_reboot();
 }
 
-void liteos_realtest_finish_failure(void) {
-    liteos_realtest_mark("LITEOS_REALTEST_FAIL");
-    liteos_realtest_capture("LITEOS_REALTEST_FAIL\r\n");
+void realtest_finish_failure(void) {
+    realtest_timeout_stop();
+    realtest_mark("OS_REALTEST_FAIL");
+    realtest_capture("OS_REALTEST_FAIL\r\n");
     seal_realtest_capture();
-    (void)liteos_realtest_flush();
-    liteos_serial_write_serial_only("LITEOS_REALTEST_FAIL\r\n");
+    (void)realtest_flush();
+    kernel_serial_write_serial_only("OS_REALTEST_FAIL\r\n");
     x86_system_reboot();
 }
 
 #else
 
-bool liteos_realtest_enabled(void) { return false; }
-void liteos_realtest_boot_info(const struct liteos_boot_info *info) {
+bool realtest_enabled(void) { return false; }
+void realtest_boot_info(const struct os_boot_info *info) {
     (void)info;
 }
-void liteos_realtest_mark(const char *state) { (void)state; }
-void liteos_realtest_checkpoint(const char *state) { (void)state; }
-void liteos_realtest_mark_number(const char *prefix, uint32_t value) {
+void realtest_mark(const char *state) { (void)state; }
+void realtest_checkpoint(const char *state) { (void)state; }
+void realtest_checkpoint_deferred(const char *state) { (void)state; }
+void realtest_mark_number(const char *prefix, uint32_t value) {
     (void)prefix;
     (void)value;
 }
-void liteos_realtest_clear_failure_state(void) { }
-void liteos_realtest_mark_value(const char *prefix, uint32_t value) {
+void realtest_clear_failure_state(void) { }
+void realtest_mark_value(const char *prefix, uint32_t value) {
     (void)prefix;
     (void)value;
 }
-void liteos_realtest_mark_xhci_control(const char *kind, uint32_t error,
+void realtest_mark_xhci_control(const char *kind, uint32_t error,
                                        uint32_t slot, uint32_t port,
                                        uint32_t length, uint32_t event_index,
                                        uint32_t event_cycle) {
@@ -488,19 +578,19 @@ void liteos_realtest_mark_xhci_control(const char *kind, uint32_t error,
     (void)event_index;
     (void)event_cycle;
 }
-void liteos_realtest_disable_runtime_services(void) { }
-void liteos_realtest_capture(const char *text) { (void)text; }
-void liteos_realtest_fat_ready(struct LITEOS_FAT32 *filesystem) {
+void realtest_disable_runtime_services(void) { }
+void realtest_capture(const char *text) { (void)text; }
+void realtest_fat_ready(struct OS_FAT32 *filesystem) {
     (void)filesystem;
 }
-void liteos_realtest_fat_lost(const char *reason) { (void)reason; }
-void liteos_realtest_filesystem_ready(void) { }
-bool liteos_realtest_flush(void) { return false; }
-void liteos_realtest_record_failure(const char *file, uint32_t line) {
+void realtest_fat_lost(const char *reason) { (void)reason; }
+void realtest_filesystem_ready(void) { }
+bool realtest_flush(void) { return false; }
+void realtest_record_failure(const char *file, uint32_t line) {
     (void)file;
     (void)line;
 }
-void liteos_realtest_record_exception(uint64_t vector, uint64_t error_code,
+void realtest_record_exception(uint64_t vector, uint64_t error_code,
                                       uint64_t rip, uint64_t fault_address,
                                       bool has_fault_address) {
     (void)vector;
@@ -509,8 +599,18 @@ void liteos_realtest_record_exception(uint64_t vector, uint64_t error_code,
     (void)fault_address;
     (void)has_fault_address;
 }
-void liteos_realtest_finish_success(void) { }
-void liteos_realtest_finish_failure(void) {
+void realtest_timeout_start(void) { }
+void realtest_timeout_stop(void) { }
+bool realtest_timeout_poll(uint64_t now_tsc) {
+    (void)now_tsc;
+    return false;
+}
+void realtest_timeout_reboot(void) {
+    x86_system_reboot();
+    __builtin_unreachable();
+}
+void realtest_finish_success(void) { }
+void realtest_finish_failure(void) {
     x86_system_reboot();
     __builtin_unreachable();
 }

@@ -12,6 +12,8 @@ typedef struct user_elf_image_info {
     uint16_t program_header_size;
     uint16_t program_header_count;
     vaddr_t load_bias;
+    vaddr_t brk_base;
+    bool linux_abi;
 } user_elf_image_info_t;
 
 kstatus_t process_load_elf_image(process_t *process, const void *image, size_t image_size,

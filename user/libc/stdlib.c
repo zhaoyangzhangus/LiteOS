@@ -1,10 +1,13 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+char *program_invocation_name;
+char *program_invocation_short_name;
 
 static bool digit_value(int value, unsigned int *digit) {
     if (value >= '0' && value <= '9') *digit = (unsigned int)(value - '0');
@@ -492,6 +495,35 @@ int rand(void) {
     return (int)((g_random_state >> 1U) & RAND_MAX);
 }
 
+int rand_r(unsigned int *seed) {
+    if (seed == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    *seed = *seed * 1103515245U + 12345U;
+    return (int)((*seed >> 1U) & RAND_MAX);
+}
+
+int initstate_r(unsigned int seed, char *state_buffer, size_t state_length,
+               struct random_data *buffer) {
+    if (state_buffer == 0 || state_length < 8U || buffer == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    buffer->state = seed == 0U ? 1U : seed;
+    return 0;
+}
+
+int random_r(struct random_data *buffer, int32_t *result) {
+    if (buffer == 0 || result == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    buffer->state = buffer->state * 1103515245U + 12345U;
+    *result = (int32_t)((buffer->state >> 1U) & RAND_MAX);
+    return 0;
+}
+
 static void swap_bytes(unsigned char *left, unsigned char *right, size_t size) {
     while (size-- != 0U) {
         unsigned char value = *left;
@@ -591,6 +623,27 @@ int mkstemp(char *template_name) {
     template_name[0] = '\0';
     errno = EEXIST;
     return -1;
+}
+
+char *mkdtemp(char *template_name) {
+    size_t length;
+    if (!has_six_template_markers(template_name)) {
+        errno = EINVAL;
+        return 0;
+    }
+    length = strlen(template_name);
+    for (unsigned int attempt = 0U; attempt < 1000000U; ++attempt) {
+        unsigned int value = attempt;
+        for (size_t index = 0U; index < 6U; ++index) {
+            template_name[length - 1U - index] = base36_digit(value % 36U);
+            value /= 36U;
+        }
+        if (mkdir(template_name, 0700U) == 0) return template_name;
+        if (errno != EEXIST) return 0;
+    }
+    template_name[0] = '\0';
+    errno = EEXIST;
+    return 0;
 }
 
 char *mktemp(char *template_name) {

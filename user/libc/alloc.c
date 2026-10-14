@@ -1,4 +1,9 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <uapi/linux_abi.h>
 
 #define LIBC_PAGE_SIZE 4096U
 #define LIBC_ALLOC_MAGIC 0x4C4954454F53414CULL
@@ -10,6 +15,10 @@ typedef struct libc_allocation {
     uint64_t mapping_size;
     uint64_t requested_size;
 } libc_allocation_t;
+
+static bool libc_linux_personality(void) {
+    return __libc_linux_personality();
+}
 
 static bool is_power_of_two(size_t value) {
     return value != 0U && (value & (value - 1U)) == 0U;
@@ -30,6 +39,7 @@ static void *allocate_aligned(size_t size, size_t alignment) {
     size_t overhead;
     size_t total;
     int64_t status;
+    bool linux_personality;
 
     if (size == 0U) size = 1U;
     if (alignment < LIBC_DEFAULT_ALIGNMENT) alignment = LIBC_DEFAULT_ALIGNMENT;
@@ -45,12 +55,19 @@ static void *allocate_aligned(size_t size, size_t alignment) {
         errno = EOVERFLOW;
         return 0;
     }
+    linux_personality = libc_linux_personality();
+    if (linux_personality) {
+        void *mapping = mmap(0, total, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) return 0;
+        request.address = (uint64_t)(uintptr_t)mapping;
+    } else {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.length = total;
     request.prot = OS_VM_READ | OS_VM_WRITE;
     request.flags = OS_VM_PRIVATE;
-    status = liteos_syscall6(OS_SYS_VM_MAP,
+    status = __libc_native_syscall6(OS_SYS_VM_MAP,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (status < 0 || request.address == 0U) {
@@ -58,10 +75,15 @@ static void *allocate_aligned(size_t size, size_t alignment) {
         else errno = ENOMEM;
         return 0;
     }
+    }
     base = (uintptr_t)request.address;
     if (base > UINTPTR_MAX - sizeof(*allocation) - (alignment - 1U)) {
-        (void)liteos_syscall6(OS_SYS_VM_UNMAP, request.address, total,
+        if (linux_personality) {
+            (void)munmap((void *)(uintptr_t)request.address, total);
+        } else {
+        (void)__libc_native_syscall6(OS_SYS_VM_UNMAP, request.address, total,
                               0U, 0U, 0U, 0U);
+        }
         errno = EOVERFLOW;
         return 0;
     }
@@ -143,19 +165,43 @@ static libc_allocation_t *allocation_from_pointer(const void *pointer) {
     return allocation;
 }
 
-size_t malloc_usable_size(const void *pointer) {
+size_t malloc_usable_size(void *pointer) {
     libc_allocation_t *allocation = allocation_from_pointer(pointer);
     return allocation == 0 ? 0U : (size_t)allocation->requested_size;
 }
 
-void free(void *pointer) {
+static void libc_free_impl(void *pointer) {
     libc_allocation_t *allocation = allocation_from_pointer(pointer);
     if (allocation == 0) return;
     allocation->magic = 0U;
-    if (liteos_syscall6(OS_SYS_VM_UNMAP, allocation->mapping,
+    if (libc_linux_personality()) {
+        if (munmap((void *)(uintptr_t)allocation->mapping,
+                   (size_t)allocation->mapping_size) < 0) {
+            errno = EIO;
+        }
+    } else if (__libc_native_syscall6(OS_SYS_VM_UNMAP, allocation->mapping,
                         allocation->mapping_size, 0U, 0U, 0U, 0U) < 0) {
         errno = EIO;
     }
+}
+
+void free(void *pointer) {
+    libc_free_impl(pointer);
+}
+
+/*
+ * Chromium exports its own malloc/free shim.  Calls made inside this shared
+ * libc are bound locally by -Bsymbolic, but a pointer allocated here can still
+ * cross the ABI boundary and be released by Chromium.  Keep private entry
+ * points for that boundary so the two allocators never call each other's
+ * implementation by symbol interposition.
+ */
+void __system_free(void *pointer) {
+    libc_free_impl(pointer);
+}
+
+size_t __system_malloc_usable_size(void *pointer) {
+    return malloc_usable_size(pointer);
 }
 
 void *realloc(void *pointer, size_t size) {
@@ -181,6 +227,10 @@ void *realloc(void *pointer, size_t size) {
     replacement = malloc(size);
     if (replacement == 0) return 0;
     memcpy(replacement, pointer, previous_size);
-    free(pointer);
+    libc_free_impl(pointer);
     return replacement;
+}
+
+void *__system_realloc(void *pointer, size_t size) {
+    return realloc(pointer, size);
 }

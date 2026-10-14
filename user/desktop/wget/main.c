@@ -951,14 +951,18 @@ static bool build_http_request(const wget_url_t *url, const wget_options_t *opti
                                uint64_t continue_offset, char *request,
                                size_t capacity, size_t *length) {
     const char *method;
+    const char *user_agent;
     bool has_body;
     if (url == 0 || options == 0 || request == 0 || length == 0 || capacity == 0U) return false;
     method = options->method[0] == '\0' ?
              (!options->post_data_set ? "GET" : "POST") : options->method;
     has_body = options->post_data_set;
+    user_agent = options->user_agent[0] == '\0' ? "wget/1.0" : options->user_agent;
     request[0] = '\0';
     *length = 0U;
-    if (!header_value_safe(method) ||
+    if (!header_value_safe(method) || !header_value_safe(user_agent) ||
+        !header_value_safe(url->host) || !header_value_safe(url->path) ||
+        options->extra_header_count > WGET_MAX_EXTRA_HEADERS ||
         !append_text(request, capacity, length, method) ||
         !append_char(request, capacity, length, ' ') ||
         !append_text(request, capacity, length, url->path) ||
@@ -967,8 +971,7 @@ static bool build_http_request(const wget_url_t *url, const wget_options_t *opti
         !append_text(request, capacity, length,
                      "\r\nUser-Agent: ")) return false;
     if (!append_text(request, capacity, length,
-                     options->user_agent[0] == '\0' ? "LiteOS-wget/1.0" :
-                     options->user_agent) ||
+                     user_agent) ||
         !append_text(request, capacity, length,
                      "\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n")) {
         return false;

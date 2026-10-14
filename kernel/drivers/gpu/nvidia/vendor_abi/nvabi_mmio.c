@@ -65,6 +65,12 @@ void *NV_API_CALL os_map_kernel_space(NvU64 physical, NvU64 length,
                               nvabi_mmio_cache_type(cache_type),
                               &record->mapping);
     if (status != K_OK) {
+        kernel_serial_printf_serial_only(
+            "OS_NVIDIA_MMIO_MAP_FAIL physical=%llx length=%llx "
+            "cache=%u status=%d\r\n",
+            (unsigned long long)page_physical,
+            (unsigned long long)mapped_length,
+            nvabi_mmio_cache_type(cache_type), (int)status);
         kfree(record);
         nvabi_log_unsupported("os_map_kernel_space", "os-mmio-map");
         return NULL;

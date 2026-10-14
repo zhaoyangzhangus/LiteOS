@@ -3,27 +3,11 @@
 #include <kernel/resource.h>
 
 static void resource_lock(spinlock_t *lock) {
-    while (atomic_exchange_explicit(&lock->state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(lock);
 }
 
 static void resource_unlock(spinlock_t *lock) {
-    atomic_store_explicit(&lock->state, 0U, memory_order_release);
-}
-
-static void resource_list_insert_tail(list_head_t *head, list_head_t *node) {
-    node->next = head;
-    node->prev = head->prev;
-    head->prev->next = node;
-    head->prev = node;
-}
-
-static void resource_list_remove(list_head_t *node) {
-    node->prev->next = node->next;
-    node->next->prev = node->prev;
-    list_init(node);
+    spinlock_unlock(lock);
 }
 
 static void job_destroy(void *object) {
@@ -44,11 +28,8 @@ kstatus_t job_create(job_t *parent, const job_limits_t *limits, job_t **out) {
     if (out == 0) return K_EINVAL;
     job_t *job = (job_t *)kzalloc(sizeof(*job), 0);
     if (job == 0) return K_ENOMEM;
-    refcount_init(&job->object.refs, 1U);
-    job->object.type = KOBJECT_TYPE_JOB;
-    job->object.flags = 0U;
-    job->object.ops = &g_job_ops;
-    atomic_init(&job->lock.state, 0U);
+    object_header_init(&job->object, KOBJECT_TYPE_JOB, &g_job_ops);
+    spinlock_init(&job->lock);
     list_init(&job->processes);
     job->parent = parent;
     if (parent != 0) object_get(parent);
@@ -68,7 +49,7 @@ kstatus_t job_attach_process(job_t *job, struct process *process) {
     }
     object_get(job);
     process->job = job;
-    resource_list_insert_tail(&job->processes, &process->job_node);
+    list_add_tail(&job->processes, &process->job_node);
     resource_unlock(&job->lock);
     return K_OK;
 }
@@ -77,13 +58,16 @@ kstatus_t job_detach_process(struct process *process) {
     if (process == 0) return K_EINVAL;
     job_t *job = process->job;
     if (job == 0) return K_ENOENT;
+    bool detached = false;
     resource_lock(&job->lock);
     if (process->job == job && process->job_node.next != &process->job_node) {
-        resource_list_remove(&process->job_node);
+        list_del(&process->job_node);
         process->job = 0;
+        detached = true;
     }
     resource_unlock(&job->lock);
-    if (process->job == 0) {
+    /* Only the operation which removed the attachment owns its reference. */
+    if (detached) {
         object_put(job);
         return K_OK;
     }

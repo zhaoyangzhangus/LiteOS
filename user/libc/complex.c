@@ -2,8 +2,8 @@
 
 #include <stdbool.h>
 
-#define LITEOS_PI_2 1.570796326794896619231321691639751442L
-#define LITEOS_SSE __attribute__((target("sse")))
+#define LIBC_PI_2 1.570796326794896619231321691639751442L
+#define LIBC_SSE __attribute__((target("sse")))
 
 typedef float _Complex float_complex_t;
 typedef double _Complex double_complex_t;
@@ -16,29 +16,29 @@ static long_double_complex_t complex_makel(long double real, long double imagina
     return __builtin_complex(real, imaginary);
 }
 
-static LITEOS_SSE float_complex_t complex_makef(float real, float imaginary) {
+static LIBC_SSE float_complex_t complex_makef(float real, float imaginary) {
     return __builtin_complex(real, imaginary);
 }
 
-static LITEOS_SSE double_complex_t complex_make(double real, double imaginary) {
+static LIBC_SSE double_complex_t complex_make(double real, double imaginary) {
     return __builtin_complex(real, imaginary);
 }
 
-static LITEOS_SSE long_double_complex_t complex_widenf(float_complex_t value) {
+static LIBC_SSE long_double_complex_t complex_widenf(float_complex_t value) {
     return complex_makel((long double)COMPLEX_REAL(value),
                          (long double)COMPLEX_IMAG(value));
 }
 
-static LITEOS_SSE long_double_complex_t complex_widen(double_complex_t value) {
+static LIBC_SSE long_double_complex_t complex_widen(double_complex_t value) {
     return complex_makel((long double)COMPLEX_REAL(value),
                          (long double)COMPLEX_IMAG(value));
 }
 
-static LITEOS_SSE float_complex_t complex_narrowf(long_double_complex_t value) {
+static LIBC_SSE float_complex_t complex_narrowf(long_double_complex_t value) {
     return complex_makef((float)COMPLEX_REAL(value), (float)COMPLEX_IMAG(value));
 }
 
-static LITEOS_SSE double_complex_t complex_narrow(long_double_complex_t value) {
+static LIBC_SSE double_complex_t complex_narrow(long_double_complex_t value) {
     return complex_make((double)COMPLEX_REAL(value), (double)COMPLEX_IMAG(value));
 }
 
@@ -298,7 +298,7 @@ long_double_complex_t casinl(long_double_complex_t value) {
 
 long_double_complex_t cacosl(long_double_complex_t value) {
     long_double_complex_t inverse_sine = casinl(value);
-    return complex_makel(LITEOS_PI_2 - COMPLEX_REAL(inverse_sine),
+    return complex_makel(LIBC_PI_2 - COMPLEX_REAL(inverse_sine),
                          -COMPLEX_IMAG(inverse_sine));
 }
 
@@ -333,26 +333,26 @@ long_double_complex_t catanhl(long_double_complex_t value) {
 }
 
 #define DEFINE_COMPLEX_SCALAR(name) \
-    LITEOS_SSE float name##f(float_complex_t value) { \
+    LIBC_SSE float name##f(float_complex_t value) { \
         return (float)name##l(complex_widenf(value)); \
     } \
-    LITEOS_SSE double name(double_complex_t value) { \
+    LIBC_SSE double name(double_complex_t value) { \
         return (double)name##l(complex_widen(value)); \
     }
 
 #define DEFINE_COMPLEX_UNARY(name) \
-    LITEOS_SSE float_complex_t name##f(float_complex_t value) { \
+    LIBC_SSE float_complex_t name##f(float_complex_t value) { \
         return complex_narrowf(name##l(complex_widenf(value))); \
     } \
-    LITEOS_SSE double_complex_t name(double_complex_t value) { \
+    LIBC_SSE double_complex_t name(double_complex_t value) { \
         return complex_narrow(name##l(complex_widen(value))); \
     }
 
 #define DEFINE_COMPLEX_BINARY(name) \
-    LITEOS_SSE float_complex_t name##f(float_complex_t left, float_complex_t right) { \
+    LIBC_SSE float_complex_t name##f(float_complex_t left, float_complex_t right) { \
         return complex_narrowf(name##l(complex_widenf(left), complex_widenf(right))); \
     } \
-    LITEOS_SSE double_complex_t name(double_complex_t left, double_complex_t right) { \
+    LIBC_SSE double_complex_t name(double_complex_t left, double_complex_t right) { \
         return complex_narrow(name##l(complex_widen(left), complex_widen(right))); \
     }
 
@@ -380,7 +380,7 @@ DEFINE_COMPLEX_UNARY(cacosh)
 DEFINE_COMPLEX_UNARY(catanh)
 DEFINE_COMPLEX_BINARY(cpow)
 
-LITEOS_SSE float_complex_t __mulsc3(float left_real, float left_imaginary,
+LIBC_SSE float_complex_t __mulsc3(float left_real, float left_imaginary,
                                     float right_real, float right_imaginary) {
     return complex_narrowf(complex_mull_parts((long double)left_real,
                                                (long double)left_imaginary,
@@ -388,7 +388,7 @@ LITEOS_SSE float_complex_t __mulsc3(float left_real, float left_imaginary,
                                                (long double)right_imaginary));
 }
 
-LITEOS_SSE double_complex_t __muldc3(double left_real, double left_imaginary,
+LIBC_SSE double_complex_t __muldc3(double left_real, double left_imaginary,
                                      double right_real, double right_imaginary) {
     return complex_narrow(complex_mull_parts((long double)left_real,
                                               (long double)left_imaginary,
@@ -401,7 +401,7 @@ long_double_complex_t __mulxc3(long double left_real, long double left_imaginary
     return complex_mull_parts(left_real, left_imaginary, right_real, right_imaginary);
 }
 
-LITEOS_SSE float_complex_t __divsc3(float left_real, float left_imaginary,
+LIBC_SSE float_complex_t __divsc3(float left_real, float left_imaginary,
                                     float right_real, float right_imaginary) {
     return complex_narrowf(complex_divl_parts((long double)left_real,
                                                (long double)left_imaginary,
@@ -409,7 +409,7 @@ LITEOS_SSE float_complex_t __divsc3(float left_real, float left_imaginary,
                                                (long double)right_imaginary));
 }
 
-LITEOS_SSE double_complex_t __divdc3(double left_real, double left_imaginary,
+LIBC_SSE double_complex_t __divdc3(double left_real, double left_imaginary,
                                      double right_real, double right_imaginary) {
     return complex_narrow(complex_divl_parts((long double)left_real,
                                               (long double)left_imaginary,

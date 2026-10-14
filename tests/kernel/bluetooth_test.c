@@ -4,6 +4,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
+
+static _Thread_local unsigned preempt_depth;
+void sched_preempt_disable(void) { ++preempt_depth; }
+void sched_preempt_enable(void) { assert(preempt_depth); --preempt_depth; }
 
 static input_event_t g_events[16];
 static uint32_t g_event_count;
@@ -86,5 +91,6 @@ int main(void) {
         return 1;
     }
     puts("bluetooth: ok");
+    assert(preempt_depth == 0U);
     return 0;
 }

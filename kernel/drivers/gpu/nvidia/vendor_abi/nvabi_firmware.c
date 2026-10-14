@@ -8,7 +8,7 @@
 /*
  * The vendor nv_get_firmware contract returns an opaque lifetime handle and
  * a separately visible immutable byte buffer.  This adapter owns only the
- * system-memory copy read from the mounted LiteOS filesystem.  It does not
+ * system-memory copy read from the mounted System filesystem.  It does not
  * assign GPU addresses, create GMMU mappings, or speak GSP RPC.
  */
 #define NVABI_FIRMWARE_MAGIC 0x4E564657U
@@ -103,8 +103,8 @@ static void nvabi_firmware_hash_text(const uint8_t digest[32], char out[65]) {
 static void nvabi_firmware_fail(const char *requested,
                                 nv_firmware_type_t type,
                                 nv_firmware_chip_family_t family) {
-    liteos_serial_printf_serial_only(
-        "LITEOS_NVIDIA_FIRMWARE_FAIL type=%u family=%u requested=%s expectation=595.84\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_NVIDIA_FIRMWARE_FAIL type=%u family=%u requested=%s expectation=595.84\r\n",
         (unsigned)type, (unsigned)family,
         requested != NULL ? requested : "unsupported");
 }
@@ -118,7 +118,7 @@ const void *NV_API_CALL nv_get_firmware(
     const char *name = NULL;
     const uint8_t *expected_hash = NULL;
     static const char *const roots[] = {
-        "/EFI/LITEOS/firmware",
+        "/EFI/OS/firmware",
         "/lib/firmware",
     };
     char requested[NVABI_FIRMWARE_PATH_CAP];
@@ -146,8 +146,8 @@ const void *NV_API_CALL nv_get_firmware(
     /* The leading slash in the requested name is kept as a bounded metadata
      * string; the vendor name itself remains the request identity. */
     nvabi_memcpy(requested, name, nvabi_strlen(name) + 1U);
-    liteos_serial_printf_serial_only(
-        "LITEOS_NVIDIA_FIRMWARE_REQUEST type=%u family=%u requested=%s expectation=595.84\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_NVIDIA_FIRMWARE_REQUEST type=%u family=%u requested=%s expectation=595.84\r\n",
         (unsigned)type, (unsigned)family, requested);
 
     for (size_t root_index = 0U;
@@ -195,8 +195,8 @@ const void *NV_API_CALL nv_get_firmware(
     sha256_compute(data, (UINTN)file_size, digest);
     nvabi_firmware_hash_text(digest, digest_text);
     if (!nvabi_firmware_hash_matches(digest, expected_hash)) {
-        liteos_serial_printf_serial_only(
-            "LITEOS_NVIDIA_FIRMWARE_HASH_FAIL path=%s size=%u sha256=%s expectation=595.84\r\n",
+        kernel_serial_printf_serial_only(
+            "OS_NVIDIA_FIRMWARE_HASH_FAIL path=%s size=%u sha256=%s expectation=595.84\r\n",
             resolved, (unsigned)file_size, digest_text);
         kfree(data);
         return NULL;
@@ -216,8 +216,8 @@ const void *NV_API_CALL nv_get_firmware(
 
     *fw_buf = handle->data;
     *fw_size = handle->size;
-    liteos_serial_printf_serial_only(
-        "LITEOS_NVIDIA_FIRMWARE_RESOLVED path=%s size=%u sha256=%s expectation=595.84 hash_ok=1\r\n",
+    kernel_serial_printf_serial_only(
+        "OS_NVIDIA_FIRMWARE_RESOLVED path=%s size=%u sha256=%s expectation=595.84 hash_ok=1\r\n",
         handle->path, (unsigned)handle->size, digest_text);
     return handle;
 }
@@ -226,8 +226,8 @@ void NV_API_CALL nv_put_firmware(const void *fw_handle) {
     nvabi_firmware_handle_t *handle = (nvabi_firmware_handle_t *)fw_handle;
     if (handle == NULL) return;
     if (handle->magic != NVABI_FIRMWARE_MAGIC) {
-        liteos_serial_write_serial_only(
-            "LITEOS_NVIDIA_FIRMWARE_RELEASE_FAIL\r\n");
+        kernel_serial_write_serial_only(
+            "OS_NVIDIA_FIRMWARE_RELEASE_FAIL\r\n");
         return;
     }
     handle->magic = 0U;

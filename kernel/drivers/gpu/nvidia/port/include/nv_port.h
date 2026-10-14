@@ -1,7 +1,7 @@
 #pragma once
 
 /*
- * LiteOS port contract for the NVIDIA OpenRM integration.
+ * System port contract for the NVIDIA OpenRM integration.
  *
  * This header is deliberately below the vendor ABI boundary.  NVIDIA symbol
  * names must not be added here; vendor_abi/ will translate those names later.
@@ -151,6 +151,10 @@ typedef struct nv_port_semaphore {
 typedef struct nv_port_rwlock {
     atomic_uint state;
     atomic_uint writers_waiting;
+#ifndef NV_PORT_HOST_TEST
+    wait_queue_t readers_waitq;
+    wait_queue_t writers_waitq;
+#endif
 } nv_port_rwlock_t;
 
 typedef struct nv_port_once {
@@ -175,6 +179,7 @@ kstatus_t nv_port_mutex_lock(nv_port_mutex_t *mutex, uint64_t timeout_ns);
 kstatus_t nv_port_mutex_unlock(nv_port_mutex_t *mutex);
 
 void nv_port_rwlock_init(nv_port_rwlock_t *lock);
+bool nv_port_rwlock_read_try_lock(nv_port_rwlock_t *lock);
 void nv_port_rwlock_read_lock(nv_port_rwlock_t *lock);
 void nv_port_rwlock_read_unlock(nv_port_rwlock_t *lock);
 void nv_port_rwlock_write_lock(nv_port_rwlock_t *lock);

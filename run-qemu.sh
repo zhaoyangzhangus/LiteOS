@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run LiteOS with the Linux QEMU/OVMF stack inside WSL.
+# Run System with the Linux QEMU/OVMF stack.
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,22 +12,41 @@ firmware="${OVMF_CODE:-}"
 build_dir="${BUILD:-build}"
 debug=0
 no_build=0
+prepare_only=0
 headless=0
 usb_nested=0
 all_disks=0
+stdvga=1
+ramfb=0
+vga_width=0
+vga_height=0
+vga_memory_mb=64
+vfio_devices=()
+vfio_primary=""
 # Boot from the removable FAT volume by default.  The USB-root kernel path
 # already validates /init and /init-runtime before selecting it as /.  Keep an
 # explicit NVMe switch for diagnostics and for comparing the old path.
 usb_storage=1
+chrome_fast=0
 monitor_socket=""
+qmp_socket=""
 keep_open=0
+fullscreen=0
 no_kvm=0
 net_dump=""
 seconds=10
 cpu_count=4
+qemu_memory="${QEMU_MEMORY:-4096M}"
 gdb_port=1234
 debug_level=2
+serial_trace=0
 qemu_trace="${QEMU_TRACE:-}"
+stream_log_dir="${QEMU_STREAM_LOG_DIR:-}"
+# QEMU's GTK Wayland client can keep a stale black surface even when the
+# guest scanout (and HMP screendump) is correct.  Prefer the XWayland path
+# when an X display is available; QEMU_GDK_BACKEND can explicitly select
+# wayland, x11, or another GTK backend for hosts that need a different path.
+qemu_gdk_backend="${QEMU_GDK_BACKEND:-${GDK_BACKEND:-}}"
 
 usage() {
     cat <<'EOF'
@@ -39,13 +58,23 @@ usage() {
   --headless          不显示图形窗口
   --usb-nested        测试 xHCI -> Hub -> Hub -> Mouse
   --usb-storage       使用 xHCI USB Mass Storage U盘启动（默认）
+  --chrome-fast       使用 NVMe 根盘启动 Chrome，避免 USB 随机 I/O 瓶颈
   --all-disks         在 USB 根盘之外附加一个 NVMe 数据盘
   --nvme-root         使用原来的 NVMe 根盘启动（诊断/回退）
+  --no-stdvga         不添加 QEMU Standard VGA（给 VFIO GPU 直通使用）
+  --vga-1080p         使用 1920x1080 QEMU Standard VGA framebuffer
+  --ramfb             使用不占 PCI 资源的 EFI/QEMU RAM framebuffer
+  --vfio-pci BDF      将主机 PCI 设备 BDF 直通到来宾（可重复）
+  --vfio-primary BDF  将一个 VFIO GPU 作为来宾 primary VGA（启用 x-vga）
   --monitor-socket P  在 Unix socket P 开启 HMP monitor
+  --qmp-socket P     在 Unix socket P 开启 QMP（虚拟设备输入/诊断）
   --keep-open         普通运行模式下持续运行，Ctrl-C 退出
+  --fullscreen        将 QEMU GTK 输出切换为全屏并按窗口缩放
   --seconds N         普通运行模式最多运行 N 秒（默认 10）
   --no-build          使用现有 build/esp，不重新编译
+  --prepare-only      只准备统一磁盘镜像，不启动 QEMU（可配合 --no-build）
   --debug-level N     编译 DEBUG 等级（默认 2）
+  --serial-trace      保留 COM1 串口诊断输出（会明显降低启动速度）
   --cpu N             vCPU 数量（默认 4）
   --no-kvm            强制使用软件模拟
   --net-dump PATH     将 QEMU 虚拟网卡报文保存到 PATH（诊断用）
@@ -53,6 +82,7 @@ usage() {
   --firmware PATH     指定 OVMF_CODE 固件路径
   -h, --help          显示帮助
 EOF
+    echo '环境变量 QEMU_STREAM_LOG_DIR：将完整 stdout/stderr 额外写入已有目录内的独立运行目录（图形模式 stdout 包含串口；headless 串口仍为 build/qemu-serial.log）'
 }
 
 while (($# > 0)); do
@@ -67,8 +97,41 @@ while (($# > 0)); do
         # semantics even though normal boots default to USB.
         --usb-nested) usb_nested=1; usb_storage=0; shift ;;
         --usb-storage) usb_storage=1; shift ;;
+        --chrome-fast) chrome_fast=1; shift ;;
         --all-disks) all_disks=1; shift ;;
         --nvme-root) usb_storage=0; shift ;;
+        --no-stdvga) stdvga=0; shift ;;
+        --vga-1080p)
+            stdvga=1
+            ramfb=0
+            vga_width=1920
+            vga_height=1080
+            vga_memory_mb=32
+            shift
+            ;;
+        --ramfb) ramfb=1; stdvga=0; shift ;;
+        --vfio-pci)
+            (($# >= 2)) || { echo "--vfio-pci 需要 BDF 参数" >&2; exit 2; }
+            if [[ ! "$2" =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+                echo "无效的 PCI BDF：$2" >&2
+                exit 2
+            fi
+            vfio_devices+=("$2")
+            shift 2
+            ;;
+        --vfio-primary)
+            (($# >= 2)) || { echo "--vfio-primary 需要 BDF 参数" >&2; exit 2; }
+            if [[ ! "$2" =~ ^([0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$ ]]; then
+                echo "无效的 primary VGA BDF：$2" >&2
+                exit 2
+            fi
+            [[ -z "$vfio_primary" ]] || {
+                echo "--vfio-primary 只能指定一个 BDF" >&2
+                exit 2
+            }
+            vfio_primary="$2"
+            shift 2
+            ;;
         --monitor-socket)
             (($# >= 2)) || {
                 echo "--monitor-socket 需要参数" >&2
@@ -77,15 +140,26 @@ while (($# > 0)); do
             monitor_socket="$2"
             shift 2
             ;;
+        --qmp-socket)
+            (($# >= 2)) || {
+                echo "--qmp-socket 需要参数" >&2
+                exit 2
+            }
+            qmp_socket="$2"
+            shift 2
+            ;;
 
         --keep-open) keep_open=1; shift ;;
+        --fullscreen) fullscreen=1; shift ;;
         --seconds)
             (($# >= 2)) || { echo "--seconds 需要参数" >&2; exit 2; }
             seconds="$2"; shift 2 ;;
         --no-build) no_build=1; shift ;;
+        --prepare-only) prepare_only=1; shift ;;
         --debug-level)
             (($# >= 2)) || { echo "--debug-level 需要参数" >&2; exit 2; }
             debug_level="$2"; shift 2 ;;
+        --serial-trace) serial_trace=1; shift ;;
         --cpu)
             (($# >= 2)) || { echo "--cpu 需要参数" >&2; exit 2; }
             cpu_count="$2"; shift 2 ;;
@@ -104,10 +178,20 @@ while (($# > 0)); do
     esac
 done
 
+# Chrome maps large read-only assets and performs many small profile I/O
+# operations during startup. Keep USB as the explicit default for storage
+# validation, but let the runtime-oriented launch select the fast NVMe path.
+if ((chrome_fast)); then
+    usb_storage=0
+fi
+
 # B10B-3 HMP HOTPLUG MONITOR
 if [[ -n "$monitor_socket" &&
       "$monitor_socket" != /* ]]; then
     monitor_socket="$script_dir/$monitor_socket"
+fi
+if [[ -n "$qmp_socket" && "$qmp_socket" != /* ]]; then
+    qmp_socket="$script_dir/$qmp_socket"
 fi
 
 if ((usb_nested && usb_storage)); then
@@ -139,6 +223,40 @@ fi
 }
 
 mkdir -p "$build_dir"
+build_dir="$(cd -- "$build_dir" && pwd -P)"
+qemu_fat_image="$build_dir/qemu-fat.img"
+
+# Keep one QEMU launcher per BUILD alive at a time.  The lock is held by this
+# shell for the full QEMU lifetime, including timeout/debug wrappers, so a
+# second invocation cannot rebuild the shared disk or silently start a second
+# VM against a different inode.
+command -v flock >/dev/null 2>&1 || {
+    echo "缺少 flock（util-linux），无法保证同一 BUILD 只运行一台 QEMU" >&2
+    exit 1
+}
+exec {qemu_lock_fd}>"$build_dir/qemu-run.lock"
+if ! flock -n "$qemu_lock_fd"; then
+    echo "该 BUILD 已有 QEMU 启动器运行，拒绝并行构建/启动：$build_dir" >&2
+    exit 1
+fi
+
+# Validate an explicitly requested evidence destination before compiling or
+# replacing the disk. Never silently create a missing removable mount path.
+stream_log_run=""
+if [[ -n "$stream_log_dir" ]]; then
+    [[ -d "$stream_log_dir" ]] || {
+        echo "完整日志目录不存在：$stream_log_dir" >&2; exit 1;
+    }
+    stream_log_run="$(mktemp -d "$stream_log_dir/qemu-stream.XXXXXX")" || exit 1
+    echo "QEMU 完整输出镜像：$stream_log_run"
+fi
+
+# Fail before builds or disk replacement when this process cannot open/map
+# the requested devices. Image-only preparation needs neither VFIO nor mlock.
+if ((prepare_only == 0 && ${#vfio_devices[@]} > 0)); then
+    python3 "$script_dir/tools/qemu-vfio-preflight.py" \
+        --memory "$qemu_memory" "${vfio_devices[@]}"
+fi
 
 mirror_build_stdout() {
     tee "$build_dir/qemu-build.log" |
@@ -157,21 +275,30 @@ mirror_build_stderr() {
 }
 
 if ((no_build == 0)); then
-    # QEMU keeps the COM1 mirror enabled so this script can expose boot
-    # markers in qemu-serial.log.  A normal hardware build uses the makefile
-    # default LITEOS_DEBUG_SERIAL=0 and is GOP-only.
+    # COM1 is byte-serial at 115200 baud and every diagnostic character stalls
+    # the guest while it waits for the UART.  Keep normal runtime boots fast;
+    # opt into the diagnostic path only when --serial-trace is requested.
     build_status=0
-    "$make_cmd" -f GNUmakefile esp DEBUG="$debug_level" LITEOS_DEBUG_SERIAL=1 \
+    nvidia_make_args=()
+    if ((${#vfio_devices[@]} > 0)); then
+        nvidia_make_args+=(OS_NVIDIA=1)
+    fi
+    "$make_cmd" -f GNUmakefile esp DEBUG="$debug_level" \
+        OS_DEBUG_SERIAL="$serial_trace" \
+        OS_AUTOSTART_CHROME="${OS_AUTOSTART_CHROME:-0}" \
+        OS_INTERACTIVE_DESKTOP="${OS_INTERACTIVE_DESKTOP:-1}" \
+        "${nvidia_make_args[@]}" \
         > >(mirror_build_stdout) 2> >(mirror_build_stderr) || build_status=$?
     if ((build_status != 0)); then
-        echo "LiteOS 构建失败（退出码：$build_status），请查看 $build_dir/qemu-build.log" >&2
+        echo "System 构建失败（退出码：$build_status），请查看 $build_dir/qemu-build.log" >&2
         exit "$build_status"
     fi
 fi
-[[ -f "$build_dir/esp/EFI/LITEOS/kernel.elf" ]] || {
-    echo "找不到 $build_dir/esp/EFI/LITEOS/kernel.elf，请先构建镜像" >&2
+[[ -f "$build_dir/esp/EFI/OS/kernel.elf" ]] || {
+    echo "找不到 $build_dir/esp/EFI/OS/kernel.elf，请先构建镜像" >&2
     exit 1
 }
+python3 "$script_dir/tools/clean-runtime-aliases.py" "$build_dir/esp"
 
 # The kernel VFS self-tests create temporary entries at the ESP root.  QEMU
 # 10's vvfat backend can leave those entries visible on the host after the
@@ -196,21 +323,115 @@ done
 # fsyncs a file (for example Ctrl+S in notepad).  Materialize a normal FAT
 # disk image from a read-only directory view, then let the guest write that
 # raw image.  The generated image is disposable and never mutates build/esp.
-qemu_fat_image="$build_dir/qemu-fat.img"
 qemu_secondary_image="$build_dir/qemu-nvme-data.img"
-rm -f -- "$qemu_fat_image"
-if ! "$qemu_img_path" convert -O raw "fat:ro:$build_dir/esp" \
-        "$qemu_fat_image" >/dev/null 2>"$build_dir/qemu-img.stderr"; then
-    echo "无法生成 QEMU FAT 磁盘镜像，请查看 $build_dir/qemu-img.stderr" >&2
-    exit 1
-fi
-if ((all_disks)); then
-    rm -f -- "$qemu_secondary_image"
-    if ! "$qemu_img_path" convert -O raw "fat:ro:$build_dir/esp" \
-            "$qemu_secondary_image" >/dev/null 2>"$build_dir/qemu-img-secondary.stderr"; then
-        echo "无法生成 QEMU 第二个 FAT 磁盘镜像，请查看 $build_dir/qemu-img-secondary.stderr" >&2
+
+# qemu-img's legacy `fat:ro:` source defaults to FAT16 and refuses a Chrome
+# payload larger than roughly 512 MiB.  Keep the small-image path fast, but
+# materialize large images as FAT32 with a little writable headroom for
+# /tmp/chrome-data and the guest's runtime files.
+fat_mkfs=""
+for candidate in "${MKFS_FAT:-}" /sbin/mkfs.fat /usr/sbin/mkfs.fat; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        fat_mkfs="$candidate"
+        break
+    fi
+done
+mformat_path=""
+for candidate in "${MFORMAT:-}" /usr/bin/mformat /bin/mformat; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        mformat_path="$candidate"
+        break
+    fi
+done
+mcopy_path=""
+for candidate in "${MCOPY:-}" /usr/bin/mcopy /bin/mcopy; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+        mcopy_path="$candidate"
+        break
+    fi
+done
+
+create_large_fat_image() {
+    local source_dir="$1"
+    local output_image="$2"
+    local source_bytes
+    local image_bytes
+    local alignment=$((256 * 1024 * 1024))
+    local headroom=$((512 * 1024 * 1024))
+
+    [[ ( -n "$fat_mkfs" || -n "$mformat_path" ) && -n "$mcopy_path" ]] || {
+        echo "大于 FAT16 容量的镜像需要 mkfs.fat（或 mformat）和 mcopy" >&2
+        return 1
+    }
+    source_bytes="$(du -sb "$source_dir" | awk 'NR == 1 { print $1 }')" || return 1
+    image_bytes=$((source_bytes + headroom))
+    image_bytes=$(((image_bytes + alignment - 1) / alignment * alignment))
+    truncate -s "$image_bytes" "$output_image" || return 1
+    if [[ -n "$fat_mkfs" ]]; then
+        "$fat_mkfs" -F 32 -n SYSTEM "$output_image" >/dev/null || return 1
+    else
+        "$mformat_path" -F -i "$output_image" -v SYSTEM :: >/dev/null || return 1
+    fi
+    (
+        shopt -s dotglob nullglob
+        local entries=("$source_dir"/*)
+        ((${#entries[@]} > 0)) || exit 0
+        "$mcopy_path" -s -i "$output_image" "${entries[@]}" ::
+    ) || return 1
+}
+
+materialize_fat_image() {
+    local output_image="$1"
+    local source_bytes
+    local temp_dir
+    local temp_image
+    source_bytes="$(du -sb "$build_dir/esp" | awk 'NR == 1 { print $1 }')"
+    temp_dir="$(mktemp -d "$build_dir/.qemu-image.tmp.XXXXXX")"
+    temp_image="$temp_dir/$(basename -- "$output_image")"
+    if ((source_bytes > 480 * 1024 * 1024)); then
+        if ! create_large_fat_image "$build_dir/esp" "$temp_image"; then
+            rm -f -- "$temp_image"
+            rmdir -- "$temp_dir" 2>/dev/null || true
+            return 1
+        fi
+    elif ! "$qemu_img_path" convert -O raw "fat:ro:$build_dir/esp" \
+            "$temp_image" >/dev/null 2>"$build_dir/qemu-img.stderr"; then
+        rm -f -- "$temp_image"
+        rmdir -- "$temp_dir" 2>/dev/null || true
+        echo "无法生成 QEMU FAT 磁盘镜像，请查看 $build_dir/qemu-img.stderr" >&2
+        return 1
+    fi
+
+    if ! mv -f -- "$temp_image" "$output_image"; then
+        rm -f -- "$temp_image"
+        rmdir -- "$temp_dir" 2>/dev/null || true
+        echo "无法替换 QEMU FAT 磁盘镜像：$output_image" >&2
+        return 1
+    fi
+    rmdir -- "$temp_dir" 2>/dev/null || true
+}
+
+if [[ -e "$qemu_fat_image" ]]; then
+    command -v fuser >/dev/null 2>&1 || {
+        echo "缺少 fuser（psmisc），无法确认磁盘未被运行中的 QEMU 使用" >&2
+        exit 1
+    }
+    active_image_users="$(fuser "$qemu_fat_image" 2>/dev/null || true)"
+    if [[ -n "$active_image_users" ]]; then
+        echo "拒绝重建正在使用的 QEMU 磁盘：$qemu_fat_image" >&2
+        fuser -v "$qemu_fat_image" 2>&1 >&2 || true
         exit 1
     fi
+fi
+
+materialize_fat_image "$qemu_fat_image"
+if ((all_disks)); then
+    materialize_fat_image "$qemu_secondary_image"
+fi
+
+if ((prepare_only)); then
+    echo "QEMU 磁盘镜像已准备：$qemu_fat_image（未启动虚拟机）"
+    exit 0
 fi
 
 # A non-interactive headless launch must not make QEMU's serial backend depend
@@ -225,17 +446,29 @@ if ((headless)) && [[ ! -t 1 ]]; then
     serial_to_file=1
 fi
 
+qemu_use_kvm=0
+if ((no_kvm == 0)) && [[ -r /dev/kvm && -w /dev/kvm ]]; then
+    qemu_use_kvm=1
+fi
+source "$script_dir/tools/qemu-cpu-model.sh"
+qemu_cpu_model="$(qemu_select_cpu_model /proc/cpuinfo "$qemu_use_kvm" "$chrome_fast")"
+
+qemu_machine=q35
+if ((${#vfio_devices[@]} > 0)); then
+    # Keep guest RAM below the platform's IVMD reserved ranges around 2 GiB.
+    # The rest of RAM is placed above 4 GiB; DMA isolation remains enabled.
+    qemu_machine+=",max-ram-below-4g=${QEMU_MAX_RAM_BELOW_4G:-1G}"
+fi
+
 qemu_args=(
-    -machine q35
-    # P14: deterministic QEMU Standard VGA with enough BAR0 VRAM for two
-    # 2560x1440x32bpp scanout pages.
+    -machine "$qemu_machine"
     -vga none
-    -device "VGA,vgamem_mb=64"
-    -m 4096M
+    -m "$qemu_memory"
     # The freestanding crypto tests require a strong seed.  QEMU's qemu64
     # model hides RDRAND by default, so expose the virtual instruction without
-    # changing the rest of the compatibility-oriented CPU model.
-    -cpu qemu64,rdrand=on
+    # enabling AVX/XSAVE, which the kernel does not yet preserve. Chrome/KVM
+    # may use host-supported SSSE3/SSE4/POPCNT with the existing FXSAVE64 state.
+    -cpu "$qemu_cpu_model"
     -smp "$cpu_count"
     -drive "if=pflash,format=raw,readonly=on,file=$firmware"
     -boot order=c
@@ -249,26 +482,41 @@ qemu_args=(
     -D "$build_dir/qemu.log"
 )
 
+if ((stdvga)); then
+    # P14: deterministic QEMU Standard VGA.  A configured mode lets OVMF
+    # expose a real 1920x1080 GOP instead of merely scaling an 800x600 RAMFB.
+    vga_spec="VGA,vgamem_mb=${vga_memory_mb}"
+    if ((vga_width > 0 && vga_height > 0)); then
+        vga_spec+=",xres=${vga_width},yres=${vga_height}"
+    fi
+    qemu_args+=( -device "$vga_spec" )
+elif ((ramfb)); then
+    # RAMFB is a system device rather than a PCI VGA device.  It gives the
+    # GTK backend a visible EFI framebuffer without consuming MMIO space or
+    # changing the BAR placement of a VFIO GPU.
+    qemu_args+=( -device ramfb )
+fi
+
 if ((usb_storage)); then
     # The generated image is deliberately the only boot disk in USB mode, so
-    # both OVMF and LiteOS exercise the same U盘 filesystem and write path.
+    # both OVMF and System exercise the same U盘 filesystem and write path.
     qemu_args+=(
-        -drive "if=none,id=liteos-usb-stick,format=raw,file=$qemu_fat_image"
-        -device "qemu-xhci,id=liteos-xhci,msix=on"
+        -drive "if=none,id=vm-usb-stick,format=raw,file=$qemu_fat_image"
+        -device "qemu-xhci,id=vm-xhci,msix=on"
     )
-    usb_storage_device="usb-storage,id=liteos-usb-storage,drive=liteos-usb-stick,bus=liteos-xhci.0,port=1"
+    usb_storage_device="usb-storage,id=vm-usb-storage,drive=vm-usb-stick,bus=vm-xhci.0,port=1"
     if ((all_disks)); then usb_storage_device+=",bootindex=1"; fi
     qemu_args+=( -device "$usb_storage_device" )
     if ((all_disks)); then
         qemu_args+=(
-            -drive "if=none,id=liteos-nvme-data,format=raw,file=$qemu_secondary_image"
-            -device "nvme,drive=liteos-nvme-data,serial=liteos-data,bootindex=2"
+            -drive "if=none,id=vm-nvme-data,format=raw,file=$qemu_secondary_image"
+            -device "nvme,drive=vm-nvme-data,serial=vm-data,bootindex=2"
         )
     fi
 else
     qemu_args+=(
-        -drive "if=none,id=liteos-nvme0,format=raw,file=$qemu_fat_image"
-        -device "nvme,drive=liteos-nvme0,serial=liteos-system,bootindex=1"
+        -drive "if=none,id=vm-nvme0,format=raw,file=$qemu_fat_image"
+        -device "nvme,drive=vm-nvme0,serial=vm-system,bootindex=1"
     )
 fi
 
@@ -287,8 +535,14 @@ else
     )
 fi
 
+if [[ -n "$qmp_socket" ]]; then
+    mkdir -p "$(dirname -- "$qmp_socket")"
+    rm -f "$qmp_socket"
+    qemu_args+=( -qmp "unix:$qmp_socket,server=on,wait=off" )
+fi
 
-if ((no_kvm == 0)) && [[ -r /dev/kvm && -w /dev/kvm ]]; then
+
+if ((qemu_use_kvm)); then
     qemu_args+=( -accel kvm )
 else
     qemu_args+=( -accel tcg,thread=multi )
@@ -301,7 +555,19 @@ else
     # does not provide the macOS-only `full-grab` option; `grab-on-hover` is
     # the supported Linux mechanism and avoids sending guest keys to the
     # launcher terminal when the VM window is active.
-    qemu_args+=( -display gtk,zoom-to-fit=off,grab-on-hover=on )
+    if ((fullscreen)); then
+        qemu_args+=( -display gtk,zoom-to-fit=on,full-screen=on,grab-on-hover=on,show-cursor=off )
+    else
+        qemu_args+=( -display gtk,zoom-to-fit=off,grab-on-hover=on,show-cursor=off )
+    fi
+fi
+
+if [[ -z "$qemu_gdk_backend" && -n "${DISPLAY:-}" && "$headless" -eq 0 ]]; then
+    qemu_gdk_backend=x11
+fi
+qemu_launcher=()
+if [[ -n "$qemu_gdk_backend" ]]; then
+    qemu_launcher=(env "GDK_BACKEND=$qemu_gdk_backend")
 fi
 
 if ((usb_nested)); then
@@ -318,7 +584,7 @@ if ((usb_nested)); then
     #                          |
     #                          +-- port 1: Mouse
     #
-    # xHCI route strings expected by LiteOS:
+    # xHCI route strings expected by System:
     #
     #   Hub #1 : 0x00000
     #   Hub #2 : 0x00001
@@ -327,27 +593,38 @@ if ((usb_nested)); then
     # Keep the topology independent of the display backend so automated HMP
     # tests can inject input in headless QEMU as well as in the GTK window.
     qemu_args+=(
-        -device "qemu-xhci,id=liteos-xhci,msix=on"
-        -device "usb-hub,id=liteos-hub1,bus=liteos-xhci.0,port=1"
-        -device "usb-hub,id=liteos-hub2,bus=liteos-xhci.0,port=1.1"
-        -device "usb-mouse,id=liteos-nested-mouse,bus=liteos-xhci.0,port=1.1.1"
+        -device "qemu-xhci,id=vm-xhci,msix=on"
+        -device "usb-hub,id=vm-hub1,bus=vm-xhci.0,port=1"
+        -device "usb-hub,id=vm-hub2,bus=vm-xhci.0,port=1.1"
+        -device "usb-mouse,id=vm-nested-mouse,bus=vm-xhci.0,port=1.1.1"
     )
 elif ((usb_storage == 0)); then
     qemu_args+=(
-        -device "qemu-xhci,id=liteos-xhci,msix=on"
-        -device "usb-kbd,bus=liteos-xhci.0"
-        -device "usb-mouse,bus=liteos-xhci.0"
+        -device "qemu-xhci,id=vm-xhci,msix=on"
+        -device "usb-kbd,bus=vm-xhci.0"
+        -device "usb-mouse,bus=vm-xhci.0"
     )
 else
     # USB boot already created the xHCI controller for the storage device;
     # add the input devices to that same controller in every display mode.
     qemu_args+=(
-        -device "usb-kbd,bus=liteos-xhci.0"
-        -device "usb-mouse,bus=liteos-xhci.0"
+        -device "usb-kbd,bus=vm-xhci.0"
+        -device "usb-mouse,bus=vm-xhci.0"
     )
 fi
 
 if ((debug)); then qemu_args+=( -gdb "tcp::${gdb_port}" -S ); fi
+
+for vfio_device in "${vfio_devices[@]}"; do
+    vfio_device_short="${vfio_device#0000:}"
+    vfio_primary_short="${vfio_primary#0000:}"
+    vfio_device_options="vfio-pci,host=$vfio_device"
+    if [[ -n "$vfio_primary" && "$vfio_device_short" == "$vfio_primary_short" ]]; then
+        vfio_device_options+=",x-vga=on"
+    fi
+    qemu_args+=( -device "$vfio_device_options" )
+done
+
 if [[ -n "$qemu_trace" ]]; then
     IFS=',' read -r -a trace_events <<< "$qemu_trace"
     for trace_event in "${trace_events[@]}"; do
@@ -356,28 +633,39 @@ if [[ -n "$qemu_trace" ]]; then
     done
     qemu_args+=( -trace "file=$build_dir/qemu-trace.log" )
 fi
+# Keep the network present in normal boots as well as packet-capture boots.
+# `-net dump` was removed from newer QEMU builds, so the optional diagnostic
+# path adds a filter to this explicitly named user-mode NIC.
+qemu_args+=(
+    # Chrome reaches 127.0.0.1:7890 through SLIRP's host alias. Normal NAT
+    # sockets are independent per connection, without a guestfwd subprocess
+    # or a persistent TCP chardev that could mix concurrent TLS streams.
+    -netdev "user,id=vm-net,host=10.0.2.2"
+    -device "e1000e,netdev=vm-net,mac=52:54:00:12:34:56"
+)
 if [[ -n "$net_dump" ]]; then
-    # Give the diagnostic filter a named user-net backend.  `-net dump` was
-    # removed from newer QEMU builds and cannot attach to the implicit NIC.
     qemu_args+=(
-        -net none
-        -netdev "user,id=liteos-net"
-        -device "e1000e,netdev=liteos-net,mac=52:54:00:12:34:56"
-        -object "filter-dump,id=liteos-net-dump,netdev=liteos-net,file=$net_dump"
+        -object "filter-dump,id=vm-net-dump,netdev=vm-net,file=$net_dump"
     )
 fi
 
 stdout_log="$build_dir/qemu-stdout.log"
 stderr_log="$build_dir/qemu-stderr.log"
 serial_log="$build_dir/qemu-serial.log"
+stdout_targets=("$stdout_log")
+stderr_targets=("$stderr_log")
+if [[ -n "$stream_log_run" ]]; then
+    stdout_targets+=("$stream_log_run/stdout.log")
+    stderr_targets+=("$stream_log_run/stderr.log")
+fi
 
 # Keep the complete stream in the two log files, but keep the interactive
 # terminal quiet unless a line describes a failure or an abnormal stop.
 mirror_qemu_stdout() {
     if ((serial_to_file)); then
-        tee "$stdout_log"
+        tee "${stdout_targets[@]}"
     else
-        tee "$stdout_log" "$serial_log"
+        tee "${stdout_targets[@]}" "$serial_log"
     fi |
     awk '/(^|[^A-Z])(FAIL|ERROR|FATAL|PANIC|FAULT|TIMEOUT|ASSERT)([^A-Z]|$)/ {
             sub(/\r$/, "", $0)
@@ -390,7 +678,7 @@ mirror_qemu_stderr() {
     # QEMU normally reports the deliberate timeout termination on stderr.  It
     # remains in qemu-stderr.log, but only diagnostic-looking lines reach the
     # interactive terminal.
-    tee "$stderr_log" |
+    tee "${stderr_targets[@]}" |
         awk '!/terminating on signal 15 from pid/ &&
              tolower($0) ~ /error|fail|fatal|panic|abort|invalid|cannot|could not|unsupported|assert|segmentation|fault/ {
             print
@@ -421,7 +709,7 @@ fi
 
 if ((debug)); then
     emit_debug_marker() {
-        [[ "${LITEOS_DEBUG_PROTOCOL:-0}" == "1" ]] || return 0
+        [[ "${OS_DEBUG_PROTOCOL:-0}" == "1" ]] || return 0
         printf '%s\n' "$1"
     }
 
@@ -448,7 +736,7 @@ if ((debug)); then
         rm -f "$pid_file"
     fi
     emit_debug_marker 'QEMU_DEBUG_START'
-    "$qemu_path" "${qemu_args[@]}" \
+    "${qemu_launcher[@]}" "$qemu_path" "${qemu_args[@]}" \
         > >(mirror_qemu_stdout) \
         2> >(mirror_qemu_stderr) &
     qemu_pid=$!
@@ -478,12 +766,12 @@ if ((debug)); then
 else
     run_status=0
     if ((keep_open)); then
-        "$qemu_path" "${qemu_args[@]}" \
+        "${qemu_launcher[@]}" "$qemu_path" "${qemu_args[@]}" \
             > >(mirror_qemu_stdout) \
             2> >(mirror_qemu_stderr) || run_status=$?
     else
         timeout --foreground --signal=TERM "${seconds}s" \
-            "$qemu_path" "${qemu_args[@]}" \
+            "${qemu_launcher[@]}" "$qemu_path" "${qemu_args[@]}" \
             > >(mirror_qemu_stdout) \
             2> >(mirror_qemu_stderr) || run_status=$?
         if ((run_status == 124)); then run_status=0; fi

@@ -32,7 +32,7 @@ typedef enum {
 typedef struct {
     filesystem_source_t source;
     UINT32 source_index;
-    LITEOS_BLOCK_DEVICE *usb_device;
+    OS_BLOCK_DEVICE *usb_device;
     device_t *nvme_device;
     UINT64 disk_block_count;
 } filesystem_disk_t;
@@ -40,7 +40,7 @@ typedef struct {
 typedef struct {
     filesystem_source_t source;
     UINT32 source_index;
-    LITEOS_BLOCK_DEVICE *usb_device;
+    OS_BLOCK_DEVICE *usb_device;
     device_t *nvme_device;
     UINT64 disk_block_count;
     UINT64 start_lba;
@@ -56,30 +56,75 @@ typedef struct {
 
 typedef struct {
     filesystem_source_t source;
-    LITEOS_BLOCK_DEVICE *usb_device;
+    OS_BLOCK_DEVICE *usb_device;
     device_t *nvme_device;
     UINT64 start_lba;
     UINT64 block_count;
 } filesystem_slice_t;
 
 typedef struct {
-    BOOLEAN used;
-    UINT32 candidate_index;
     filesystem_slice_t slice;
-    LITEOS_BLOCK_DEVICE block_device;
-    LITEOS_FAT32 filesystem;
+    OS_BLOCK_DEVICE block_device;
+    OS_FAT32 filesystem;
 } filesystem_volume_t;
 
 static filesystem_candidate_t g_candidates[FILESYSTEM_CANDIDATE_LIMIT];
 static UINT32 g_candidate_count;
-static filesystem_volume_t g_volumes[FILESYSTEM_VOLUME_LIMIT];
-static LITEOS_FAT32 g_probe_filesystem;
-static filesystem_slice_t g_probe_slice;
-static LITEOS_BLOCK_DEVICE g_probe_block_device;
+/* Allocate only mounted volumes; each embeds a large FAT open-file table.
+ * Published volume addresses stay stable for the lifetime of their VFS mount. */
+static filesystem_volume_t *g_volumes[FILESYSTEM_VOLUME_LIMIT];
+/* Transient read-only probe; retained only if cleanup needs a retry. */
+static filesystem_volume_t *g_probe_volume;
 static BOOLEAN g_usb_discovered;
 static BOOLEAN g_nvme_discovered;
 static BOOLEAN g_root_mounted;
 static UINT32 g_root_candidate = UINT32_MAX;
+
+/* Keep failure-only storage diagnostics available when normal serial logging
+ * is compiled out.  The QEMU regression image captures COM1 for this path. */
+static void filesystem_diag_putc(char value) {
+    uint16_t status_port = 0x3FDU;
+    uint16_t data_port = 0x3F8U;
+    for (uint32_t attempt = 0U; attempt < 100000U; ++attempt) {
+        uint8_t ready;
+        __asm__ volatile ("inb %w1, %0" : "=a"(ready) : "d"(status_port));
+        if ((ready & 0x20U) != 0U) break;
+        __asm__ volatile ("pause");
+    }
+    __asm__ volatile ("outb %0, %w1" : : "a"((uint8_t)value), "d"(data_port));
+}
+
+static void filesystem_diag_text(const char *text) {
+    while (*text != '\0') filesystem_diag_putc(*text++);
+}
+
+static void filesystem_diag_hex(uint64_t value) {
+    static const char digits[] = "0123456789abcdef";
+    filesystem_diag_text("0x");
+    for (int shift = 60; shift >= 0; shift -= 4) {
+        filesystem_diag_putc(digits[(value >> (uint32_t)shift) & 0xFU]);
+    }
+}
+
+static void filesystem_nvme_diag(uint32_t stage, uint64_t lba,
+                                 uint32_t sectors, kstatus_t status,
+                                 const io_request_t *request) {
+    filesystem_diag_text("OS_NVME_IO_FAIL stage=");
+    filesystem_diag_hex(stage);
+    filesystem_diag_text(" lba=");
+    filesystem_diag_hex(lba);
+    filesystem_diag_text(" sectors=");
+    filesystem_diag_hex(sectors);
+    filesystem_diag_text(" status=");
+    filesystem_diag_hex((uint32_t)status);
+    filesystem_diag_text(" request_status=");
+    filesystem_diag_hex(request != 0 ? (uint32_t)request->status : 0U);
+    filesystem_diag_text(" bytes=");
+    filesystem_diag_hex(request != 0 ? request->bytes_done : 0U);
+    filesystem_diag_text(" cqe=");
+    filesystem_diag_hex(nvme_last_completion_status());
+    filesystem_diag_text("\r\n");
+}
 
 static UINT32 filesystem_load_u32(const UINT8 *source) {
     return (UINT32)source[0] | ((UINT32)source[1] << 8) |
@@ -106,24 +151,24 @@ static void filesystem_copy(UINT8 *destination, const UINT8 *source,
 }
 
 static void filesystem_log_source(filesystem_source_t source, UINT32 index) {
-    liteos_serial_write(source == FILESYSTEM_SOURCE_USB ? "USB" : "NVME");
-    liteos_serial_write(" INDEX=");
-    liteos_serial_write_u32(index);
+    kernel_serial_write(source == FILESYSTEM_SOURCE_USB ? "USB" : "NVME");
+    kernel_serial_write(" INDEX=");
+    kernel_serial_write_u32(index);
 }
 
 static void filesystem_log_candidate(const char *stage,
                                      const filesystem_candidate_t *candidate) {
     if (stage == 0 || candidate == 0) return;
-    liteos_serial_write(stage);
-    liteos_serial_write(" SOURCE=");
+    kernel_serial_write(stage);
+    kernel_serial_write(" SOURCE=");
     filesystem_log_source(candidate->source, candidate->source_index);
-    liteos_serial_write(" START=");
-    liteos_serial_write_u32((UINT32)candidate->start_lba);
-    liteos_serial_write(" COUNT=");
-    liteos_serial_write_u32((UINT32)candidate->block_count);
-    liteos_serial_write(" PART=");
-    liteos_serial_write_u32(candidate->partition_number);
-    liteos_serial_write("\r\n");
+    kernel_serial_write(" START=");
+    kernel_serial_write_u32((UINT32)candidate->start_lba);
+    kernel_serial_write(" COUNT=");
+    kernel_serial_write_u32((UINT32)candidate->block_count);
+    kernel_serial_write(" PART=");
+    kernel_serial_write_u32(candidate->partition_number);
+    kernel_serial_write("\r\n");
 }
 
 static BOOLEAN filesystem_range_valid(UINT64 disk_count, UINT64 start_lba,
@@ -140,7 +185,7 @@ static BOOLEAN filesystem_usb_read(VOID *context, UINT64 lba, UINT32 count,
                                 slice->start_lba, slice->block_count) ||
         lba >= slice->block_count || count > slice->block_count - lba ||
         slice->start_lba > UINT64_MAX - lba) return 0;
-    return liteos_block_read(slice->usb_device, slice->start_lba + lba,
+    return block_read(slice->usb_device, slice->start_lba + lba,
                              count, buffer);
 }
 
@@ -152,58 +197,93 @@ static BOOLEAN filesystem_usb_write(VOID *context, UINT64 lba, UINT32 count,
                                 slice->start_lba, slice->block_count) ||
         lba >= slice->block_count || count > slice->block_count - lba ||
         slice->start_lba > UINT64_MAX - lba) return 0;
-    return liteos_block_write(slice->usb_device, slice->start_lba + lba,
+    return block_write(slice->usb_device, slice->start_lba + lba,
                               count, buffer);
 }
 
 static BOOLEAN filesystem_usb_flush(VOID *context) {
     filesystem_slice_t *slice = (filesystem_slice_t *)context;
     return slice != 0 && slice->usb_device != 0 &&
-           liteos_block_flush(slice->usb_device);
+           block_flush(slice->usb_device);
 }
 
 static kstatus_t filesystem_nvme_submit(filesystem_slice_t *slice,
                                         UINT64 lba, UINT32 opcode,
-                                        UINT32 bio_opcode, VOID *buffer) {
+                                        UINT32 bio_opcode,
+                                        UINT32 sector_count, VOID *buffer) {
     page_t *page = 0;
     VOID *page_memory = 0;
+    BOOLEAN owns_page = 0;
     io_vec_t vector = {0};
     bio_vec_t bio_vector = {0};
-    io_request_t request;
+    io_request_t request = {0};
     bio_t bio = {0};
     kstatus_t status = K_EIO;
+    UINT32 diag_stage = 1U;
 
     if (slice == 0 || slice->nvme_device == 0 ||
         (opcode != IO_READ && opcode != IO_WRITE && opcode != IO_FLUSH) ||
         (bio_opcode != BIO_OP_READ && bio_opcode != BIO_OP_WRITE &&
          bio_opcode != BIO_OP_FLUSH) ||
-        lba >= slice->block_count) return K_EINVAL;
-    if (bio_opcode != BIO_OP_FLUSH && buffer == 0) return K_EINVAL;
+        lba > slice->block_count) return K_EINVAL;
+    if (bio_opcode == BIO_OP_FLUSH) {
+        if (sector_count != 0U || buffer != 0) return K_EINVAL;
+    } else if (buffer == 0 || sector_count == 0U ||
+               sector_count > 2U * PAGE_SIZE / 512U ||
+               sector_count > slice->block_count - lba) {
+        return K_EINVAL;
+    }
 
     if (bio_opcode != BIO_OP_FLUSH) {
-        page = page_alloc(0, opcode == IO_WRITE ?
-                          PAGE_ALLOC_ZERO | PAGE_ALLOC_DMA32 :
-                          PAGE_ALLOC_DMA32);
-        if (page == 0) return K_ENOMEM;
-        page_memory = phys_to_direct(page_to_phys(page));
-        if (page_memory == 0) {
-            page_free(page);
-            return K_EIO;
+        /* VFS file faults already provide a page-aligned direct-map page.
+         * DMA it in place instead of allocating and copying through a
+         * temporary DMA32 page for every 4 KiB file read.  Stack, slab, and
+         * block-cache buffers still use the safe bounce path below. */
+        uint64_t physical = direct_to_phys(buffer).value;
+        if (physical != UINT64_MAX &&
+            (physical & (PAGE_SIZE - 1ULL)) == 0U) {
+            page = phys_to_page(paddr_make(physical));
+            if (page != 0 &&
+                (page->flags & (PAGE_FREE | PAGE_COMPOUND_TAIL)) == 0U &&
+                phys_to_direct(page_to_phys(page)) == buffer &&
+                ((page->flags & PAGE_COMPOUND_HEAD) != 0U ||
+                 sector_count <= PAGE_SIZE / 512U) &&
+                (uint64_t)sector_count * 512U <=
+                    ((page->flags & PAGE_COMPOUND_HEAD) != 0U ?
+                     ((uint64_t)PAGE_SIZE << page->order) : PAGE_SIZE)) {
+                page_memory = buffer;
+            } else {
+                page = 0;
+            }
         }
-        if (opcode == IO_WRITE) {
-            for (UINT32 index = 0U; index < 512U; ++index) {
-                ((UINT8 *)page_memory)[index] =
-                    ((const UINT8 *)buffer)[index];
+        if (page == 0) {
+            page = page_alloc(sector_count > PAGE_SIZE / 512U ? 1U : 0U,
+                              PAGE_ALLOC_DMA32);
+            if (page == 0) {
+                status = K_ENOMEM;
+                goto done;
+            }
+            owns_page = 1;
+            page_memory = phys_to_direct(page_to_phys(page));
+            if (page_memory == 0) {
+                status = K_EIO;
+                goto done;
+            }
+            if (opcode == IO_WRITE) {
+                /* Every byte submitted to DMA is overwritten before io_submit;
+                 * the unused allocation tail is never part of the transfer. */
+                filesystem_copy(page_memory, buffer, (UINTN)sector_count * 512U);
             }
         }
         vector.base = page_memory;
-        vector.length = 512U;
+        vector.length = sector_count * 512U;
         bio_vector.page = page;
         bio_vector.offset = 0U;
-        bio_vector.length = 512U;
+        bio_vector.length = sector_count * 512U;
     }
 
     for (UINT32 attempt = 0U; attempt < 2U; ++attempt) {
+        diag_stage = 2U;
         io_request_init(&request, opcode, slice->nvme_device, 0,
                         bio_opcode == BIO_OP_FLUSH ? 0 : &vector,
                         bio_opcode == BIO_OP_FLUSH ? 0U : 1U);
@@ -217,7 +297,10 @@ static kstatus_t filesystem_nvme_submit(filesystem_slice_t *slice,
         request.completion_target = &bio;
 
         status = io_submit(&request);
-        if (status != K_OK) break;
+        if (status != K_OK) {
+            diag_stage = 3U;
+            break;
+        }
 
         uint64_t start_tsc = x86_read_tsc();
         uint64_t timeout_ticks = x86_timeout_ns_to_tsc(5000000000ULL);
@@ -226,9 +309,10 @@ static kstatus_t filesystem_nvme_submit(filesystem_slice_t *slice,
             if (io_request_is_terminal(&request)) break;
             if (timeout_ticks != 0U &&
                 x86_read_tsc() - start_tsc >= timeout_ticks) {
-                liteos_serial_write("LITEOS_VOLUME_NVME_TIMEOUT LBA_LOW=");
-                liteos_serial_write_u32((UINT32)(slice->start_lba + lba));
-                liteos_serial_write("\r\n");
+                diag_stage = 4U;
+                kernel_serial_write("OS_VOLUME_NVME_TIMEOUT LBA_LOW=");
+                kernel_serial_write_u32((UINT32)(slice->start_lba + lba));
+                kernel_serial_write("\r\n");
                 status = nvme_recover_after_timeout(slice->nvme_device);
                 if (status != K_OK) goto done;
                 while (!io_request_is_terminal(&request)) {
@@ -244,19 +328,25 @@ static kstatus_t filesystem_nvme_submit(filesystem_slice_t *slice,
         if (status == K_ETIMEDOUT && attempt == 0U) continue;
         if (status == K_ETIMEDOUT) break;
         status = request.status;
+        diag_stage = 5U;
         if (status == K_OK && bio_opcode != BIO_OP_FLUSH &&
-            request.bytes_done != 512U) status = K_EIO;
+            request.bytes_done != (uint64_t)sector_count * 512U) {
+            status = K_EIO;
+            diag_stage = 6U;
+        }
         break;
     }
 
-    if (status == K_OK && opcode == IO_READ) {
-        for (UINT32 index = 0U; index < 512U; ++index) {
-            ((UINT8 *)buffer)[index] = ((UINT8 *)page_memory)[index];
-        }
+    if (status == K_OK && opcode == IO_READ && owns_page) {
+        filesystem_copy(buffer, page_memory, (UINTN)sector_count * 512U);
     }
 
 done:
-    if (page != 0) page_free(page);
+    if (status != K_OK) {
+        filesystem_nvme_diag(diag_stage, slice->start_lba + lba,
+                             sector_count, status, &request);
+    }
+    if (owns_page && page != 0) page_free(page);
     return status;
 }
 
@@ -265,11 +355,15 @@ static BOOLEAN filesystem_nvme_read(VOID *context, UINT64 lba, UINT32 count,
     filesystem_slice_t *slice = (filesystem_slice_t *)context;
     if (slice == 0 || buffer == 0 || count == 0U ||
         lba >= slice->block_count || count > slice->block_count - lba) return 0;
-    for (UINT32 index = 0U; index < count; ++index) {
+    for (UINT32 index = 0U; index < count;) {
+        UINT32 chunk = count - index;
+        if (chunk > 2U * PAGE_SIZE / 512U) chunk = 2U * PAGE_SIZE / 512U;
         if (filesystem_nvme_submit(slice, lba + index, IO_READ, BIO_OP_READ,
+                                    chunk,
                                     (UINT8 *)buffer + index * 512U) != K_OK) {
             return 0;
         }
+        index += chunk;
     }
     return 1;
 }
@@ -279,18 +373,22 @@ static BOOLEAN filesystem_nvme_write(VOID *context, UINT64 lba, UINT32 count,
     filesystem_slice_t *slice = (filesystem_slice_t *)context;
     if (slice == 0 || buffer == 0 || count == 0U ||
         lba >= slice->block_count || count > slice->block_count - lba) return 0;
-    for (UINT32 index = 0U; index < count; ++index) {
+    for (UINT32 index = 0U; index < count;) {
+        UINT32 chunk = count - index;
+        if (chunk > 2U * PAGE_SIZE / 512U) chunk = 2U * PAGE_SIZE / 512U;
         if (filesystem_nvme_submit(slice, lba + index, IO_WRITE, BIO_OP_WRITE,
+                                    chunk,
                                     (UINT8 *)buffer + index * 512U) != K_OK) {
             return 0;
         }
+        index += chunk;
     }
     return 1;
 }
 
 static BOOLEAN filesystem_nvme_flush(VOID *context) {
     return filesystem_nvme_submit((filesystem_slice_t *)context, 0U,
-                                   IO_FLUSH, BIO_OP_FLUSH, 0) == K_OK;
+                                   IO_FLUSH, BIO_OP_FLUSH, 0U, 0) == K_OK;
 }
 
 static BOOLEAN filesystem_slice_read(filesystem_slice_t *slice, UINT64 lba,
@@ -312,7 +410,7 @@ static void filesystem_prepare_slice(const filesystem_candidate_t *candidate,
 }
 
 static void filesystem_prepare_block_device(filesystem_slice_t *slice,
-                                            LITEOS_BLOCK_DEVICE *device) {
+                                            OS_BLOCK_DEVICE *device) {
     filesystem_zero(device, sizeof(*device));
     device->Name[0] = 'f';
     device->Name[1] = 's';
@@ -333,27 +431,49 @@ static void filesystem_prepare_block_device(filesystem_slice_t *slice,
     device->Registered = 1U;
 }
 
-static BOOLEAN filesystem_has_required_files(LITEOS_FAT32 *filesystem) {
+static BOOLEAN filesystem_has_required_files(OS_FAT32 *filesystem) {
     os_file_info_t info = {0};
     if (filesystem == 0 ||
-        !liteos_fat32_stat_path(filesystem, "/init", &info) ||
+        !fat32_stat_path(filesystem, "/init", &info) ||
         info.type != OS_FILE_TYPE_REGULAR) return 0;
     info = (os_file_info_t){0};
-    return liteos_fat32_stat_path(filesystem, "/init-runtime", &info) &&
+    return fat32_stat_path(filesystem, "/init-runtime", &info) &&
            info.type == OS_FILE_TYPE_REGULAR;
 }
 
-static BOOLEAN filesystem_probe_candidate(filesystem_candidate_t *candidate) {
-    if (candidate == 0) return 0;
-    filesystem_prepare_slice(candidate, &g_probe_slice);
-    filesystem_prepare_block_device(&g_probe_slice, &g_probe_block_device);
-    filesystem_zero(&g_probe_filesystem, sizeof(g_probe_filesystem));
-    if (!liteos_fat32_init(&g_probe_filesystem, &g_probe_block_device)) return 0;
-    candidate->has_required_files = filesystem_has_required_files(
-        &g_probe_filesystem);
-    (void)liteos_fat32_destroy(&g_probe_filesystem);
-    filesystem_zero(&g_probe_filesystem, sizeof(g_probe_filesystem));
+static BOOLEAN filesystem_release_probe(void) {
+    if (g_probe_volume == 0) return 1U;
+    OS_FAT32 *filesystem = &g_probe_volume->filesystem;
+    if (filesystem->Mounted) {
+        if (!fat32_destroy(filesystem)) return 0;
+    } else if (filesystem->Cache.Initialized) {
+        /* Initialization can fail after creating its block cache. */
+        if (!block_cache_destroy(&filesystem->Cache)) return 0;
+    }
+    kfree(g_probe_volume);
+    g_probe_volume = 0;
     return 1U;
+}
+
+static BOOLEAN filesystem_probe_candidate(filesystem_candidate_t *candidate) {
+    if (candidate == 0 || !filesystem_release_probe()) return 0;
+    g_probe_volume = kzalloc(sizeof(*g_probe_volume), 0);
+    if (g_probe_volume == 0) return 0;
+    filesystem_prepare_slice(candidate, &g_probe_volume->slice);
+    filesystem_prepare_block_device(&g_probe_volume->slice,
+                                    &g_probe_volume->block_device);
+    /* init/stat never mutate the disk. Do not flush a device for a read-only
+     * probe, or allow an accidental write through this temporary view. */
+    g_probe_volume->block_device.Write = 0;
+    g_probe_volume->block_device.Flush = 0;
+    BOOLEAN initialized = fat32_init(&g_probe_volume->filesystem,
+                                           &g_probe_volume->block_device);
+    if (initialized) {
+        candidate->has_required_files = filesystem_has_required_files(
+            &g_probe_volume->filesystem);
+    }
+    if (!filesystem_release_probe()) return 0;
+    return initialized;
 }
 
 static BOOLEAN filesystem_candidate_equal(const filesystem_candidate_t *left,
@@ -400,11 +520,11 @@ static BOOLEAN filesystem_add_candidate(const filesystem_disk_t *disk,
     }
     if (!filesystem_probe_candidate(&candidate)) return 1U;
     if (g_candidate_count >= FILESYSTEM_CANDIDATE_LIMIT) {
-        liteos_serial_write("LITEOS_VOLUME_CANDIDATE_LIMIT\r\n");
+        kernel_serial_write("OS_VOLUME_CANDIDATE_LIMIT\r\n");
         return 0U;
     }
     g_candidates[g_candidate_count++] = candidate;
-    filesystem_log_candidate("LITEOS_VOLUME_CANDIDATE", &candidate);
+    filesystem_log_candidate("OS_VOLUME_CANDIDATE", &candidate);
     return 1U;
 }
 
@@ -547,7 +667,7 @@ static BOOLEAN filesystem_scan_disk(const filesystem_disk_t *disk) {
 static void filesystem_discover_usb(void) {
     if (g_usb_discovered) return;
     if (!xhci_hardware_present() || !xhci_usb_mass_storage_configured()) {
-        liteos_realtest_mark("ROOT_USB_NO_MSC");
+        realtest_mark("ROOT_USB_NO_MSC");
         g_usb_discovered = 1U;
         return;
     }
@@ -559,12 +679,12 @@ static void filesystem_discover_usb(void) {
                                 &bulk_in, &bulk_out)) continue;
         if (!usb_msc_present((UINT8)slot) &&
             !usb_msc_attach((UINT8)slot)) {
-            liteos_realtest_mark_number("ROOT_USB_ATTACH_FAIL", slot);
+            realtest_mark_number("ROOT_USB_ATTACH_FAIL", slot);
             continue;
         }
-        LITEOS_BLOCK_DEVICE *device = usb_msc_block_device((UINT8)slot);
+        OS_BLOCK_DEVICE *device = usb_msc_block_device((UINT8)slot);
         if (device == 0) {
-            liteos_realtest_mark_number("ROOT_USB_NO_BLOCK_DEVICE", slot);
+            realtest_mark_number("ROOT_USB_NO_BLOCK_DEVICE", slot);
             continue;
         }
         filesystem_disk_t disk = {
@@ -573,11 +693,11 @@ static void filesystem_discover_usb(void) {
             .usb_device = device,
             .disk_block_count = device->BlockCount,
         };
-        liteos_serial_write("LITEOS_VOLUME_SCAN USB SLOT=");
-        liteos_serial_write_u32(slot);
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_VOLUME_SCAN USB SLOT=");
+        kernel_serial_write_u32(slot);
+        kernel_serial_write("\r\n");
         if (!filesystem_scan_disk(&disk)) {
-            liteos_realtest_mark_number("ROOT_USB_SCAN_FAIL", slot);
+            realtest_mark_number("ROOT_USB_SCAN_FAIL", slot);
         }
     }
     g_usb_discovered = 1U;
@@ -592,11 +712,11 @@ static void filesystem_discover_nvme(const nvme_controller_t *fallback) {
             !controller->identified || controller->namespace_count == 0U) continue;
         if (controller->namespace_block_size != 512U ||
             controller->namespace_block_count == 0U) {
-            liteos_serial_write("LITEOS_VOLUME_NVME_UNSUPPORTED_BLOCK_SIZE INDEX=");
-            liteos_serial_write_u32(index);
-            liteos_serial_write(" SIZE=");
-            liteos_serial_write_u32(controller->namespace_block_size);
-            liteos_serial_write("\r\n");
+            kernel_serial_write("OS_VOLUME_NVME_UNSUPPORTED_BLOCK_SIZE INDEX=");
+            kernel_serial_write_u32(index);
+            kernel_serial_write(" SIZE=");
+            kernel_serial_write_u32(controller->namespace_block_size);
+            kernel_serial_write("\r\n");
             continue;
         }
         filesystem_disk_t disk = {
@@ -605,34 +725,34 @@ static void filesystem_discover_nvme(const nvme_controller_t *fallback) {
             .nvme_device = controller->device,
             .disk_block_count = controller->namespace_block_count,
         };
-        liteos_serial_write("LITEOS_VOLUME_SCAN NVME INDEX=");
-        liteos_serial_write_u32(index);
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_VOLUME_SCAN NVME INDEX=");
+        kernel_serial_write_u32(index);
+        kernel_serial_write("\r\n");
         if (!filesystem_scan_disk(&disk)) {
-            liteos_serial_write("LITEOS_VOLUME_NVME_SCAN_FAIL INDEX=");
-            liteos_serial_write_u32(index);
-            liteos_serial_write("\r\n");
+            kernel_serial_write("OS_VOLUME_NVME_SCAN_FAIL INDEX=");
+            kernel_serial_write_u32(index);
+            kernel_serial_write("\r\n");
         }
     }
     g_nvme_discovered = 1U;
 }
 
 static BOOLEAN filesystem_boot_source_matches(filesystem_source_t source,
-                                              const LITEOS_BOOT_INFO *info) {
-    if (info == 0 || (info->Flags & LITEOS_BOOTINFO_HAS_BOOT_DEVICE) == 0U) {
+                                              const OS_BOOT_INFO *info) {
+    if (info == 0 || (info->Flags & OS_BOOTINFO_HAS_BOOT_DEVICE) == 0U) {
         return 0U;
     }
-    if (info->BootDeviceTransport == LITEOS_BOOT_DEVICE_TRANSPORT_USB) {
+    if (info->BootDeviceTransport == OS_BOOT_DEVICE_TRANSPORT_USB) {
         return source == FILESYSTEM_SOURCE_USB;
     }
-    if (info->BootDeviceTransport == LITEOS_BOOT_DEVICE_TRANSPORT_NVME) {
+    if (info->BootDeviceTransport == OS_BOOT_DEVICE_TRANSPORT_NVME) {
         return source == FILESYSTEM_SOURCE_NVME;
     }
     return 1U;
 }
 
 static BOOLEAN filesystem_boot_candidate_matches(
-    const filesystem_candidate_t *candidate, const LITEOS_BOOT_INFO *info,
+    const filesystem_candidate_t *candidate, const OS_BOOT_INFO *info,
     filesystem_source_t source_filter) {
     if (candidate == 0 || !filesystem_boot_source_matches(candidate->source, info) ||
         (source_filter != FILESYSTEM_SOURCE_NONE &&
@@ -662,14 +782,14 @@ static BOOLEAN filesystem_boot_candidate_matches(
     return 1U;
 }
 
-static UINT32 filesystem_find_boot_candidate(const LITEOS_BOOT_INFO *info,
+static UINT32 filesystem_find_boot_candidate(const OS_BOOT_INFO *info,
                                              filesystem_source_t source_filter) {
     UINT32 selected = UINT32_MAX;
     UINT32 match_count = 0U;
     UINT32 required_count = 0U;
     UINT32 required_selected = UINT32_MAX;
-    if (info == 0 || (info->Flags & LITEOS_BOOTINFO_HAS_BOOT_DEVICE) == 0U) {
-        liteos_serial_write("LITEOS_ROOT_BOOT_INFO_MISSING\r\n");
+    if (info == 0 || (info->Flags & OS_BOOTINFO_HAS_BOOT_DEVICE) == 0U) {
+        kernel_serial_write("OS_ROOT_BOOT_INFO_MISSING\r\n");
         return UINT32_MAX;
     }
     for (UINT32 index = 0U; index < g_candidate_count; ++index) {
@@ -687,11 +807,11 @@ static UINT32 filesystem_find_boot_candidate(const LITEOS_BOOT_INFO *info,
     if (match_count == 1U) return selected;
     if (match_count > 1U && required_count == 1U) return required_selected;
     if (match_count == 0U) {
-        liteos_serial_write("LITEOS_ROOT_BOOT_VOLUME_NOT_FOUND\r\n");
+        kernel_serial_write("OS_ROOT_BOOT_VOLUME_NOT_FOUND\r\n");
     } else {
-        liteos_serial_write("LITEOS_ROOT_BOOT_VOLUME_AMBIGUOUS COUNT=");
-        liteos_serial_write_u32(match_count);
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_ROOT_BOOT_VOLUME_AMBIGUOUS COUNT=");
+        kernel_serial_write_u32(match_count);
+        kernel_serial_write("\r\n");
     }
     return UINT32_MAX;
 }
@@ -743,72 +863,77 @@ static BOOLEAN filesystem_mount_candidate(UINT32 candidate_index,
                                           BOOLEAN root) {
     filesystem_candidate_t *candidate;
     filesystem_volume_t *volume = 0;
+    UINT32 volume_index = FILESYSTEM_VOLUME_LIMIT;
     CHAR8 mount_path[FILESYSTEM_PATH_LIMIT];
     if (candidate_index >= g_candidate_count) return 0U;
     candidate = &g_candidates[candidate_index];
     if (candidate->mounted_volume != UINT32_MAX) {
         return root && candidate->mounted_volume < FILESYSTEM_VOLUME_LIMIT &&
-               g_volumes[candidate->mounted_volume].used;
+               g_volumes[candidate->mounted_volume] != 0;
     }
     for (UINT32 index = 0U; index < FILESYSTEM_VOLUME_LIMIT; ++index) {
-        if (!g_volumes[index].used) {
-            volume = &g_volumes[index];
-            volume->used = 1U;
-            volume->candidate_index = candidate_index;
+        if (g_volumes[index] == 0) {
+            volume_index = index;
             break;
         }
     }
+    if (volume_index == FILESYSTEM_VOLUME_LIMIT) {
+        filesystem_log_candidate("OS_VOLUME_MOUNT_LIMIT", candidate);
+        return 0U;
+    }
+    volume = kzalloc(sizeof(*volume), 0);
     if (volume == 0) {
-        filesystem_log_candidate("LITEOS_VOLUME_MOUNT_LIMIT", candidate);
+        filesystem_log_candidate("OS_VOLUME_MOUNT_OOM", candidate);
         return 0U;
     }
     filesystem_prepare_slice(candidate, &volume->slice);
     filesystem_prepare_block_device(&volume->slice, &volume->block_device);
     filesystem_zero(&volume->filesystem, sizeof(volume->filesystem));
-    if (!liteos_fat32_init(&volume->filesystem, &volume->block_device)) {
-        filesystem_log_candidate("LITEOS_VOLUME_MOUNT_FAIL", candidate);
-        filesystem_zero(volume, sizeof(*volume));
+    if (!fat32_init(&volume->filesystem, &volume->block_device)) {
+        filesystem_log_candidate("OS_VOLUME_MOUNT_FAIL", candidate);
+        kfree(volume);
         return 0U;
     }
     if (root && !filesystem_has_required_files(&volume->filesystem)) {
-        liteos_serial_write("LITEOS_ROOT_REQUIRED_FILES_FAIL\r\n");
-        liteos_realtest_fat_lost("required-files");
-        (void)liteos_fat32_destroy(&volume->filesystem);
-        filesystem_zero(volume, sizeof(*volume));
+        kernel_serial_write("OS_ROOT_REQUIRED_FILES_FAIL\r\n");
+        realtest_fat_lost("required-files");
+        (void)fat32_destroy(&volume->filesystem);
+        kfree(volume);
         return 0U;
     }
     if (root) {
         if (vfs_mount_fat32("/", &volume->filesystem) != K_OK) {
-            liteos_serial_write("LITEOS_ROOT_VFS_MOUNT_FAIL\r\n");
-            liteos_realtest_fat_lost("vfs-mount");
-            (void)liteos_fat32_destroy(&volume->filesystem);
-            filesystem_zero(volume, sizeof(*volume));
+            kernel_serial_write("OS_ROOT_VFS_MOUNT_FAIL\r\n");
+            realtest_fat_lost("vfs-mount");
+            (void)fat32_destroy(&volume->filesystem);
+            kfree(volume);
             return 0U;
         }
-        liteos_realtest_fat_ready(&volume->filesystem);
+        realtest_fat_ready(&volume->filesystem);
         g_root_mounted = 1U;
         g_root_candidate = candidate_index;
     } else {
         if (!filesystem_make_mount_path(candidate, mount_path) ||
             vfs_mount_fat32(mount_path, &volume->filesystem) != K_OK) {
-            filesystem_log_candidate("LITEOS_VOLUME_MOUNT_FAIL", candidate);
-            (void)liteos_fat32_destroy(&volume->filesystem);
-            filesystem_zero(volume, sizeof(*volume));
+            filesystem_log_candidate("OS_VOLUME_MOUNT_FAIL", candidate);
+            (void)fat32_destroy(&volume->filesystem);
+            kfree(volume);
             return 0U;
         }
     }
-    candidate->mounted_volume = (UINT32)(volume - g_volumes);
-    filesystem_log_candidate(root ? "LITEOS_ROOT_VOLUME_MOUNTED" :
-                             "LITEOS_VOLUME_MOUNTED", candidate);
+    g_volumes[volume_index] = volume;
+    candidate->mounted_volume = volume_index;
+    filesystem_log_candidate(root ? "OS_ROOT_VOLUME_MOUNTED" :
+                             "OS_VOLUME_MOUNTED", candidate);
     return 1U;
 }
 
-static BOOLEAN filesystem_mount_selected_root(const LITEOS_BOOT_INFO *info,
+static BOOLEAN filesystem_mount_selected_root(const OS_BOOT_INFO *info,
                                               filesystem_source_t source_filter) {
     UINT32 candidate = filesystem_find_boot_candidate(info, source_filter);
     if (candidate == UINT32_MAX) return 0U;
     if (g_root_mounted && g_root_candidate != candidate) {
-        liteos_serial_write("LITEOS_ROOT_BOOT_VOLUME_CHANGED\r\n");
+        kernel_serial_write("OS_ROOT_BOOT_VOLUME_CHANGED\r\n");
         return 0U;
     }
     if (g_root_mounted) return 1U;
@@ -820,7 +945,7 @@ static BOOLEAN filesystem_ensure_mount_directory(void) {
     kstatus_t status = vfs_stat_kernel("/mnt", &info);
     if (status == K_OK) return info.type == OS_FILE_TYPE_DIRECTORY;
     if (status != K_ENOENT || vfs_mkdir_kernel("/mnt", 0755U) != K_OK) {
-        liteos_serial_write("LITEOS_VOLUME_MOUNT_ROOT_DIR_FAIL\r\n");
+        kernel_serial_write("OS_VOLUME_MOUNT_ROOT_DIR_FAIL\r\n");
         return 0U;
     }
     return 1U;
@@ -835,19 +960,19 @@ static BOOLEAN filesystem_mount_all_secondary(void) {
     return 1U;
 }
 
-BOOLEAN filesystem_mount_usb_root(const LITEOS_BOOT_INFO *boot_info) {
+BOOLEAN filesystem_mount_usb_root(const OS_BOOT_INFO *boot_info) {
     filesystem_discover_usb();
     return filesystem_mount_selected_root(boot_info, FILESYSTEM_SOURCE_USB);
 }
 
-BOOLEAN filesystem_mount_nvme_root(const LITEOS_BOOT_INFO *boot_info,
+BOOLEAN filesystem_mount_nvme_root(const OS_BOOT_INFO *boot_info,
                                    device_t *fallback_device) {
     (void)fallback_device;
     filesystem_discover_nvme(nvme_active_controller());
     return filesystem_mount_selected_root(boot_info, FILESYSTEM_SOURCE_NVME);
 }
 
-BOOLEAN filesystem_mount_all_volumes(const LITEOS_BOOT_INFO *boot_info,
+BOOLEAN filesystem_mount_all_volumes(const OS_BOOT_INFO *boot_info,
                                      const nvme_controller_t *active_controller,
                                      BOOLEAN *root_is_nvme) {
     UINT32 root_candidate;
@@ -863,7 +988,7 @@ BOOLEAN filesystem_mount_all_volumes(const LITEOS_BOOT_INFO *boot_info,
     }
     if (root_candidate == UINT32_MAX) return 0U;
     if (g_root_mounted && g_root_candidate != root_candidate) {
-        liteos_serial_write("LITEOS_ROOT_BOOT_VOLUME_CHANGED\r\n");
+        kernel_serial_write("OS_ROOT_BOOT_VOLUME_CHANGED\r\n");
         return 0U;
     }
     if (!g_root_mounted && !filesystem_mount_candidate(root_candidate, 1U)) {
@@ -871,7 +996,7 @@ BOOLEAN filesystem_mount_all_volumes(const LITEOS_BOOT_INFO *boot_info,
     }
     if (!filesystem_ensure_mount_directory()) {
         /* A read-only root may still expose mount children through VFS. */
-        liteos_serial_write("LITEOS_VOLUME_MOUNT_ROOT_DIR_CONTINUE\r\n");
+        kernel_serial_write("OS_VOLUME_MOUNT_ROOT_DIR_CONTINUE\r\n");
     }
     (void)filesystem_mount_all_secondary();
     if (root_is_nvme != 0) {

@@ -103,18 +103,12 @@ void nvme_record_completion_status(uint16_t status) {
  */
 void nvme_lock(spinlock_t *lock) {
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&lock->state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(lock);
 }
 
 bool nvme_try_lock(spinlock_t *lock) {
-    unsigned expected = 0U;
     sched_preempt_disable();
-    if (!atomic_compare_exchange_strong_explicit(&lock->state, &expected, 1U,
-                                                 memory_order_acquire,
-                                                 memory_order_relaxed)) {
+    if (!spinlock_try_lock(lock)) {
         sched_preempt_enable();
         return false;
     }
@@ -122,7 +116,7 @@ bool nvme_try_lock(spinlock_t *lock) {
 }
 
 void nvme_unlock(spinlock_t *lock) {
-    atomic_store_explicit(&lock->state, 0U, memory_order_release);
+    spinlock_unlock(lock);
     sched_preempt_enable();
 }
 

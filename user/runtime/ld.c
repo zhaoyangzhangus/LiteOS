@@ -4,23 +4,26 @@
 
 #include <uapi/file.h>
 #include <uapi/mm.h>
+#include <uapi/process.h>
 #include <uapi/syscall.h>
 
 #include "elf64.h"
 
-#define LITEOS_RT_PAGE_SIZE       4096ULL
-#define LITEOS_RT_FILE_LIMIT      (64ULL * 1024ULL * 1024ULL)
-#define LITEOS_RT_MAX_SEGMENT_SIZE (256ULL * 1024ULL * 1024ULL)
-#define LITEOS_RT_MAX_PROGRAMS    64U
-#define LITEOS_RT_MAX_IMAGES      8U
-#define LITEOS_RT_MAX_NEEDED      16U
-#define LITEOS_RT_MAX_AUX         128U
-#define LITEOS_RT_MAX_ENV         256U
-#define LITEOS_RT_MAX_PATH        128U
-#define LITEOS_RT_MAX_NAME        64U
-#define LITEOS_RT_LIBRARY_BASE    0x0000000060000000ULL
-#define LITEOS_RT_LIBRARY_ALIGN   0x00100000ULL
-#define LITEOS_RT_LIBRARY_GAP     0x00100000ULL
+#define OS_RT_PAGE_SIZE       4096ULL
+#define OS_RT_FILE_LIMIT      (64ULL * 1024ULL * 1024ULL)
+#define OS_RT_MAX_SEGMENT_SIZE (256ULL * 1024ULL * 1024ULL)
+#define OS_RT_MAX_PROGRAMS    64U
+#define OS_RT_MAX_IMAGES      8U
+#define OS_RT_MAX_NEEDED      16U
+#define OS_RT_MAX_AUX         128U
+#define OS_RT_MAX_ENV         256U
+#define OS_RT_MAX_PATH        128U
+#define OS_RT_MAX_NAME        64U
+#define OS_RT_TLS_HEADER_WORDS 6U
+#define OS_RT_TLS_MAGIC        0x4C4954454F53544CULL
+#define OS_RT_LIBRARY_BASE    0x0000000060000000ULL
+#define OS_RT_LIBRARY_ALIGN   0x00100000ULL
+#define OS_RT_LIBRARY_GAP     0x00100000ULL
 
 __attribute__((visibility("hidden"))) void *memset(void *destination, int value,
                                                      size_t length) {
@@ -30,15 +33,15 @@ __attribute__((visibility("hidden"))) void *memset(void *destination, int value,
 }
 
 enum {
-    LITEOS_RT_AT_PHDR = 3,
-    LITEOS_RT_AT_PHENT = 4,
-    LITEOS_RT_AT_PHNUM = 5,
-    LITEOS_RT_AT_ENTRY = 9,
+    OS_RT_AT_PHDR = 3,
+    OS_RT_AT_PHENT = 4,
+    OS_RT_AT_PHNUM = 5,
+    OS_RT_AT_ENTRY = 9,
 };
 
 typedef struct loaded_image {
     bool used;
-    char name[LITEOS_RT_MAX_NAME];
+    char name[OS_RT_MAX_NAME];
     uint64_t base;
     uint64_t entry;
     uint64_t phdr_address;
@@ -46,7 +49,7 @@ typedef struct loaded_image {
     uint16_t phdr_count;
     uint64_t image_start;
     uint64_t image_end;
-    liteos_rt_elf64_program_header_t phdrs[LITEOS_RT_MAX_PROGRAMS];
+    runtime_elf64_program_header_t phdrs[OS_RT_MAX_PROGRAMS];
 
     uint64_t dynamic_address;
     uint64_t dynamic_size;
@@ -65,8 +68,13 @@ typedef struct loaded_image {
     uint64_t init;
     uint64_t init_array;
     uint64_t init_array_size;
-    uint64_t needed[LITEOS_RT_MAX_NEEDED];
+    uint64_t needed[OS_RT_MAX_NEEDED];
     uint32_t needed_count;
+    uint64_t tls_offset;
+    uint64_t tls_size;
+    uint64_t tls_file_size;
+    uint64_t tls_source;
+    uint64_t tls_alignment;
 } loaded_image_t;
 
 typedef struct aux_value {
@@ -74,7 +82,7 @@ typedef struct aux_value {
     uint64_t value;
 } aux_value_t;
 
-static int64_t liteos_rt_syscall6(uint64_t number, uint64_t argument0,
+static int64_t runtime_syscall6(uint64_t number, uint64_t argument0,
                                   uint64_t argument1, uint64_t argument2,
                                   uint64_t argument3, uint64_t argument4,
                                   uint64_t argument5) {
@@ -90,29 +98,29 @@ static int64_t liteos_rt_syscall6(uint64_t number, uint64_t argument0,
     return (int64_t)result;
 }
 
-static int64_t liteos_rt_syscall1(uint64_t number, uint64_t argument0) {
-    return liteos_rt_syscall6(number, argument0, 0U, 0U, 0U, 0U, 0U);
+static int64_t runtime_syscall1(uint64_t number, uint64_t argument0) {
+    return runtime_syscall6(number, argument0, 0U, 0U, 0U, 0U, 0U);
 }
 
-static int64_t liteos_rt_syscall3(uint64_t number, uint64_t argument0,
+static int64_t runtime_syscall3(uint64_t number, uint64_t argument0,
                                   uint64_t argument1, uint64_t argument2) {
-    return liteos_rt_syscall6(number, argument0, argument1, argument2,
+    return runtime_syscall6(number, argument0, argument1, argument2,
                               0U, 0U, 0U);
 }
 
-static int64_t liteos_rt_syscall4(uint64_t number, uint64_t argument0,
+static int64_t runtime_syscall4(uint64_t number, uint64_t argument0,
                                   uint64_t argument1, uint64_t argument2,
                                   uint64_t argument3) {
-    return liteos_rt_syscall6(number, argument0, argument1, argument2,
+    return runtime_syscall6(number, argument0, argument1, argument2,
                               argument3, 0U, 0U);
 }
 
 /* Failure-only loader diagnostics. */
-static void liteos_rt_diag(const char *message) {
+static void runtime_diag(const char *message) {
     uint64_t length = 0U;
     if (message == 0) return;
     while (message[length] != '\0') ++length;
-    (void)liteos_rt_syscall3(OS_SYS_DEBUG_WRITE,
+    (void)runtime_syscall3(OS_SYS_DEBUG_WRITE,
                              (uint64_t)(uintptr_t)message, length, 0U);
 }
 
@@ -188,14 +196,14 @@ static bool bounded_string(const char *text, uint64_t limit, uint64_t *length) {
 static int64_t file_open(const char *path, os_handle_t *handle) {
     if (path == 0 || handle == 0) return -1;
     *handle = OS_INVALID_HANDLE;
-    return liteos_rt_syscall4(OS_SYS_FILE_OPEN, (uint64_t)(uintptr_t)path,
+    return runtime_syscall4(OS_SYS_FILE_OPEN, (uint64_t)(uintptr_t)path,
                               OS_FILE_OPEN_READ, 0U,
                               (uint64_t)(uintptr_t)handle);
 }
 
 static void file_close(os_handle_t handle) {
     if (handle != OS_INVALID_HANDLE) {
-        (void)liteos_rt_syscall1(OS_SYS_HANDLE_CLOSE, handle);
+        (void)runtime_syscall1(OS_SYS_HANDLE_CLOSE, handle);
     }
 }
 
@@ -206,9 +214,9 @@ static bool file_stat_size(const char *path, uint64_t *size) {
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.path = (uint64_t)(uintptr_t)path;
-    status = liteos_rt_syscall1(OS_SYS_FILE_STAT, (uint64_t)(uintptr_t)&request);
+    status = runtime_syscall1(OS_SYS_FILE_STAT, (uint64_t)(uintptr_t)&request);
     if (status < 0 || request.info.type != OS_FILE_TYPE_REGULAR ||
-        request.info.size == 0U || request.info.size > LITEOS_RT_FILE_LIMIT) {
+        request.info.size == 0U || request.info.size > OS_RT_FILE_LIMIT) {
         return false;
     }
     *size = request.info.size;
@@ -223,7 +231,7 @@ static bool file_seek(os_handle_t handle, uint64_t offset) {
     request.handle = handle;
     request.offset = (int64_t)offset;
     request.whence = OS_FILE_SEEK_SET;
-    return liteos_rt_syscall1(OS_SYS_FILE_SEEK, (uint64_t)(uintptr_t)&request) == 0;
+    return runtime_syscall1(OS_SYS_FILE_SEEK, (uint64_t)(uintptr_t)&request) == 0;
 }
 
 static bool file_read_exact(os_handle_t handle, void *destination, uint64_t length) {
@@ -231,7 +239,7 @@ static bool file_read_exact(os_handle_t handle, void *destination, uint64_t leng
     while (length != 0U) {
         uint64_t request_size = length > 65536U ? 65536U : length;
         uint64_t bytes = 0U;
-        int64_t status = liteos_rt_syscall4(
+        int64_t status = runtime_syscall4(
             OS_SYS_FILE_READ, handle, (uint64_t)(uintptr_t)output,
             request_size, (uint64_t)(uintptr_t)&bytes);
         if (status < 0 || bytes == 0U || bytes > request_size) return false;
@@ -264,8 +272,8 @@ static bool link_pointer(const loaded_image_t *image, uint64_t link_address,
 static bool map_anonymous(uint64_t address, uint64_t length, uint32_t protection) {
     os_vm_map_args_t request = {0};
     int64_t status;
-    if (address == 0U || length == 0U || (address & (LITEOS_RT_PAGE_SIZE - 1U)) != 0U ||
-        (length & (LITEOS_RT_PAGE_SIZE - 1U)) != 0U) return false;
+    if (address == 0U || length == 0U || (address & (OS_RT_PAGE_SIZE - 1U)) != 0U ||
+        (length & (OS_RT_PAGE_SIZE - 1U)) != 0U) return false;
     request.hdr.size = sizeof(request);
     request.hdr.version = OS_SYSCALL_ABI_VERSION;
     request.address = address;
@@ -273,33 +281,51 @@ static bool map_anonymous(uint64_t address, uint64_t length, uint32_t protection
     request.object = OS_INVALID_HANDLE;
     request.prot = protection;
     request.flags = OS_VM_PRIVATE | OS_VM_FIXED;
-    status = liteos_rt_syscall1(OS_SYS_VM_MAP, (uint64_t)(uintptr_t)&request);
+    status = runtime_syscall1(OS_SYS_VM_MAP, (uint64_t)(uintptr_t)&request);
     return status == 0 && request.address == address;
+}
+
+static bool map_anonymous_any(uint64_t length, uint32_t protection,
+                              uint64_t *address) {
+    os_vm_map_args_t request = {0};
+    int64_t status;
+    if (address == 0 || length == 0U ||
+        (length & (OS_RT_PAGE_SIZE - 1U)) != 0U) return false;
+    request.hdr.size = sizeof(request);
+    request.hdr.version = OS_SYSCALL_ABI_VERSION;
+    request.length = length;
+    request.object = OS_INVALID_HANDLE;
+    request.prot = protection;
+    request.flags = OS_VM_PRIVATE;
+    status = runtime_syscall1(OS_SYS_VM_MAP, (uint64_t)(uintptr_t)&request);
+    if (status != 0 || request.address == 0U) return false;
+    *address = request.address;
+    return true;
 }
 
 static bool unmap_image(const loaded_image_t *image) {
     if (image == 0 || image->image_start >= image->image_end) return false;
-    return liteos_rt_syscall3(OS_SYS_VM_UNMAP, image->image_start,
+    return runtime_syscall3(OS_SYS_VM_UNMAP, image->image_start,
                               image->image_end - image->image_start, 0U) == 0;
 }
 
 static bool protect_range(uint64_t address, uint64_t length, uint32_t flags) {
     uint32_t protection = 0U;
-    if ((flags & LITEOS_RT_PF_R) != 0U) protection |= OS_VM_READ;
-    if ((flags & LITEOS_RT_PF_W) != 0U) protection |= OS_VM_WRITE;
-    if ((flags & LITEOS_RT_PF_X) != 0U) protection |= OS_VM_EXEC;
-    return liteos_rt_syscall3(OS_SYS_VM_PROTECT, address, length, protection) == 0;
+    if ((flags & OS_RT_PF_R) != 0U) protection |= OS_VM_READ;
+    if ((flags & OS_RT_PF_W) != 0U) protection |= OS_VM_WRITE;
+    if ((flags & OS_RT_PF_X) != 0U) protection |= OS_VM_EXEC;
+    return runtime_syscall3(OS_SYS_VM_PROTECT, address, length, protection) == 0;
 }
 
 static bool image_contains_writable(const loaded_image_t *image, uint64_t address,
                                     uint64_t length) {
     if (image == 0) return false;
     for (uint16_t index = 0U; index < image->phdr_count; ++index) {
-        const liteos_rt_elf64_program_header_t *program = &image->phdrs[index];
+        const runtime_elf64_program_header_t *program = &image->phdrs[index];
         uint64_t start;
         uint64_t end;
-        if (program->type != LITEOS_RT_PT_LOAD ||
-            (program->flags & LITEOS_RT_PF_W) == 0U ||
+        if (program->type != OS_RT_PT_LOAD ||
+            (program->flags & OS_RT_PF_W) == 0U ||
             !add_u64(image->base, program->virtual_address, &start) ||
             !add_u64(start, program->memory_size, &end)) continue;
         if (address >= start && address <= end && length <= end - address) return true;
@@ -307,19 +333,19 @@ static bool image_contains_writable(const loaded_image_t *image, uint64_t addres
     return false;
 }
 
-static bool valid_header(const liteos_rt_elf64_header_t *header, uint64_t file_size) {
+static bool valid_header(const runtime_elf64_header_t *header, uint64_t file_size) {
     uint64_t table_size;
     if (header == 0 || header->ident[0] != 0x7FU || header->ident[1] != 'E' ||
         header->ident[2] != 'L' || header->ident[3] != 'F' ||
-        header->ident[4] != LITEOS_RT_ELF_CLASS_64 ||
-        header->ident[5] != LITEOS_RT_ELF_DATA_LSB ||
-        header->ident[6] != LITEOS_RT_ELF_VERSION ||
-        header->machine != LITEOS_RT_ELF_MACHINE_X86_64 ||
-        header->version != LITEOS_RT_ELF_VERSION ||
+        header->ident[4] != OS_RT_ELF_CLASS_64 ||
+        header->ident[5] != OS_RT_ELF_DATA_LSB ||
+        header->ident[6] != OS_RT_ELF_VERSION ||
+        header->machine != OS_RT_ELF_MACHINE_X86_64 ||
+        header->version != OS_RT_ELF_VERSION ||
         header->header_size < sizeof(*header) ||
-        header->program_header_size < sizeof(liteos_rt_elf64_program_header_t) ||
+        header->program_header_size < sizeof(runtime_elf64_program_header_t) ||
         header->program_header_count == 0U ||
-        header->program_header_count > LITEOS_RT_MAX_PROGRAMS) return false;
+        header->program_header_count > OS_RT_MAX_PROGRAMS) return false;
     if (header->program_header_count > UINT64_MAX / header->program_header_size) {
         return false;
     }
@@ -328,16 +354,16 @@ static bool valid_header(const liteos_rt_elf64_header_t *header, uint64_t file_s
            table_size <= file_size - header->program_header_offset;
 }
 
-static bool valid_load_range(const liteos_rt_elf64_program_header_t *program,
+static bool valid_load_range(const runtime_elf64_program_header_t *program,
                              uint64_t file_size) {
     uint64_t file_end;
     uint64_t memory_end;
-    if (program == 0 || program->type != LITEOS_RT_PT_LOAD ||
+    if (program == 0 || program->type != OS_RT_PT_LOAD ||
         program->memory_size < program->file_size ||
-        program->memory_size > LITEOS_RT_MAX_SEGMENT_SIZE ||
-        (program->flags & ~(LITEOS_RT_PF_R | LITEOS_RT_PF_W | LITEOS_RT_PF_X)) != 0U ||
-        (program->flags & (LITEOS_RT_PF_W | LITEOS_RT_PF_X)) ==
-            (LITEOS_RT_PF_W | LITEOS_RT_PF_X) ||
+        program->memory_size > OS_RT_MAX_SEGMENT_SIZE ||
+        (program->flags & ~(OS_RT_PF_R | OS_RT_PF_W | OS_RT_PF_X)) != 0U ||
+        (program->flags & (OS_RT_PF_W | OS_RT_PF_X)) ==
+            (OS_RT_PF_W | OS_RT_PF_X) ||
         !add_u64(program->offset, program->file_size, &file_end) ||
         file_end > file_size ||
         !add_u64(program->virtual_address, program->memory_size, &memory_end) ||
@@ -350,8 +376,8 @@ static bool valid_load_range(const liteos_rt_elf64_program_header_t *program,
 }
 
 static bool read_program_headers(os_handle_t handle,
-                                 const liteos_rt_elf64_header_t *header,
-                                 liteos_rt_elf64_program_header_t *programs) {
+                                 const runtime_elf64_header_t *header,
+                                 runtime_elf64_program_header_t *programs) {
     for (uint16_t index = 0U; index < header->program_header_count; ++index) {
         uint64_t offset = header->program_header_offset +
                           (uint64_t)index * header->program_header_size;
@@ -365,71 +391,71 @@ static bool read_program_headers(os_handle_t handle,
 static bool parse_dynamic(loaded_image_t *image) {
     bool terminated = false;
     if (image == 0 || image->dynamic_address == 0U || image->dynamic_size <
-        sizeof(liteos_rt_elf64_dynamic_t) ||
+        sizeof(runtime_elf64_dynamic_t) ||
         !pointer_range(image, image->dynamic_address, image->dynamic_size)) return false;
     for (uint64_t offset = 0U;
-         offset + sizeof(liteos_rt_elf64_dynamic_t) <= image->dynamic_size;
-         offset += sizeof(liteos_rt_elf64_dynamic_t)) {
-        const liteos_rt_elf64_dynamic_t *entry =
-            (const liteos_rt_elf64_dynamic_t *)(uintptr_t)(image->dynamic_address + offset);
+         offset + sizeof(runtime_elf64_dynamic_t) <= image->dynamic_size;
+         offset += sizeof(runtime_elf64_dynamic_t)) {
+        const runtime_elf64_dynamic_t *entry =
+            (const runtime_elf64_dynamic_t *)(uintptr_t)(image->dynamic_address + offset);
         uint64_t runtime_address;
         switch (entry->tag) {
-        case LITEOS_RT_DT_NULL:
+        case OS_RT_DT_NULL:
             terminated = true;
             offset = image->dynamic_size;
             continue;
-        case LITEOS_RT_DT_NEEDED:
-            if (image->needed_count >= LITEOS_RT_MAX_NEEDED) return false;
+        case OS_RT_DT_NEEDED:
+            if (image->needed_count >= OS_RT_MAX_NEEDED) return false;
             image->needed[image->needed_count++] = entry->value;
             break;
-        case LITEOS_RT_DT_STRTAB:
+        case OS_RT_DT_STRTAB:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->string_table = runtime_address;
             break;
-        case LITEOS_RT_DT_STRSZ:
+        case OS_RT_DT_STRSZ:
             image->string_size = entry->value;
             break;
-        case LITEOS_RT_DT_SYMTAB:
+        case OS_RT_DT_SYMTAB:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->symbol_table = runtime_address;
             break;
-        case LITEOS_RT_DT_HASH:
+        case OS_RT_DT_HASH:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->sysv_hash = runtime_address;
             break;
-        case LITEOS_RT_DT_GNU_HASH:
+        case OS_RT_DT_GNU_HASH:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->gnu_hash = runtime_address;
             break;
-        case LITEOS_RT_DT_RELA:
+        case OS_RT_DT_RELA:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->rela = runtime_address;
             break;
-        case LITEOS_RT_DT_RELASZ:
+        case OS_RT_DT_RELASZ:
             image->rela_size = entry->value;
             break;
-        case LITEOS_RT_DT_RELAENT:
+        case OS_RT_DT_RELAENT:
             image->rela_entry_size = entry->value;
             break;
-        case LITEOS_RT_DT_JMPREL:
+        case OS_RT_DT_JMPREL:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->jmprel = runtime_address;
             break;
-        case LITEOS_RT_DT_PLTRELSZ:
+        case OS_RT_DT_PLTRELSZ:
             image->jmprel_size = entry->value;
             break;
-        case LITEOS_RT_DT_PLTREL:
+        case OS_RT_DT_PLTREL:
             image->plt_reloc_type = entry->value;
             break;
-        case LITEOS_RT_DT_INIT:
+        case OS_RT_DT_INIT:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->init = runtime_address;
             break;
-        case LITEOS_RT_DT_INIT_ARRAY:
+        case OS_RT_DT_INIT_ARRAY:
             if (!link_pointer(image, entry->value, &runtime_address)) return false;
             image->init_array = runtime_address;
             break;
-        case LITEOS_RT_DT_INIT_ARRAYSZ:
+        case OS_RT_DT_INIT_ARRAYSZ:
             image->init_array_size = entry->value;
             break;
         default:
@@ -475,13 +501,13 @@ static bool parse_dynamic(loaded_image_t *image) {
     }
     if (image->symbol_count == 0U && image->symbol_table < image->image_end) {
         image->symbol_count = (image->image_end - image->symbol_table) /
-                              sizeof(liteos_rt_elf64_symbol_t);
+                              sizeof(runtime_elf64_symbol_t);
     }
     if (image->rela_size != 0U || image->jmprel_size != 0U) {
         if (image->rela_entry_size == 0U) {
-            image->rela_entry_size = sizeof(liteos_rt_elf64_rela_t);
+            image->rela_entry_size = sizeof(runtime_elf64_rela_t);
         }
-        if (image->plt_reloc_type == 0U) image->plt_reloc_type = LITEOS_RT_DT_RELA_TYPE;
+        if (image->plt_reloc_type == 0U) image->plt_reloc_type = OS_RT_DT_RELA_TYPE;
     }
     return image->symbol_count != 0U;
 }
@@ -489,7 +515,7 @@ static bool parse_dynamic(loaded_image_t *image) {
 static bool initialize_main_image(uint64_t stack, loaded_image_t *image) {
     uint64_t argc;
     uint64_t *cursor;
-    aux_value_t aux[LITEOS_RT_MAX_AUX];
+    aux_value_t aux[OS_RT_MAX_AUX];
     uint32_t aux_count = 0U;
     uint64_t phdr_address = 0U;
     uint64_t phdr_size = 0U;
@@ -502,35 +528,35 @@ static bool initialize_main_image(uint64_t stack, loaded_image_t *image) {
     if (argc > 128U) return false;
     cursor = (uint64_t *)(uintptr_t)(stack + sizeof(uint64_t));
     cursor += argc + 1U;
-    for (uint32_t index = 0U; index < LITEOS_RT_MAX_ENV; ++index) {
+    for (uint32_t index = 0U; index < OS_RT_MAX_ENV; ++index) {
         if (cursor[index] == 0U) break;
-        if (index + 1U == LITEOS_RT_MAX_ENV) return false;
+        if (index + 1U == OS_RT_MAX_ENV) return false;
     }
     while (cursor[0] != 0U) ++cursor;
     ++cursor;
-    while (aux_count < LITEOS_RT_MAX_AUX) {
+    while (aux_count < OS_RT_MAX_AUX) {
         aux[aux_count].type = cursor[0];
         aux[aux_count].value = cursor[1];
         ++aux_count;
         cursor += 2U;
         if (aux[aux_count - 1U].type == 0U) break;
     }
-    if (aux_count == LITEOS_RT_MAX_AUX && aux[aux_count - 1U].type != 0U) return false;
+    if (aux_count == OS_RT_MAX_AUX && aux[aux_count - 1U].type != 0U) return false;
     for (uint32_t index = 0U; index < aux_count; ++index) {
-        if (aux[index].type == LITEOS_RT_AT_PHDR) {
+        if (aux[index].type == OS_RT_AT_PHDR) {
             phdr_address = aux[index].value;
             has_phdr = true;
-        } else if (aux[index].type == LITEOS_RT_AT_PHENT) {
+        } else if (aux[index].type == OS_RT_AT_PHENT) {
             phdr_size = aux[index].value;
-        } else if (aux[index].type == LITEOS_RT_AT_PHNUM) {
+        } else if (aux[index].type == OS_RT_AT_PHNUM) {
             phdr_count = aux[index].value;
-        } else if (aux[index].type == LITEOS_RT_AT_ENTRY) {
+        } else if (aux[index].type == OS_RT_AT_ENTRY) {
             entry = aux[index].value;
             has_entry = true;
         }
     }
     if (!has_phdr || !has_entry || phdr_size < sizeof(image->phdrs[0]) ||
-        phdr_count == 0U || phdr_count > LITEOS_RT_MAX_PROGRAMS) return false;
+        phdr_count == 0U || phdr_count > OS_RT_MAX_PROGRAMS) return false;
     *image = (loaded_image_t){0};
     image->used = true;
     image->base = 0U;
@@ -545,14 +571,14 @@ static bool initialize_main_image(uint64_t stack, loaded_image_t *image) {
         copy_bytes(&image->phdrs[index], source, sizeof(image->phdrs[index]));
     }
     for (uint16_t index = 0U; index < image->phdr_count; ++index) {
-        const liteos_rt_elf64_program_header_t *program = &image->phdrs[index];
+        const runtime_elf64_program_header_t *program = &image->phdrs[index];
         uint64_t start;
         uint64_t end;
-        if (program->type == LITEOS_RT_PT_PHDR) {
+        if (program->type == OS_RT_PT_PHDR) {
             if (phdr_address < program->virtual_address) return false;
             image->base = phdr_address - program->virtual_address;
         }
-        if (program->type == LITEOS_RT_PT_LOAD) {
+        if (program->type == OS_RT_PT_LOAD) {
             if (!add_u64(image->base, program->virtual_address, &start) ||
                 !add_u64(start, program->memory_size, &end) || end <= start) return false;
             if (image->image_start == 0U || start < image->image_start) image->image_start = start;
@@ -561,8 +587,8 @@ static bool initialize_main_image(uint64_t stack, loaded_image_t *image) {
     }
     if (image->image_start >= image->image_end) return false;
     for (uint16_t index = 0U; index < image->phdr_count; ++index) {
-        const liteos_rt_elf64_program_header_t *program = &image->phdrs[index];
-        if (program->type == LITEOS_RT_PT_DYNAMIC) {
+        const runtime_elf64_program_header_t *program = &image->phdrs[index];
+        if (program->type == OS_RT_PT_DYNAMIC) {
             if (!link_pointer(image, program->virtual_address, &image->dynamic_address)) {
                 return false;
             }
@@ -573,10 +599,198 @@ static bool initialize_main_image(uint64_t stack, loaded_image_t *image) {
     return image->dynamic_address != 0U && parse_dynamic(image);
 }
 
+/* Keep a private TLS template and place a tiny System TCB after an aligned
+ * copy of PT_TLS.  The FS offset is align_up(p_memsz, p_align), not p_memsz:
+ * fs:0 is the TLS self pointer required by the local-exec ABI, fs:8 is the
+ * exact TLS size, fs:16 is the template, fs:24 is a validation marker, and
+ * fs:32 is the System pthread_t, fs:40 is PT_TLS alignment. */
+static bool setup_main_tls(const loaded_image_t *image) {
+    const runtime_elf64_program_header_t *tls = 0;
+    uint64_t tls_source;
+    uint64_t tls_offset;
+    uint64_t tls_alignment;
+    uint64_t total_size;
+    uint64_t mapping_size;
+    uint64_t template_mapping = 0U;
+    uint64_t template_tls_base;
+    uint64_t main_mapping = 0U;
+    uint64_t main_tls_base;
+    uint64_t fs_base;
+    uint64_t *tcb;
+
+    if (image == 0) return false;
+    for (uint16_t index = 0U; index < image->phdr_count; ++index) {
+        if (image->phdrs[index].type == OS_RT_PT_TLS) {
+            if (tls != 0) return false;
+            tls = &image->phdrs[index];
+        }
+    }
+    if (tls == 0) return true;
+    tls_alignment = tls->alignment > 1U ? tls->alignment : 1U;
+    if (tls->memory_size == 0U || tls->file_size > tls->memory_size ||
+        tls->memory_size > (1ULL << 20U) ||
+        tls_alignment > (1ULL << 20U) ||
+        (tls_alignment & (tls_alignment - 1U)) != 0U ||
+        !add_u64(image->base, tls->virtual_address, &tls_source) ||
+        !pointer_range(image, tls_source, tls->file_size) ||
+        !align_up_u64(tls->memory_size, tls_alignment, &tls_offset) ||
+        !add_u64(tls_offset, tls_alignment - 1U, &total_size) ||
+        !add_u64(total_size,
+                 (uint64_t)OS_RT_TLS_HEADER_WORDS * sizeof(uint64_t),
+                 &total_size) ||
+        !align_up_u64(total_size, OS_RT_PAGE_SIZE, &mapping_size)) {
+        return false;
+    }
+    if (!map_anonymous_any(mapping_size, OS_VM_READ | OS_VM_WRITE,
+                           &template_mapping)) return false;
+    zero_bytes((void *)(uintptr_t)template_mapping, mapping_size);
+    if (!align_up_u64(template_mapping, tls_alignment,
+                      &template_tls_base)) {
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, template_mapping,
+                                 mapping_size, 0U);
+        return false;
+    }
+    if (tls->file_size != 0U) {
+        copy_bytes((void *)(uintptr_t)template_tls_base,
+                   (const void *)(uintptr_t)tls_source,
+                   (size_t)tls->file_size);
+    }
+    if (!map_anonymous_any(mapping_size, OS_VM_READ | OS_VM_WRITE,
+                           &main_mapping)) {
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, template_mapping,
+                                 mapping_size, 0U);
+        return false;
+    }
+    if (!align_up_u64(main_mapping, tls_alignment, &main_tls_base) ||
+        !add_u64(main_tls_base, tls_offset, &fs_base)) {
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, main_mapping,
+                                 mapping_size, 0U);
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, template_mapping,
+                                 mapping_size, 0U);
+        return false;
+    }
+    copy_bytes((void *)(uintptr_t)main_tls_base,
+               (const void *)(uintptr_t)template_tls_base,
+               (size_t)tls->memory_size);
+    tcb = (uint64_t *)(uintptr_t)fs_base;
+    tcb[0] = fs_base;
+    tcb[1] = tls->memory_size;
+    tcb[2] = template_tls_base;
+    tcb[3] = OS_RT_TLS_MAGIC;
+    tcb[4] = 0U;
+    tcb[5] = tls_alignment;
+    if (runtime_syscall6(OS_SYS_THREAD_CONTEXT,
+                           OS_THREAD_CONTEXT_SET_FS, fs_base,
+                           0U, 0U, 0U, 0U) < 0) {
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, main_mapping,
+                                 mapping_size, 0U);
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, template_mapping,
+                                 mapping_size, 0U);
+        return false;
+    }
+    return true;
+}
+
+/* x86-64 variant-II static TLS: keep the executable nearest FS, then put
+ * startup DSOs below it. Respect the TLS segment's first-byte alignment phase.
+ * The existing six-word TCB describes the whole immutable template, so pthread
+ * creation can clone all startup modules without changing the deployed ABI. */
+static bool plan_static_tls(loaded_image_t *images, uint32_t count,
+                            uint64_t *total, uint64_t *alignment) {
+    const uint64_t limit = 1ULL << 20U;
+    if (images == 0 || count == 0U || count > OS_RT_MAX_IMAGES ||
+        total == 0 || alignment == 0) return false;
+    *total = 0U;
+    *alignment = sizeof(uint64_t);
+    for (uint32_t index = 0U; index < count; ++index) {
+        loaded_image_t *image = &images[index];
+        const runtime_elf64_program_header_t *tls = 0;
+        uint64_t size, phase, end;
+        image->tls_offset = image->tls_size = image->tls_file_size = 0U;
+        image->tls_source = image->tls_alignment = 0U;
+        if (image->phdr_count > OS_RT_MAX_PROGRAMS) return false;
+        for (uint16_t program = 0U; program < image->phdr_count; ++program) {
+            if (image->phdrs[program].type != OS_RT_PT_TLS) continue;
+            if (tls != 0) return false;
+            tls = &image->phdrs[program];
+        }
+        if (tls == 0) continue;
+        size = tls->alignment > 1U ? tls->alignment : 1U;
+        if (tls->memory_size > limit || tls->file_size > tls->memory_size ||
+            size > limit || (size & (size - 1U)) != 0U) return false;
+        if (tls->memory_size == 0U) continue;
+        phase = tls->virtual_address & (size - 1U);
+        if (!add_u64(*total, tls->memory_size, &end) ||
+            !add_u64(end, phase, &end) || !align_up_u64(end, size, &end) ||
+            end < phase || end - phase > limit ||
+            !add_u64(image->base, tls->virtual_address, &image->tls_source) ||
+            !pointer_range(image, image->tls_source, tls->file_size)) return false;
+        image->tls_offset = end - phase;
+        image->tls_size = tls->memory_size;
+        image->tls_file_size = tls->file_size;
+        image->tls_alignment = size;
+        *total = image->tls_offset;
+        if (size > *alignment) *alignment = size;
+    }
+    return align_up_u64(*total, *alignment, total) && *total <= limit;
+}
+
+static bool setup_static_tls(const loaded_image_t *images, uint32_t count,
+                             uint64_t total, uint64_t alignment) {
+    uint64_t template_mapping = 0U, main_mapping = 0U;
+    uint64_t template_base, main_base, fs_base, length, mapping_size;
+    uint32_t modules = 0U;
+    for (uint32_t index = 0U; index < count; ++index) {
+        if (images[index].tls_size != 0U) ++modules;
+    }
+    if (modules == 0U) return true;
+    if (modules == 1U && images[0].tls_size != 0U &&
+        images[0].tls_alignment >= sizeof(uint64_t) &&
+        (images[0].tls_source & (images[0].tls_alignment - 1U)) == 0U) {
+        return setup_main_tls(&images[0]);
+    }
+    if (total == 0U || alignment == 0U ||
+        !add_u64(total, alignment - 1U, &length) ||
+        !add_u64(length, OS_RT_TLS_HEADER_WORDS * sizeof(uint64_t), &length) ||
+        !align_up_u64(length, OS_RT_PAGE_SIZE, &mapping_size) ||
+        !map_anonymous_any(mapping_size, OS_VM_READ | OS_VM_WRITE,
+                           &template_mapping)) return false;
+    zero_bytes((void *)(uintptr_t)template_mapping, mapping_size);
+    if (!align_up_u64(template_mapping, alignment, &template_base)) goto failure;
+    for (uint32_t index = 0U; index < count; ++index) {
+        if (images[index].tls_file_size == 0U) continue;
+        copy_bytes((void *)(uintptr_t)(template_base + total - images[index].tls_offset),
+                   (const void *)(uintptr_t)images[index].tls_source,
+                   (size_t)images[index].tls_file_size);
+    }
+    if (!map_anonymous_any(mapping_size, OS_VM_READ | OS_VM_WRITE,
+                           &main_mapping) ||
+        !align_up_u64(main_mapping, alignment, &main_base) ||
+        !add_u64(main_base, total, &fs_base)) goto failure;
+    zero_bytes((void *)(uintptr_t)main_mapping, mapping_size);
+    copy_bytes((void *)(uintptr_t)main_base, (const void *)(uintptr_t)template_base,
+               (size_t)total);
+    uint64_t *tcb = (uint64_t *)(uintptr_t)fs_base;
+    tcb[0] = fs_base;
+    tcb[1] = total;
+    tcb[2] = template_base;
+    tcb[3] = OS_RT_TLS_MAGIC;
+    tcb[4] = 0U;
+    tcb[5] = alignment;
+    if (runtime_syscall6(OS_SYS_THREAD_CONTEXT, OS_THREAD_CONTEXT_SET_FS,
+                           fs_base, 0U, 0U, 0U, 0U) >= 0) return true;
+failure:
+    if (main_mapping != 0U) {
+        (void)runtime_syscall3(OS_SYS_VM_UNMAP, main_mapping, mapping_size, 0U);
+    }
+    (void)runtime_syscall3(OS_SYS_VM_UNMAP, template_mapping, mapping_size, 0U);
+    return false;
+}
+
 static bool load_library_file(const char *path, const char *name,
                               uint64_t *next_base, loaded_image_t *image) {
-    liteos_rt_elf64_header_t header = {0};
-    liteos_rt_elf64_program_header_t programs[LITEOS_RT_MAX_PROGRAMS] = {0};
+    runtime_elf64_header_t header = {0};
+    runtime_elf64_program_header_t programs[OS_RT_MAX_PROGRAMS] = {0};
     uint64_t file_size;
     uint64_t minimum = UINT64_MAX;
     uint64_t maximum = 0U;
@@ -593,28 +807,28 @@ static bool load_library_file(const char *path, const char *name,
     if (path == 0 || name == 0 || next_base == 0 || image == 0 ||
         !file_stat_size(path, &file_size) || file_open(path, &handle) < 0) return false;
     if (!file_read_at(handle, 0U, &header, sizeof(header)) ||
-        !valid_header(&header, file_size) || header.type != LITEOS_RT_ET_DYN ||
+        !valid_header(&header, file_size) || header.type != OS_RT_ET_DYN ||
         !read_program_headers(handle, &header, programs)) goto failure;
     for (uint16_t index = 0U; index < header.program_header_count; ++index) {
-        const liteos_rt_elf64_program_header_t *program = &programs[index];
+        const runtime_elf64_program_header_t *program = &programs[index];
         uint64_t end;
-        if (program->type == LITEOS_RT_PT_LOAD) {
+        if (program->type == OS_RT_PT_LOAD) {
             if (!valid_load_range(program, file_size)) goto failure;
             if (program->virtual_address < minimum) minimum = program->virtual_address;
             if (!add_u64(program->virtual_address, program->memory_size, &end) ||
                 end > maximum) maximum = end;
             has_load = true;
-        } else if (program->type == LITEOS_RT_PT_DYNAMIC) {
-            if (has_dynamic || program->memory_size < sizeof(liteos_rt_elf64_dynamic_t)) {
+        } else if (program->type == OS_RT_PT_DYNAMIC) {
+            if (has_dynamic || program->memory_size < sizeof(runtime_elf64_dynamic_t)) {
                 goto failure;
             }
             has_dynamic = true;
         }
     }
     if (!has_load || !has_dynamic || minimum == UINT64_MAX ||
-        !align_up_u64(maximum, LITEOS_RT_PAGE_SIZE, &load_end)) goto failure;
-    minimum = align_down_u64(minimum, LITEOS_RT_PAGE_SIZE);
-    if (!align_up_u64(*next_base, LITEOS_RT_LIBRARY_ALIGN, &mapping_start) ||
+        !align_up_u64(maximum, OS_RT_PAGE_SIZE, &load_end)) goto failure;
+    minimum = align_down_u64(minimum, OS_RT_PAGE_SIZE);
+    if (!align_up_u64(*next_base, OS_RT_LIBRARY_ALIGN, &mapping_start) ||
         mapping_start == 0U || mapping_start < minimum || load_end <= minimum) goto failure;
     image_span = load_end - minimum;
     if (!add_u64(mapping_start, image_span, &runtime_end) ||
@@ -633,19 +847,19 @@ static bool load_library_file(const char *path, const char *name,
     image->phdr_count = header.program_header_count;
     for (uint16_t index = 0U; index < image->phdr_count; ++index) {
         image->phdrs[index] = programs[index];
-        if (programs[index].type == LITEOS_RT_PT_PHDR) {
+        if (programs[index].type == OS_RT_PT_PHDR) {
             image->phdr_address = base + programs[index].virtual_address;
         }
-        if (programs[index].type == LITEOS_RT_PT_DYNAMIC) {
+        if (programs[index].type == OS_RT_PT_DYNAMIC) {
             image->dynamic_address = base + programs[index].virtual_address;
             image->dynamic_size = programs[index].memory_size;
         }
     }
     if (!copy_string(image->name, sizeof(image->name), name)) goto failure;
     for (uint16_t index = 0U; index < image->phdr_count; ++index) {
-        const liteos_rt_elf64_program_header_t *program = &programs[index];
+        const runtime_elf64_program_header_t *program = &programs[index];
         uint64_t target;
-        if (program->type != LITEOS_RT_PT_LOAD || program->memory_size == 0U) continue;
+        if (program->type != OS_RT_PT_LOAD || program->memory_size == 0U) continue;
         if (!add_u64(base, program->virtual_address, &target) ||
             !file_read_at(handle, program->offset, (void *)(uintptr_t)target,
                           program->file_size)) goto failure;
@@ -659,7 +873,7 @@ static bool load_library_file(const char *path, const char *name,
         (void)unmap_image(image);
         return false;
     }
-    if (!add_u64(runtime_end, LITEOS_RT_LIBRARY_GAP, next_base)) {
+    if (!add_u64(runtime_end, OS_RT_LIBRARY_GAP, next_base)) {
         (void)unmap_image(image);
         return false;
     }
@@ -667,28 +881,34 @@ static bool load_library_file(const char *path, const char *name,
 
 failure:
     file_close(handle);
-    if (mapped) (void)liteos_rt_syscall3(OS_SYS_VM_UNMAP, mapping_start,
+    if (mapped) (void)runtime_syscall3(OS_SYS_VM_UNMAP, mapping_start,
                                          mapping_length, 0U);
     return false;
 }
 
-static bool make_library_path(const char *name, char path[LITEOS_RT_MAX_PATH]) {
+static bool make_library_path(const char *name, char path[OS_RT_MAX_PATH]) {
     static const char prefix[] = "/lib/";
     size_t index = 0U;
     size_t name_index = 0U;
     if (name == 0 || path == 0 || name[0] == '\0') return false;
-    if (name[0] == '/') return copy_string(path, LITEOS_RT_MAX_PATH, name);
+    if (name[0] == '/') return copy_string(path, OS_RT_MAX_PATH, name);
     while (prefix[index] != '\0') {
-        if (index + 1U >= LITEOS_RT_MAX_PATH) return false;
+        if (index + 1U >= OS_RT_MAX_PATH) return false;
         path[index] = prefix[index];
         ++index;
     }
-    while (index + 1U < LITEOS_RT_MAX_PATH && name[name_index] != '\0') {
+    while (index + 1U < OS_RT_MAX_PATH && name[name_index] != '\0') {
         path[index++] = name[name_index++];
     }
     if (name[name_index] != '\0') return false;
     path[index] = '\0';
     return true;
+}
+
+/* Absolute and SONAME dependencies must share one libc state. */
+static const char *canonical_library_name(const char *name) {
+    if (same_string(name, "/lib/libsystemc.so.1")) return "libsystemc.so.1";
+    return name;
 }
 
 static int32_t find_image(const loaded_image_t *images, uint32_t count,
@@ -708,15 +928,16 @@ static bool load_needed(loaded_image_t *images, uint32_t *count,
          ++needed_index) {
         uint64_t name_offset = owner->needed[needed_index];
         const char *name;
-        char path[LITEOS_RT_MAX_PATH];
+        char path[OS_RT_MAX_PATH];
         uint64_t name_length;
         if (name_offset >= owner->string_size ||
             owner->string_table > UINT64_MAX - name_offset) return false;
         name = (const char *)(uintptr_t)(owner->string_table + name_offset);
         if (!bounded_string(name, owner->string_size - name_offset, &name_length) ||
-            name_length == 0U || name_length >= LITEOS_RT_MAX_NAME) return false;
+            name_length == 0U || name_length >= OS_RT_MAX_NAME) return false;
+        name = canonical_library_name(name);
         if (find_image(images, *count, name) >= 0) continue;
-        if (*count >= LITEOS_RT_MAX_IMAGES || !make_library_path(name, path) ||
+        if (*count >= OS_RT_MAX_IMAGES || !make_library_path(name, path) ||
             !load_library_file(path, name, next_base, &images[*count])) return false;
         ++*count;
         if (!load_needed(images, count, next_base, *count - 1U)) return false;
@@ -725,19 +946,19 @@ static bool load_needed(loaded_image_t *images, uint32_t *count,
 }
 
 static bool image_symbol(const loaded_image_t *image, uint32_t index,
-                         const liteos_rt_elf64_symbol_t **symbol) {
+                         const runtime_elf64_symbol_t **symbol) {
     uint64_t offset;
     uint64_t address;
     if (image == 0 || symbol == 0 || (uint64_t)index >= image->symbol_count) return false;
-    offset = (uint64_t)index * sizeof(liteos_rt_elf64_symbol_t);
+    offset = (uint64_t)index * sizeof(runtime_elf64_symbol_t);
     if (!add_u64(image->symbol_table, offset, &address) ||
-        !pointer_range(image, address, sizeof(liteos_rt_elf64_symbol_t))) return false;
-    *symbol = (const liteos_rt_elf64_symbol_t *)(uintptr_t)address;
+        !pointer_range(image, address, sizeof(runtime_elf64_symbol_t))) return false;
+    *symbol = (const runtime_elf64_symbol_t *)(uintptr_t)address;
     return true;
 }
 
 static bool symbol_name(const loaded_image_t *image,
-                        const liteos_rt_elf64_symbol_t *symbol,
+                        const runtime_elf64_symbol_t *symbol,
                         const char **name) {
     uint64_t address;
     uint64_t unused_length;
@@ -752,49 +973,52 @@ static bool symbol_name(const loaded_image_t *image,
 
 static bool symbol_value(const loaded_image_t *image, uint32_t index,
                          const char *wanted, uint64_t *value) {
-    const liteos_rt_elf64_symbol_t *symbol;
+    const runtime_elf64_symbol_t *symbol;
     const char *name;
     uint64_t address;
-    if (!image_symbol(image, index, &symbol) || symbol->section == LITEOS_RT_SHN_UNDEF ||
+    if (!image_symbol(image, index, &symbol) || symbol->section == OS_RT_SHN_UNDEF ||
         !symbol_name(image, symbol, &name) || !same_string(name, wanted) ||
         !add_u64(image->base, symbol->value, &address)) return false;
     *value = address;
     return true;
 }
 
-static bool symbol_exported(const liteos_rt_elf64_symbol_t *symbol) {
+static bool symbol_exported(const runtime_elf64_symbol_t *symbol) {
     uint32_t binding;
     uint32_t visibility;
     if (symbol == 0) return false;
-    binding = liteos_rt_elf64_symbol_bind(symbol->info);
+    binding = runtime_elf64_symbol_bind(symbol->info);
     visibility = symbol->other & 3U;
-    return (binding == LITEOS_RT_STB_GLOBAL || binding == LITEOS_RT_STB_WEAK) &&
+    return (binding == OS_RT_STB_GLOBAL || binding == OS_RT_STB_WEAK ||
+            binding == OS_RT_STB_GNU_UNIQUE) &&
            (visibility == 0U || visibility == 3U);
 }
 
 static bool resolve_symbol(const loaded_image_t *images, uint32_t count,
                            const loaded_image_t *owner, uint32_t symbol_index,
                            uint64_t *value) {
-    const liteos_rt_elf64_symbol_t *symbol;
+    const runtime_elf64_symbol_t *symbol;
     const char *name;
     uint32_t binding;
     uint64_t weak_value = 0U;
     bool weak_found = false;
     if (!image_symbol(owner, symbol_index, &symbol) ||
         !symbol_name(owner, symbol, &name)) return false;
-    binding = liteos_rt_elf64_symbol_bind(symbol->info);
-    if ((symbol->other & 3U) != 0U || binding == LITEOS_RT_STB_LOCAL) {
-        if (symbol->section == LITEOS_RT_SHN_UNDEF) return binding == LITEOS_RT_STB_WEAK;
+    binding = runtime_elf64_symbol_bind(symbol->info);
+    if ((symbol->other & 3U) != 0U || binding == OS_RT_STB_LOCAL) {
+        if (symbol->section == OS_RT_SHN_UNDEF) return binding == OS_RT_STB_WEAK;
         return symbol_value(owner, symbol_index, name, value);
     }
     for (uint32_t index = 0U; index < count; ++index) {
         for (uint32_t candidate = 0U; candidate < images[index].symbol_count; ++candidate) {
-            const liteos_rt_elf64_symbol_t *candidate_symbol;
+            const runtime_elf64_symbol_t *candidate_symbol;
             if (!image_symbol(&images[index], candidate, &candidate_symbol) ||
                 !symbol_exported(candidate_symbol)) continue;
             if (symbol_value(&images[index], candidate, name, value)) {
-                if (liteos_rt_elf64_symbol_bind(candidate_symbol->info) ==
-                    LITEOS_RT_STB_GLOBAL) return true;
+                if (runtime_elf64_symbol_bind(candidate_symbol->info) ==
+                    OS_RT_STB_GLOBAL ||
+                    runtime_elf64_symbol_bind(candidate_symbol->info) ==
+                    OS_RT_STB_GNU_UNIQUE) return true;
                 weak_value = *value;
                 weak_found = true;
             }
@@ -804,11 +1028,57 @@ static bool resolve_symbol(const loaded_image_t *images, uint32_t count,
         *value = weak_value;
         return true;
     }
-    if (binding == LITEOS_RT_STB_WEAK) {
+    if (binding == OS_RT_STB_WEAK) {
         *value = 0U;
         return true;
     }
     return false;
+}
+
+static bool resolve_static_tls(const loaded_image_t *images, uint32_t count,
+                               const loaded_image_t *owner, uint32_t symbol_index,
+                               uint64_t *value, uint64_t *offset) {
+    const runtime_elf64_symbol_t *reference, *selected = 0;
+    const loaded_image_t *definition = 0;
+    const char *name;
+    if (!image_symbol(owner, symbol_index, &reference) ||
+        !symbol_name(owner, reference, &name)) return false;
+    uint32_t binding = runtime_elf64_symbol_bind(reference->info);
+    if ((reference->other & 3U) != 0U || binding == OS_RT_STB_LOCAL) {
+        if (reference->section != OS_RT_SHN_UNDEF) {
+            selected = reference;
+            definition = owner;
+        }
+    } else {
+        for (uint32_t index = 0U; index < count; ++index) {
+            for (uint32_t candidate = 0U; candidate < images[index].symbol_count;
+                 ++candidate) {
+                const runtime_elf64_symbol_t *symbol;
+                const char *candidate_name;
+                if (!image_symbol(&images[index], candidate, &symbol) ||
+                    symbol->section == OS_RT_SHN_UNDEF || !symbol_exported(symbol) ||
+                    !symbol_name(&images[index], symbol, &candidate_name) ||
+                    !same_string(candidate_name, name)) continue;
+                selected = symbol;
+                definition = &images[index];
+                if (runtime_elf64_symbol_bind(symbol->info) != OS_RT_STB_WEAK) {
+                    goto found;
+                }
+            }
+        }
+    }
+found:
+    if (selected == 0) {
+        if (binding != OS_RT_STB_WEAK) return false;
+        *value = *offset = 0U;
+        return true;
+    }
+    if ((selected->info & 15U) != OS_RT_STT_TLS || definition->tls_offset == 0U ||
+        selected->value >= definition->tls_size ||
+        selected->size > definition->tls_size - selected->value) return false;
+    *value = selected->value;
+    *offset = definition->tls_offset;
+    return true;
 }
 
 static bool relocation_target(const loaded_image_t *image, uint64_t offset,
@@ -823,49 +1093,72 @@ static bool apply_relocation_table(const loaded_image_t *images, uint32_t count,
                                    const loaded_image_t *image, uint64_t address,
                                    uint64_t size) {
     uint64_t entry_size = image->rela_entry_size == 0U ?
-                          sizeof(liteos_rt_elf64_rela_t) : image->rela_entry_size;
+                          sizeof(runtime_elf64_rela_t) : image->rela_entry_size;
     if (size == 0U) return true;
-    if (address == 0U || entry_size != sizeof(liteos_rt_elf64_rela_t) ||
+    if (address == 0U || entry_size != sizeof(runtime_elf64_rela_t) ||
         size % entry_size != 0U || !pointer_range(image, address, size)) return false;
     for (uint64_t offset = 0U; offset < size; offset += entry_size) {
-        const liteos_rt_elf64_rela_t *rela =
-            (const liteos_rt_elf64_rela_t *)(uintptr_t)(address + offset);
-        uint32_t type = liteos_rt_elf64_relocation_type(rela->info);
-        uint32_t symbol_index = liteos_rt_elf64_relocation_symbol(rela->info);
+        const runtime_elf64_rela_t *rela =
+            (const runtime_elf64_rela_t *)(uintptr_t)(address + offset);
+        uint32_t type = runtime_elf64_relocation_type(rela->info);
+        uint32_t symbol_index = runtime_elf64_relocation_symbol(rela->info);
         uint64_t target;
         uint64_t symbol = 0U;
         uint64_t value;
-        if (type == LITEOS_RT_R_X86_64_NONE) continue;
-        if (type == LITEOS_RT_R_X86_64_32 || type == LITEOS_RT_R_X86_64_32S) {
+        if (type == OS_RT_R_X86_64_NONE) continue;
+        /* Resolvers can call other DSOs and read TLS. Defer their execution
+         * until every ordinary relocation, TLS and executable mapping is ready. */
+        if (type == OS_RT_R_X86_64_IRELATIVE) {
+            if (symbol_index != 0U ||
+                !relocation_target(image, rela->offset, sizeof(uint64_t), &target)) {
+                return false;
+            }
+            continue;
+        }
+        if (type == OS_RT_R_X86_64_TPOFF64) {
+            uint64_t tls_offset;
+            if (!relocation_target(image, rela->offset, sizeof(uint64_t), &target)) {
+                return false;
+            }
+            if (symbol_index == 0U) {
+                if (image->tls_offset == 0U) return false;
+                symbol = 0U;
+                tls_offset = image->tls_offset;
+            } else if (!resolve_static_tls(images, count, image, symbol_index,
+                                            &symbol, &tls_offset)) return false;
+            *(uint64_t *)(uintptr_t)target = symbol + (uint64_t)rela->addend - tls_offset;
+            continue;
+        }
+        if (type == OS_RT_R_X86_64_32 || type == OS_RT_R_X86_64_32S) {
             if (!relocation_target(image, rela->offset, sizeof(uint32_t), &target)) return false;
         } else if (!relocation_target(image, rela->offset, sizeof(uint64_t), &target)) {
             return false;
         }
-        if (type != LITEOS_RT_R_X86_64_RELATIVE &&
+        if (type != OS_RT_R_X86_64_RELATIVE &&
             !resolve_symbol(images, count, image, symbol_index, &symbol)) return false;
         switch (type) {
-        case LITEOS_RT_R_X86_64_RELATIVE:
+        case OS_RT_R_X86_64_RELATIVE:
             value = image->base + (uint64_t)rela->addend;
             *(uint64_t *)(uintptr_t)target = value;
             break;
-        case LITEOS_RT_R_X86_64_64:
-        case LITEOS_RT_R_X86_64_GLOB_DAT:
-        case LITEOS_RT_R_X86_64_JUMP_SLOT:
+        case OS_RT_R_X86_64_64:
+        case OS_RT_R_X86_64_GLOB_DAT:
+        case OS_RT_R_X86_64_JUMP_SLOT:
             *(uint64_t *)(uintptr_t)target = symbol + (uint64_t)rela->addend;
             break;
-        case LITEOS_RT_R_X86_64_PC32:
-        case LITEOS_RT_R_X86_64_PLT32: {
+        case OS_RT_R_X86_64_PC32:
+        case OS_RT_R_X86_64_PLT32: {
             int64_t relative = (int64_t)(symbol + (uint64_t)rela->addend - target);
             if (relative < INT32_MIN || relative > INT32_MAX) return false;
             *(uint32_t *)(uintptr_t)target = (uint32_t)(int32_t)relative;
             break;
         }
-        case LITEOS_RT_R_X86_64_32:
+        case OS_RT_R_X86_64_32:
             value = symbol + (uint64_t)rela->addend;
             if (value > UINT32_MAX) return false;
             *(uint32_t *)(uintptr_t)target = (uint32_t)value;
             break;
-        case LITEOS_RT_R_X86_64_32S:
+        case OS_RT_R_X86_64_32S:
             value = symbol + (uint64_t)rela->addend;
             if ((int64_t)value < INT32_MIN || (int64_t)value > INT32_MAX) return false;
             *(uint32_t *)(uintptr_t)target = (uint32_t)value;
@@ -882,7 +1175,7 @@ static bool apply_relocations(const loaded_image_t *images, uint32_t count,
     if (!apply_relocation_table(images, count, image, image->rela, image->rela_size)) {
         return false;
     }
-    if (image->jmprel_size != 0U && image->plt_reloc_type != LITEOS_RT_DT_RELA_TYPE) {
+    if (image->jmprel_size != 0U && image->plt_reloc_type != OS_RT_DT_RELA_TYPE) {
         return false;
     }
     return apply_relocation_table(images, count, image, image->jmprel,
@@ -891,23 +1184,23 @@ static bool apply_relocations(const loaded_image_t *images, uint32_t count,
 
 static bool protect_image(const loaded_image_t *image) {
     for (uint16_t index = 0U; index < image->phdr_count; ++index) {
-        const liteos_rt_elf64_program_header_t *program = &image->phdrs[index];
+        const runtime_elf64_program_header_t *program = &image->phdrs[index];
         uint64_t start;
         uint64_t end;
-        if (program->type != LITEOS_RT_PT_LOAD) continue;
+        if (program->type != OS_RT_PT_LOAD) continue;
         if (program->memory_size == 0U ||
             !add_u64(image->base, program->virtual_address, &start) ||
             !add_u64(start, program->memory_size, &end)) {
-            liteos_rt_diag("LITEOS_DIAG_RT_PROTECT_CALC\r\n");
+            runtime_diag("OS_DIAG_RT_PROTECT_CALC\r\n");
             return false;
         }
-        start = align_down_u64(start, LITEOS_RT_PAGE_SIZE);
-        if (!align_up_u64(end, LITEOS_RT_PAGE_SIZE, &end) || end <= start) {
-            liteos_rt_diag("LITEOS_DIAG_RT_PROTECT_ALIGN\r\n");
+        start = align_down_u64(start, OS_RT_PAGE_SIZE);
+        if (!align_up_u64(end, OS_RT_PAGE_SIZE, &end) || end <= start) {
+            runtime_diag("OS_DIAG_RT_PROTECT_ALIGN\r\n");
             return false;
         }
         if (!protect_range(start, end - start, program->flags)) {
-            liteos_rt_diag("LITEOS_DIAG_RT_PROTECT_SYSCALL\r\n");
+            runtime_diag("OS_DIAG_RT_PROTECT_SYSCALL\r\n");
             return false;
         }
     }
@@ -915,6 +1208,46 @@ static bool protect_image(const loaded_image_t *image) {
 }
 
 typedef void (*init_function_t)(void);
+
+static bool apply_indirect_relocation_table(const loaded_image_t *image,
+                                            uint64_t address, uint64_t size) {
+    uint64_t entry_size = image->rela_entry_size == 0U ?
+                          sizeof(runtime_elf64_rela_t) : image->rela_entry_size;
+    if (size == 0U) return true;
+    if (address == 0U || entry_size != sizeof(runtime_elf64_rela_t) ||
+        size % entry_size != 0U || !pointer_range(image, address, size)) return false;
+    for (uint64_t offset = 0U; offset < size; offset += entry_size) {
+        const runtime_elf64_rela_t *rela =
+            (const runtime_elf64_rela_t *)(uintptr_t)(address + offset);
+        uint64_t target, resolver;
+        bool executable = false;
+        if (runtime_elf64_relocation_type(rela->info) != OS_RT_R_X86_64_IRELATIVE) {
+            continue;
+        }
+        if (runtime_elf64_relocation_symbol(rela->info) != 0U || rela->addend < 0 ||
+            !relocation_target(image, rela->offset, sizeof(uint64_t), &target) ||
+            !add_u64(image->base, (uint64_t)rela->addend, &resolver)) return false;
+        for (uint16_t index = 0U; index < image->phdr_count; ++index) {
+            const runtime_elf64_program_header_t *program = &image->phdrs[index];
+            uint64_t start;
+            if (program->type == OS_RT_PT_LOAD && (program->flags & OS_RT_PF_X) &&
+                add_u64(image->base, program->virtual_address, &start) &&
+                resolver >= start && resolver - start < program->memory_size) {
+                executable = true;
+                break;
+            }
+        }
+        if (!executable) return false;
+        *(uint64_t *)(uintptr_t)target =
+            ((uint64_t (*)(void))(uintptr_t)resolver)();
+    }
+    return true;
+}
+
+static bool apply_indirect_relocations(const loaded_image_t *image) {
+    return apply_indirect_relocation_table(image, image->rela, image->rela_size) &&
+           apply_indirect_relocation_table(image, image->jmprel, image->jmprel_size);
+}
 
 static bool call_initializers(const loaded_image_t *image) {
     if (image->init != 0U) ((init_function_t)(uintptr_t)image->init)();
@@ -928,33 +1261,61 @@ static bool call_initializers(const loaded_image_t *image) {
     return true;
 }
 
-uint64_t liteos_dynamic_linker_main(uint64_t initial_stack) {
-    loaded_image_t images[LITEOS_RT_MAX_IMAGES] = {0};
+uint64_t runtime_linker_main(uint64_t initial_stack) {
+    loaded_image_t images[OS_RT_MAX_IMAGES] = {0};
     uint32_t image_count = 1U;
-    uint64_t next_base = LITEOS_RT_LIBRARY_BASE;
+    uint64_t next_base = OS_RT_LIBRARY_BASE;
+    uint64_t library_floor;
+    uint64_t tls_total, tls_alignment;
     if (!initialize_main_image(initial_stack, &images[0])) {
-        liteos_rt_diag("LITEOS_DIAG_RT_FAIL main-image\\n");
+        runtime_diag("OS_DIAG_RT_FAIL main-image\r\n");
         return 0U;
     }
+    /* A large PIE such as Chrome can extend past the historical fixed
+     * library base.  Place DSOs after the main image so their fixed mappings
+     * cannot collide with the executable's PT_LOAD span. */
+    if (images[0].image_end >= next_base) {
+        if (!add_u64(images[0].image_end, OS_RT_LIBRARY_GAP,
+                     &library_floor) ||
+            !align_up_u64(library_floor, OS_RT_LIBRARY_ALIGN,
+                          &next_base)) {
+            runtime_diag("OS_DIAG_RT_FAIL library-base\r\n");
+            return 0U;
+        }
+    }
     if (!load_needed(images, &image_count, &next_base, 0U)) {
-        liteos_rt_diag("LITEOS_DIAG_RT_FAIL needed\\n");
+        runtime_diag("OS_DIAG_RT_FAIL needed\r\n");
+        return 0U;
+    }
+    if (!plan_static_tls(images, image_count, &tls_total, &tls_alignment)) {
+        runtime_diag("OS_DIAG_RT_FAIL tls-layout\r\n");
         return 0U;
     }
     for (uint32_t index = 0U; index < image_count; ++index) {
         if (!apply_relocations(images, image_count, &images[index])) {
-            liteos_rt_diag("LITEOS_DIAG_RT_FAIL reloc\\n");
+            runtime_diag("OS_DIAG_RT_FAIL reloc\r\n");
             return 0U;
         }
     }
+    if (!setup_static_tls(images, image_count, tls_total, tls_alignment)) {
+        runtime_diag("OS_DIAG_RT_FAIL tls\r\n");
+        return 0U;
+    }
     for (uint32_t index = 1U; index < image_count; ++index) {
         if (!protect_image(&images[index])) {
-            liteos_rt_diag("LITEOS_DIAG_RT_FAIL protect\r\n");
+            runtime_diag("OS_DIAG_RT_FAIL protect\r\n");
+            return 0U;
+        }
+    }
+    for (uint32_t index = 0U; index < image_count; ++index) {
+        if (!apply_indirect_relocations(&images[index])) {
+            runtime_diag("OS_DIAG_RT_FAIL indirect-reloc\r\n");
             return 0U;
         }
     }
     for (uint32_t index = image_count; index > 1U; --index) {
         if (!call_initializers(&images[index - 1U])) {
-            liteos_rt_diag("LITEOS_DIAG_RT_FAIL init\\n");
+            runtime_diag("OS_DIAG_RT_FAIL init\r\n");
             return 0U;
         }
     }

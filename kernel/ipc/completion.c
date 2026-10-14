@@ -2,14 +2,11 @@
 #include <kernel/mm.h>
 
 static void completion_port_lock(completion_port_t *port) {
-    while (atomic_exchange_explicit(&port->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&port->lock);
 }
 
 static void completion_port_unlock(completion_port_t *port) {
-    atomic_store_explicit(&port->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&port->lock);
 }
 
 static bool completion_port_ready(void *context) {
@@ -69,13 +66,14 @@ kstatus_t completion_port_create(uint32_t capacity, completion_port_t **out) {
     if (capacity == 0U) capacity = COMPLETION_PORT_DEFAULT_CAPACITY;
     if (capacity > COMPLETION_PORT_MAX_CAPACITY) return K_EINVAL;
 
-    completion_port_t *port = (completion_port_t *)kzalloc(sizeof(*port), 0);
+    /* Capacity is bounded above before sizing. Every readable slot is fully
+     * written by post before count publishes it under the port lock. */
+    completion_port_t *port = (completion_port_t *)kmalloc(
+        sizeof(*port) + (size_t)capacity * sizeof(port->entries[0]), 0);
     if (port == 0) return K_ENOMEM;
-    refcount_init(&port->object.refs, 1U);
-    port->object.type = KOBJECT_TYPE_COMPLETION_PORT;
-    port->object.flags = 0;
-    port->object.ops = &g_completion_port_ops;
-    atomic_init(&port->lock.state, 0U);
+    object_header_init(&port->object, KOBJECT_TYPE_COMPLETION_PORT,
+                       &g_completion_port_ops);
+    spinlock_init(&port->lock);
     wait_queue_init(&port->waitq);
     atomic_init(&port->closed, false);
     port->capacity = capacity;
@@ -99,7 +97,7 @@ kstatus_t completion_port_post(completion_port_t *port,
         return K_EAGAIN;
     }
     port->entries[port->tail] = *entry;
-    port->tail = (port->tail + 1U) % port->capacity;
+    if (++port->tail == port->capacity) port->tail = 0U;
     ++port->count;
     completion_port_unlock(port);
     (void)wake_one(&port->waitq);
@@ -111,14 +109,12 @@ kstatus_t completion_port_wait(completion_port_t *port, uint64_t timeout_ns,
                                os_completion_entry_t *entry) {
     if (port == 0 || entry == 0) return K_EINVAL;
     for (;;) {
-        kstatus_t status = wait_on_queue(&port->waitq, completion_port_ready,
-                                         port, timeout_ns);
-        if (status != K_OK) return status;
-
+        /* Ready entries do not need a wait subscription/predicate lock.
+         * The wait path rechecks readiness before it can sleep. */
         completion_port_lock(port);
         if (port->count != 0U) {
             *entry = port->entries[port->head];
-            port->head = (port->head + 1U) % port->capacity;
+            if (++port->head == port->capacity) port->head = 0U;
             --port->count;
             completion_port_unlock(port);
             return K_OK;
@@ -126,6 +122,10 @@ kstatus_t completion_port_wait(completion_port_t *port, uint64_t timeout_ns,
         bool closed = atomic_load_explicit(&port->closed, memory_order_acquire);
         completion_port_unlock(port);
         if (closed) return K_ECANCELED;
+        if (timeout_ns == 0U) return K_ETIMEDOUT;
+        kstatus_t status = wait_on_queue(&port->waitq, completion_port_ready,
+                                         port, timeout_ns);
+        if (status != K_OK) return status;
     }
 }
 
@@ -133,8 +133,12 @@ kstatus_t completion_port_close(completion_port_t *port) {
     if (port == 0) return K_EINVAL;
     bool was_closed = atomic_exchange_explicit(&port->closed, true,
                                                memory_order_acq_rel);
-    (void)wake_all(&port->waitq);
-    if (!was_closed) object_notify_signaled(port);
+    /* Closed readiness is permanent. A later waiter rechecks the predicate
+     * while subscribing; repeated closes need not rescan either wait queue. */
+    if (!was_closed) {
+        (void)wake_all(&port->waitq);
+        object_notify_signaled(port);
+    }
     return K_OK;
 }
 
@@ -165,6 +169,13 @@ bool completion_port_self_test(void) {
                    completion_port_wait(port, 0U, &received) == K_ETIMEDOUT &&
                    completion_port_close(port) == K_OK &&
                    completion_port_wait(port, 0U, &received) == K_ECANCELED;
+    uint32_t sequence = atomic_load_explicit(&port->waitq.sequence,
+                                              memory_order_acquire);
+    for (uint32_t i = 0U; success && i < 64U; ++i) {
+        success = completion_port_close(port) == K_OK &&
+                  atomic_load_explicit(&port->waitq.sequence,
+                                       memory_order_acquire) == sequence;
+    }
     object_put(port);
     return success;
 }

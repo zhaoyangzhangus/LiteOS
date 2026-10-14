@@ -1,5 +1,8 @@
 #pragma once
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int isalnum(int value);
 int isalpha(int value);
 int isblank(int value);
@@ -15,3 +18,6 @@ int isupper(int value);
 int isxdigit(int value);
 int tolower(int value);
 int toupper(int value);
+#ifdef __cplusplus
+}
+#endif

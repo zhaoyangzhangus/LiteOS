@@ -18,7 +18,7 @@ $phase3Root = Join-Path $repoRoot 'build\nvidia\phase3'
 $phase4Root = Join-Path $repoRoot 'build\nvidia\phase4'
 $phase5Root = Join-Path $repoRoot 'build\nvidia\phase5'
 $phase5ObjectRoot = Join-Path $phase5Root 'objects'
-$phase5LiteosRoot = Join-Path $phase5ObjectRoot 'liteos'
+$phase5SystemRoot = Join-Path $phase5ObjectRoot 'system'
 $phase5AbiRoot = Join-Path $phase5ObjectRoot 'vendor_abi'
 $phase5LinkList = Join-Path $phase5Root 'phase5_link_objects.list'
 $phase5Kernel = Join-Path $phase5Root 'kernel.elf'
@@ -126,8 +126,8 @@ if (Test-Path -LiteralPath $priorLogsRoot -PathType Container) {
 $priorGateLog = $null
 foreach ($candidate in $priorLogs) {
     $candidateText = Get-Content -LiteralPath $candidate.FullName -Raw
-    if ($candidateText -match 'LITEOS_NVIDIA_PHASE4_GATE_READY' -and
-        $candidateText -match 'LITEOS_REALTEST_PASS') {
+    if ($candidateText -match 'OS_NVIDIA_PHASE4_GATE_READY' -and
+        $candidateText -match 'OS_REALTEST_PASS') {
         $priorGateLog = $candidate.FullName
         break
     }
@@ -206,7 +206,7 @@ $abiDefines = @(
     '-DRS_PROVIDES_API_STATE=0', '-DNV_CONTAINERS_NO_TEMPLATES',
     '-DINCLUDE_NVLINK_LIB', '-DINCLUDE_NVSWITCH_LIB',
     '-DNV_PRINTF_STRINGS_ALLOWED=0', '-DNV_ASSERT_FAILED_USES_STRINGS=0',
-    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DLITEOS_KERNEL_BUILD')
+    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DOS_KERNEL_BUILD')
 $abiCommonFlags = @(
     '-fno-strict-aliasing', '-fno-omit-frame-pointer', '-Wformat=2',
     '-Wno-unused-parameter', '-O2', '-ffreestanding', '-fno-stack-protector',
@@ -220,7 +220,7 @@ $abiCFlags = @('-include', $cpuOpsysHeader.Replace('\', '/')) +
 $abiAsmFlags = @(
     '-ffreestanding', '-fno-stack-protector', '-fno-common', '-fno-pic',
     '-mno-red-zone', '-mno-mmx', '-mno-sse', '-mno-sse2', '-mno-3dnow',
-    '-mcmodel=kernel', '-DLITEOS_NVIDIA_PHASE5=1')
+    '-mcmodel=kernel', '-DOS_NVIDIA_PHASE5=1')
 $bridgeIncludes = @(
     ('-I' + (Join-Path $repoRoot 'include').Replace('\', '/')),
     ('-I' + (Join-Path $rmSourceRoot 'include').Replace('\', '/'))) +
@@ -238,8 +238,8 @@ $bridgeDefines = @(
     '-DRS_PROVIDES_API_STATE=0', '-DNV_CONTAINERS_NO_TEMPLATES',
     '-DINCLUDE_NVLINK_LIB', '-DINCLUDE_NVSWITCH_LIB',
     '-DNV_PRINTF_STRINGS_ALLOWED=0', '-DNV_ASSERT_FAILED_USES_STRINGS=0',
-    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DLITEOS_KERNEL_BUILD',
-    '-DLITEOS_NVIDIA_PHASE5=1')
+    '-DPORT_ASSERT_FAILED_USES_STRINGS=0', '-DOS_KERNEL_BUILD',
+    '-DOS_NVIDIA_PHASE5=1')
 $bridgeFlags = @('-include', $cpuOpsysHeader.Replace('\', '/')) +
                $bridgeIncludes + $bridgeDefines + @(
     '-fno-strict-aliasing', '-fno-omit-frame-pointer', '-Wformat=2',
@@ -249,40 +249,44 @@ $bridgeFlags = @('-include', $cpuOpsysHeader.Replace('\', '/')) +
     '-mno-3dnow', '-Werror-implicit-function-declaration', '-Wwrite-strings',
     '-Wundef', '--std=gnu11', '-mcmodel=kernel')
 
-$liteosFlags = @(
+$systemFlags = @(
     '-O2', '-g3', '-fno-omit-frame-pointer', '-Wall', '-Wextra', '-Werror',
     '-Wno-error=unused-function', '-ffreestanding', '-fno-builtin',
     '-fno-stack-protector', '-fno-stack-check', '-fno-pic', '-mno-red-zone',
     '-mno-sse', '-mno-mmx', '-mno-stack-arg-probe', '-fshort-wchar',
     ('-I' + (Join-Path $repoRoot 'include').Replace('\', '/')), '-MMD', '-MP',
-    '-DLITEOS_REALTEST=1', '-mabi=sysv', '-DLITEOS_KERNEL_BUILD',
-    '-DLITEOS_DEBUG_SERIAL=1', '-DLITEOS_REALTEST_FAILURE_TEST=0',
-    '-DLITEOS_XHCI_DIAGNOSTIC_BOT=0', '-DLITEOS_NVIDIA_REALTEST_NO_DESKTOP=1',
-    '-DLITEOS_NVIDIA_PHASE5=1', '-mcmodel=kernel')
-$driverLiteosFlags = $liteosFlags + @(
+    '-DOS_REALTEST=1', '-mabi=sysv', '-DOS_KERNEL_BUILD',
+    '-DOS_DEBUG_SERIAL=1', '-DOS_REALTEST_FAILURE_TEST=0',
+    '-DOS_XHCI_DIAGNOSTIC_BOT=0', '-DOS_NVIDIA_REALTEST_NO_DESKTOP=1',
+    '-DOS_NVIDIA_PHASE5=1', '-mcmodel=kernel')
+$driverSystemFlags = $systemFlags + @(
     ('-I' + (Join-Path $repoRoot 'kernel\drivers\gpu\nvidia\port\include').Replace('\', '/')),
     ('-I' + (Join-Path $rmSourceRoot 'include').Replace('\', '/')))
 
 New-Item -ItemType Directory -Path $phase5Root -Force | Out-Null
-New-Item -ItemType Directory -Path $phase5LiteosRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $phase5SystemRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $phase5AbiRoot -Force | Out-Null
 
 Invoke-CompileIfChanged (Join-Path $repoRoot 'kernel\init\devices.c') `
-    (Join-Path $phase5LiteosRoot 'devices-init.o') $liteosFlags
+    (Join-Path $phase5SystemRoot 'devices-init.o') $systemFlags
 Invoke-CompileIfChanged (Join-Path $repoRoot 'kernel\init\runtime.c') `
-    (Join-Path $phase5LiteosRoot 'runtime-init.o') $liteosFlags
+    (Join-Path $phase5SystemRoot 'runtime-init.o') $systemFlags
 Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_driver.c') `
-    (Join-Path $phase5LiteosRoot 'nvidia-rm-driver.o') $driverLiteosFlags
+    (Join-Path $phase5SystemRoot 'nvidia-rm-driver.o') $driverSystemFlags
+Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_frontend.c') `
+    (Join-Path $phase5SystemRoot 'nvidia-rm-frontend.o') $driverSystemFlags
 Invoke-CompileIfChanged (Join-Path $portSourceRoot 'nv_port_memory.c') `
-    (Join-Path $phase5ObjectRoot 'nvidia-port-memory.o') $driverLiteosFlags
+    (Join-Path $phase5ObjectRoot 'nvidia-port-memory.o') $driverSystemFlags
 Invoke-CompileIfChanged (Join-Path $portSourceRoot 'nv_port_vm.c') `
-    (Join-Path $phase5ObjectRoot 'nvidia-port-vm.o') $driverLiteosFlags
+    (Join-Path $phase5ObjectRoot 'nvidia-port-vm.o') $driverSystemFlags
 Invoke-CompileIfChanged (Join-Path $mmSourceRoot 'vmalloc.c') `
-    (Join-Path $phase5ObjectRoot 'vmalloc.o') $liteosFlags
+    (Join-Path $phase5ObjectRoot 'vmalloc.o') $systemFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_nv_unsupported.S') `
     (Join-Path $phase5AbiRoot '0006.o') $abiAsmFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_memory.c') `
     (Join-Path $phase5AbiRoot '0003.o') $abiCFlags
+Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_os.c') `
+    (Join-Path $phase5AbiRoot '0009.o') $abiCFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_pci.c') `
     (Join-Path $phase5AbiRoot '0011.o') $abiCFlags
 Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_firmware.c') `
@@ -290,16 +294,18 @@ Invoke-CompileIfChanged (Join-Path $abiSourceRoot 'nvabi_firmware.c') `
 Invoke-CompileIfChanged (Join-Path $rmSourceRoot 'nv_rm_vendor_bridge.c') `
     (Join-Path $phase5ObjectRoot 'nv_rm_vendor_bridge.o') $bridgeFlags
 Invoke-CompileIfChanged (Join-Path $repoRoot 'boot\uefi\sha256.c') `
-    (Join-Path $phase5ObjectRoot 'sha256.o') $liteosFlags
+    (Join-Path $phase5ObjectRoot 'sha256.o') $systemFlags
 
 $replacementObjects = @{
-    'devices-init.o' = (Join-Path $phase5LiteosRoot 'devices-init.o').Replace('\', '/')
-    'runtime-init.o' = (Join-Path $phase5LiteosRoot 'runtime-init.o').Replace('\', '/')
-    'nvidia-rm-driver.o' = (Join-Path $phase5LiteosRoot 'nvidia-rm-driver.o').Replace('\', '/')
+    'devices-init.o' = (Join-Path $phase5SystemRoot 'devices-init.o').Replace('\', '/')
+    'runtime-init.o' = (Join-Path $phase5SystemRoot 'runtime-init.o').Replace('\', '/')
+    'nvidia-rm-driver.o' = (Join-Path $phase5SystemRoot 'nvidia-rm-driver.o').Replace('\', '/')
+    'nvidia-rm-frontend.o' = (Join-Path $phase5SystemRoot 'nvidia-rm-frontend.o').Replace('\', '/')
     'nvidia-port-memory.o' = (Join-Path $phase5ObjectRoot 'nvidia-port-memory.o').Replace('\', '/')
     'nvidia-port-vm.o' = (Join-Path $phase5ObjectRoot 'nvidia-port-vm.o').Replace('\', '/')
     'vmalloc.o' = (Join-Path $phase5ObjectRoot 'vmalloc.o').Replace('\', '/')
     '0011.o' = (Join-Path $phase5AbiRoot '0011.o').Replace('\', '/')
+    '0009.o' = (Join-Path $phase5AbiRoot '0009.o').Replace('\', '/')
 }
 $phase4Rows = @(Get-Content -LiteralPath $phase4LinkList |
     Where-Object { $_ -and $_[0] -ne '#' })
@@ -322,6 +328,7 @@ foreach ($row in $phase4Rows) {
         [void]$linkRows.Add($row)
     }
 }
+[void]$linkRows.Add((Join-Path $phase5SystemRoot 'nvidia-rm-frontend.o').Replace('\', '/'))
 [void]$linkRows.Add((Join-Path $phase5AbiRoot 'nvabi_firmware.o').Replace('\', '/'))
 [void]$linkRows.Add((Join-Path $phase5ObjectRoot 'sha256.o').Replace('\', '/'))
 [IO.File]::WriteAllLines($phase5LinkList, [string[]]$linkRows,
@@ -347,10 +354,10 @@ if (@($undefined | Where-Object { $_.Trim() }).Count -ne 0) {
 $script:stageCopied = 0
 $script:stageSkipped = 0
 Copy-DirectoryContents (Join-Path $phase4Root 'esp') $phase5Esp
-Copy-FileIfChanged $phase5Kernel (Join-Path $phase5Esp 'EFI\LITEOS\kernel.elf')
+Copy-FileIfChanged $phase5Kernel (Join-Path $phase5Esp 'EFI\OS\kernel.elf')
 foreach ($firmwareName in $firmwareNames) {
     Copy-FileIfChanged (Join-Path $firmwareRoot $firmwareName) `
-        (Join-Path $phase5Esp ('EFI\LITEOS\firmware\{0}' -f $firmwareName))
+        (Join-Path $phase5Esp ('EFI\OS\firmware\{0}' -f $firmwareName))
 }
 
 $firmwareManifest = New-Object 'System.Collections.Generic.List[string]'

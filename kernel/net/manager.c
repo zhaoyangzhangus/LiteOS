@@ -5,6 +5,7 @@
 #include <kernel/rtl8126.h>
 #include <kernel/spinlock.h>
 #include <kernel/socket.h>
+#include <kernel/string.h>
 #include <uapi/network.h>
 #include <uapi/syscall.h>
 
@@ -15,28 +16,24 @@ static uint32_t g_net_manager_poll_divider;
 static message_port_t *g_net_manager_event_port;
 
 static void net_manager_lock(void) {
-    while (atomic_exchange_explicit(&g_net_manager_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_net_manager_lock);
 }
 
 static void net_manager_unlock(void) {
-    atomic_store_explicit(&g_net_manager_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_net_manager_lock);
 }
 
 static void net_manager_zero(void *memory, size_t length) {
-    uint8_t *bytes = (uint8_t *)memory;
-    while (length-- != 0U) *bytes++ = 0U;
+    memset(memory, 0, length);
 }
 
 static void net_manager_copy(void *destination, const void *source, size_t length) {
-    uint8_t *out = (uint8_t *)destination;
-    const uint8_t *in = (const uint8_t *)source;
-    while (length-- != 0U) *out++ = *in++;
+    memmove(destination, source, length);
 }
 
 bool net_manager_init(void) {
+    if (atomic_load_explicit(&g_net_manager_init_state, memory_order_acquire) == 2U)
+        return true;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_net_manager_init_state, &expected, 1U,
                                                 memory_order_acq_rel,
@@ -85,8 +82,9 @@ void net_manager_poll(void) {
     uint8_t mac[6] = {0};
     bool ipv6_configured = false;
     bool link_changed = false;
+    bool interrupt_ready;
     message_port_t *event_port = 0;
-    os_net_event_t event = {0};
+    os_net_event_t event;
     if (atomic_load_explicit(&g_net_manager_init_state, memory_order_acquire) != 2U) {
         return;
     }
@@ -96,7 +94,11 @@ void net_manager_poll(void) {
      * queued behind an ARP request; an IRQ for the ARP reply alone is not a
      * timer.  The deferred-poll gate coalesces this with an IRQ-triggered
      * poll, so keeping the kick here is bounded and does not duplicate work. */
-    if (!e1000_interrupt_ready()) (void)e1000_schedule_deferred_poll();
+    interrupt_ready = e1000_interrupt_ready();
+    if (!interrupt_ready) (void)e1000_schedule_deferred_poll();
+    /* An acknowledged MSI must survive a temporarily full work queue.
+     * This is only an atomic flag check when no enqueue failure occurred. */
+    e1000_retry_deferred_poll();
     /* Keep the retransmission clock independent from RX/deferred-worker
      * progress.  An ARP reply may be the last packet received before a
      * pending SYN needs to be emitted. */
@@ -105,6 +107,12 @@ void net_manager_poll(void) {
     g_net_manager_poll_divider = 0U;
     hardware_present = e1000_hardware_present();
     if (hardware_present) {
+        /* A configured MSI vector is not proof that notifications arrive.
+         * Recover a lost RX notification at the existing status cadence,
+         * rather than draining DMA rings in every idle-loop iteration.
+         * The deferred gate coalesces this with IRQ work and retains retries
+         * if its queue is full. No extra kick in polling-only mode. */
+        if (interrupt_ready) (void)e1000_schedule_deferred_poll();
         link_up = e1000_link_up();
         ipv4_address = e1000_ipv4_address();
         ipv4_prefix_length = e1000_ipv4_prefix_length();
@@ -140,16 +148,18 @@ void net_manager_poll(void) {
     if (link_changed && g_net_manager_event_port != 0 &&
         object_try_get(g_net_manager_event_port)) {
         event_port = g_net_manager_event_port;
+        /* Construct a snapshot only when its subscriber reference is held.
+         * Ordinary timer polls need neither event clearing nor field stores. */
+        event = (os_net_event_t){0};
+        event.hdr.size = sizeof(event);
+        event.hdr.version = OS_SYSCALL_ABI_VERSION;
+        event.type = OS_NET_EVENT_LINK_CHANGED;
+        event.status_flags =
+            (hardware_present ? OS_NET_STATUS_HARDWARE_PRESENT : 0U) |
+            (link_up ? OS_NET_STATUS_LINK_UP : 0U) |
+            (ipv6_configured ? OS_NET_STATUS_IPV6_CONFIGURED : 0U);
+        event.link_transitions = g_net_manager.link_transitions;
     }
-
-    event.hdr.size = sizeof(event);
-    event.hdr.version = OS_SYSCALL_ABI_VERSION;
-    event.type = OS_NET_EVENT_LINK_CHANGED;
-    event.status_flags =
-        (hardware_present ? OS_NET_STATUS_HARDWARE_PRESENT : 0U) |
-        (link_up ? OS_NET_STATUS_LINK_UP : 0U) |
-        (ipv6_configured ? OS_NET_STATUS_IPV6_CONFIGURED : 0U);
-    event.link_transitions = g_net_manager.link_transitions;
     net_manager_unlock();
 
     if (event_port != 0) {
@@ -167,8 +177,11 @@ bool net_manager_get_status(net_manager_status_t *status) {
 }
 
 bool net_manager_ready(void) {
-    net_manager_status_t status;
-    return net_manager_get_status(&status) && status.hardware_present && status.link_up;
+    if (!net_manager_init()) return false;
+    net_manager_lock();
+    bool ready = g_net_manager.hardware_present && g_net_manager.link_up;
+    net_manager_unlock();
+    return ready;
 }
 
 bool net_manager_self_test(void) {
@@ -176,6 +189,9 @@ bool net_manager_self_test(void) {
     if (!net_manager_init() || !net_manager_get_status(&status) || !status.initialized) {
         return false;
     }
-    /* QEMU 没有 e1000 时网络设备允许缺席，但管理器自身必须保持可用。 */
-    return status.hardware_present ? status.ipv6_configured : !status.link_up;
+    /* Address configuration is asynchronous: IPv4 arrives through DHCP and
+     * IPv6 may arrive later through router advertisements.  Neither is a
+     * prerequisite for the manager itself to be healthy.  The invariant we
+     * can check here is that a link cannot be up when no NIC is present. */
+    return status.hardware_present || !status.link_up;
 }

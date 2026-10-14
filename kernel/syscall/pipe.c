@@ -63,6 +63,9 @@ static int64_t syscall_pipe_transfer(bool write, uint64_t handle,
                                      uint64_t timeout_ns, uint64_t output_bytes) {
     process_t *process = current_process();
     pipe_endpoint_t *endpoint = 0;
+    /* Small control/output records need no allocator round trip. Keep this
+     * syscall-local so sleeping I/O cannot share or overwrite the staging. */
+    uint8_t inline_buffer[256];
     uint8_t *temporary = 0;
     uint64_t bytes = 0U;
     size_t transfer_length;
@@ -84,7 +87,8 @@ static int64_t syscall_pipe_transfer(bool write, uint64_t handle,
         transfer_length = OS_PIPE_DEFAULT_SIZE;
     }
     if (transfer_length != 0U) {
-        temporary = (uint8_t *)kmalloc(transfer_length, 0);
+        temporary = transfer_length <= sizeof(inline_buffer) ? inline_buffer :
+                    (uint8_t *)kmalloc(transfer_length, 0);
         if (temporary == 0) {
             object_put(endpoint);
             return K_ENOMEM;
@@ -94,7 +98,7 @@ static int64_t syscall_pipe_transfer(bool write, uint64_t handle,
                                     (const void __user *)(uintptr_t)buffer,
                                     transfer_length);
             if (status != K_OK) {
-                kfree(temporary);
+                if (temporary != inline_buffer) kfree(temporary);
                 object_put(endpoint);
                 return status;
             }
@@ -115,7 +119,7 @@ static int64_t syscall_pipe_transfer(bool write, uint64_t handle,
         status = copy_to_user((void __user *)(uintptr_t)output_bytes, &bytes,
                               sizeof(bytes));
     }
-    kfree(temporary);
+    if (temporary != inline_buffer) kfree(temporary);
     object_put(endpoint);
     return status;
 }

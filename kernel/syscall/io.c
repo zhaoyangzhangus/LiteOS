@@ -18,20 +18,30 @@
 typedef struct user_io_context {
     uint32_t vector_count;
     uint32_t reserved;
-    os_io_vec_t user_vectors[USER_IO_MAX_VECTORS];
-    io_vec_t kernel_vectors[USER_IO_MAX_VECTORS];
-    void *buffers[USER_IO_MAX_VECTORS];
+    io_vec_t *kernel_vectors;
+    void **buffers;
+    os_io_vec_t user_vectors[];
 } user_io_context_t;
 
-static void user_io_context_release(io_request_t *request) {
-    if (request == 0 || request->private_data == 0) return;
-    user_io_context_t *context = (user_io_context_t *)request->private_data;
+_Static_assert(sizeof(os_io_vec_t) % _Alignof(io_vec_t) == 0,
+               "captured vectors must align kernel vectors");
+_Static_assert(sizeof(io_vec_t) % _Alignof(void *) == 0,
+               "kernel vectors must align buffer pointers");
+
+static void user_io_context_free(user_io_context_t *context) {
+    if (context == 0) return;
     for (uint32_t i = 0; i < context->vector_count; ++i) {
         if (context->buffers[i] != 0) kfree(context->buffers[i]);
     }
     kfree(context);
+}
+
+static void user_io_context_release(io_request_t *request) {
+    if (request == 0 || request->private_data == 0) return;
+    user_io_context_t *context = (user_io_context_t *)request->private_data;
     request->private_data = 0;
     request->private_release = 0;
+    user_io_context_free(context);
 }
 
 static void user_io_complete(io_request_t *request) {
@@ -54,7 +64,9 @@ static void user_io_complete(io_request_t *request) {
             remaining -= length;
         }
     }
-    user_io_context_release(request);
+    /* Submission and pending DMA may still hold request references after a
+     * cancellation publishes completion. Keep staging vectors alive with
+     * those references; private_release frees them at final destruction. */
 }
 
 int64_t syscall_io_submit(uint64_t arguments_pointer, uint64_t unused1,
@@ -112,13 +124,30 @@ int64_t syscall_io_submit(uint64_t arguments_pointer, uint64_t unused1,
         goto cleanup;
     }
 
-    context = (user_io_context_t *)kzalloc(sizeof(*context), 0);
-    request = (io_request_t *)kzalloc(sizeof(*request), 0);
-    if (context == 0 || request == 0) {
+    /* vector_count was capped above: one bounded allocation contains all
+     * three arrays, without reserving 64 entries for a small request. */
+    size_t context_bytes = sizeof(*context) + (size_t)arguments.vector_count *
+        (sizeof(os_io_vec_t) + sizeof(io_vec_t) + sizeof(void *));
+    context = arguments.vector_count != 0U ?
+        (user_io_context_t *)kmalloc(context_bytes, 0) : 0;
+    if (arguments.vector_count != 0U && context == 0) {
         status = K_ENOMEM;
         goto cleanup;
     }
-    context->vector_count = arguments.vector_count;
+    if (context != 0) context->vector_count = arguments.vector_count;
+    if (context != 0) {
+        context->kernel_vectors = (io_vec_t *)(context->user_vectors +
+                                             arguments.vector_count);
+        context->buffers = (void **)(context->kernel_vectors +
+                                    arguments.vector_count);
+    }
+    /* Only active slots are visible to submission and cleanup. Descriptors
+     * are fully overwritten by copy_from_user; no inactive slots are allocated.
+     * Initialize ownership before that copy can fail. */
+    for (uint32_t i = 0; i < arguments.vector_count; ++i) {
+        context->kernel_vectors[i] = (io_vec_t){0};
+        context->buffers[i] = 0;
+    }
     if (arguments.vector_count != 0U && copy_from_user(
             context->user_vectors,
             (const void __user *)(uintptr_t)arguments.vectors,
@@ -126,9 +155,13 @@ int64_t syscall_io_submit(uint64_t arguments_pointer, uint64_t unused1,
         status = K_EACCES;
         goto cleanup;
     }
-    for (uint32_t i = 0; i < context->vector_count; ++i) {
+    /* Validate the complete captured vector list before allocating payloads
+     * or reading user data. A bad late vector must not consume a large
+     * valid prefix's staging memory and copy work. */
+    for (uint32_t i = 0; i < arguments.vector_count; ++i) {
         const os_io_vec_t *user_vector = &context->user_vectors[i];
-        if (user_vector->length > (uint64_t)SIZE_MAX ||
+        if (user_vector->length > USER_IO_MAX_BYTES ||
+            user_vector->length > (uint64_t)SIZE_MAX ||
             (user_vector->length != 0U &&
              !x86_user_range_valid((const void __user *)(uintptr_t)user_vector->address,
                                    (size_t)user_vector->length)) ||
@@ -137,9 +170,16 @@ int64_t syscall_io_submit(uint64_t arguments_pointer, uint64_t unused1,
             goto cleanup;
         }
         total += user_vector->length;
+    }
+    for (uint32_t i = 0; i < arguments.vector_count; ++i) {
+        const os_io_vec_t *user_vector = &context->user_vectors[i];
         context->kernel_vectors[i].length = (size_t)user_vector->length;
         if (user_vector->length == 0U) continue;
-        context->buffers[i] = kzalloc((size_t)user_vector->length, 0);
+        /* Writes fill every staged byte before submission; reads and
+         * control requests retain blank buffers for short device output. */
+        context->buffers[i] = arguments.opcode == OS_IO_WRITE ?
+            kmalloc((size_t)user_vector->length, 0) :
+            kzalloc((size_t)user_vector->length, 0);
         if (context->buffers[i] == 0) {
             status = K_ENOMEM;
             goto cleanup;
@@ -159,8 +199,16 @@ int64_t syscall_io_submit(uint64_t arguments_pointer, uint64_t unused1,
         goto cleanup;
     }
 
+    /* No request object exists on staging failure. The initializer clears
+     * it once and installs its first reference before cleanup can put it. */
+    request = (io_request_t *)kmalloc(sizeof(*request), 0);
+    if (request == 0) {
+        status = K_ENOMEM;
+        goto cleanup;
+    }
     io_request_init(request, arguments.opcode, (device_t *)device_object,
-                    process, context->kernel_vectors, arguments.vector_count);
+                    process, context != 0 ? context->kernel_vectors : 0,
+                    arguments.vector_count);
     request->offset = arguments.offset;
     request->internal_flags = IOREQ_INTERNAL_DYNAMIC | IOREQ_INTERNAL_PROCESS_REF;
     object_get(process);
@@ -173,7 +221,7 @@ int64_t syscall_io_submit(uint64_t arguments_pointer, uint64_t unused1,
     if (status != K_OK) goto cleanup;
     status = io_request_register_user(request);
     if (status != K_OK) goto cleanup;
-    object_get(request); /* cover synchronous devices completing in io_submit. */
+    /* Registration owns a separate reference; retain ours until submit returns. */
     uint64_t request_id = request->request_id;
     status = io_submit(request);
     object_put(request);
@@ -193,12 +241,7 @@ cleanup:
         }
         object_put(request);
     }
-    if (context != 0) {
-        for (uint32_t i = 0; i < context->vector_count; ++i) {
-            if (context->buffers[i] != 0) kfree(context->buffers[i]);
-        }
-        kfree(context);
-    }
+    user_io_context_free(context);
     if (port_object != 0) object_put(port_object);
     if (device_object != 0) object_put(device_object);
     return status;

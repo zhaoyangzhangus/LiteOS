@@ -3,25 +3,28 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
-
-typedef struct mbstate {
-    uint32_t codepoint;
-    uint32_t minimum;
-    uint16_t surrogate;
-    unsigned char expected;
-} mbstate_t;
+#include <libc/mbstate.h>
 
 #ifndef WEOF
 #define WEOF ((wint_t)-1)
 #endif
 
 #ifndef WCHAR_MIN
-#define WCHAR_MIN 0U
+#ifdef __WCHAR_MIN__
+#define WCHAR_MIN __WCHAR_MIN__
+#elif __WCHAR_MAX__ == 0xffffU || __WCHAR_MAX__ == 0xffffffffU
+#define WCHAR_MIN 0
+#else
+#define WCHAR_MIN (-__WCHAR_MAX__ - 1)
+#endif
 #endif
 #ifndef WCHAR_MAX
-#define WCHAR_MAX 0xffffU
+#define WCHAR_MAX __WCHAR_MAX__
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 size_t wcslen(const wchar_t *text);
 size_t wcsnlen(const wchar_t *text, size_t limit);
 int wcscmp(const wchar_t *left, const wchar_t *right);
@@ -68,6 +71,9 @@ size_t mbstowcs(wchar_t *wide, const char *multibyte, size_t count);
 size_t wcstombs(char *multibyte, const wchar_t *wide, size_t count);
 wint_t btowc(int value);
 int wctob(wint_t value);
+double wcstod(const wchar_t *text, wchar_t **end);
+float wcstof(const wchar_t *text, wchar_t **end);
+long double wcstold(const wchar_t *text, wchar_t **end);
 
 long wcstol(const wchar_t *text, wchar_t **end, int base);
 unsigned long wcstoul(const wchar_t *text, wchar_t **end, int base);
@@ -76,5 +82,11 @@ unsigned long long wcstoull(const wchar_t *text, wchar_t **end, int base);
 
 int wcwidth(wchar_t value);
 int wcswidth(const wchar_t *text, size_t length);
+#ifdef __cplusplus
+}
+#endif
 size_t wcsftime(wchar_t *buffer, size_t capacity, const wchar_t *format,
                 const struct tm *value);
+int vswprintf(wchar_t *buffer, size_t capacity, const wchar_t *format,
+              va_list arguments);
+int swprintf(wchar_t *buffer, size_t capacity, const wchar_t *format, ...);

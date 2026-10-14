@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 static int ascii_lower(int value) {
     return value >= 'A' && value <= 'Z' ? value + ('a' - 'A') : value;

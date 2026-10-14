@@ -150,6 +150,20 @@ kstatus_t nv_port_thread_join(nv_port_thread_t *thread, uint64_t timeout_ns) {
 
 kstatus_t nv_port_thread_destroy(nv_port_thread_t *thread) {
     if (thread == 0) return K_EINVAL;
+#ifdef NV_PORT_HOST_TEST
+    if (!atomic_load_explicit(&thread->started, memory_order_acquire)) {
+        free(thread);
+        return K_OK;
+    }
+#else
+    if (!atomic_load_explicit(&thread->started, memory_order_acquire)) {
+        if (atomic_load_explicit(&thread->thread.state, memory_order_acquire) !=
+            THREAD_NEW) return K_EBUSY;
+        vfree(thread->stack_base);
+        kfree(thread);
+        return K_OK;
+    }
+#endif
     if (!atomic_load_explicit(&thread->finished, memory_order_acquire)) {
         return K_EBUSY;
     }

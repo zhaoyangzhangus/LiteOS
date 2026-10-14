@@ -26,5 +26,6 @@ bool e1000_ipv6_address(uint8_t address[16]);
 bool e1000_poll(void);
 bool e1000_interrupt_ready(void);
 bool e1000_schedule_deferred_poll(void);
+void e1000_retry_deferred_poll(void);
 void e1000_deferred_poll(void *argument);
 uint32_t e1000_last_error(void);

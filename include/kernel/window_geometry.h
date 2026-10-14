@@ -1,6 +1,7 @@
 #pragma once
 
 #include <uapi/window.h>
+#include <stdbool.h>
 
 /* Shared window-frame geometry.  Ownership stays outside the compositor. */
 #define WINDOW_FRAME_BORDER              1U
@@ -23,6 +24,10 @@ enum {
 };
 
 bool window_client_decorations(uint32_t flags);
+bool window_standard_caption(uint32_t flags);
+bool window_caption_button_rect(uint32_t flags, int32_t x, int32_t y,
+                                uint32_t width, uint32_t button,
+                                int32_t *out_x, int32_t *out_y);
 uint32_t window_frame_border(uint32_t flags);
 uint32_t window_frame_extra(uint32_t flags);
 uint32_t window_titlebar_height(uint32_t flags);

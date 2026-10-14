@@ -2,33 +2,33 @@
 
 #include <uefi.h>
 
-#define LITEOS_BOOTINFO_MAGIC 0x4C4954454F534249ULL
-#define LITEOS_BOOTINFO_VERSION 6U
-#define LITEOS_BOOTSTRAP_STACK_SIZE (2ULL * 1024ULL * 1024ULL)
+#define OS_BOOTINFO_MAGIC 0x4C4954454F534249ULL
+#define OS_BOOTINFO_VERSION 6U
+#define OS_BOOTSTRAP_STACK_SIZE (2ULL * 1024ULL * 1024ULL)
 
 enum {
-    LITEOS_BOOTINFO_HAS_FRAMEBUFFER = 1U << 0,
-    LITEOS_BOOTINFO_HAS_ACPI        = 1U << 1,
-    LITEOS_BOOTINFO_HAS_SMBIOS      = 1U << 2,
-    LITEOS_BOOTINFO_HAS_RNG         = 1U << 3,
-    LITEOS_BOOTINFO_HAS_BOOT_DEVICE = 1U << 11,
+    OS_BOOTINFO_HAS_FRAMEBUFFER = 1U << 0,
+    OS_BOOTINFO_HAS_ACPI        = 1U << 1,
+    OS_BOOTINFO_HAS_SMBIOS      = 1U << 2,
+    OS_BOOTINFO_HAS_RNG         = 1U << 3,
+    OS_BOOTINFO_HAS_BOOT_DEVICE = 1U << 11,
 };
 
 enum {
-    LITEOS_BOOT_DEVICE_TRANSPORT_UNKNOWN = 0,
-    LITEOS_BOOT_DEVICE_TRANSPORT_USB = 1,
-    LITEOS_BOOT_DEVICE_TRANSPORT_NVME = 2,
+    OS_BOOT_DEVICE_TRANSPORT_UNKNOWN = 0,
+    OS_BOOT_DEVICE_TRANSPORT_USB = 1,
+    OS_BOOT_DEVICE_TRANSPORT_NVME = 2,
 };
 
 enum {
-    LITEOS_PIXEL_RGBR = 0,
-    LITEOS_PIXEL_BGRR = 1,
-    LITEOS_PIXEL_BITMASK = 2,
-    LITEOS_PIXEL_BLT_ONLY = 3,
+    OS_PIXEL_RGBR = 0,
+    OS_PIXEL_BGRR = 1,
+    OS_PIXEL_BITMASK = 2,
+    OS_PIXEL_BLT_ONLY = 3,
 };
 
 /* This structure is a loader/kernel ABI. Keep field order and widths stable. */
-typedef struct liteos_boot_info {
+typedef struct os_boot_info {
     UINT64 Magic;
     UINT32 Version;
     UINT32 Size;
@@ -91,4 +91,4 @@ typedef struct liteos_boot_info {
     UINT8 BootDeviceTransport;
     UINT8 Reserved3;
     UINT16 Reserved4;
-} LITEOS_BOOT_INFO;
+} OS_BOOT_INFO;

@@ -1,5 +1,4 @@
 #pragma once
-#pragma once
 #include "base.h"
 
 typedef struct spinlock {
@@ -17,9 +16,14 @@ static inline void spinlock_init(spinlock_t *lock) {
 }
 
 static inline void spinlock_lock(spinlock_t *lock) {
-    while (atomic_exchange_explicit(&lock->state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
+    unsigned expected = 0U;
+    while (!atomic_compare_exchange_strong_explicit(&lock->state, &expected,
+                1U, memory_order_acquire, memory_order_relaxed)) {
+        /* Avoid repeated exclusive cache-line ownership while contended. */
+        do {
+            __asm__ volatile ("pause");
+        } while (atomic_load_explicit(&lock->state, memory_order_relaxed) != 0U);
+        expected = 0U;
     }
 }
 

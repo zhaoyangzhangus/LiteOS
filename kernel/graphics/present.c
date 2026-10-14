@@ -3,6 +3,7 @@
 #include <arch/x86_64/smp.h>
 #include <kernel/display.h>
 #include <kernel/sched.h>
+#include <kernel/string.h>
 #include <kernel/qemu_stdvga.h>
 #include "internal.h"
 
@@ -216,10 +217,7 @@ bool compositor_present_start_copy_workers(uint32_t compositor_cpu) {
 
     for (uint32_t index = 0U; index < count; ++index) {
         thread_t *worker = &g_compositor_copy_workers[index];
-        uint8_t *worker_bytes = (uint8_t *)worker;
-        for (size_t byte = 0U; byte < sizeof(*worker); ++byte) {
-            worker_bytes[byte] = 0U;
-        }
+        memset(worker, 0, sizeof(*worker));
 
         refcount_init(&worker->object.refs, 1U);
         worker->object.type = KOBJECT_TYPE_THREAD;
@@ -366,7 +364,7 @@ bool compositor_copy_rect_parallel(const Rect *rect) {
 
 
 /*
- * LITEOS_QEMU_INCREMENTAL_REPAIR_V1
+ * OS_QEMU_INCREMENTAL_REPAIR_V1
  *
  * Each QEMU hidden-VRAM page is a retained scanout cache.
  *
@@ -411,20 +409,29 @@ typedef struct compositor_qemu_repair_state {
 static compositor_qemu_repair_state_t
     g_compositor_qemu_repair;
 
+static inline uint64_t compositor_qemu_repair_area(const Rect *rect) {
+    return (uint64_t)((int64_t)rect->x1 - rect->x0) *
+           (uint64_t)((int64_t)rect->y1 - rect->y0);
+}
+
 static inline bool compositor_qemu_repair_mergeable(
     const Rect *a,
     const Rect *b) {
 
-    /*
-     * Half-open rectangles.  Treat touching edges as mergeable so sequential
-     * drag strips collapse into one transaction instead of exhausting the
-     * small repair list.
-     */
-    return
-        a->x0 <= b->x1 &&
-        b->x0 <= a->x1 &&
-        a->y0 <= b->y1 &&
-        b->y0 <= a->y1;
+    if (a->x0 > b->x1 || b->x0 > a->x1 ||
+        a->y0 > b->y1 || b->y0 > a->y1) return false;
+    /* Touching thin strips can otherwise inflate into a large L-shaped
+     * bounding box. Merge only when copying that box is no more expensive
+     * than copying both rectangles. Full-edge neighbours still coalesce. */
+    int32_t left = a->x0 < b->x0 ? a->x0 : b->x0;
+    int32_t top = a->y0 < b->y0 ? a->y0 : b->y0;
+    int32_t right = a->x1 > b->x1 ? a->x1 : b->x1;
+    int32_t bottom = a->y1 > b->y1 ? a->y1 : b->y1;
+    uint64_t merged_area = (uint64_t)((int64_t)right - left) *
+                           (uint64_t)((int64_t)bottom - top);
+    uint64_t separate_area = compositor_qemu_repair_area(a) +
+                             compositor_qemu_repair_area(b);
+    return merged_area <= separate_area;
 }
 
 static inline void compositor_qemu_repair_union(
@@ -453,23 +460,14 @@ static void compositor_qemu_repair_add(
     if (set == 0 || input == 0)
         return;
 
-    merged = *input;
-
-    if (merged.x1 > (int32_t)g_window_server.display_width)
-        merged.x1 = g_window_server.display_width;
-
-    if (merged.y1 > (int32_t)g_window_server.display_height)
-        merged.y1 = g_window_server.display_height;
-
-    if (merged.x0 >= merged.x1 ||
-        merged.y0 >= merged.y1) {
-        return;
-    }
+    if (!rect_clip_to_extent(input->x0, input->y0, input->x1, input->y1,
+            g_window_server.display_width, g_window_server.display_height,
+            &merged)) return;
 
     /*
-     * Remove every rectangle touching the new one, expanding merged as we go.
-     * Restart after every merge because the enlarged rectangle may now touch
-     * an earlier entry.
+     * Remove every cost-compatible rectangle touching the new one, expanding
+     * merged as we go. Restart because the enlarged rectangle may now be
+     * mergeable with an earlier entry.
      */
     for (;;) {
         bool changed = false;
@@ -508,21 +506,28 @@ static void compositor_qemu_repair_add(
         return;
     }
 
-    /*
-     * Pathological fragmentation.  Collapse to one bounding rectangle rather
-     * than fall back to the old unconditional full-screen publication.
-     */
+    /* Bounded fragmentation: absorb the new region into the existing entry
+     * with the smallest copy-area increase. Do not connect every sparse
+     * region into one large bounding box merely because the list is full.
+     * Overlap with other entries is safe (at worst copied twice), and the
+     * fixed-size linear search never allocates or drops dirty pixels. */
+    uint32_t best = 0U;
+    uint64_t best_growth = UINT64_MAX;
+    Rect best_union = merged;
     for (uint32_t index = 0U;
          index < set->count;
          ++index) {
-
-        compositor_qemu_repair_union(
-            &merged,
-            &set->rects[index]);
+        Rect candidate = set->rects[index];
+        compositor_qemu_repair_union(&candidate, &merged);
+        uint64_t growth = compositor_qemu_repair_area(&candidate) -
+                          compositor_qemu_repair_area(&set->rects[index]);
+        if (growth < best_growth) {
+            best = index;
+            best_growth = growth;
+            best_union = candidate;
+        }
     }
-
-    set->rects[0] = merged;
-    set->count = 1U;
+    set->rects[best] = best_union;
 }
 
 static void compositor_qemu_repair_add_i64(
@@ -534,31 +539,9 @@ static void compositor_qemu_repair_add_i64(
 
     Rect rect;
 
-    if (left < 0)
-        left = 0;
-
-    if (top < 0)
-        top = 0;
-
-    if (right >
-        (int64_t)g_window_server.display_width) {
-        right = g_window_server.display_width;
-    }
-
-    if (bottom >
-        (int64_t)g_window_server.display_height) {
-        bottom = g_window_server.display_height;
-    }
-
-    if (left >= right ||
-        top >= bottom) {
-        return;
-    }
-
-    rect.x0 = (uint32_t)left;
-    rect.y0 = (uint32_t)top;
-    rect.x1 = (uint32_t)right;
-    rect.y1 = (uint32_t)bottom;
+    if (!rect_clip_to_extent(left, top, right, bottom,
+            g_window_server.display_width, g_window_server.display_height,
+            &rect)) return;
 
     compositor_qemu_repair_add(
         set,
@@ -637,7 +620,7 @@ void compositor_qemu_repair_mark_front_cursor(
     int64_t right,
     int64_t bottom) {
 
-    if (!qemu_stdvga_flip_available())
+    if (!qemu_stdvga_page_flip_active())
         return;
 
     compositor_qemu_repair_ensure();
@@ -782,10 +765,13 @@ static void compositor_qemu_copy_repair_set(
         }
 
         /*
-         * Large rectangles can still use the persistent helper CPUs.  Small
-         * repairs deliberately stay on one CPU; waking remote workers for a
-         * 64x64/24x24 rectangle costs more than the copy itself.
+         * Large rectangles may use the persistent helper CPUs once the
+         * QEMU-specific second-generation completion protocol is enabled.
+         * The safe default is serial publication: a missed helper wake must
+         * not turn a desktop asset update into an infinite compositor wait.
+         * Small repairs stay on one CPU in either mode.
          */
+#if WINDOW_COMPOSITOR_PARALLEL_QEMU_COPY
         if (compositor_copy_rect_parallel_buffers(
                 destination,
                 source,
@@ -794,6 +780,7 @@ static void compositor_qemu_copy_repair_set(
                 rect)) {
             continue;
         }
+#endif
 
         const uint32_t width =
             rect->x1 - rect->x0;
@@ -822,6 +809,9 @@ bool compositor_commit_qemu_stdvga(void) {
     const uint32_t *scene;
     compositor_qemu_repair_set_t *repair;
     uint32_t repaired_slot;
+    uint32_t pointer_x;
+    uint32_t pointer_y;
+    uint32_t shape;
 
     if (!qemu_stdvga_flip_available() ||
         g_window_server.composite_framebuffer == 0 ||
@@ -860,6 +850,29 @@ bool compositor_commit_qemu_stdvga(void) {
         back,
         scene,
         repair);
+
+    /*
+     * QEMU has no hardware cursor plane.  Put the current cursor into the
+     * hidden page before flipping it, so the newly visible page is complete
+     * from its first scanout sample onward.
+     */
+    window_lock();
+    pointer_x = g_window_server.pointer_x;
+    pointer_y = g_window_server.pointer_y;
+    shape = window_input_cursor_shape_locked();
+    window_unlock();
+    /* The cursor changes the hidden page even when drawing or flipping later
+     * fails. Retain this damage before touching pixels so a retry with a new
+     * pointer position removes the failed attempt's old cursor too. A
+     * successful flip clears the repaired set and marks its new front below. */
+    compositor_qemu_repair_add_i64(repair,
+        (int64_t)pointer_x - window_cursor_hotspot_x(shape),
+        (int64_t)pointer_y - window_cursor_hotspot_y(shape),
+        (int64_t)pointer_x - window_cursor_hotspot_x(shape) + WINDOW_CURSOR_WIDTH,
+        (int64_t)pointer_y - window_cursor_hotspot_y(shape) + WINDOW_CURSOR_HEIGHT);
+    if (!window_present_cursor_into_buffer(back, pointer_x, pointer_y, shape)) {
+        return false;
+    }
 
     /*
      * Local serial stores need this fence.  Parallel helpers already fence
@@ -901,11 +914,25 @@ bool compositor_commit_qemu_stdvga(void) {
         return false;
 
     /*
-     * Cursor-only HID updates write directly to this newly visible page.
-     * compositor_present_cursor_direct(true) immediately follows this commit
-     * and records that overlay into the new front page's repair set.
+     * The newly visible page already contains the cursor.  Remember its
+     * rectangle so the repair tracker removes it when this page becomes the
+     * hidden page on a later flip.  Pointer-only HID motion is also routed
+     * through this path on QEMU, so the front page is never patched
+     * asynchronously while it is scanned out.
      */
     window_display_set_scanout_locked(front);
+
+    g_window_server.presented_pointer_x = pointer_x;
+    g_window_server.presented_pointer_y = pointer_y;
+    g_window_server.presented_cursor_shape = shape;
+    g_window_server.presented_pointer_valid = true;
+    compositor_qemu_repair_mark_front_cursor(
+        (int64_t)pointer_x - window_cursor_hotspot_x(shape),
+        (int64_t)pointer_y - window_cursor_hotspot_y(shape),
+        (int64_t)pointer_x - window_cursor_hotspot_x(shape) +
+            WINDOW_CURSOR_WIDTH,
+        (int64_t)pointer_y - window_cursor_hotspot_y(shape) +
+            WINDOW_CURSOR_HEIGHT);
 
     return true;
 }

@@ -22,34 +22,13 @@ if ! command -v "$objdump" >/dev/null 2>&1; then
     exit 1
 fi
 
-loader_program_headers="$($objdump -p "$loader")"
-library_program_headers="$($objdump -p "$library")"
-test_program_headers="$($objdump -p "$test_image")"
-test_interpreter="$($objdump -s -j .interp "$test_image")"
+python3 "$(dirname -- "$0")/verify-elf-runtime.py" "$loader" "$library" "$test_image" libgraphics.so.1
 library_symbols="$($objdump -T "$library")"
 test_relocations="$($objdump -R "$test_image")"
 
-if grep -Fq 'NEEDED' <<<"$loader_program_headers" ||
-   grep -Fq 'NEEDED' <<<"$library_program_headers"; then
-    printf 'dynamic loader: loader or graphics library has an external dependency\n' >&2
-    exit 1
-fi
-if ! grep -Fq 'INTERP' <<<"$test_program_headers" ||
-   ! grep -Fq '2f6c6962' <<<"$test_interpreter" ||
-   ! grep -Fq '6c697465' <<<"$test_interpreter" ||
-   ! grep -Fq '6f732e73' <<<"$test_interpreter" ||
-   ! grep -Fq '6f2e3100' <<<"$test_interpreter"; then
-    printf 'dynamic loader: test image has no LiteOS interpreter\n' >&2
-    exit 1
-fi
-if ! grep -Fq 'NEEDED' <<<"$test_program_headers" ||
-   ! grep -Fq 'libliteosgfx.so.1' <<<"$test_program_headers"; then
-    printf 'dynamic loader: test image has no graphics-library dependency\n' >&2
-    exit 1
-fi
-for symbol in liteos_gfx_clear liteos_gfx_fill_rect \
-              liteos_gfx_gradient_rect liteos_gfx_frame; do
-    if ! grep -Fq "$symbol" <<<"$library_symbols"; then
+for symbol in gfx_clear gfx_fill_rect \
+              gfx_gradient_rect gfx_frame; do
+    if ! awk -v symbol="$symbol" '$NF == symbol && $0 !~ /\*UND\*/ {found=1} END {exit !found}' <<<"$library_symbols"; then
         printf 'dynamic loader: missing exported graphics symbol: %s\n' "$symbol" >&2
         exit 1
     fi

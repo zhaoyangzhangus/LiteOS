@@ -1,4 +1,6 @@
 #include <kernel/journal.h>
+#include <kernel/crc32.h>
+#include <kernel/string.h>
 #include <kernel/block.h>
 #include <kernel/kmem.h>
 #include <kernel/io.h>
@@ -28,37 +30,24 @@ static bool journal_decode(const uint8_t block[JOURNAL_BLOCK_SIZE],
                            journal_disk_header_t *header);
 
 static void journal_lock(journal_t *journal) {
-    while (atomic_exchange_explicit(&journal->lock.state, 1U,
-                                     memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&journal->lock);
 }
 
 static void journal_unlock(journal_t *journal) {
-    atomic_store_explicit(&journal->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&journal->lock);
 }
 
 static void bytes_zero(void *memory, size_t length) {
-    uint8_t *bytes = (uint8_t *)memory;
-    while (length-- != 0) *bytes++ = 0;
+    memset(memory, 0, length);
 }
 
 static void bytes_copy(void *destination, const void *source, size_t length) {
-    uint8_t *out = (uint8_t *)destination;
-    const uint8_t *in = (const uint8_t *)source;
-    while (length-- != 0) *out++ = *in++;
+    memmove(destination, source, length);
 }
 
 static uint32_t journal_crc(const uint8_t *block) {
-    uint32_t crc = UINT32_MAX;
-    for (uint32_t i = 0; i < JOURNAL_BLOCK_SIZE; ++i) {
-        uint8_t byte = i >= 28U && i < 32U ? 0U : block[i];
-        crc ^= byte;
-        for (uint32_t bit = 0; bit < 8U; ++bit) {
-            crc = (crc >> 1) ^ ((crc & 1U) != 0 ? 0xEDB88320U : 0U);
-        }
-    }
-    return ~crc;
+    return crc32_ieee_zeroed(block, JOURNAL_BLOCK_SIZE,
+                            __builtin_offsetof(journal_disk_header_t, checksum));
 }
 
 static bool sequence_newer(uint64_t left, uint64_t right) {
@@ -301,7 +290,7 @@ kstatus_t journal_init(journal_t *journal, const journal_storage_t *storage,
     journal->block_count = block_count;
     journal->next_slot = 0;
     journal->next_sequence = 1U;
-    atomic_init(&journal->lock.state, 0U);
+    spinlock_init(&journal->lock);
 
     uint64_t latest_sequence = 0;
     uint32_t latest_slot = 0;

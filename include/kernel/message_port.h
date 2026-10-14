@@ -30,7 +30,8 @@ typedef struct message_port {
     uint32_t head;
     uint32_t tail;
     uint32_t count;
-    message_port_message_t messages[OS_PORT_MAX_CAPACITY];
+    /* One allocation with capacity slots; only published message bytes read. */
+    message_port_message_t messages[];
 } message_port_t;
 
 kstatus_t message_port_create(uint32_t capacity, message_port_t **out);

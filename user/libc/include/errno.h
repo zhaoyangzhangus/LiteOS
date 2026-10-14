@@ -1,11 +1,17 @@
 #pragma once
 
-/* LiteOS uses the stable negative-kernel-status values as errno values. */
+/* System uses the stable negative-kernel-status values as errno values. */
 
 /* errno is per-thread.  The main thread uses the libc-owned fallback slot;
  * pthread-created threads use the slot behind their existing FS base. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern int __libc_errno;
 int *__errno_location(void);
+#ifdef __cplusplus
+}
+#endif
 #define errno (*__errno_location())
 
 #define EPERM        1
@@ -47,6 +53,7 @@ int *__errno_location(void);
 #define ENOTEMPTY    39
 #define ELOOP        40
 #define ENOMSG       42
+#define ENOPKG       65
 #define EIDRM        43
 #define ENOLCK       37
 #define ENOSR        63
@@ -71,7 +78,9 @@ int *__errno_location(void);
 #define ENOBUFS      105
 #define EISCONN      106
 #define ENOTCONN     107
+#define EUSERS       87
 #define ETIMEDOUT   110
+#define EHOSTDOWN   112
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
 #define EALREADY     114

@@ -2,14 +2,39 @@
 
 #include <arch/x86_64/uaccess.h>
 #include <kernel/console.h>
+#include <kernel/mm.h>
 #include <kernel/process.h>
 #include <kernel/shared_section.h>
 #include <kernel/vfs.h>
 #include <kernel/vm.h>
 #include <uapi/file.h>
+#include <uapi/memory.h>
 #include <uapi/mm.h>
+#include <uapi/syscall.h>
 
 #include "internal.h"
+#include "../process/internal.h"
+
+int64_t syscall_memory_info(uint64_t output_pointer, uint64_t unused1,
+                            uint64_t unused2, uint64_t unused3,
+                            uint64_t unused4, uint64_t unused5) {
+    os_memory_info_t info = {0};
+    kstatus_t status;
+    (void)unused1;
+    (void)unused2;
+    (void)unused3;
+    (void)unused4;
+    (void)unused5;
+    if (current_process() == 0) return K_EPERM;
+    if (output_pointer == 0U) return K_EINVAL;
+    status = page_memory_get_stats(&info.total_pages, &info.free_pages);
+    if (status != K_OK) return status;
+    info.hdr.size = sizeof(info);
+    info.hdr.version = OS_SYSCALL_ABI_VERSION;
+    info.page_size = PAGE_SIZE;
+    return copy_to_user((void __user *)(uintptr_t)output_pointer,
+                        &info, sizeof(info));
+}
 
 uint32_t translate_vm_protection(uint32_t protection) {
     uint32_t result = VM_PROT_USER;
@@ -103,20 +128,25 @@ int64_t syscall_vm_map(uint64_t arguments_pointer, uint64_t unused1,
     }
 
 map_object:
+    vm_space_t *space = process_vm_reference(process);
     vaddr_t address = (vaddr_t)arguments.address;
-    status = vm_map_object(process->vm, mapped_object, &address, mapped_offset,
+    status = vm_map_object(space, mapped_object, &address, mapped_offset,
                            (size_t)arguments.length,
                            translate_vm_protection(arguments.prot),
                            translate_vm_flags(arguments.flags));
     if (mapped_object != 0) vm_object_put(mapped_object);
-    if (status != K_OK) return status;
+    if (status != K_OK) {
+        vm_space_put(space);
+        return status;
+    }
     arguments.address = (uint64_t)address;
     status = copy_to_user((void __user *)(uintptr_t)arguments_pointer,
                           &arguments, sizeof(arguments));
     if (status != K_OK) {
         /* 用户态看不到返回地址时，映射也不能留在进程中。 */
-        (void)vm_unmap(process->vm, address, (size_t)arguments.length);
+        (void)vm_unmap(space, address, (size_t)arguments.length);
     }
+    vm_space_put(space);
     return status;
 }
 
@@ -165,7 +195,11 @@ int64_t syscall_vm_unmap(uint64_t address, uint64_t length, uint64_t unused2,
     (void)unused4;
     (void)unused5;
     process_t *process = current_process();
-    return process != 0 ? vm_unmap(process->vm, (vaddr_t)address, (size_t)length) : K_EPERM;
+    if (process == 0) return K_EPERM;
+    vm_space_t *space = process_vm_reference(process);
+    kstatus_t status = vm_unmap(space, (vaddr_t)address, (size_t)length);
+    vm_space_put(space);
+    return status;
 }
 
 int64_t syscall_vm_protect(uint64_t address, uint64_t length, uint64_t protection,
@@ -176,21 +210,23 @@ int64_t syscall_vm_protect(uint64_t address, uint64_t length, uint64_t protectio
     const uint32_t valid = OS_VM_READ | OS_VM_WRITE | OS_VM_EXEC;
     if ((protection & ~valid) != 0) return K_EINVAL;
     process_t *process = current_process();
+    vm_space_t *space = process != 0 ? process_vm_reference(process) : 0;
     kstatus_t status = process != 0 ?
-        vm_protect(process->vm, (vaddr_t)address, (size_t)length,
+        vm_protect(space, (vaddr_t)address, (size_t)length,
                    translate_vm_protection((uint32_t)protection)) : K_EPERM;
+    vm_space_put(space);
     if (status != K_OK) {
-        liteos_serial_write("LITEOS_DIAG_VM_PROTECT_FAIL STATUS=");
-        liteos_serial_write_u32((uint32_t)(status < 0 ? -status : status));
-        liteos_serial_write(" ADDRESS_LO=");
-        liteos_serial_write_u32((uint32_t)address);
-        liteos_serial_write(" ADDRESS_HI=");
-        liteos_serial_write_u32((uint32_t)(address >> 32));
-        liteos_serial_write(" LENGTH=");
-        liteos_serial_write_u32((uint32_t)length);
-        liteos_serial_write(" PROTECTION=");
-        liteos_serial_write_u32((uint32_t)protection);
-        liteos_serial_write("\r\n");
+        kernel_serial_write("OS_DIAG_VM_PROTECT_FAIL STATUS=");
+        kernel_serial_write_u32((uint32_t)(status < 0 ? -status : status));
+        kernel_serial_write(" ADDRESS_LO=");
+        kernel_serial_write_u32((uint32_t)address);
+        kernel_serial_write(" ADDRESS_HI=");
+        kernel_serial_write_u32((uint32_t)(address >> 32));
+        kernel_serial_write(" LENGTH=");
+        kernel_serial_write_u32((uint32_t)length);
+        kernel_serial_write(" PROTECTION=");
+        kernel_serial_write_u32((uint32_t)protection);
+        kernel_serial_write("\r\n");
     }
     return status;
 }
@@ -206,8 +242,11 @@ int64_t syscall_vm_sync(uint64_t address, uint64_t length, uint64_t flags,
     if (length > (uint64_t)SIZE_MAX || flags > (uint64_t)UINT32_MAX) {
         return K_EINVAL;
     }
-    return vm_sync(process->vm, (vaddr_t)address, (size_t)length,
-                   (uint32_t)flags);
+    vm_space_t *space = process_vm_reference(process);
+    kstatus_t status = vm_sync(space, (vaddr_t)address, (size_t)length,
+                              (uint32_t)flags);
+    vm_space_put(space);
+    return status;
 }
 
 int64_t syscall_vm_advise(uint64_t address, uint64_t length, uint64_t advice,
@@ -221,6 +260,9 @@ int64_t syscall_vm_advise(uint64_t address, uint64_t length, uint64_t advice,
     if (length > (uint64_t)SIZE_MAX || advice > (uint64_t)UINT32_MAX) {
         return K_EINVAL;
     }
-    return vm_advise(process->vm, (vaddr_t)address, (size_t)length,
-                     (uint32_t)advice);
+    vm_space_t *space = process_vm_reference(process);
+    kstatus_t status = vm_advise(space, (vaddr_t)address, (size_t)length,
+                                (uint32_t)advice);
+    vm_space_put(space);
+    return status;
 }

@@ -17,25 +17,36 @@ typedef struct anon_page_node {
     uint64_t index;
     page_t *page;
     struct anon_page_node *next;
+    /* Stable owning link permits O(1) removal after an indexed lookup. */
+    struct anon_page_node **list_link;
+    rb_node_t index_node;
 } anon_page_node_t;
 
 typedef struct anon_store {
     spinlock_t lock;
     anon_page_node_t *pages;
-    anon_page_node_t *lookup_hint;
+    rb_root_t page_index;
 } anon_store_t;
 
 void vm_object_stats_init(vm_object_t *object);
+/* Common anonymous backing; shared callers additionally require alignment. */
+kstatus_t vm_object_create_anon_store(size_t size, uint32_t type,
+                                      vm_object_t **out);
 
 /* Private VMA helpers shared by the VM-space implementation units. */
 vm_area_t *area_from_list(list_head_t *node);
 vm_area_t *area_from_rb(rb_node_t *node);
 void rebuild_area_tree(vm_space_t *space);
+void insert_area_tree(vm_space_t *space, vm_area_t *area);
+void update_area_tree(vm_area_t *area);
+void erase_area_tree(vm_space_t *space, vm_area_t *area);
 vm_area_t *find_area(const vm_space_t *space, uint64_t address);
+vm_area_t *find_area_at_or_after(const vm_space_t *space, uint64_t address);
 bool range_size_valid(uint64_t size);
 bool range_valid(uint64_t address, uint64_t size, uint64_t *end);
 uint64_t find_gap(const vm_space_t *space, uint64_t hint, uint64_t size);
 vm_area_t *area_allocate(void);
+vm_area_t *vm_area_copy_tail(const vm_area_t *area, uint64_t start);
 vm_area_t *vm_area_split(vm_area_t *area, uint64_t split);
 
 void map_lock(vm_space_t *space);
@@ -47,6 +58,10 @@ uint32_t vm_area_page_flags(const vm_area_t *area, uint64_t page_address,
 kstatus_t anon_page_get(vm_object_t *object, uint64_t index, bool create,
                         page_t **out);
 page_t *anon_page_lookup(vm_object_t *object, uint64_t index);
+bool anon_page_pin(vm_object_t *object, uint64_t index, page_t *expected);
+void anon_page_unpin(page_t *page);
+kstatus_t anon_page_discard_range(vm_object_t *object, uint64_t first_index,
+                                  uint64_t end_index);
 kstatus_t private_file_shadow_page(vm_area_t *area, uint64_t index,
                                    paddr_t source, page_t **out);
 kstatus_t anon_page_cow(vm_object_t *object, uint64_t index, page_t **out);

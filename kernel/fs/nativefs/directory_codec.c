@@ -146,12 +146,16 @@ BOOLEAN fat32_make_long_name_alias(const CHAR8 *name, UINT32 length,
     return 1;
 }
 
-void fat32_lfn_reset(UINT16 characters[260], BOOLEAN *valid,
-                     UINT32 *expected, UINT8 *checksum) {
-    for (UINT32 i = 0U; i < 260U; ++i) characters[i] = 0xFFFFU;
+void fat32_lfn_invalidate(BOOLEAN *valid, UINT32 *expected, UINT8 *checksum) {
     *valid = 0;
     *expected = 0U;
     *checksum = 0U;
+}
+
+void fat32_lfn_reset(UINT16 characters[260], BOOLEAN *valid,
+                     UINT32 *expected, UINT8 *checksum) {
+    for (UINT32 i = 0U; i < 260U; ++i) characters[i] = 0xFFFFU;
+    fat32_lfn_invalidate(valid, expected, checksum);
 }
 
 void fat32_lfn_store_entry(const UINT8 entry[32], UINT16 characters[260],

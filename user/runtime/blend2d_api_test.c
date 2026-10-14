@@ -16,7 +16,7 @@ static bool blend2d_result_ok(BLResult result) {
     return result == BL_SUCCESS;
 }
 
-int liteos_blend2d_api_test(void) {
+int blend2d_api_test(void) {
     BLImageCore image = {0};
     BLContextCore context = {0};
     BLPathCore path = {0};
@@ -134,7 +134,7 @@ int liteos_blend2d_api_test(void) {
     if (!blend2d_result_ok(result)) goto cleanup;
     font_data_ready = true;
     if (!blend2d_result_ok(bl_font_data_create_from_file(
-            &font_data, "/etc/fonts/liteos.ttf", BL_FILE_READ_NO_FLAGS))) {
+            &font_data, "/etc/fonts/default.ttf", BL_FILE_READ_NO_FLAGS))) {
         goto cleanup;
     }
     result = bl_font_face_init(&font_face);
@@ -151,11 +151,11 @@ int liteos_blend2d_api_test(void) {
     if (!blend2d_result_ok(result)) goto cleanup;
     glyph_buffer_ready = true;
     if (!blend2d_result_ok(bl_glyph_buffer_set_text(
-            &glyph_buffer, "LiteOS Blend2D", SIZE_MAX,
+            &glyph_buffer, "System Blend2D", SIZE_MAX,
             BL_TEXT_ENCODING_UTF8)) ||
         !blend2d_result_ok(bl_font_shape(&font, &glyph_buffer)) ||
         !blend2d_result_ok(bl_context_fill_utf8_text_i_rgba32(
-            &context, &text_origin, &font, "LiteOS Blend2D", SIZE_MAX,
+            &context, &text_origin, &font, "System Blend2D", SIZE_MAX,
             0xFFFFFFFFU))) goto cleanup;
 
     if (!blend2d_result_ok(bl_context_end(&context))) goto cleanup;

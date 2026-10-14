@@ -4,8 +4,8 @@
 #include <boot/sha256.h>
 #include <kernel/memory_map.h>
 
-#ifndef LITEOS_REALTEST
-#define LITEOS_REALTEST 0
+#ifndef OS_REALTEST
+#define OS_REALTEST 0
 #endif
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -13,7 +13,7 @@
 #define CMDLINE_CAP 1024U
 #define MAP_EXTRA_DESCRIPTORS 8U
 #define MAX_MAP_RETRIES 8U
-#define BOOTSTRAP_STACK_SIZE LITEOS_BOOTSTRAP_STACK_SIZE
+#define BOOTSTRAP_STACK_SIZE OS_BOOTSTRAP_STACK_SIZE
 #define BOOTSTRAP_STACK_PAGES (BOOTSTRAP_STACK_SIZE / 4096ULL)
 #define BOOTSTRAP_STACK_ALLOCATION_PAGES (BOOTSTRAP_STACK_PAGES * 2ULL)
 #define AP_TRAMPOLINE_PAGES 1ULL
@@ -41,13 +41,13 @@ const EFI_GUID gEfiSmbiosTableGuid =
     {0xEB9D2D31,0x2D88,0x11D3,{0x9A,0x16,0x00,0x90,0x27,0x3F,0xC1,0x4D}};
 
 static EFI_SYSTEM_TABLE *g_system_table;
-static const CHAR8 g_loader_name[] = "LiteOS UEFI Loader 1.0";
+static const CHAR8 g_loader_name[] = "System UEFI Loader 1.0";
 static const CHAR8 g_default_cmdline[] = "";
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 static EFI_FILE_PROTOCOL *g_realtest_loader_log;
 static CHAR16 g_realtest_loader_log_path[] = {
-    '\\', 'E', 'F', 'I', '\\', 'L', 'I', 'T', 'E', 'O', 'S', '\\',
+    '\\', 'E', 'F', 'I', '\\', 'O', 'S', '\\',
     'r', 'e', 'a', 'l', 't', 'e', 's', 't', '.', 'l', 'o', 'g', 0
 };
 static const EFI_GUID g_realtest_variable_guid = {
@@ -77,7 +77,7 @@ static UINT64 page_table_address(const VOID *table) {
     return (UINT64)(uintptr_t)table;
 }
 
-static BOOLEAN build_handoff_page_tables(const LITEOS_ELF_IMAGE *image, UINT64 *root) {
+static BOOLEAN build_handoff_page_tables(const OS_ELF_IMAGE *image, UINT64 *root) {
     if (image == 0 || root == 0 || image->PhysicalBase == 0 || image->Size == 0 ||
         (image->VirtualBase & 0xFFFULL) != 0 || (image->Size & 0xFFFULL) != 0) return 0;
     mem_zero(g_handoff_pml4, sizeof(g_handoff_pml4));
@@ -129,7 +129,7 @@ static BOOLEAN build_handoff_page_tables(const LITEOS_ELF_IMAGE *image, UINT64 *
  * 调整为 16 字节对齐。内核从 RDI 接收 BootInfo，不预留 shadow space。
  */
 static VOID EFIAPI __attribute__((noreturn, naked)) loader_enter_kernel(
-    UINT64, LITEOS_BOOT_INFO *, UINT64, UINT64) {
+    UINT64, OS_BOOT_INFO *, UINT64, UINT64) {
     __asm__(
         "movq %rcx, %rax\n"
         "movq %rdx, %rdi\n"
@@ -165,7 +165,7 @@ static UINTN ascii_length(const CHAR8 *text) {
     return length;
 }
 
-#if LITEOS_REALTEST
+#if OS_REALTEST
 static VOID loader_log_write(const CHAR8 *text) {
     if (g_realtest_loader_log == 0 || text == 0) return;
     UINTN size = ascii_length(text);
@@ -261,7 +261,7 @@ static VOID loader_log_open(EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs) {
     }
     root->Close(root);
     g_realtest_loader_log = file;
-    loader_log_write("LITEOS_LOADER_BEGIN\r\n");
+    loader_log_write("OS_LOADER_BEGIN\r\n");
 }
 #else
 static VOID loader_log_write(const CHAR8 *text) { (void)text; }
@@ -302,10 +302,10 @@ static VOID console_hex(UINT64 value) {
 }
 
 static VOID report_error(const CHAR8 *what, EFI_STATUS status) {
-    loader_log_write("LITEOS_LOADER_ERROR ");
+    loader_log_write("OS_LOADER_ERROR ");
     loader_log_write(what);
     loader_log_write("\r\n");
-    console_ascii("LiteOS loader: ");
+    console_ascii("System loader: ");
     console_ascii(what);
     console_ascii(" (status ");
     console_hex(status);
@@ -440,7 +440,7 @@ static EFI_STATUS get_filesystem(EFI_BOOT_SERVICES *bs, EFI_HANDLE image_handle,
     return status;
 }
 
-static VOID discover_tables(EFI_SYSTEM_TABLE *st, LITEOS_BOOT_INFO *info) {
+static VOID discover_tables(EFI_SYSTEM_TABLE *st, OS_BOOT_INFO *info) {
     for (UINTN i = 0; i < st->NumberOfTableEntries; ++i) {
         EFI_CONFIGURATION_TABLE *entry = &st->ConfigurationTable[i];
         if (guid_equal(&entry->VendorGuid, &gEfiAcpi20TableGuid) ||
@@ -450,11 +450,11 @@ static VOID discover_tables(EFI_SYSTEM_TABLE *st, LITEOS_BOOT_INFO *info) {
         if (guid_equal(&entry->VendorGuid, &gEfiSmbios3TableGuid)) info->Smbios3 = (UINT64)(uintptr_t)entry->VendorTable;
         if (guid_equal(&entry->VendorGuid, &gEfiSmbiosTableGuid)) info->Smbios = (UINT64)(uintptr_t)entry->VendorTable;
     }
-    if (info->AcpiRsdp != 0) info->Flags |= LITEOS_BOOTINFO_HAS_ACPI;
-    if (info->Smbios != 0 || info->Smbios3 != 0) info->Flags |= LITEOS_BOOTINFO_HAS_SMBIOS;
+    if (info->AcpiRsdp != 0) info->Flags |= OS_BOOTINFO_HAS_ACPI;
+    if (info->Smbios != 0 || info->Smbios3 != 0) info->Flags |= OS_BOOTINFO_HAS_SMBIOS;
 }
 
-static VOID discover_graphics(EFI_BOOT_SERVICES *bs, LITEOS_BOOT_INFO *info) {
+static VOID discover_graphics(EFI_BOOT_SERVICES *bs, OS_BOOT_INFO *info) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = 0;
     if (EFI_ERROR(bs->LocateProtocol((EFI_GUID *)&gEfiGraphicsOutputProtocolGuid, 0, (VOID **)&gop)) ||
         gop == 0 || gop->Mode == 0 || gop->Mode->Info == 0) return;
@@ -466,13 +466,13 @@ static VOID discover_graphics(EFI_BOOT_SERVICES *bs, LITEOS_BOOT_INFO *info) {
     info->FrameBufferPixelsPerScanLine = mode->PixelsPerScanLine;
     info->FrameBufferFormat = mode->PixelFormat;
     for (UINTN i = 0; i < 4; ++i) info->FrameBufferMask[i] = mode->PixelInformation[i];
-    if (mode->PixelFormat <= LITEOS_PIXEL_BITMASK) info->Flags |= LITEOS_BOOTINFO_HAS_FRAMEBUFFER;
+    if (mode->PixelFormat <= OS_PIXEL_BITMASK) info->Flags |= OS_BOOTINFO_HAS_FRAMEBUFFER;
 }
 
-static VOID discover_rng(EFI_BOOT_SERVICES *bs, LITEOS_BOOT_INFO *info) {
+static VOID discover_rng(EFI_BOOT_SERVICES *bs, OS_BOOT_INFO *info) {
     EFI_RNG_PROTOCOL *rng = 0;
     if (EFI_ERROR(bs->LocateProtocol((EFI_GUID *)&gEfiRngProtocolGuid, 0, (VOID **)&rng)) || rng == 0) return;
-    if (!EFI_ERROR(rng->GetRNG(rng, 0, sizeof(info->RandomSeed), info->RandomSeed))) info->Flags |= LITEOS_BOOTINFO_HAS_RNG;
+    if (!EFI_ERROR(rng->GetRNG(rng, 0, sizeof(info->RandomSeed), info->RandomSeed))) info->Flags |= OS_BOOTINFO_HAS_RNG;
 }
 
 static UINT32 device_path_u32(const UINT8 *bytes) {
@@ -496,7 +496,7 @@ static UINT64 device_path_u64(const UINT8 *bytes) {
 
 /* 在 Boot Services 仍然有效时解析启动设备路径，只复制稳定元数据给内核。 */
 static BOOLEAN discover_boot_device(EFI_BOOT_SERVICES *bs, EFI_HANDLE device_handle,
-                                    LITEOS_BOOT_INFO *info) {
+                                    OS_BOOT_INFO *info) {
     EFI_DEVICE_PATH_PROTOCOL *path = 0;
     if (bs == 0 || device_handle == 0 || info == 0 ||
         EFI_ERROR(bs->HandleProtocol(device_handle, (EFI_GUID *)&gEfiDevicePathProtocolGuid,
@@ -505,7 +505,7 @@ static BOOLEAN discover_boot_device(EFI_BOOT_SERVICES *bs, EFI_HANDLE device_han
     const UINTN maximum_path_size = 64U * 1024U;
     UINTN path_size = 0;
     BOOLEAN reached_end = 0;
-    info->BootDeviceTransport = LITEOS_BOOT_DEVICE_TRANSPORT_UNKNOWN;
+    info->BootDeviceTransport = OS_BOOT_DEVICE_TRANSPORT_UNKNOWN;
     for (;;) {
         if (path_size > maximum_path_size - sizeof(EFI_DEVICE_PATH_PROTOCOL)) return 0;
         EFI_DEVICE_PATH_PROTOCOL *node =
@@ -523,16 +523,16 @@ static BOOLEAN discover_boot_device(EFI_BOOT_SERVICES *bs, EFI_HANDLE device_han
             (node->SubType == EFI_DEVICE_PATH_SUBTYPE_USB ||
              node->SubType == EFI_DEVICE_PATH_SUBTYPE_USB_CLASS ||
              node->SubType == EFI_DEVICE_PATH_SUBTYPE_USB_WWID)) {
-            info->BootDeviceTransport = LITEOS_BOOT_DEVICE_TRANSPORT_USB;
+            info->BootDeviceTransport = OS_BOOT_DEVICE_TRANSPORT_USB;
         } else if (node->Type == EFI_DEVICE_PATH_TYPE_MESSAGING &&
                    node->SubType == EFI_DEVICE_PATH_SUBTYPE_NVME) {
-            info->BootDeviceTransport = LITEOS_BOOT_DEVICE_TRANSPORT_NVME;
+            info->BootDeviceTransport = OS_BOOT_DEVICE_TRANSPORT_NVME;
         } else if (node->Type == EFI_DEVICE_PATH_TYPE_HARDWARE &&
                    node->SubType == EFI_DEVICE_PATH_SUBTYPE_PCI &&
                    info->BootDeviceTransport ==
-                       LITEOS_BOOT_DEVICE_TRANSPORT_UNKNOWN) {
+                       OS_BOOT_DEVICE_TRANSPORT_UNKNOWN) {
             /* Keep PCI-only paths distinguishable from USB aliases below. */
-            info->BootDeviceTransport = LITEOS_BOOT_DEVICE_TRANSPORT_NVME;
+            info->BootDeviceTransport = OS_BOOT_DEVICE_TRANSPORT_NVME;
         }
         if (node->Type == EFI_DEVICE_PATH_TYPE_MEDIA &&
             node->SubType == EFI_DEVICE_PATH_SUBTYPE_HARDDRIVE && node_size >= 42U) {
@@ -553,11 +553,11 @@ static BOOLEAN discover_boot_device(EFI_BOOT_SERVICES *bs, EFI_HANDLE device_han
     sha256_compute((const UINT8 *)path, path_size, info->BootDevicePathHash);
     info->BootDeviceHandle = (UINT64)(uintptr_t)device_handle;
     info->BootDevicePathSize = (UINT32)path_size;
-    info->Flags |= LITEOS_BOOTINFO_HAS_BOOT_DEVICE;
+    info->Flags |= OS_BOOTINFO_HAS_BOOT_DEVICE;
     return 1;
 }
 
-static EFI_STATUS allocate_command_line(EFI_BOOT_SERVICES *bs, LITEOS_BOOT_INFO *info, const CHAR8 *command_line) {
+static EFI_STATUS allocate_command_line(EFI_BOOT_SERVICES *bs, OS_BOOT_INFO *info, const CHAR8 *command_line) {
     UINTN length = ascii_length(command_line) + 1;
     VOID *copy = 0;
     EFI_STATUS status = bs->AllocatePool(EFI_LOADER_DATA, length, &copy);
@@ -568,7 +568,7 @@ static EFI_STATUS allocate_command_line(EFI_BOOT_SERVICES *bs, LITEOS_BOOT_INFO 
     return EFI_SUCCESS;
 }
 
-static EFI_STATUS allocate_loader_name(EFI_BOOT_SERVICES *bs, LITEOS_BOOT_INFO *info) {
+static EFI_STATUS allocate_loader_name(EFI_BOOT_SERVICES *bs, OS_BOOT_INFO *info) {
     UINTN length = ascii_length(g_loader_name) + 1;
     VOID *copy = 0;
     EFI_STATUS status = bs->AllocatePool(EFI_LOADER_DATA, length, &copy);
@@ -609,21 +609,21 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     EFI_BOOT_SERVICES *bs = system_table->BootServices;
     if (bs == 0) return EFI_LOAD_ERROR;
     if (bs->SetWatchdogTimer != 0) bs->SetWatchdogTimer(0, 0, 0, 0);
-    console_ascii("LiteOS UEFI loader\r\n");
+    console_ascii("System UEFI loader\r\n");
 
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = 0;
     EFI_STATUS status = get_filesystem(bs, image_handle, &fs);
     if (EFI_ERROR(status)) { report_error("filesystem unavailable", status); return status; }
     loader_log_open(fs);
-    loader_runtime_mark("LITEOS_LOADER_START");
-    loader_log_write("LITEOS_LOADER_FILESYSTEM_OK\r\n");
+    loader_runtime_mark("OS_LOADER_START");
+    loader_log_write("OS_LOADER_FILESYSTEM_OK\r\n");
 
     LOADER_CONFIG config;
     mem_zero(&config, sizeof(config));
-    ascii_to_char16(config.kernel_path, ARRAY_SIZE(config.kernel_path), "\\EFI\\LITEOS\\kernel.elf");
+    ascii_to_char16(config.kernel_path, ARRAY_SIZE(config.kernel_path), "\\EFI\\OS\\kernel.elf");
     copy_ascii(config.cmdline, sizeof(config.cmdline), g_default_cmdline, ascii_length(g_default_cmdline));
 
-    static CHAR16 config_path[] = {'\\','E','F','I','\\','L','I','T','E','O','S','\\','l','o','a','d','e','r','.','c','o','n','f',0};
+    static CHAR16 config_path[] = {'\\','E','F','I','\\','O','S','\\','l','o','a','d','e','r','.','c','o','n','f',0};
     VOID *config_data = 0;
     UINTN config_size = 0;
     status = read_file(bs, fs, config_path, &config_data, &config_size);
@@ -631,32 +631,32 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         status = parse_config(config_data, config_size, &config);
         bs->FreePool(config_data);
         if (EFI_ERROR(status)) { report_error("invalid loader.conf", status); return status; }
-        loader_log_write("LITEOS_LOADER_CONFIG_OK\r\n");
+        loader_log_write("OS_LOADER_CONFIG_OK\r\n");
     } else if (status != EFI_NOT_FOUND && status != EFI_NO_MEDIA) {
         report_error("cannot read loader.conf", status);
         return status;
     }
     if (status == EFI_NOT_FOUND || status == EFI_NO_MEDIA) {
-        loader_log_write("LITEOS_LOADER_CONFIG_DEFAULT\r\n");
+        loader_log_write("OS_LOADER_CONFIG_DEFAULT\r\n");
     }
     VOID *kernel_file = 0;
     UINTN kernel_file_size = 0;
     status = read_file(bs, fs, config.kernel_path, &kernel_file, &kernel_file_size);
     if (EFI_ERROR(status)) { report_error("cannot read kernel.elf", status); return status; }
-    loader_log_write("LITEOS_LOADER_KERNEL_FILE_OK\r\n");
+    loader_log_write("OS_LOADER_KERNEL_FILE_OK\r\n");
 
-    LITEOS_ELF_IMAGE image;
+    OS_ELF_IMAGE image;
     status = elf_load(bs, (const UINT8 *)kernel_file, kernel_file_size, &image);
     bs->FreePool(kernel_file);
     if (EFI_ERROR(status)) { report_error("invalid or unsupported kernel.elf", status); return status; }
-    loader_log_write("LITEOS_LOADER_ELF_OK\r\n");
+    loader_log_write("OS_LOADER_ELF_OK\r\n");
 
-    LITEOS_BOOT_INFO *boot_info = 0;
+    OS_BOOT_INFO *boot_info = 0;
     status = bs->AllocatePool(EFI_LOADER_DATA, sizeof(*boot_info), (VOID **)&boot_info);
     if (EFI_ERROR(status)) { report_error("cannot allocate BootInfo", status); return status; }
     mem_zero(boot_info, sizeof(*boot_info));
-    boot_info->Magic = LITEOS_BOOTINFO_MAGIC;
-    boot_info->Version = LITEOS_BOOTINFO_VERSION;
+    boot_info->Magic = OS_BOOTINFO_MAGIC;
+    boot_info->Version = OS_BOOTINFO_VERSION;
     boot_info->Size = sizeof(*boot_info);
     boot_info->KernelPhysicalBase = image.PhysicalBase;
     boot_info->KernelVirtualBase = image.VirtualBase;
@@ -685,7 +685,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
     discover_rng(bs, boot_info);
     boot_info->RuntimeServices = (UINT64)(uintptr_t)system_table->RuntimeServices;
     boot_info->SystemTable = (UINT64)(uintptr_t)system_table;
-    loader_log_write("LITEOS_LOADER_BOOTINFO_OK\r\n");
+    loader_log_write("OS_LOADER_BOOTINFO_OK\r\n");
 
     EFI_PHYSICAL_ADDRESS bootstrap_stack = 0;
     bootstrap_stack = BOOTSTRAP_STACK_MAX_ADDRESS;
@@ -721,7 +721,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
 
     /* Build the post-EBS address space while EFI services are still valid. */
     UINT64 handoff_cr3 = 0;
-    LITEOS_ELF_IMAGE handoff_image;
+    OS_ELF_IMAGE handoff_image;
     handoff_image.PhysicalBase = boot_info->KernelPhysicalBase;
     handoff_image.VirtualBase = boot_info->KernelVirtualBase;
     handoff_image.Size = boot_info->KernelSize;
@@ -729,24 +729,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         report_error("cannot build handoff page tables", EFI_LOAD_ERROR);
         return EFI_LOAD_ERROR;
     }
-    loader_log_write("LITEOS_LOADER_HANDOFF_OK\r\n");
-    loader_log_address("LITEOS_LOADER_KERNEL_PA ", boot_info->KernelPhysicalBase);
-    loader_log_address("LITEOS_LOADER_BOOTINFO ", (UINT64)(uintptr_t)boot_info);
-    loader_log_address("LITEOS_LOADER_STACK ", boot_info->BootstrapStackBase);
-    loader_log_address("LITEOS_LOADER_HANDOFF_CR3 ", handoff_cr3);
+    loader_log_write("OS_LOADER_HANDOFF_OK\r\n");
+    loader_log_address("OS_LOADER_KERNEL_PA ", boot_info->KernelPhysicalBase);
+    loader_log_address("OS_LOADER_BOOTINFO ", (UINT64)(uintptr_t)boot_info);
+    loader_log_address("OS_LOADER_STACK ", boot_info->BootstrapStackBase);
+    loader_log_address("OS_LOADER_HANDOFF_CR3 ", handoff_cr3);
 
     EFI_MEMORY_DESCRIPTOR *memory_map = 0;
     UINTN map_capacity = 0, map_size = 0, map_key = 0;
     UINTN descriptor_size = 0;
     UINT32 descriptor_version = 0;
-    loader_log_write("LITEOS_LOADER_EXIT_BOOT_SERVICES\r\n");
-    loader_runtime_mark("LITEOS_LOADER_EBS_BEGIN");
+    loader_log_write("OS_LOADER_EXIT_BOOT_SERVICES\r\n");
+    loader_runtime_mark("OS_LOADER_EBS_BEGIN");
     loader_log_close();
     for (UINTN attempt = 0; attempt < MAX_MAP_RETRIES; ++attempt) {
         status = capture_memory_map(bs, &memory_map, &map_capacity, &map_size, &map_key,
                                     &descriptor_size, &descriptor_version);
         if (EFI_ERROR(status)) { report_error("cannot obtain memory map", status); return status; }
-        loader_runtime_mark("LITEOS_LOADER_MEMORY_MAP_OK");
+        loader_runtime_mark("OS_LOADER_MEMORY_MAP_OK");
         boot_info->MemoryMap = (UINT64)(uintptr_t)memory_map;
         boot_info->MemoryMapSize = map_size;
         boot_info->MemoryMapBufferSize = map_capacity;
@@ -754,14 +754,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
         boot_info->MemoryDescriptorVersion = descriptor_version;
         status = bs->ExitBootServices(image_handle, map_key);
         if (!EFI_ERROR(status)) break;
-        loader_runtime_mark("LITEOS_LOADER_EBS_RETRY");
+        loader_runtime_mark("OS_LOADER_EBS_RETRY");
         if (status != EFI_INVALID_PARAMETER) { report_error("ExitBootServices failed", status); return status; }
     }
     if (EFI_ERROR(status)) { report_error("ExitBootServices retry limit", status); return status; }
-    loader_runtime_mark("LITEOS_LOADER_EBS_RETURN");
+    loader_runtime_mark("OS_LOADER_EBS_RETURN");
 
     /* 最终 MapKey 被接受后，合并相邻的可用内存范围。 */
-    map_size = liteos_merge_usable_memory_map(memory_map, map_size, descriptor_size);
+    map_size = boot_merge_usable_memory_map(memory_map, map_size, descriptor_size);
     boot_info->MemoryMapSize = map_size;
 
     /* 使用私有启动栈进入内核。 */

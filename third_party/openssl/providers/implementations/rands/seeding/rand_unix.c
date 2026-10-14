@@ -21,7 +21,7 @@
 #include "internal/nelem.h"
 #include "prov/seeding.h"
 
-#if defined(OPENSSL_SYS_LITEOS)
+#if defined(OPENSSL_SYS_FREESTANDING)
 extern int getentropy(void *buffer, size_t length);
 #endif
 
@@ -333,7 +333,7 @@ static ssize_t sysctl_random(char *buf, size_t buflen)
  */
 static ssize_t syscall_random(void *buf, size_t buflen)
 {
-#if defined(OPENSSL_SYS_LITEOS)
+#if defined(OPENSSL_SYS_FREESTANDING)
     return getentropy(buf, buflen) == 0 ? (ssize_t)buflen : -1;
 #else
     /*
@@ -409,7 +409,7 @@ static ssize_t syscall_random(void *buf, size_t buflen)
     errno = ENOSYS;
     return -1;
 #endif
-#endif /* OPENSSL_SYS_LITEOS */
+#endif /* OPENSSL_SYS_FREESTANDING */
 }
 #endif /* defined(OPENSSL_RAND_SEED_GETRANDOM) */
 

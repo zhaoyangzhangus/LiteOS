@@ -4,17 +4,45 @@ LD = $(TOOLPREFIX)gcc
 AR = $(TOOLPREFIX)ar
 OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
-# These programs run in the build environment rather than in LiteOS.  Keep
+# These programs run in the build environment rather than in System.  Keep
 # them on the native or WSL host so `make test` and build-id do not need Wine.
 HOSTCC ?= gcc
 
+# The original Windows build used a dedicated x86_64-elf toolchain for the
+# dynamic ELF user images.  On Linux the native GNU ELF tools produce the same
+# freestanding output, so prefer the dedicated toolchain when installed and
+# otherwise use the distro target prefix (or the unprefixed tools as a last
+# resort).  An explicit command-line/environment value always wins.
+ifeq ($(origin ELFTOOLPREFIX),undefined)
+ifeq ($(OS),Windows_NT)
+ELFTOOLPREFIX = x86_64-elf-
+else ifneq ($(shell command -v x86_64-elf-gcc >/dev/null 2>&1 && command -v x86_64-elf-g++ >/dev/null 2>&1 && echo yes),)
+ELFTOOLPREFIX = x86_64-elf-
+else ifneq ($(shell command -v x86_64-linux-gnu-gcc >/dev/null 2>&1 && command -v x86_64-linux-gnu-g++ >/dev/null 2>&1 && echo yes),)
+ELFTOOLPREFIX = x86_64-linux-gnu-
+else
+ELFTOOLPREFIX =
+endif
+endif
+
 DEBUG ?= 0
-LITEOS_DEBUG_SERIAL ?= 0
-LITEOS_REALTEST ?= 0
-LITEOS_REALTEST_FAILURE_TEST ?= 0
-LITEOS_XHCI_DIAGNOSTIC_BOT ?= 0
+OS_DEBUG_SERIAL ?= 0
+OS_REALTEST ?= 0
+OS_REALTEST_FAILURE_TEST ?= 0
+OS_ENABLE_FRAME_TRACE ?= 0
+OS_PHASE7 ?= 0
+OS_PHASE8 ?= 0
+OS_PHASE9 ?= 0
+OS_PHASE10 ?= 0
+OS_PHASE13 ?= 0
+OS_XHCI_DIAGNOSTIC_BOT ?= 0
+OS_AUTOSTART_CHROME ?= 0
+OS_INTERACTIVE_DESKTOP ?= 0
+OS_NVIDIA ?= $(if $(wildcard $(BUILD)/nvidia/driver/driver.o),1,0)
 KERNEL_EXTRA_CFLAGS ?=
 VM_FAULT_AROUND_PAGES ?= 16
+QEMU_TEST_SECONDS ?= 60
+QEMU_TEST_CPU ?= 4
 .DEFAULT_GOAL := all
 ifeq ($(DEBUG),1)
 DEBUG_CFLAGS = -O0 -g3 -fno-omit-frame-pointer
@@ -30,16 +58,24 @@ endif
 COMMON_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -Werror -Wno-error=unused-function -ffreestanding -fno-builtin \
                 -fno-stack-protector -fno-stack-check -fno-pic -mno-red-zone \
                 -mno-sse -mno-mmx -mno-stack-arg-probe -fshort-wchar -Iinclude -MMD -MP \
-                -DLITEOS_REALTEST=$(LITEOS_REALTEST)
-KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DLITEOS_KERNEL_BUILD \
-                -DLITEOS_DEBUG_SERIAL=$(LITEOS_DEBUG_SERIAL) \
+                -DOS_REALTEST=$(OS_REALTEST)
+KERNEL_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -DOS_KERNEL_BUILD \
+                -DOS_DEBUG_SERIAL=$(OS_DEBUG_SERIAL) \
+                -DOS_ENABLE_FRAME_TRACE=$(OS_ENABLE_FRAME_TRACE) \
+                -DOS_PHASE7=$(OS_PHASE7) \
+                -DOS_PHASE8=$(OS_PHASE8) \
+                -DOS_PHASE9=$(OS_PHASE9) \
+                -DOS_PHASE10=$(OS_PHASE10) \
                 -DVM_FAULT_AROUND_PAGES=$(VM_FAULT_AROUND_PAGES) \
-                -DLITEOS_REALTEST_FAILURE_TEST=$(LITEOS_REALTEST_FAILURE_TEST) \
-                -DLITEOS_XHCI_DIAGNOSTIC_BOT=$(LITEOS_XHCI_DIAGNOSTIC_BOT) \
+                -DOS_REALTEST_FAILURE_TEST=$(OS_REALTEST_FAILURE_TEST) \
+                -DOS_XHCI_DIAGNOSTIC_BOT=$(OS_XHCI_DIAGNOSTIC_BOT) \
+                -DOS_AUTOSTART_CHROME=$(OS_AUTOSTART_CHROME) \
+                -DOS_INTERACTIVE_DESKTOP=$(OS_INTERACTIVE_DESKTOP) \
                 $(KERNEL_EXTRA_CFLAGS)
-USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -Iuser/services/audiod \
+USER_CFLAGS = $(COMMON_CFLAGS) -mabi=sysv -msse2 -Iuser/services/audiod \
               -Iuser/libc/include
 USER_LIBC_SOURCES = user/libc/memory.c user/libc/syscall.c \
+                    user/libc/personality.c \
                     user/libc/alloc.c user/libc/stdio.c user/libc/stdlib.c \
                     user/libc/random.c \
                     user/libc/string.c user/libc/ctype.c user/libc/env.c \
@@ -51,14 +87,16 @@ USER_LIBC_SOURCES = user/libc/memory.c user/libc/syscall.c \
                     user/libc/netdb.c user/libc/glob.c \
                     user/libc/strings.c user/libc/libgen.c user/libc/signal.c \
                     user/libc/math.c user/libc/fenv.c user/libc/complex.c \
-                    user/libc/uchar.c user/libc/threads.c
+                    user/libc/uchar.c user/libc/threads.c user/libc/semaphore.c \
+                    user/libc/posix_compat.c
 USER_LIBC_ASM_SOURCES = user/libc/setjmp.S user/libc/signal_restorer.S
+USER_LIBC_ASM_SOURCES += user/libc/posix_compat.S
 # The freestanding CRT calls the application's main().  Keep that object out
 # of both shared and static libraries: the shared object must not carry an
 # unresolved application symbol, and legacy PE services do not define main().
 DYNAMIC_LIBC_SOURCES = $(USER_LIBC_SOURCES)
 USER_LIBC_OBJECTS = $(patsubst user/libc/%.c,$(BUILD)/user/libc-%.o,$(USER_LIBC_SOURCES))
-USER_LIBC_ASM_OBJECTS = $(patsubst user/libc/%.S,$(BUILD)/user/libc-%.o,$(USER_LIBC_ASM_SOURCES))
+USER_LIBC_ASM_OBJECTS = $(patsubst user/libc/%.S,$(BUILD)/user/libc-asm-%.o,$(USER_LIBC_ASM_SOURCES))
 USER_LIBC_LINK_OBJECTS = $(USER_LIBC_OBJECTS) $(USER_LIBC_ASM_OBJECTS)
 ELFTOOLPREFIX ?= x86_64-elf-
 ELFCC = $(ELFTOOLPREFIX)gcc
@@ -69,23 +107,32 @@ ELFOBJDUMP = $(ELFTOOLPREFIX)objdump
 ELF_COMMON_CFLAGS = $(DEBUG_CFLAGS) -Wall -Wextra -Werror -ffreestanding -fno-builtin \
                     -fno-stack-protector -fno-stack-check -fno-asynchronous-unwind-tables \
                     -fno-unwind-tables -mno-red-zone -mno-mmx -mabi=sysv \
-                    -fshort-wchar -Iinclude -Iuser/runtime -Iuser/libc/include \
-                    -I$(BLEND2D_DIR) -DLITEOS_REALTEST=$(LITEOS_REALTEST) -MMD -MP
+                    -include user/runtime/elf_abi.h -Iinclude -Iuser/runtime -Iuser/libc/include \
+                    -I$(BLEND2D_DIR) -DOS_REALTEST=$(OS_REALTEST) \
+                    -DOS_DEBUG_SERIAL=$(OS_DEBUG_SERIAL) -MMD -MP
 ELF_RUNTIME_CFLAGS = $(ELF_COMMON_CFLAGS) -fPIC
-ELF_APP_CFLAGS = $(ELF_COMMON_CFLAGS) -fPIE
+# Keep executable data references position independent as well.  Native
+# Debian GCC emits R_X86_64_COPY for external data under -fPIE, while the
+# freestanding System loader intentionally handles GOT/PLT relocations and
+# does not provide a host ABI copy-relocation path.  -fPIC produces the same
+# PIE-compatible code without making the image depend on that ABI detail.
+ELF_APP_CFLAGS = $(ELF_COMMON_CFLAGS) -fPIC
 ELF_LINK_FLAGS = --build-id=none
 ELF_RUNTIME_DIR = $(BUILD)/elf
 DYNAMIC_LIBC_OBJECTS = $(patsubst user/libc/%.c,$(ELF_RUNTIME_DIR)/libc-%.o,$(DYNAMIC_LIBC_SOURCES)) \
-                       $(patsubst user/libc/%.S,$(ELF_RUNTIME_DIR)/libc-%.o,$(USER_LIBC_ASM_SOURCES))
-DYNAMIC_LOADER_ELF = $(ELF_RUNTIME_DIR)/ld-liteos.so.1
-DYNAMIC_LIBC_ELF = $(ELF_RUNTIME_DIR)/libliteosc.so.1
-DYNAMIC_GFX_LIBRARY_ELF = $(ELF_RUNTIME_DIR)/libliteosgfx.so.1
+                       $(patsubst user/libc/%.S,$(ELF_RUNTIME_DIR)/libc-asm-%.o,$(USER_LIBC_ASM_SOURCES))
+DYNAMIC_LOADER_ELF = $(ELF_RUNTIME_DIR)/ld-system.so.1
+DYNAMIC_LIBC_ELF = $(ELF_RUNTIME_DIR)/libsystemc.so.1
+DYNAMIC_GFX_LIBRARY_ELF = $(ELF_RUNTIME_DIR)/libgraphics.so.1
 DYNAMIC_GFX_TEST_ELF = $(ELF_RUNTIME_DIR)/dyn-gfx.elf
 DYNAMIC_LIBC_TEST_ELF = $(ELF_RUNTIME_DIR)/libc-test.elf
+DYNAMIC_LINUX_EVENTS_TEST_ELF = $(ELF_RUNTIME_DIR)/linux-events-test.elf
+DYNAMIC_FSYNC_PROBE_ELF = $(ELF_RUNTIME_DIR)/fat-fsync-probe.elf
 DYNAMIC_IMAGEVIEW_ELF = $(ELF_RUNTIME_DIR)/imageview.elf
 DYNAMIC_NASM_ELF = $(ELF_RUNTIME_DIR)/nasm.elf
 DYNAMIC_NDISASM_ELF = $(ELF_RUNTIME_DIR)/ndisasm.elf
 DYNAMIC_GSHELL_ELF = $(ELF_RUNTIME_DIR)/gshell.elf
+DYNAMIC_CHROME_START_ELF = $(ELF_RUNTIME_DIR)/chrome-start.elf
 DYNAMIC_NOTEPAD_ELF = $(ELF_RUNTIME_DIR)/notepad.elf
 DYNAMIC_FILEMAN_ELF = $(ELF_RUNTIME_DIR)/fileman.elf
 DYNAMIC_TASKMGR_ELF = $(ELF_RUNTIME_DIR)/taskmgr.elf
@@ -100,17 +147,15 @@ KERNEL_LDFLAGS = -nostdlib -Wl,--entry,kernel_entry -Wl,--subsystem,0 \
 
 BUILD ?= build
 NASM_DIR = third_party/nasm
-include tools/nasm-liteos/sources.mk
+include tools/nasm-platform/sources.mk
 NASM_SOURCES = $(addprefix $(NASM_DIR)/,$(NASM_SOURCE_FILES))
 NASM_OBJECTS = $(patsubst $(NASM_DIR)/%.c,$(BUILD)/nasm/%.o,$(NASM_SOURCES))
 NDISASM_SOURCES = $(addprefix $(NASM_DIR)/,$(NDISASM_SOURCE_FILES))
 NDISASM_OBJECTS = $(patsubst $(NASM_DIR)/%.c,$(BUILD)/nasm/%.o,$(NDISASM_SOURCES))
 NASM_DEPENDENCY_FILES = $(shell find $(BUILD)/nasm -type f -name '*.d' -print 2>/dev/null)
-NASM_SMOKE_SOURCE = tests/user/nasm_smoke.asm
-NASM_SMOKE_IMAGE = $(BUILD)/esp/tmp/nasm-smoke.asm
 NASM_CFLAGS = $(filter-out -Werror,$(ELF_APP_CFLAGS)) \
 	-DHAVE_CONFIG_H -D__unix__ \
-	-Itools/nasm-liteos -I$(NASM_DIR) -I$(NASM_DIR)/include \
+	-Itools/nasm-platform -I$(NASM_DIR) -I$(NASM_DIR)/include \
 	-I$(NASM_DIR)/x86 -I$(NASM_DIR)/asm -I$(NASM_DIR)/output \
 	-I$(NASM_DIR)/zlib \
 	-Wno-maybe-uninitialized -Wno-return-type -Wno-sign-compare
@@ -120,12 +165,30 @@ else
 STAGE_LOG ?= $(BUILD)/qemu-serial.log
 endif
 DEBUG_SERIAL_STAMP = $(BUILD)/kernel/.debug-serial
+DEBUG_SERIAL_CONFIG_VALUE = os-config-v1:$(OS_DEBUG_SERIAL):$(OS_REALTEST):$(OS_REALTEST_FAILURE_TEST):$(OS_XHCI_DIAGNOSTIC_BOT):$(OS_PHASE7):$(OS_PHASE8):$(OS_PHASE9):$(OS_PHASE10):$(OS_AUTOSTART_CHROME):$(OS_INTERACTIVE_DESKTOP):$(OS_NVIDIA)
+DEBUG_SERIAL_STAMP_VALUE := $(shell cat '$(DEBUG_SERIAL_STAMP)' 2>/dev/null)
+FRAME_TRACE_STAMP = $(BUILD)/kernel/.frame-trace
+FRAME_TRACE_STAMP_VALUE := $(shell cat '$(FRAME_TRACE_STAMP)' 2>/dev/null)
+FRAME_TRACE_KERNEL_OBJECTS = $(BUILD)/kernel/graphics-window.o \
+                             $(BUILD)/kernel/syscall-graphics.o \
+                             $(BUILD)/kernel/linux-abi.o
+PHASE13_STAMP = $(BUILD)/kernel/.phase13
+ifeq ($(OS_PHASE13),1)
+PHASE13_KERNEL_OBJECT = $(BUILD)/kernel/linux-phase13-test.o
+endif
 
 # Every kernel object embeds the serial-debug switch.  Keep the stamp as a
-# shared prerequisite so changing LITEOS_DEBUG_SERIAL cannot leave a mixed
+# shared prerequisite so changing OS_DEBUG_SERIAL cannot leave a mixed
 # image with only entry.o rebuilt.
 KERNEL_DEBUG_STAMP_TARGETS = $(wildcard $(BUILD)/kernel/*.o)
 $(KERNEL_DEBUG_STAMP_TARGETS): $(DEBUG_SERIAL_STAMP)
+$(FRAME_TRACE_KERNEL_OBJECTS): $(FRAME_TRACE_STAMP)
+ifneq ($(DEBUG_SERIAL_STAMP_VALUE),$(DEBUG_SERIAL_CONFIG_VALUE))
+$(DEBUG_SERIAL_STAMP): FORCE
+endif
+ifneq ($(FRAME_TRACE_STAMP_VALUE),$(OS_ENABLE_FRAME_TRACE))
+$(FRAME_TRACE_STAMP): FORCE
+endif
 
 # GNU objcopy's binary backend derives symbols from its input pathname and
 # replaces every non-alphanumeric separator with an underscore.  Keep the
@@ -136,15 +199,18 @@ LOADER_OBJECTS = $(BUILD)/loader/main.o $(BUILD)/loader/elf.o $(BUILD)/loader/sh
                  $(BUILD)/loader/memory_map.o
 
 KERNEL_PE = $(BUILD)/kernel/kernel.pe
-KERNEL_ELF = $(BUILD)/esp/EFI/LITEOS/kernel.elf
-KERNEL_BUILD_ID = $(BUILD)/esp/EFI/LITEOS/kernel.build-id
+KERNEL_ELF = $(BUILD)/esp/EFI/OS/kernel.elf
+KERNEL_BUILD_ID = $(BUILD)/esp/EFI/OS/kernel.build-id
 KERNEL_SYMBOLS = $(BUILD)/kernel/kernel.sym
 NVIDIA_PORT_DIR = kernel/drivers/gpu/nvidia/port
-NVIDIA_PORT_NAMES = memory atomic cache sync time thread worker vm pci mmio vbios dma irq firmware registry
+NVIDIA_PORT_NAMES = memory atomic cache sync time thread worker vm pci mmio vbios dma irq firmware registry events
 NVIDIA_PORT_SOURCES = $(addprefix $(NVIDIA_PORT_DIR)/nv_port_,$(addsuffix .c,$(NVIDIA_PORT_NAMES)))
 NVIDIA_PORT_OBJECTS = $(addprefix $(BUILD)/kernel/nvidia-port-,$(addsuffix .o,$(NVIDIA_PORT_NAMES)))
 NVIDIA_RM_DIR = kernel/drivers/gpu/nvidia/rm
 NVIDIA_RM_DRIVER_OBJECTS = $(BUILD)/kernel/nvidia-rm-driver.o
+KERNEL_LINK = $(LD) $(KERNEL_LDFLAGS)
+KERNEL_OBJECT_FORMAT = pe-x86-64
+include tools/nvidia/driver.mk
 NVIDIA_PORT_HOST_OBJECTS = $(addprefix $(BUILD)/nvidia/host-test/nv_port_,$(addsuffix .o,$(NVIDIA_PORT_NAMES)))
 USER_AUDIOD_PE = $(BUILD)/user/audiod.pe
 USER_AUDIOD_ELF = $(BUILD)/user/audiod.elf
@@ -178,7 +244,7 @@ OPENSSL_CRYPTO_OBJECT_LIST = $(BUILD)/openssl/crypto.objects
 OPENSSL_SSL_OBJECT_LIST = $(BUILD)/openssl/ssl.objects
 OPENSSL_LIBS = $(OPENSSL_SSL_LIB) $(OPENSSL_CRYPTO_LIB)
 OPENSSL_DEPENDENCY_FILES = $(shell find $(BUILD)/openssl -type f -name '*.d' -print 2>/dev/null)
-OPENSSL_PLATFORM_CFLAGS = -DOPENSSL_SYS_LITEOS -U_WIN32 -U_WIN64 \
+OPENSSL_PLATFORM_CFLAGS = -DOPENSSL_SYS_FREESTANDING -U_WIN32 -U_WIN64 \
                           -U__WIN32__ -U__MINGW32__ -U__MINGW64__ \
                           -UWIN32 -UWIN64 -UWINNT -U__WIN32 -U__WIN64 \
                           -U__WINNT -U__WIN64__ -U__WINNT__
@@ -201,10 +267,14 @@ OPENSSL_CFLAGS = -O2 -ffreestanding -fno-builtin \
 # Blend2D is compiled for the ELF user runtime with its reference rasterizer.
 # The x86_64-elf toolchain intentionally has no libstdc++ headers, therefore
 # the small C++ language-library compatibility layer is kept beside the
-# vendored source and the final shared object links only against LiteOS libc.
+# vendored source and the final shared object links only against System libc.
 BLEND2D_DIR = third_party/blend2d
 include $(BLEND2D_DIR)/sources.mk
-BLEND2D_ENABLE_JIT ?= 1
+# System currently uses the reference Blend2D pipeline: its native VM ABI does
+# not provide the executable-memory contract required by AsmJit.  Keep JIT an
+# explicit opt-in for host experiments instead of making every desktop launch
+# enter the unsupported JIT initialization path.
+BLEND2D_ENABLE_JIT ?= 0
 ASMJIT_DIR = $(BLEND2D_DIR)/3rdparty/asmjit
 include $(BLEND2D_DIR)/asmjit-sources.mk
 ifeq ($(BLEND2D_ENABLE_JIT),1)
@@ -239,7 +309,7 @@ BLEND2D_ALL_OBJECTS = $(BLEND2D_OBJECTS) $(BLEND2D_ASMJIT_OBJECTS)
 BLEND2D_LIB = $(BUILD)/blend2d/libblend2d.a
 BLEND2D_OBJECT_LIST = $(BUILD)/blend2d/objects
 BLEND2D_DEPENDENCY_FILES = $(shell find $(BUILD)/blend2d -type f -name '*.d' -print 2>/dev/null)
-BLEND2D_LITEOS_OBJECT = $(ELF_RUNTIME_DIR)/blend2d-compiler.o
+BLEND2D_PLATFORM_OBJECT = $(ELF_RUNTIME_DIR)/blend2d-compiler.o
 BLEND2D_CXX_RUNTIME_OBJECT = $(ELF_RUNTIME_DIR)/blend2d-cxx-runtime.o
 BLEND2D_API_TEST_OBJECT = $(ELF_RUNTIME_DIR)/blend2d-api-test.o
 BLEND2D_CXXFLAGS = -O2 -Wall -Wextra -Werror -Wno-unused-function \
@@ -251,11 +321,16 @@ BLEND2D_CXXFLAGS = -O2 -Wall -Wextra -Werror -Wno-unused-function \
                    -mno-stack-arg-probe -msse2 -mabi=sysv \
                    -DBL_STATIC -DBL_BUILD_NO_TLS \
                    -DBL_BUILD_NO_FUTEX -DBL_BUILD_NO_STDCXX -DBL_BUILD_OPT_AVX512 \
-                   -DBL_PLATFORM_LITEOS -DNDEBUG \
-                   -I$(BLEND2D_DIR)/liteos/cxx \
-                   -I$(BLEND2D_DIR)/liteos/include \
+                   -DBL_PLATFORM_FREESTANDING -DNDEBUG \
+                   -I$(BLEND2D_DIR)/platform/cxx \
+                   -I$(BLEND2D_DIR)/platform/include \
                    -I$(BLEND2D_DIR) -I$(ASMJIT_DIR) -Iinclude \
                    -Iuser/libc/include -MMD -MP
+# The native Linux compiler defines __linux__, but these sources are being
+# compiled against System' guest sys/stat.h, not the host libc ABI.  Prevent
+# Blend2D from selecting Linux-only st_mtim/stat feature branches; the
+# System ABI intentionally exposes the portable st_mtime field instead.
+BLEND2D_CXXFLAGS += -U__linux__
 ifeq ($(BLEND2D_ENABLE_JIT),1)
 BLEND2D_CXXFLAGS += -DASMJIT_STATIC -DASMJIT_NO_FOREIGN -DASMJIT_NO_STDCXX \
                     -DASMJIT_NO_SHM_OPEN -DASMJIT_ABI_NAMESPACE=abi_bl
@@ -264,26 +339,27 @@ BLEND2D_CXXFLAGS += -DBL_BUILD_NO_JIT
 endif
 
 # The MinGW compiler predefines Windows compatibility macros. Clear all of
-# them so OpenSSL selects the LiteOS POSIX-shaped ABI instead of the host CRT.
+# them so OpenSSL selects the System POSIX-shaped ABI instead of the host CRT.
 USER_NETD_PE = $(BUILD)/user/netd.pe
 USER_NETD_ELF = $(BUILD)/user/netd.elf
 USER_NETD_LDFLAGS = -nostdlib -Wl,--entry,netd_entry -Wl,--subsystem,0 \
                     -Wl,--image-base,0x400000 -Wl,--section-alignment,0x1000 \
                     -Wl,--file-alignment,0x1000 -Wl,--disable-auto-import
 
-.PHONY: all clean esp loader kernel openssl blend2d nasm ndisasm wget debug-image debug-locations roadmap-stage-layout roadmap-stages qemu-matrix refactor-benchmark refactor-layout test header-sanity stage-sanity abi-sanity dynamic-loader-sanity libc-sanity libc-header-sanity bluetooth-test firmware-test audiod-test nvidia-port-test release-metadata FORCE \
-        $(BUILD)/build-id.exe $(BUILD)/sha256-test.exe $(BUILD)/mm-api-test.exe \
-        $(BUILD)/memory-map-test.exe $(BUILD)/fat32-test.exe $(BUILD)/cache-test.exe \
-        $(BUILD)/primitives-test.exe \
-        $(BUILD)/bluetooth-test.exe $(BUILD)/firmware-test.exe \
-        $(BUILD)/audiod-test.exe $(BUILD)/header-sanity.exe $(BUILD)/abi-sanity.exe
+.PHONY: all clean esp loader kernel openssl blend2d nasm ndisasm wget debug-image debug-locations roadmap-stage-layout roadmap-stages qemu-test qemu-matrix qemu-vfio-5070 audit refactor-benchmark refactor-layout test header-sanity stage-sanity abi-sanity dynamic-loader-sanity libc-sanity libc-header-sanity bluetooth-test firmware-test audiod-test nvidia-port-test wait-subscription-test frame-trace-test chrome-start-test release-metadata FORCE
 
 FORCE:
 
-$(DEBUG_SERIAL_STAMP): FORCE | $(BUILD)/kernel
-	@printf '%s:%s:%s:%s\n' '$(LITEOS_DEBUG_SERIAL)' '$(LITEOS_REALTEST)' \
-		'$(LITEOS_REALTEST_FAILURE_TEST)' \
-		'$(LITEOS_XHCI_DIAGNOSTIC_BOT)' > $@.tmp
+$(DEBUG_SERIAL_STAMP): | $(BUILD)/kernel
+	@printf '%s\n' '$(DEBUG_SERIAL_CONFIG_VALUE)' > $@.tmp
+	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(FRAME_TRACE_STAMP): | $(BUILD)/kernel
+	@printf '%s\n' '$(OS_ENABLE_FRAME_TRACE)' > $@.tmp
+	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(PHASE13_STAMP): FORCE | $(BUILD)/kernel
+	@printf '%s\n' '$(OS_PHASE13)' > $@.tmp
 	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
 all: esp
@@ -299,7 +375,7 @@ ndisasm: $(DYNAMIC_NDISASM_ELF)
 wget: $(USER_WGET_PE)
 
 debug-image:
-	"$(MAKE)" -f GNUmakefile esp DEBUG=2 LITEOS_DEBUG_SERIAL=1
+	$(MAKE) -f GNUmakefile esp BUILD="$(BUILD)" DEBUG=2 OS_DEBUG_SERIAL=1
 
 debug-locations:
 	BUILD="$(BUILD)" ./tools/verify-debug-locations.sh "$(KERNEL_ELF)" "$(STAGE_LOG)"
@@ -310,9 +386,20 @@ roadmap-stage-layout:
 roadmap-stages: roadmap-stage-layout
 	BUILD="$(BUILD)" ./tools/verify-roadmap-stages.sh "$(KERNEL_ELF)" "$(STAGE_LOG)"
 
+audit:
+	BUILD="$(BUILD)" ./tools/audit-environment.sh
+
+qemu-test: debug-image
+	BUILD="$(BUILD)" ./run-qemu.sh --headless --cpu "$(QEMU_TEST_CPU)" \
+		--seconds "$(QEMU_TEST_SECONDS)" --no-build
+	BUILD="$(BUILD)" ./tools/verify-qemu-stages.sh "$(STAGE_LOG)"
+
 qemu-matrix: debug-image
 	BUILD="$(BUILD)" QEMU_MATRIX_SECONDS="$(QEMU_MATRIX_SECONDS)" \
 	QEMU_MATRIX_CPUS="$(QEMU_MATRIX_CPUS)" ./tools/run-qemu-matrix.sh
+
+qemu-vfio-5070:
+	BUILD="$(BUILD)" ./tools/run-qemu-vfio-5070.sh --build "$(BUILD)"
 
 refactor-benchmark:
 	BUILD="$(BUILD)" BENCHMARK_RUNS="$(BENCHMARK_RUNS)" \
@@ -323,7 +410,7 @@ refactor-layout:
 	@bash ./tools/verify-refactor-layout.sh
 
 $(BUILD)/loader $(BUILD)/kernel $(BUILD)/user $(BUILD)/openssl $(BUILD)/blend2d $(BUILD)/nasm $(ELF_RUNTIME_DIR) \
-$(BUILD)/esp $(BUILD)/esp/EFI/BOOT $(BUILD)/esp/EFI/LITEOS \
+$(BUILD)/esp $(BUILD)/esp/EFI/BOOT $(BUILD)/esp/EFI/OS \
 $(BUILD)/esp/etc/fonts:
 	mkdir -p $@
 
@@ -334,23 +421,23 @@ $(BUILD)/esp/boot $(BUILD)/esp/lib $(BUILD)/esp/sbin $(BUILD)/esp/tmp:
 # The compositor can load these files after the root filesystem is mounted;
 # no scaled or pixel-expanded copy is embedded in the kernel image.
 DESKTOP_ASSET_DIR = $(BUILD)/esp/etc/desktop
-FONT_ASSET = $(BUILD)/esp/etc/fonts/liteos.ttf
+FONT_ASSET = $(BUILD)/esp/etc/fonts/default.ttf
 VFS_SELF_TEST_SEED = $(BUILD)/esp/etc/vfsmap.tst
 DESKTOP_ASSETS = $(DESKTOP_ASSET_DIR)/wall.png \
 	$(DESKTOP_ASSET_DIR)/icons.png \
 	$(DESKTOP_ASSET_DIR)/fm.png \
 	$(FONT_ASSET)
 
-$(FONT_ASSET): assets/fonts/liteos.ttf | $(BUILD)/esp/etc/fonts
+$(FONT_ASSET): assets/fonts/default.ttf | $(BUILD)/esp/etc/fonts
 	cp $< $@
 
 $(DESKTOP_ASSET_DIR):
 	mkdir -p $@
 
-$(DESKTOP_ASSET_DIR)/wall.png: assets/desktop/liteos-wallpaper.png | $(DESKTOP_ASSET_DIR)
+$(DESKTOP_ASSET_DIR)/wall.png: assets/desktop/wallpaper.png | $(DESKTOP_ASSET_DIR)
 	cp $< $@
 
-$(DESKTOP_ASSET_DIR)/icons.png: assets/desktop/macos-icons.png | $(DESKTOP_ASSET_DIR)
+$(DESKTOP_ASSET_DIR)/icons.png: assets/desktop/whitesur-icons.png | $(DESKTOP_ASSET_DIR)
 	cp $< $@
 
 $(DESKTOP_ASSET_DIR)/fm.png: assets/desktop/file-manager-icon.png | $(DESKTOP_ASSET_DIR)
@@ -359,9 +446,6 @@ $(DESKTOP_ASSET_DIR)/fm.png: assets/desktop/file-manager-icon.png | $(DESKTOP_AS
 $(VFS_SELF_TEST_SEED): assets/desktop/vfsmap.tst | $(DESKTOP_ASSET_DIR)
 	cp $< $@
 	truncate -s 5 $@
-
-$(NASM_SMOKE_IMAGE): $(NASM_SMOKE_SOURCE) | $(BUILD)/esp/tmp
-	cp $< $@
 
 $(BUILD)/loader/%.o: boot/uefi/%.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/loader
 	$(CC) $(COMMON_CFLAGS) -c $< -o $@
@@ -381,29 +465,36 @@ $(ELF_RUNTIME_DIR)/ld.o: user/runtime/ld.c user/runtime/elf64.h | $(ELF_RUNTIME_
 $(ELF_RUNTIME_DIR)/ld-start.o: user/runtime/ld_start.S | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_RUNTIME_CFLAGS) -c $< -o $@
 
-$(DYNAMIC_LOADER_ELF): $(ELF_RUNTIME_DIR)/ld.o $(ELF_RUNTIME_DIR)/ld-start.o | $(ELF_RUNTIME_DIR)
+$(DYNAMIC_LOADER_ELF): makefile $(ELF_RUNTIME_DIR)/ld.o $(ELF_RUNTIME_DIR)/ld-start.o | $(ELF_RUNTIME_DIR)
 	$(ELFLD) $(ELF_LINK_FLAGS) -shared -e ld_entry \
-		--soname ld-liteos.so.1 --hash-style=sysv -Bsymbolic \
-		-z now -z text $^ -o $@
+		--soname ld-system.so.1 --hash-style=sysv -Bsymbolic \
+		-z now -z text $(filter %.o,$^) -o $@
 
 $(ELF_RUNTIME_DIR)/libc-%.o: user/libc/%.c \
-		user/libc/include/liteos/libc.h | $(ELF_RUNTIME_DIR)
+		user/libc/include/libc/libc.h | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_RUNTIME_CFLAGS) -c $< -o $@
 
-$(ELF_RUNTIME_DIR)/libc-%.o: user/libc/%.S | $(ELF_RUNTIME_DIR)
+$(ELF_RUNTIME_DIR)/libc-memory.o: include/uapi/memory.h include/uapi/syscall.h
+$(ELF_RUNTIME_DIR)/libc-mman.o $(ELF_RUNTIME_DIR)/libc-posix_compat.o: \
+		include/uapi/memory.h
+
+$(ELF_RUNTIME_DIR)/libc-mman.o: user/libc/include/unistd.h
+$(ELF_RUNTIME_DIR)/libc-posix_compat.o: user/libc/include/unistd.h
+
+$(ELF_RUNTIME_DIR)/libc-asm-%.o: user/libc/%.S | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_RUNTIME_CFLAGS) -c $< -o $@
 
-$(DYNAMIC_LIBC_ELF): $(DYNAMIC_LIBC_OBJECTS) | $(ELF_RUNTIME_DIR)
+$(DYNAMIC_LIBC_ELF): makefile $(DYNAMIC_LIBC_OBJECTS) | $(ELF_RUNTIME_DIR)
 	$(ELFLD) $(ELF_LINK_FLAGS) -shared -e 0 \
-		--soname libliteosc.so.1 --hash-style=sysv -Bsymbolic \
-		-z now -z text $^ -o $@
+		--soname libsystemc.so.1 --hash-style=sysv -Bsymbolic \
+		-z now -z text $(filter %.o,$^) -o $@
 
 $(ELF_RUNTIME_DIR)/libc-crt-start.o: user/libc/crt_start.S | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
 $(ELF_RUNTIME_DIR)/libc-test.o: user/runtime/libc_test.c \
-		user/libc/include/liteos/libc.h user/runtime/blend2d_api_test.h \
-		user/runtime/liteos_text.h | \
+		user/libc/include/libc/libc.h user/runtime/blend2d_api_test.h \
+		user/runtime/text.h | \
 		$(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
@@ -411,78 +502,116 @@ $(BLEND2D_API_TEST_OBJECT): user/runtime/blend2d_api_test.c \
 		user/runtime/blend2d_api_test.h | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
-$(DYNAMIC_LIBC_TEST_ELF): $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+$(DYNAMIC_LIBC_TEST_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
 		$(ELF_RUNTIME_DIR)/libc-startup.o $(ELF_RUNTIME_DIR)/libc-test.o \
-		$(BLEND2D_API_TEST_OBJECT) $(ELF_RUNTIME_DIR)/liteos-text.o \
+		$(BLEND2D_API_TEST_OBJECT) $(ELF_RUNTIME_DIR)/text.o \
 		$(DYNAMIC_LIBC_ELF) $(DYNAMIC_GFX_LIBRARY_ELF) | $(ELF_RUNTIME_DIR)
-	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e liteos_crt_entry \
-		-dynamic-linker /lib/ld-liteos.so.1 --hash-style=sysv \
-		--no-as-needed $^ -o $@
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
 
-$(ELF_RUNTIME_DIR)/liteos-text.o: user/runtime/liteos_text.c \
-		user/runtime/liteos_text.h | $(ELF_RUNTIME_DIR)
+$(ELF_RUNTIME_DIR)/linux-events-test.o: tools/chromium/linux_events_test.c \
+		include/uapi/memory.h user/libc/include/unistd.h \
+		user/libc/include/sys/sysinfo.h | $(ELF_RUNTIME_DIR)
+	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
+
+$(DYNAMIC_LINUX_EVENTS_TEST_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+		$(ELF_RUNTIME_DIR)/libc-startup.o \
+		$(ELF_RUNTIME_DIR)/linux-events-test.o $(DYNAMIC_LIBC_ELF) | $(ELF_RUNTIME_DIR)
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-linux-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
+
+$(ELF_RUNTIME_DIR)/text.o: user/runtime/text.c \
+		user/runtime/text.h | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
 $(ELF_RUNTIME_DIR)/imageview.o: user/desktop/imageview/main.c \
-		user/runtime/liteos_text.h user/client_chrome.h include/uapi/image.h | \
+		user/runtime/text.h user/runtime/caption.h include/uapi/window_theme.h include/uapi/image.h | \
 		$(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
-$(BUILD)/nasm/%.o: $(NASM_DIR)/%.c tools/nasm-liteos/config/config.h \
+$(BUILD)/nasm/%.o: $(NASM_DIR)/%.c tools/nasm-platform/config/config.h \
 		$(NASM_DIR)/config/unconfig.h $(NASM_DIR)/autoconf/attribute.h | \
 		$(BUILD)/nasm
 	mkdir -p $(@D)
 	$(ELFCC) $(NASM_CFLAGS) -c $< -o $@
 
-$(DYNAMIC_NASM_ELF): $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+$(DYNAMIC_NASM_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
 		$(ELF_RUNTIME_DIR)/libc-startup.o $(NASM_OBJECTS) \
 		$(DYNAMIC_LIBC_ELF) | $(ELF_RUNTIME_DIR)
-	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e liteos_crt_entry \
-		-dynamic-linker /lib/ld-liteos.so.1 --hash-style=sysv \
-		--no-as-needed $^ -o $@
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
 
-$(DYNAMIC_NDISASM_ELF): $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+$(DYNAMIC_NDISASM_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
 		$(ELF_RUNTIME_DIR)/libc-startup.o $(NDISASM_OBJECTS) \
 		$(DYNAMIC_LIBC_ELF) | $(ELF_RUNTIME_DIR)
-	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e liteos_crt_entry \
-		-dynamic-linker /lib/ld-liteos.so.1 --hash-style=sysv \
-		--no-as-needed $^ -o $@
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
 
-$(DYNAMIC_IMAGEVIEW_ELF): $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+$(DYNAMIC_IMAGEVIEW_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
 		$(ELF_RUNTIME_DIR)/libc-startup.o $(ELF_RUNTIME_DIR)/imageview.o \
-		$(ELF_RUNTIME_DIR)/liteos-text.o $(DYNAMIC_LIBC_ELF) \
+		$(ELF_RUNTIME_DIR)/text.o $(DYNAMIC_LIBC_ELF) \
 		$(DYNAMIC_GFX_LIBRARY_ELF) | $(ELF_RUNTIME_DIR)
-	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e liteos_crt_entry \
-		-dynamic-linker /lib/ld-liteos.so.1 --hash-style=sysv \
-		--no-as-needed $^ -o $@
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
 
 define DYNAMIC_TEXT_APP_RULE
-$(ELF_RUNTIME_DIR)/$(1).o: $(2) user/runtime/liteos_text.h | $(ELF_RUNTIME_DIR)
+$(ELF_RUNTIME_DIR)/$(1).o: $(2) user/runtime/text.h user/runtime/caption.h user/runtime/paint.h user/client_chrome.h include/uapi/window_theme.h | $(ELF_RUNTIME_DIR)
 	$$(ELFCC) $$(ELF_APP_CFLAGS) -c $$< -o $$@
 
-$(ELF_RUNTIME_DIR)/$(1).elf: $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+
+$(ELF_RUNTIME_DIR)/$(1).elf: makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
 		$$(ELF_RUNTIME_DIR)/libc-startup.o $(ELF_RUNTIME_DIR)/$(1).o \
-		$$(ELF_RUNTIME_DIR)/liteos-text.o $$(DYNAMIC_LIBC_ELF) \
+		$$(ELF_RUNTIME_DIR)/text.o $$(DYNAMIC_LIBC_ELF) \
 		$$(DYNAMIC_GFX_LIBRARY_ELF) | $$(ELF_RUNTIME_DIR)
-	$$(ELFLD) $$(ELF_LINK_FLAGS) -pie -e liteos_crt_entry \
-		-dynamic-linker /lib/ld-liteos.so.1 --hash-style=sysv \
-		--no-as-needed $$^ -o $$@
+	$$(ELFLD) $$(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker $(if $(filter chrome-start,$(1)),/lib/ld-linux-system.so.1,/lib/ld-system.so.1) --hash-style=sysv \
+		--no-as-needed $$(filter %.o %.so.1,$$^) -o $$@
 endef
 
 $(eval $(call DYNAMIC_TEXT_APP_RULE,gshell,user/desktop/gshell/main.c))
+# The launcher has no window/text renderer. Do not load the graphics library
+# merely to select arguments and exec the browser.
+$(ELF_RUNTIME_DIR)/chrome-start.o: user/runtime/chrome_start.c | $(ELF_RUNTIME_DIR)
+	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
+
+$(DYNAMIC_CHROME_START_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+		$(ELF_RUNTIME_DIR)/libc-startup.o $(ELF_RUNTIME_DIR)/chrome-start.o \
+		$(DYNAMIC_LIBC_ELF) | $(ELF_RUNTIME_DIR)
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-linux-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
 $(eval $(call DYNAMIC_TEXT_APP_RULE,notepad,user/desktop/notepad/main.c))
+$(ELF_RUNTIME_DIR)/notepad.o: user/runtime/message_box.h
 $(eval $(call DYNAMIC_TEXT_APP_RULE,fileman,user/desktop/fileman/main.c))
 $(eval $(call DYNAMIC_TEXT_APP_RULE,taskmgr,user/desktop/taskmgr/main.c))
 $(eval $(call DYNAMIC_TEXT_APP_RULE,netmgr,user/services/networkd/manager.c))
 
-$(ELF_RUNTIME_DIR)/libliteos-gfx.o: user/runtime/libliteos_gfx.c \
-		user/runtime/liteos_gfx.h $(BLEND2D_DIR)/blend2d/blend2d.h | $(ELF_RUNTIME_DIR)
+$(ELF_RUNTIME_DIR)/graphics.o: user/runtime/graphics.c \
+		user/runtime/graphics.h $(BLEND2D_DIR)/blend2d/blend2d.h | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_RUNTIME_CFLAGS) -I$(BLEND2D_DIR) -c $< -o $@
 
-$(BLEND2D_LITEOS_OBJECT): $(BLEND2D_DIR)/liteos/compiler.c | $(ELF_RUNTIME_DIR)
+$(BLEND2D_PLATFORM_OBJECT): $(BLEND2D_DIR)/platform/compiler.c | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_RUNTIME_CFLAGS) -c $< -o $@
 
-$(BLEND2D_CXX_RUNTIME_OBJECT): $(BLEND2D_DIR)/liteos/cxx_runtime.cpp | $(ELF_RUNTIME_DIR)
+$(ELF_RUNTIME_DIR)/fat-fsync-probe.o: tests/user/fat_fsync_probe.c | $(ELF_RUNTIME_DIR)
+	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
+
+$(DYNAMIC_FSYNC_PROBE_ELF): makefile $(ELF_RUNTIME_DIR)/libc-crt-start.o \
+        $(ELF_RUNTIME_DIR)/libc-startup.o $(ELF_RUNTIME_DIR)/fat-fsync-probe.o \
+        $(DYNAMIC_LIBC_ELF) | $(ELF_RUNTIME_DIR)
+	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e libc_crt_entry \
+		-dynamic-linker /lib/ld-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
+
+.PHONY: fat-fsync-probe
+fat-fsync-probe: $(BUILD)/esp/sbin/fat-fsync-probe
+
+$(BLEND2D_CXX_RUNTIME_OBJECT): $(BLEND2D_DIR)/platform/cxx_runtime.cpp | $(ELF_RUNTIME_DIR)
 	$(ELFCXX) $(BLEND2D_CXXFLAGS) -c $< -o $@
 
 $(BUILD)/blend2d/%.o: $(BLEND2D_DIR)/%.cpp | $(BUILD)/blend2d
@@ -507,18 +636,18 @@ $(BLEND2D_OBJECT_LIST): $(BLEND2D_DIR)/sources.mk $(BLEND2D_DIR)/asmjit-sources.
 $(BLEND2D_LIB): $(BLEND2D_OBJECT_LIST) tools/archive-objects.sh | $(BUILD)/blend2d
 	sh tools/archive-objects.sh "$(ELFTOOLPREFIX)ar" "$@" "$<"
 
-$(DYNAMIC_GFX_LIBRARY_ELF): $(ELF_RUNTIME_DIR)/libliteos-gfx.o \
-                             $(BLEND2D_LITEOS_OBJECT) $(BLEND2D_CXX_RUNTIME_OBJECT) $(BLEND2D_LIB) \
+$(DYNAMIC_GFX_LIBRARY_ELF): $(ELF_RUNTIME_DIR)/graphics.o \
+                             $(BLEND2D_PLATFORM_OBJECT) $(BLEND2D_CXX_RUNTIME_OBJECT) $(BLEND2D_LIB) \
                              $(DYNAMIC_LIBC_OBJECTS) | $(ELF_RUNTIME_DIR)
-	$(ELFLD) $(ELF_LINK_FLAGS) -shared -e 0 --soname libliteosgfx.so.1 \
+	$(ELFLD) $(ELF_LINK_FLAGS) -shared -e 0 --soname libgraphics.so.1 \
 		--hash-style=sysv -Bsymbolic -z now -z text \
-		--start-group $(ELF_RUNTIME_DIR)/libliteos-gfx.o \
-			$(BLEND2D_LITEOS_OBJECT) $(BLEND2D_CXX_RUNTIME_OBJECT) \
+		--start-group $(ELF_RUNTIME_DIR)/graphics.o \
+			$(BLEND2D_PLATFORM_OBJECT) $(BLEND2D_CXX_RUNTIME_OBJECT) \
 			$(DYNAMIC_LIBC_OBJECTS) --end-group \
 		--whole-archive $(BLEND2D_LIB) --no-whole-archive -o $@
 
 $(ELF_RUNTIME_DIR)/dyn-gfx.o: user/runtime/dyn_gfx.c \
-		user/runtime/liteos_gfx.h user/runtime/blend2d_demo.h | \
+		user/runtime/graphics.h user/runtime/blend2d_demo.h | \
 		$(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
@@ -529,17 +658,24 @@ $(ELF_RUNTIME_DIR)/blend2d-demo.o: user/runtime/blend2d_demo.c \
 $(ELF_RUNTIME_DIR)/dyn-gfx-start.o: user/runtime/dyn_gfx_start.S | $(ELF_RUNTIME_DIR)
 	$(ELFCC) $(ELF_APP_CFLAGS) -c $< -o $@
 
-$(DYNAMIC_GFX_TEST_ELF): $(ELF_RUNTIME_DIR)/dyn-gfx-start.o \
+$(DYNAMIC_GFX_TEST_ELF): makefile $(ELF_RUNTIME_DIR)/dyn-gfx-start.o \
 		$(ELF_RUNTIME_DIR)/dyn-gfx.o $(ELF_RUNTIME_DIR)/blend2d-demo.o \
 		$(DYNAMIC_GFX_LIBRARY_ELF) | $(ELF_RUNTIME_DIR)
 	$(ELFLD) $(ELF_LINK_FLAGS) -pie -e dyn_gfx_entry \
-		-dynamic-linker /lib/ld-liteos.so.1 --hash-style=sysv \
-		--no-as-needed $^ -o $@
+		-dynamic-linker /lib/ld-system.so.1 --hash-style=sysv \
+		--no-as-needed $(filter %.o %.so.1,$^) -o $@
 
-$(BUILD)/user/libc-%.o: user/libc/%.c user/libc/include/liteos/libc.h | $(BUILD)/user
+$(BUILD)/user/libc-%.o: user/libc/%.c user/libc/include/libc/libc.h | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
-$(BUILD)/user/libc-%.o: user/libc/%.S | $(BUILD)/user
+$(BUILD)/user/libc-memory.o: include/uapi/memory.h include/uapi/syscall.h
+$(BUILD)/user/libc-mman.o $(BUILD)/user/libc-posix_compat.o: \
+		include/uapi/memory.h
+
+$(BUILD)/user/libc-mman.o: user/libc/include/unistd.h
+$(BUILD)/user/libc-posix_compat.o: user/libc/include/unistd.h
+
+$(BUILD)/user/libc-asm-%.o: user/libc/%.S | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
 
 $(USER_AUDIOD_PE): $(USER_AUDIOD_OBJECTS) | $(BUILD)/user
@@ -547,11 +683,6 @@ $(USER_AUDIOD_PE): $(USER_AUDIOD_OBJECTS) | $(BUILD)/user
 
 $(USER_AUDIOD_ELF): $(USER_AUDIOD_PE) | $(BUILD)/user
 	$(OBJCOPY) -O elf64-x86-64 $< $@
-
-$(BUILD)/kernel/audiod-blob.o: $(USER_AUDIOD_ELF) | $(BUILD)/kernel
-	$(OBJCOPY) -I binary -O pe-x86-64 -B i386:x86-64 \
-		--redefine-sym _binary_$(call binary_input_symbol,$(USER_AUDIOD_ELF))_start=liteos_audiod_blob_start \
-		--redefine-sym _binary_$(call binary_input_symbol,$(USER_AUDIOD_ELF))_end=liteos_audiod_blob_end $< $@
 
 $(BUILD)/user/netd.o: user/services/networkd/netd.c | $(BUILD)/user
 	$(CC) $(USER_CFLAGS) -c $< -o $@
@@ -615,7 +746,8 @@ $(BUILD)/kernel/entry.o: kernel/init/main.c \
 $(BUILD)/kernel/early-init.o: kernel/init/early.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/memory-init.o: kernel/init/memory.c $(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
+$(BUILD)/kernel/memory-init.o: kernel/init/memory.c include/kernel/mm.h \
+		$(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/devices-init.o: kernel/init/devices.c include/kernel/realtest.h \
@@ -671,8 +803,9 @@ $(BUILD)/kernel/init-self-tests.o: kernel/init/self_tests.c \
 
 $(BUILD)/kernel/runtime-init.o: kernel/init/runtime.c \
 		include/kernel/init_runtime.h include/kernel/realtest.h \
-		$(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
-	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+		include/kernel/linux_abi.h \
+		$(DEBUG_SERIAL_STAMP) $(PHASE13_STAMP) | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -DOS_PHASE13=$(OS_PHASE13) -c $< -o $@
 
 $(BUILD)/kernel/console.o: kernel/console_printf.c include/kernel/console.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -700,7 +833,8 @@ $(BUILD)/kernel/paging.o: kernel/arch/x86_64/boot/early_paging.c | $(BUILD)/kern
 $(BUILD)/kernel/direct.o: kernel/mm/physmap.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/page-db.o: kernel/mm/phys/page_db.c kernel/mm/phys/internal.h | $(BUILD)/kernel
+$(BUILD)/kernel/page-db.o: kernel/mm/phys/page_db.c kernel/mm/phys/internal.h \
+		include/kernel/mm.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/page-alloc.o: kernel/mm/phys/page_alloc.c kernel/mm/phys/internal.h | $(BUILD)/kernel
@@ -813,8 +947,52 @@ $(BUILD)/kernel/stack-check.o: kernel/arch/x86_64/cpu/stack_check.S | $(BUILD)/k
 $(BUILD)/kernel/debug-stage.o: kernel/debug_stage.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/syscall-core.o: kernel/syscall/handlers.c | $(BUILD)/kernel
+$(BUILD)/kernel/syscall-core.o: kernel/syscall/handlers.c \
+		kernel/syscall/internal.h include/uapi/syscall.h \
+		include/uapi/memory.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-abi.o: kernel/syscall/linux.c \
+		include/kernel/linux_abi.h include/uapi/linux_abi.h \
+		include/uapi/display.h include/kernel/frame_trace.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase7-test.o: kernel/process/linux_phase7_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase8-test.o: kernel/process/linux_phase8_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h \
+		include/kernel/nv_frontend.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase9-test.o: kernel/process/linux_phase9_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase10-test.o: kernel/process/linux_phase10_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase11-test.o: kernel/process/linux_phase11_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase12-test.o: kernel/process/linux_phase12_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h \
+		include/kernel/window_server.h include/uapi/linux_abi.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD)/kernel/linux-phase13-test.o: kernel/process/linux_phase13_test.c \
+		include/kernel/linux_abi.h include/kernel/elf_loader.h \
+		$(PHASE13_STAMP) | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -DOS_PHASE13=$(OS_PHASE13) -c $< -o $@
+
+$(BUILD)/kernel/nvidia-rm-frontend.o: \
+		$(NVIDIA_RM_DIR)/nv_rm_frontend.c \
+		$(NVIDIA_RM_DIR)/include/nv_rm_vendor_bridge.h \
+		include/kernel/nv_frontend.h | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -I$(NVIDIA_RM_DIR)/include -c $< -o $@
 
 $(BUILD)/kernel/syscall-debug.o: kernel/syscall/debug.c \
 		kernel/syscall/internal.h | $(BUILD)/kernel
@@ -825,7 +1003,7 @@ $(BUILD)/kernel/syscall-network.o: kernel/syscall/network.c \
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/syscall-graphics.o: kernel/syscall/graphics.c \
-		kernel/syscall/internal.h | $(BUILD)/kernel
+		kernel/syscall/internal.h include/kernel/frame_trace.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/syscall-font.o: kernel/syscall/font.c \
@@ -870,7 +1048,8 @@ $(BUILD)/kernel/syscall-process.o: kernel/syscall/process.c \
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/syscall-vm.o: kernel/syscall/vm.c \
-		kernel/syscall/internal.h | $(BUILD)/kernel
+		kernel/syscall/internal.h include/kernel/mm.h \
+		include/uapi/memory.h include/uapi/syscall.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/syscall-handles.o: kernel/syscall/handles.c \
@@ -922,7 +1101,8 @@ $(BUILD)/kernel/user-services-init.o: kernel/init/user_services.c \
 $(BUILD)/kernel/user-test-blob.o: tests/user/user_test_blob.S | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/user-init-blob.o: kernel/process/init_blob.S | $(BUILD)/kernel
+$(BUILD)/kernel/user-init-blob.o: kernel/process/init_blob.S \
+		$(DEBUG_SERIAL_STAMP) | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/user-init-blob.bin: $(BUILD)/kernel/user-init-blob.o | $(BUILD)/kernel
@@ -1036,18 +1216,18 @@ $(BUILD)/nvidia/host-test/nv_port_%.o: $(NVIDIA_PORT_DIR)/nv_port_%.c \
 		$(NVIDIA_PORT_DIR)/include/nv_port.h | $(BUILD)/nvidia/host-test
 	$(HOSTCC) -DNV_PORT_HOST_TEST -std=c11 -O2 -Wall -Wextra -Werror -pthread \
 		-ffunction-sections -fdata-sections -Iinclude -I$(NVIDIA_PORT_DIR)/include \
-		-c $< -o $@
+		-MMD -MP -MF $@.d -c $< -o $@
 
 $(BUILD)/nvidia/host-test/nv_port_test.o: tests/kernel/nv_port_test.c \
 		$(NVIDIA_PORT_DIR)/include/nv_port.h | $(BUILD)/nvidia/host-test
 	$(HOSTCC) -DNV_PORT_HOST_TEST -std=c11 -O2 -Wall -Wextra -Werror -pthread \
 		-ffunction-sections -fdata-sections -Iinclude -I$(NVIDIA_PORT_DIR)/include \
-		-c $< -o $@
+		-MMD -MP -MF $@.d -c $< -o $@
 
 $(BUILD)/nvidia-port-test.exe: $(NVIDIA_PORT_HOST_OBJECTS) \
 		$(BUILD)/nvidia/host-test/nv_port_test.o kernel/drivers/core/firmware.c | $(BUILD)
 	$(HOSTCC) -DNV_PORT_HOST_TEST -std=c11 -O2 -Wall -Wextra -Werror -pthread \
-		-Iinclude -Wl,--gc-sections $^ -o $@
+		-Iinclude -Wl,--gc-sections -MMD -MP -MF $@.d $(filter %.o %.c,$^) -o $@
 
 nvidia-port-test: $(BUILD)/nvidia-port-test.exe
 	./$(BUILD)/nvidia-port-test.exe
@@ -1263,6 +1443,9 @@ $(BUILD)/kernel/usb-storage.o: kernel/drivers/usb/storage.c | $(BUILD)/kernel
 $(BUILD)/kernel/vfs.o: kernel/fs/vfs/core.c | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
+$(BUILD)/kernel/vfs-record-lock.o: kernel/fs/vfs/record_lock.c | $(BUILD)/kernel
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
 $(BUILD)/kernel/vfs-backend.o: kernel/fs/vfs/backend.c \
 		kernel/fs/vfs/internal.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
@@ -1334,7 +1517,7 @@ $(BUILD)/kernel/graphics-zorder.o: kernel/graphics/zorder.c \
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/graphics-window.o: kernel/graphics/window.c \
-		kernel/graphics/internal.h | $(BUILD)/kernel
+		kernel/graphics/internal.h include/kernel/frame_trace.h | $(BUILD)/kernel
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 $(BUILD)/kernel/graphics-display.o: kernel/graphics/display.c \
@@ -1533,6 +1716,10 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/irq-core.o \
                                     $(BUILD)/kernel/uaccess-entry.o $(BUILD)/kernel/uaccess.o \
                                     $(BUILD)/kernel/syscall.o $(BUILD)/kernel/syscall-core.o \
+                                    $(BUILD)/kernel/linux-abi.o \
+                                    $(BUILD)/kernel/linux-phase7-test.o \
+                                    $(BUILD)/kernel/linux-phase8-test.o \
+                                    $(PHASE13_KERNEL_OBJECT) \
                                     $(BUILD)/kernel/syscall-debug.o \
                                     $(BUILD)/kernel/syscall-network.o \
                                     $(BUILD)/kernel/syscall-graphics.o \
@@ -1597,6 +1784,7 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/pci-core.o \
                                     $(NVIDIA_PORT_OBJECTS) \
                                     $(NVIDIA_RM_DRIVER_OBJECTS) \
+                                    $(BUILD)/kernel/nvidia-rm-frontend.o \
                                      $(BUILD)/kernel/nvme-core.o $(BUILD)/kernel/nvme-completion.o \
                                      $(BUILD)/kernel/nvme-timing.o \
                                      $(BUILD)/kernel/nvme-pci.o \
@@ -1641,6 +1829,7 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/xhci-msc.o \
                                     $(BUILD)/kernel/xhci-bluetooth.o \
                                      $(BUILD)/kernel/vfs.o $(BUILD)/kernel/vfs-backend.o \
+                                     $(BUILD)/kernel/vfs-record-lock.o \
                                      $(BUILD)/kernel/vfs-file-io.o \
                                      $(BUILD)/kernel/vfs-user-api.o \
                                      $(BUILD)/kernel/vfs-page-cache.o \
@@ -1693,37 +1882,42 @@ $(KERNEL_PE): $(BUILD)/kernel/entry.o $(BUILD)/kernel/runtime-init.o \
                                     $(BUILD)/kernel/socket-protocol.o \
                                     $(BUILD)/kernel/socket-test.o | \
                                     $(BUILD)/kernel
-		$(LD) $(KERNEL_LDFLAGS) $^ -o $@
+		$(KERNEL_LINK) $^ -o $@
 
-$(KERNEL_ELF): $(KERNEL_PE) | $(BUILD)/esp/EFI/LITEOS
+$(KERNEL_ELF): $(KERNEL_PE) | $(BUILD)/esp/EFI/OS
 	$(OBJCOPY) -O elf64-x86-64 $< $@
 
-$(BUILD)/build-id.exe: tools/build_id.c boot/uefi/sha256.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
+$(BUILD)/.host-toolchain: FORCE | $(BUILD)
+	@{ printf '%s\n' '$(HOSTCC)' '$(OS)' '-O2 -Wall -Wextra -Werror -Iinclude'; \
+		$(HOSTCC) -dumpmachine && $(HOSTCC) --version; } > $@.tmp
+	@if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
-$(KERNEL_BUILD_ID): $(KERNEL_ELF) $(BUILD)/build-id.exe | $(BUILD)/esp/EFI/LITEOS
-	./$(BUILD)/build-id.exe $(KERNEL_ELF) $@
+$(BUILD)/build-id.exe: tools/build_id.c boot/uefi/sha256.c $(BUILD)/.host-toolchain makefile tools/host-tests.mk | $(BUILD)
+	$(call HOST_TEST_LINK,-O2 -Wall -Wextra -Werror -Iinclude)
+
+$(KERNEL_BUILD_ID): $(KERNEL_ELF) $(BUILD)/build-id.exe | $(BUILD)/esp/EFI/OS
+	$(BUILD)/build-id.exe $(KERNEL_ELF) $@
 
 $(KERNEL_SYMBOLS): $(KERNEL_ELF) | $(BUILD)/kernel
 	$(OBJDUMP) -t $< > $@
 
-LITEOS_CMDLINE ?= console=framebuffer loglevel=info
-ifeq ($(LITEOS_REALTEST),1)
-LITEOS_CMDLINE = realtest=1 reboot=failure
+OS_CMDLINE ?= console=framebuffer loglevel=info
+ifeq ($(OS_REALTEST),1)
+OS_CMDLINE = realtest=1 reboot=failure
 endif
 
-$(BUILD)/esp/EFI/LITEOS/loader.conf: makefile $(DEBUG_SERIAL_STAMP) | $(BUILD)/esp/EFI/LITEOS
-	@printf '%s\n' 'kernel=\EFI\LITEOS\kernel.elf' \
-		'cmdline=$(LITEOS_CMDLINE)' > $@
+$(BUILD)/esp/EFI/OS/loader.conf: makefile $(DEBUG_SERIAL_STAMP) | $(BUILD)/esp/EFI/OS
+	@printf '%s\n' 'kernel=\EFI\OS\kernel.elf' \
+		'cmdline=$(OS_CMDLINE)' > $@
 
 INIT_SERVICE_OFFSET = $(shell $(OBJDUMP) -t $(BUILD)/kernel/user-init-blob.o 2>/dev/null | \
-	awk '$$NF == "liteos_init_service" { print $$9; exit }')
+	awk '$$NF == "user_init_service" { for (i=1;i<=NF;i++) if ($$i == ".rdata") { print "0x" $$1; exit } print $$9; exit }')
 
 $(BUILD)/esp/init: $(BUILD)/kernel/user-init-blob.bin $(BUILD)/make-init-image.exe | $(BUILD)/esp
-	./$(BUILD)/make-init-image.exe $< $@ 0 $(INIT_SERVICE_OFFSET)
+	$(BUILD)/make-init-image.exe $< $@ 0 $(INIT_SERVICE_OFFSET)
 
 $(BUILD)/esp/init-runtime: $(BUILD)/kernel/user-init-blob.bin $(BUILD)/make-init-image.exe | $(BUILD)/esp
-	./$(BUILD)/make-init-image.exe $< $@ 1 $(INIT_SERVICE_OFFSET)
+	$(BUILD)/make-init-image.exe $< $@ 1 $(INIT_SERVICE_OFFSET)
 
 $(BUILD)/esp/sbin/deviced: $(BUILD)/esp/init | $(BUILD)/esp/sbin
 	cp $< $@
@@ -1734,19 +1928,28 @@ $(BUILD)/esp/sbin/logd: $(BUILD)/esp/init | $(BUILD)/esp/sbin
 $(BUILD)/esp/sbin/crashd: $(BUILD)/esp/init | $(BUILD)/esp/sbin
 	cp $< $@
 
-$(BUILD)/esp/lib/ld-liteos.so.1: $(DYNAMIC_LOADER_ELF) | $(BUILD)/esp/lib
+$(BUILD)/esp/lib/ld-system.so.1: $(DYNAMIC_LOADER_ELF) | $(BUILD)/esp/lib
 	cp $< $@
 
-$(BUILD)/esp/lib/libliteosgfx.so.1: $(DYNAMIC_GFX_LIBRARY_ELF) | $(BUILD)/esp/lib
+$(BUILD)/esp/lib/ld-linux-system.so.1: $(BUILD)/esp/lib/ld-system.so.1 | $(BUILD)/esp/lib
 	cp $< $@
 
-$(BUILD)/esp/lib/libliteosc.so.1: $(DYNAMIC_LIBC_ELF) | $(BUILD)/esp/lib
+$(BUILD)/esp/lib/libgraphics.so.1: $(DYNAMIC_GFX_LIBRARY_ELF) | $(BUILD)/esp/lib
+	cp $< $@
+
+$(BUILD)/esp/lib/libsystemc.so.1: $(DYNAMIC_LIBC_ELF) | $(BUILD)/esp/lib
 	cp $< $@
 
 $(BUILD)/esp/sbin/dyn-gfx: $(DYNAMIC_GFX_TEST_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
 $(BUILD)/esp/sbin/libc-test: $(DYNAMIC_LIBC_TEST_ELF) | $(BUILD)/esp/sbin
+	cp $< $@
+
+$(BUILD)/esp/sbin/linux-events-test: $(DYNAMIC_LINUX_EVENTS_TEST_ELF) | $(BUILD)/esp/sbin
+	cp $< $@
+
+$(BUILD)/esp/sbin/fat-fsync-probe: $(DYNAMIC_FSYNC_PROBE_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
 $(BUILD)/esp/sbin/imageview: $(DYNAMIC_IMAGEVIEW_ELF) | $(BUILD)/esp/sbin
@@ -1761,6 +1964,9 @@ $(BUILD)/esp/sbin/ndisasm: $(DYNAMIC_NDISASM_ELF) | $(BUILD)/esp/sbin
 $(BUILD)/esp/sbin/gshell: $(DYNAMIC_GSHELL_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
+$(BUILD)/esp/sbin/chrome-start: $(DYNAMIC_CHROME_START_ELF) | $(BUILD)/esp/sbin
+	cp $< $@
+
 $(BUILD)/esp/sbin/notepad: $(DYNAMIC_NOTEPAD_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
@@ -1769,6 +1975,11 @@ $(BUILD)/esp/sbin/fileman: $(DYNAMIC_FILEMAN_ELF) | $(BUILD)/esp/sbin
 
 $(BUILD)/esp/sbin/fm: $(DYNAMIC_FILEMAN_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
+
+$(BUILD)/esp/sbin/window-frame-probe: tests/user/window_frame_probe.c \
+        include/uapi/linux_abi.h include/uapi/window.h include/uapi/window_state.h | $(BUILD)/esp/sbin
+	$(ELFCC) $(ELF_APP_CFLAGS) -fPIC -nostdlib -pie -Wl,-e,_start \
+		-Wl,--hash-style=sysv -Wl,--dynamic-linker,/lib/ld-linux-system.so.1 $< -o $@
 
 $(BUILD)/esp/sbin/taskmgr: $(DYNAMIC_TASKMGR_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
@@ -1781,7 +1992,7 @@ $(BUILD)/esp/sbin/netmgr: $(DYNAMIC_NETMGR_ELF) | $(BUILD)/esp/sbin
 
 
 # QEMU 10's vvfat backend asserts when a ninth root entry is added to the
-# synthetic ESP directory.  /sbin is already on LiteOS's command search path,
+# synthetic ESP directory.  /sbin is already on System's command search path,
 # so keep wget there instead of creating a new root-level /bin directory.
 $(BUILD)/esp/sbin/wget: $(USER_WGET_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
@@ -1789,87 +2000,46 @@ $(BUILD)/esp/sbin/wget: $(USER_WGET_ELF) | $(BUILD)/esp/sbin
 $(BUILD)/esp/sbin/netd: $(USER_NETD_ELF) | $(BUILD)/esp/sbin
 	cp $< $@
 
-esp: $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI $(KERNEL_ELF) \
-     $(BUILD)/esp/EFI/LITEOS/loader.conf $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS) \
+ifeq ($(OS_PHASE13),1)
+PHASE13_TEST_IMAGE = $(BUILD)/esp/sbin/linux-events-test
+endif
+
+# Refresh diagnostic images already installed by an explicit test build;
+# fresh desktop images do not acquire extra test applications.
+EXISTING_DIAGNOSTIC_IMAGES = $(wildcard $(BUILD)/esp/sbin/fat-fsync-probe \
+                                      $(BUILD)/esp/sbin/linux-events-test)
+
+.PHONY: rtl8126-payload
+rtl8126-payload:
+	python3 tools/stage-rtl8126-firmware.py --build "$(BUILD)"
+
+esp: rtl8126-payload $(BUILD)/esp/EFI/BOOT/BOOTX64.EFI $(KERNEL_ELF) \
+     $(BUILD)/esp/EFI/OS/loader.conf $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS) \
      $(BUILD)/esp/tmp \
      $(DESKTOP_ASSETS) \
      $(VFS_SELF_TEST_SEED) \
-     $(NASM_SMOKE_IMAGE) \
      $(BUILD)/esp/init $(BUILD)/esp/init-runtime \
-     $(BUILD)/esp/lib/ld-liteos.so.1 \
-     $(BUILD)/esp/lib/libliteosc.so.1 $(BUILD)/esp/lib/libliteosgfx.so.1 \
+     $(BUILD)/esp/lib/ld-system.so.1 $(BUILD)/esp/lib/ld-linux-system.so.1 \
+     $(BUILD)/esp/lib/libsystemc.so.1 \
+     $(BUILD)/esp/lib/libgraphics.so.1 \
      $(BUILD)/esp/sbin/dyn-gfx $(BUILD)/esp/sbin/libc-test \
      $(BUILD)/esp/sbin/imageview $(BUILD)/esp/sbin/nasm \
      $(BUILD)/esp/sbin/ndisasm \
      $(BUILD)/esp/sbin/deviced $(BUILD)/esp/sbin/logd \
      $(BUILD)/esp/sbin/crashd $(BUILD)/esp/sbin/gshell \
+     $(BUILD)/esp/sbin/chrome-start \
      $(BUILD)/esp/sbin/notepad $(BUILD)/esp/sbin/fileman \
      $(BUILD)/esp/sbin/fm $(BUILD)/esp/sbin/taskmgr \
      $(BUILD)/esp/sbin/audiod \
      $(BUILD)/esp/sbin/netmgr $(BUILD)/esp/sbin/netd \
-     $(BUILD)/esp/sbin/wget
+     $(BUILD)/esp/sbin/wget $(PHASE13_TEST_IMAGE) $(EXISTING_DIAGNOSTIC_IMAGES)
+	@python3 tools/clean-runtime-aliases.py "$(BUILD)/esp"
 	@echo ESP image prepared at $(BUILD)/esp
 
 release-metadata: $(KERNEL_BUILD_ID) $(KERNEL_SYMBOLS)
 	@echo Release metadata prepared: $(KERNEL_BUILD_ID) and $(KERNEL_SYMBOLS)
 
-$(BUILD)/sha256-test.exe: tests/kernel/sha256_test.c boot/uefi/sha256.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
-
-$(BUILD)/mm-api-test.exe: tests/kernel/mm_api_test.c | $(BUILD)
-	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror -Iinclude $< -o $@
-
-$(BUILD)/memory-map-test.exe: tests/kernel/memory_map_test.c boot/uefi/memory_map.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
-
-$(BUILD)/fat32-test.exe: tests/kernel/fat32_test.c kernel/block/bio.c kernel/fs/pagecache/cache.c \
-                          kernel/fs/nativefs/fat32.c kernel/fs/nativefs/directory_codec.c \
-                          kernel/fs/nativefs/fat_table.c kernel/fs/nativefs/transaction.c \
-                          kernel/fs/nativefs/directory_lifecycle.c \
-                          kernel/fs/nativefs/file_lifecycle.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
-
-$(BUILD)/cache-test.exe: tests/kernel/cache_test.c kernel/block/bio.c kernel/fs/pagecache/cache.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
-
-$(BUILD)/primitives-test.exe: tests/kernel/primitives_test.c | $(BUILD)
-	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Werror -Iinclude $< -o $@
-
-primitives-test: $(BUILD)/primitives-test.exe
-	./$(BUILD)/primitives-test.exe
-
-$(BUILD)/bluetooth-test.exe: tests/kernel/bluetooth_test.c kernel/drivers/bluetooth/core.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
-
-bluetooth-test: $(BUILD)/bluetooth-test.exe
-	./$(BUILD)/bluetooth-test.exe
-
-$(BUILD)/firmware-test.exe: tests/kernel/firmware_test.c kernel/drivers/core/firmware.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude $^ -o $@
-
-firmware-test: $(BUILD)/firmware-test.exe
-	./$(BUILD)/firmware-test.exe
-
-$(BUILD)/audiod-test.exe: tests/kernel/audiod_test.c user/services/audiod/mixer.c | $(BUILD)
-	$(HOSTCC) -O2 -Wall -Wextra -Werror -Iinclude -Iuser/services/audiod $^ -o $@
-
-audiod-test: $(BUILD)/audiod-test.exe
-	./$(BUILD)/audiod-test.exe
-
-$(BUILD)/header-sanity.exe: tools/header_sanity.c | $(BUILD)
-	$(HOSTCC) -std=c11 -ffreestanding -Wall -Wextra -Werror -Iinclude $< -o $@
-
-header-sanity: $(BUILD)/header-sanity.exe
-	./$(BUILD)/header-sanity.exe
-
-stage-sanity: roadmap-stage-layout
-	./tools/verify-qemu-stages.sh "$(STAGE_LOG)"
-
-$(BUILD)/abi-sanity.exe: tools/abi_sanity.c | $(BUILD)
-	$(HOSTCC) -std=c11 -Wall -Wextra -Werror -Iinclude $< -o $@
-
-abi-sanity: $(BUILD)/abi-sanity.exe
-	./$(BUILD)/abi-sanity.exe
+include tools/host-tests.mk
 
 $(BUILD)/libc-header-sanity.o: tools/libc_header_sanity.c | $(BUILD)
 	$(ELFCC) $(ELF_COMMON_CFLAGS) -c $< -o $@
@@ -1885,7 +2055,7 @@ ifeq ($(OS),Windows_NT)
 		-Loader "$(DYNAMIC_LOADER_ELF)" -Library "$(DYNAMIC_GFX_LIBRARY_ELF)" \
 		-Test "$(DYNAMIC_GFX_TEST_ELF)" -Objdump "$(ELFOBJDUMP)"
 else
-	@bash tools/verify-dynamic-loader.sh "$(DYNAMIC_LOADER_ELF)" \
+	@ELFOBJDUMP="$(ELFOBJDUMP)" bash tools/verify-dynamic-loader.sh "$(DYNAMIC_LOADER_ELF)" \
 		"$(DYNAMIC_GFX_LIBRARY_ELF)" "$(DYNAMIC_GFX_TEST_ELF)"
 endif
 
@@ -1900,27 +2070,18 @@ else
 		"$(DYNAMIC_LIBC_ELF)" "$(DYNAMIC_LIBC_TEST_ELF)" "$(ELFOBJDUMP)"
 endif
 
-test: $(BUILD)/sha256-test.exe $(BUILD)/mm-api-test.exe $(BUILD)/memory-map-test.exe \
-      $(BUILD)/fat32-test.exe $(BUILD)/cache-test.exe $(BUILD)/primitives-test.exe \
-      $(BUILD)/bluetooth-test.exe $(BUILD)/firmware-test.exe $(BUILD)/audiod-test.exe \
-      $(BUILD)/abi-sanity.exe $(BUILD)/nvidia-port-test.exe
-	./$(BUILD)/sha256-test.exe
-	./$(BUILD)/mm-api-test.exe
-	./$(BUILD)/memory-map-test.exe
-	./$(BUILD)/fat32-test.exe
-	./$(BUILD)/cache-test.exe
-	./$(BUILD)/primitives-test.exe
-	./$(BUILD)/bluetooth-test.exe
-	./$(BUILD)/firmware-test.exe
-	./$(BUILD)/audiod-test.exe
-	./$(BUILD)/abi-sanity.exe
-	./$(BUILD)/nvidia-port-test.exe
 
 clean:
 	rm -rf $(BUILD)
 
+# Invalidate existing ELF objects made before the wide-character ABI guard
+# existed. Newly compiled objects also track it through their .d files.
+$(wildcard $(ELF_RUNTIME_DIR)/*.o): user/runtime/elf_abi.h
+
 # 让头文件修改自动使相关 Loader/Kernel 对象失效，避免 ABI 结构体错位。
 -include $(wildcard $(BUILD)/loader/*.d) $(wildcard $(BUILD)/kernel/*.d) \
+         $(wildcard $(BUILD)/*.exe.d) \
+         $(wildcard $(BUILD)/nvidia/host-test/*.o.d) \
          $(wildcard $(BUILD)/user/*.d) $(wildcard $(BUILD)/elf/*.d) \
          $(wildcard $(BUILD)/nasm/*.d) $(NASM_DEPENDENCY_FILES) \
          $(OPENSSL_DEPENDENCY_FILES) $(BLEND2D_DEPENDENCY_FILES)

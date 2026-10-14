@@ -1,9 +1,12 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <uapi/network.h>
+#include <uapi/syscall.h>
 
 /*
  * The kernel deliberately keeps name resolution out of the syscall ABI.  The
@@ -16,6 +19,54 @@
 #define NETDB_HOST_NAME_SIZE   256U
 #define NETDB_MAX_ALIASES      8U
 #define NETDB_MAX_ADDRESSES    8U
+#define NETDB_DNS_PACKET_SIZE 512U
+#define NETDB_DNS_PORT         53U
+#define NETDB_DNS_TIMEOUT_MS  500
+#define NETDB_DNS_ATTEMPTS     2U
+#define NETDB_DNS_RECV_LIMIT   4U
+#define NETDB_DNS_EPHEMERAL_BASE 49152U
+#define NETDB_DNS_EPHEMERAL_COUNT 16384U
+
+#ifndef OS_DEBUG_SERIAL
+#define OS_DEBUG_SERIAL 0
+#endif
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_netdb_dns_trace_count;
+
+static bool netdb_dns_trace_begin(void) {
+    uint32_t observed = __atomic_load_n(&g_netdb_dns_trace_count,
+                                       __ATOMIC_RELAXED);
+    while (observed < 4U) {
+        if (__atomic_compare_exchange_n(&g_netdb_dns_trace_count, &observed,
+                observed + 1U, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void netdb_dns_trace(bool enabled, const char *marker) {
+    if (!enabled || marker == 0) return;
+    (void)__libc_linux_syscall6(
+        OS_SYS_DEBUG_WRITE, (uint64_t)(uintptr_t)marker,
+        strlen(marker), 0U, 0U, 0U, 0U);
+}
+#else
+static bool netdb_dns_trace_begin(void) {
+    return false;
+}
+static void netdb_dns_trace(bool enabled, const char *marker) {
+    (void)enabled;
+    (void)marker;
+}
+#endif
+
+typedef enum netdb_lookup_status {
+    NETDB_LOOKUP_NOT_FOUND = 0,
+    NETDB_LOOKUP_FOUND = 1,
+    NETDB_LOOKUP_TRY_AGAIN = 2,
+} netdb_lookup_status_t;
 
 int h_errno;
 
@@ -224,27 +275,368 @@ static bool host_state_numeric(const char *name, int family,
     return false;
 }
 
-static bool host_state_lookup(const char *name, int family,
-                              netdb_host_state_t *state) {
+static uint32_t g_netdb_dns_query_sequence = 0x4C10U;
+
+static uint16_t netdb_dns_load_be16(const uint8_t *bytes) {
+    return (uint16_t)(((uint16_t)bytes[0] << 8U) | bytes[1]);
+}
+
+static void netdb_dns_store_be16(uint8_t *bytes, uint16_t value) {
+    bytes[0] = (uint8_t)(value >> 8U);
+    bytes[1] = (uint8_t)value;
+}
+
+static bool netdb_dns_read_server(uint32_t *server) {
+    char contents[256];
+    int descriptor;
+    ssize_t bytes;
+    const char *cursor;
+
+    if (server == 0) return false;
+    descriptor = open("/etc/resolv.conf", O_RDONLY);
+    if (descriptor < 0) return false;
+    bytes = read(descriptor, contents, sizeof(contents) - 1U);
+    (void)close(descriptor);
+    if (bytes <= 0 || (size_t)bytes >= sizeof(contents)) return false;
+    contents[(size_t)bytes] = '\0';
+    cursor = contents;
+
+    while (*cursor != '\0') {
+        char directive[16];
+        char address_text[INET_ADDRSTRLEN];
+        size_t directive_length = 0U;
+        size_t address_length = 0U;
+        struct in_addr address;
+
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' ||
+               *cursor == '\n') ++cursor;
+        if (*cursor == '\0') break;
+        if (*cursor == '#') {
+            while (*cursor != '\0' && *cursor != '\n') ++cursor;
+            continue;
+        }
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' &&
+               *cursor != '\r' && *cursor != '\n' && *cursor != '#') {
+            if (directive_length + 1U >= sizeof(directive)) break;
+            directive[directive_length++] = *cursor++;
+        }
+        if (directive_length + 1U >= sizeof(directive)) {
+            while (*cursor != '\0' && *cursor != '\n') ++cursor;
+            continue;
+        }
+        directive[directive_length] = '\0';
+        if (strcasecmp(directive, "nameserver") != 0) {
+            while (*cursor != '\0' && *cursor != '\n') ++cursor;
+            continue;
+        }
+        while (*cursor == ' ' || *cursor == '\t') ++cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t' &&
+               *cursor != '\r' && *cursor != '\n' && *cursor != '#') {
+            if (address_length + 1U >= sizeof(address_text)) break;
+            address_text[address_length++] = *cursor++;
+        }
+        if (address_length != 0U && address_length < sizeof(address_text)) {
+            address_text[address_length] = '\0';
+            if (inet_pton(AF_INET, address_text, &address) == 1 &&
+                ntohl(address.s_addr) != 0U) {
+                *server = ntohl(address.s_addr);
+                return true;
+            }
+        }
+        while (*cursor != '\0' && *cursor != '\n') ++cursor;
+    }
+    return false;
+}
+
+static bool netdb_dns_local_ipv4(uint32_t *address) {
+    os_net_status_t status = {0};
+    if (address == 0) return false;
+    status.hdr.size = sizeof(status);
+    status.hdr.version = OS_SYSCALL_ABI_VERSION;
+    if (__libc_native_syscall6(OS_SYS_NET_GET_STATUS,
+                        (uint64_t)(uintptr_t)&status,
+                        0U, 0U, 0U, 0U, 0U) < 0 ||
+        (status.flags & OS_NET_STATUS_LINK_UP) == 0U ||
+        status.ipv4_address == 0U) return false;
+    *address = status.ipv4_address;
+    return true;
+}
+
+static uint32_t netdb_dns_name_hash(const char *name) {
+    uint32_t hash = 2166136261U;
+    while (name != 0 && *name != '\0') {
+        hash ^= (uint8_t)*name++;
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+static bool netdb_dns_bind_local(int descriptor, uint32_t local_address,
+                                 const char *name) {
+    struct sockaddr_in address = {0};
+    uint32_t first = netdb_dns_name_hash(name) % NETDB_DNS_EPHEMERAL_COUNT;
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(local_address);
+    for (uint32_t attempt = 0U; attempt < 128U; ++attempt) {
+        uint16_t port = (uint16_t)(NETDB_DNS_EPHEMERAL_BASE +
+            ((first + attempt) % NETDB_DNS_EPHEMERAL_COUNT));
+        address.sin_port = htons(port);
+        if (bind(descriptor, (const struct sockaddr *)&address,
+                 sizeof(address)) == 0) return true;
+        if (errno != EADDRINUSE) return false;
+    }
+    return false;
+}
+
+static bool netdb_dns_encode_name(uint8_t *packet, size_t capacity,
+                                  size_t *offset, const char *name) {
+    const char *label = name;
+    size_t encoded_length = 1U;
+
+    if (packet == 0 || offset == 0 || name == 0 || *name == '\0') return false;
+    while (*label != '\0') {
+        const char *end = label;
+        size_t label_length;
+        while (*end != '\0' && *end != '.') ++end;
+        label_length = (size_t)(end - label);
+        if (label_length == 0U || label_length > 63U ||
+            encoded_length + label_length + 1U > 255U ||
+            *offset > capacity || label_length + 1U > capacity - *offset) {
+            return false;
+        }
+        packet[(*offset)++] = (uint8_t)label_length;
+        memcpy(packet + *offset, label, label_length);
+        *offset += label_length;
+        encoded_length += label_length + 1U;
+        if (*end == '\0') break;
+        label = end + 1;
+    }
+    if (*offset >= capacity) return false;
+    packet[(*offset)++] = 0U;
+    return true;
+}
+
+static bool netdb_dns_skip_name(const uint8_t *packet, size_t length,
+                                size_t *offset) {
+    size_t cursor;
+    uint32_t labels = 0U;
+
+    if (packet == 0 || offset == 0 || *offset >= length) return false;
+    cursor = *offset;
+    while (labels++ < 128U) {
+        uint8_t size;
+        if (cursor >= length) return false;
+        size = packet[cursor++];
+        if (size == 0U) {
+            *offset = cursor;
+            return true;
+        }
+        if ((size & 0xC0U) == 0xC0U) {
+            if (cursor >= length) return false;
+            *offset = cursor + 1U;
+            return true;
+        }
+        if ((size & 0xC0U) != 0U || size > 63U ||
+            (size_t)size > length - cursor) return false;
+        cursor += size;
+    }
+    return false;
+}
+
+static netdb_lookup_status_t netdb_dns_parse_response(
+    const uint8_t *packet, size_t length, uint16_t id, uint16_t query_type,
+    const char *name, netdb_host_state_t *state) {
+    uint16_t flags;
+    uint16_t question_count;
+    uint16_t answer_count;
+    size_t offset = 12U;
+    bool found = false;
+
+    if (packet == 0 || state == 0 || length < 12U ||
+        netdb_dns_load_be16(packet) != id) return NETDB_LOOKUP_TRY_AGAIN;
+    flags = netdb_dns_load_be16(packet + 2U);
+    question_count = netdb_dns_load_be16(packet + 4U);
+    answer_count = netdb_dns_load_be16(packet + 6U);
+    if ((flags & 0x8000U) == 0U || (flags & 0x7800U) != 0U ||
+        (flags & 0x0200U) != 0U || question_count != 1U) {
+        return NETDB_LOOKUP_TRY_AGAIN;
+    }
+    switch (flags & 0x000FU) {
+    case 0U: break;
+    case 3U: return NETDB_LOOKUP_NOT_FOUND;
+    default: return NETDB_LOOKUP_TRY_AGAIN;
+    }
+    if (!netdb_dns_skip_name(packet, length, &offset) ||
+        length - offset < 4U ||
+        netdb_dns_load_be16(packet + offset) != query_type ||
+        netdb_dns_load_be16(packet + offset + 2U) != 1U) {
+        return NETDB_LOOKUP_TRY_AGAIN;
+    }
+    offset += 4U;
+
+    for (uint16_t index = 0U; index < answer_count; ++index) {
+        uint16_t type;
+        uint16_t record_class;
+        uint16_t data_length;
+        const uint8_t *data;
+
+        if (!netdb_dns_skip_name(packet, length, &offset) ||
+            length - offset < 10U) return NETDB_LOOKUP_TRY_AGAIN;
+        type = netdb_dns_load_be16(packet + offset);
+        record_class = netdb_dns_load_be16(packet + offset + 2U);
+        data_length = netdb_dns_load_be16(packet + offset + 8U);
+        offset += 10U;
+        if ((size_t)data_length > length - offset) {
+            return NETDB_LOOKUP_TRY_AGAIN;
+        }
+        data = packet + offset;
+        if (type == query_type && record_class == 1U &&
+            data_length == (uint16_t)state->length) {
+            bool nonzero = false;
+            for (uint16_t byte = 0U; byte < data_length; ++byte) {
+                if (data[byte] != 0U) nonzero = true;
+            }
+            if (nonzero) {
+                found = host_state_add_address(state, data, name) || found;
+            }
+        }
+        offset += data_length;
+    }
+    return found ? NETDB_LOOKUP_FOUND : NETDB_LOOKUP_NOT_FOUND;
+}
+
+static netdb_lookup_status_t netdb_dns_lookup(const char *name, int family,
+                                               netdb_host_state_t *state) {
+    uint8_t query[NETDB_DNS_PACKET_SIZE] = {0};
+    uint8_t response[NETDB_DNS_PACKET_SIZE];
+    struct sockaddr_in server_address = {0};
+    uint32_t server;
+    uint32_t local_address;
+    uint16_t query_type = family == AF_INET ? 1U : 28U;
+    uint16_t id;
+    size_t query_length = 12U;
+    int descriptor;
+    netdb_lookup_status_t result = NETDB_LOOKUP_TRY_AGAIN;
+    bool trace = netdb_dns_trace_begin();
+
+    if (name == 0 || state == 0 ||
+        (family != AF_INET && family != AF_INET6)) {
+        return NETDB_LOOKUP_NOT_FOUND;
+    }
+    netdb_dns_trace(trace, "OS_NETDB_DNS_LOOKUP\n");
+    if (!netdb_dns_read_server(&server)) {
+        netdb_dns_trace(trace, "OS_NETDB_DNS_NO_RESOLVER\n");
+        return NETDB_LOOKUP_TRY_AGAIN;
+    }
+    if (!netdb_dns_local_ipv4(&local_address)) {
+        netdb_dns_trace(trace, "OS_NETDB_DNS_NO_LOCAL_IPV4\n");
+        return NETDB_LOOKUP_TRY_AGAIN;
+    }
+
+    id = (uint16_t)(__atomic_add_fetch(&g_netdb_dns_query_sequence, 1U,
+                                       __ATOMIC_RELAXED) & 0xFFFFU);
+    if (id == 0U) id = 1U;
+    netdb_dns_store_be16(query, id);
+    netdb_dns_store_be16(query + 2U, 0x0100U);
+    netdb_dns_store_be16(query + 4U, 1U);
+    if (!netdb_dns_encode_name(query, sizeof(query), &query_length, name) ||
+        query_length + 4U > sizeof(query)) return NETDB_LOOKUP_NOT_FOUND;
+    netdb_dns_store_be16(query + query_length, query_type);
+    netdb_dns_store_be16(query + query_length + 2U, 1U);
+    query_length += 4U;
+
+    descriptor = socket(AF_INET,
+                        SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                        IPPROTO_UDP);
+    if (descriptor < 0) {
+        netdb_dns_trace(trace, "OS_NETDB_DNS_SOCKET_FAIL\n");
+        return NETDB_LOOKUP_TRY_AGAIN;
+    }
+    if (!netdb_dns_bind_local(descriptor, local_address, name)) {
+        netdb_dns_trace(trace, "OS_NETDB_DNS_BIND_FAIL\n");
+        goto cleanup;
+    }
+
+    server_address.sin_family = AF_INET;
+    server_address.sin_port = htons(NETDB_DNS_PORT);
+    server_address.sin_addr.s_addr = htonl(server);
+    for (uint32_t attempt = 0U; attempt < NETDB_DNS_ATTEMPTS; ++attempt) {
+        ssize_t sent = sendto(descriptor, query, query_length, 0,
+                              (const struct sockaddr *)&server_address,
+                              sizeof(server_address));
+        if (sent != (ssize_t)query_length) {
+            netdb_dns_trace(trace, "OS_NETDB_DNS_SEND_FAIL\n");
+            continue;
+        }
+        netdb_dns_trace(trace, "OS_NETDB_DNS_SENT\n");
+
+        for (uint32_t received_count = 0U;
+             received_count < NETDB_DNS_RECV_LIMIT; ++received_count) {
+            struct pollfd event = {descriptor, POLLIN, 0};
+            struct sockaddr_in source = {0};
+            socklen_t source_length = sizeof(source);
+            int ready = poll(&event, 1U, NETDB_DNS_TIMEOUT_MS);
+            ssize_t received;
+
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                goto cleanup;
+            }
+            if (ready == 0) break;
+            received = recvfrom(descriptor, response, sizeof(response), 0,
+                                (struct sockaddr *)&source, &source_length);
+            if (received < 0) {
+                if (errno == EINTR || errno == EAGAIN) continue;
+                goto cleanup;
+            }
+            if (source_length < sizeof(source) || source.sin_family != AF_INET ||
+                ntohs(source.sin_port) != NETDB_DNS_PORT ||
+                ntohl(source.sin_addr.s_addr) != server) {
+                continue;
+            }
+            result = netdb_dns_parse_response(response, (size_t)received,
+                                               id, query_type, name, state);
+            if (result != NETDB_LOOKUP_TRY_AGAIN) goto cleanup;
+            break;
+        }
+    }
+
+cleanup:
+    (void)close(descriptor);
+    netdb_dns_trace(trace, result == NETDB_LOOKUP_FOUND ?
+        "OS_NETDB_DNS_FOUND\n" :
+        (result == NETDB_LOOKUP_NOT_FOUND ?
+         "OS_NETDB_DNS_NOT_FOUND\n" :
+         "OS_NETDB_DNS_TIMEOUT_OR_RECV_FAIL\n"));
+    return result;
+}
+
+static netdb_lookup_status_t host_state_lookup(const char *name, int family,
+                                               netdb_host_state_t *state) {
     struct in_addr loop4;
     struct in6_addr loop6;
     host_state_reset(state, family);
-    if (name == 0 || *name == '\0') return false;
-    if (host_state_numeric(name, family, state)) return true;
+    if (name == 0 || *name == '\0') return NETDB_LOOKUP_NOT_FOUND;
+    if (host_state_numeric(name, family, state)) return NETDB_LOOKUP_FOUND;
     if (strcasecmp(name, "localhost") == 0 ||
         (family == AF_INET6 && strcasecmp(name, "ip6-localhost") == 0)) {
         if (family == AF_INET) {
             loop4.s_addr = htonl(0x7F000001U);
             (void)netdb_copy_text(state->name, sizeof(state->name), "localhost");
-            return host_state_add_address(state, &loop4, "localhost");
+            return host_state_add_address(state, &loop4, "localhost") ?
+                   NETDB_LOOKUP_FOUND : NETDB_LOOKUP_NOT_FOUND;
         }
         memset(&loop6, 0, sizeof(loop6));
         loop6.s6_addr[15] = 1U;
         (void)netdb_copy_text(state->name, sizeof(state->name),
                                "ip6-localhost");
-        return host_state_add_address(state, &loop6, "ip6-localhost");
+        return host_state_add_address(state, &loop6, "ip6-localhost") ?
+               NETDB_LOOKUP_FOUND : NETDB_LOOKUP_NOT_FOUND;
     }
-    return host_state_from_hosts(name, family, state, 0);
+    if (host_state_from_hosts(name, family, state, 0)) return NETDB_LOOKUP_FOUND;
+    host_state_reset(state, family);
+    return netdb_dns_lookup(name, family, state);
 }
 
 static bool host_state_reverse(const void *address, socklen_t length,
@@ -355,14 +747,16 @@ static int pack_hostent(const netdb_host_state_t *source,
 }
 
 struct hostent *gethostbyname2(const char *name, int address_family) {
+    netdb_lookup_status_t status;
     if (address_family != AF_INET && address_family != AF_INET6) {
         h_errno = NO_DATA;
         errno = EAFNOSUPPORT;
         return 0;
     }
-    if (!host_state_lookup(name, address_family, &g_host_state)) {
-        h_errno = HOST_NOT_FOUND;
-        errno = ENOENT;
+    status = host_state_lookup(name, address_family, &g_host_state);
+    if (status != NETDB_LOOKUP_FOUND) {
+        h_errno = status == NETDB_LOOKUP_TRY_AGAIN ? TRY_AGAIN : HOST_NOT_FOUND;
+        errno = status == NETDB_LOOKUP_TRY_AGAIN ? EAGAIN : ENOENT;
         return 0;
     }
     h_errno = 0;
@@ -391,11 +785,13 @@ int gethostbyname_r(const char *name, struct hostent *result,
                     char *buffer, size_t buffer_length,
                     struct hostent **result_pointer, int *error_number) {
     netdb_host_state_t state;
+    netdb_lookup_status_t status;
     if (result_pointer != 0) *result_pointer = 0;
     if (error_number == 0 || result_pointer == 0) return EINVAL;
-    if (!host_state_lookup(name, AF_INET, &state)) {
-        *error_number = HOST_NOT_FOUND;
-        return ENOENT;
+    status = host_state_lookup(name, AF_INET, &state);
+    if (status != NETDB_LOOKUP_FOUND) {
+        *error_number = status == NETDB_LOOKUP_TRY_AGAIN ? TRY_AGAIN : HOST_NOT_FOUND;
+        return status == NETDB_LOOKUP_TRY_AGAIN ? EAGAIN : ENOENT;
     }
     return pack_hostent(&state, result, buffer, buffer_length,
                         result_pointer, error_number);
@@ -834,8 +1230,11 @@ int getaddrinfo(const char *node, const char *service,
         if ((flags & AI_NUMERICHOST) == 0) {
             netdb_host_state_t lookup;
             bool found = false;
+            bool temporary_failure = false;
             if (family == AF_UNSPEC || family == AF_INET) {
-                if (host_state_lookup(node, AF_INET, &lookup) &&
+                netdb_lookup_status_t lookup_status =
+                    host_state_lookup(node, AF_INET, &lookup);
+                if (lookup_status == NETDB_LOOKUP_FOUND &&
                     lookup.address_count != 0U) {
                     struct in_addr parsed;
                     memcpy(&parsed, lookup.addresses[0], sizeof(parsed));
@@ -843,18 +1242,25 @@ int getaddrinfo(const char *node, const char *service,
                     make_ipv4 = true;
                     node_family = AF_INET;
                     found = true;
+                } else if (lookup_status == NETDB_LOOKUP_TRY_AGAIN) {
+                    temporary_failure = true;
                 }
             }
             if (family == AF_UNSPEC || family == AF_INET6) {
-                if (host_state_lookup(node, AF_INET6, &lookup) &&
+                netdb_lookup_status_t lookup_status =
+                    host_state_lookup(node, AF_INET6, &lookup);
+                if (lookup_status == NETDB_LOOKUP_FOUND &&
                     lookup.address_count != 0U) {
                     memcpy(address6, lookup.addresses[0], sizeof(address6));
                     make_ipv6 = true;
                     if (!found) node_family = AF_INET6;
                     found = true;
+                } else if (lookup_status == NETDB_LOOKUP_TRY_AGAIN) {
+                    temporary_failure = true;
                 }
             }
             if (found) goto node_parsed;
+            if (temporary_failure) return EAI_AGAIN;
         }
         return EAI_NONAME;
     }

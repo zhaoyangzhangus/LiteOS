@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-build_dir="${BUILD:-build-refactor}"
-elf_path="${1:-$build_dir/esp/EFI/LITEOS/kernel.elf}"
+build_dir="${BUILD:-build}"
+elf_path="${1:-$build_dir/esp/EFI/OS/kernel.elf}"
 log_path="${2:-$build_dir/qemu-serial.log}"
 objdump_cmd="${OBJDUMP:-x86_64-w64-mingw32-objdump}"
 
@@ -20,7 +20,7 @@ if ! command -v "$objdump_cmd" >/dev/null 2>&1; then
 fi
 
 if ! "$objdump_cmd" -t "$elf_path" |
-    grep -F 'liteos_debug_stage_at' >/dev/null; then
+    grep -F 'kernel_debug_stage_at' >/dev/null; then
     printf 'debug location verification: stage symbol missing from %s\n' \
         "$elf_path" >&2
     exit 1
@@ -45,10 +45,10 @@ done
 # without its call site is useful for a graph, but not for explaining a
 # regression in a refactor.  Keep this check separate from the stage verifier
 # because a deliberately early boot-failure log may contain no benchmark yet.
-benchmark_records=$(grep -E '^LITEOS_BENCH(_VALUE)? ' "$log_path" || true)
+benchmark_records=$(grep -E '^OS_BENCH(_VALUE)? ' "$log_path" || true)
 if [[ -n "$benchmark_records" ]]; then
     unlocated_benchmarks=$(printf '%s\n' "$benchmark_records" |
-        grep -Ev '^LITEOS_BENCH(_VALUE)? name=[^[:space:]]+ (cycles|value)=[0-9]+ loc=kernel/[^[:space:]]+:[0-9]+([[:space:]]|$)' || true)
+        grep -Ev '^OS_BENCH(_VALUE)? name=[^[:space:]]+ (cycles|value)=[0-9]+ loc=kernel/[^[:space:]]+:[0-9]+([[:space:]]|$)' || true)
     if [[ -n "$unlocated_benchmarks" ]]; then
         printf 'debug location verification: unlocated benchmark record in %s\n' \
             "$log_path" >&2
@@ -90,13 +90,13 @@ if [[ -n "$benchmark_records" ]]; then
     fi
 fi
 
-# The kmalloc summary predates the generic LITEOS_BENCH format, but it is
+# The kmalloc summary predates the generic OS_BENCH format, but it is
 # still a benchmark record.  Require the same source location so a memory
 # allocator regression can be opened at the report call site.
-kmalloc_records=$(grep -E '^LITEOS_PERF_KMALLOC_OK ' "$log_path" || true)
+kmalloc_records=$(grep -E '^OS_PERF_KMALLOC_OK ' "$log_path" || true)
 if [[ -n "$kmalloc_records" ]]; then
     unlocated_kmalloc=$(printf '%s\n' "$kmalloc_records" |
-        grep -Ev '^LITEOS_PERF_KMALLOC_OK .* loc=kernel/[^[:space:]]+:[0-9]+([[:space:]]|$)' || true)
+        grep -Ev '^OS_PERF_KMALLOC_OK .* loc=kernel/[^[:space:]]+:[0-9]+([[:space:]]|$)' || true)
     if [[ -n "$unlocated_kmalloc" ]]; then
         printf 'debug location verification: unlocated kmalloc report in %s\n' \
             "$log_path" >&2

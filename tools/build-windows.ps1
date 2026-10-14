@@ -23,12 +23,12 @@ function Assert-RelativeBuild([string]$name) {
 
 $buildName = if ($Build) {
     $Build
-} elseif ($env:LITEOS_BUILD) {
-    $env:LITEOS_BUILD
+} elseif ($env:OS_BUILD) {
+    $env:OS_BUILD
 } elseif ($env:BUILD) {
     $env:BUILD
 } else {
-    'build-refactor'
+    'build'
 }
 Assert-RelativeBuild $buildName
 
@@ -84,8 +84,8 @@ if (-not $make) {
 
 $prefix = if ($ToolPrefix) {
     $ToolPrefix
-} elseif ($env:LITEOS_TOOLPREFIX) {
-    $env:LITEOS_TOOLPREFIX
+} elseif ($env:OS_TOOLPREFIX) {
+    $env:OS_TOOLPREFIX
 } elseif ($env:TOOLPREFIX) {
     $env:TOOLPREFIX
 } else {
@@ -94,8 +94,8 @@ $prefix = if ($ToolPrefix) {
 
 $elfPrefix = if ($ElfToolPrefix) {
     $ElfToolPrefix
-} elseif ($env:LITEOS_ELFTOOLPREFIX) {
-    $env:LITEOS_ELFTOOLPREFIX
+} elseif ($env:OS_ELFTOOLPREFIX) {
+    $env:OS_ELFTOOLPREFIX
 } elseif ($env:ELFTOOLPREFIX) {
     $env:ELFTOOLPREFIX
 } else {
@@ -106,7 +106,7 @@ $toolNames = @('gcc.exe', 'ar.exe', 'objcopy.exe', 'objdump.exe')
 foreach ($toolName in $toolNames) {
     $tool = Resolve-Executable '' @($prefix + $toolName)
     if (-not $tool) {
-        throw "Missing native target tool: $prefix$toolName. The LiteOS UEFI build requires the MinGW PE/COFF toolchain."
+        throw "Missing native target tool: $prefix$toolName. The System UEFI build requires the MinGW PE/COFF toolchain."
     }
 }
 
@@ -166,10 +166,10 @@ $makeArguments += @(
     "ELFTOOLPREFIX=$elfPrefix",
     'HOSTCC=gcc',
     "DEBUG=$Debug",
-    "LITEOS_DEBUG_SERIAL=$serialValue",
-    "LITEOS_REALTEST=$realTestValue",
-    "LITEOS_REALTEST_FAILURE_TEST=$failureTestValue",
-    "LITEOS_XHCI_DIAGNOSTIC_BOT=$diagnosticBotValue"
+    "OS_DEBUG_SERIAL=$serialValue",
+    "OS_REALTEST=$realTestValue",
+    "OS_REALTEST_FAILURE_TEST=$failureTestValue",
+    "OS_XHCI_DIAGNOSTIC_BOT=$diagnosticBotValue"
 )
 $makeArguments += 'esp'
 
@@ -190,13 +190,13 @@ finally {
 }
 
 if ($status -ne 0) {
-    throw "Native LiteOS build failed ($status). See $buildLog."
+    throw "Native System build failed ($status). See $buildLog."
 }
 
-$kernel = Join-Path $buildDirectory 'esp\EFI\LITEOS\kernel.elf'
+$kernel = Join-Path $buildDirectory 'esp\EFI\OS\kernel.elf'
 $bootloader = Join-Path $buildDirectory 'esp\EFI\BOOT\BOOTX64.EFI'
 if (-not (Test-Path -LiteralPath $kernel) -or -not (Test-Path -LiteralPath $bootloader)) {
     throw "Native build completed without the ESP boot files. See $buildLog."
 }
 
-Write-Host "LiteOS native build ready: $buildName"
+Write-Host "System native build ready: $buildName"

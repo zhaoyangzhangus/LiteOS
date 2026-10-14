@@ -33,7 +33,7 @@ static bool firmware_type_is_ram(uint32_t type) {
     }
 }
 
-bool direct_map_prepare_ram_ranges(const LITEOS_BOOT_INFO *boot_info) {
+bool direct_map_prepare_ram_ranges(const OS_BOOT_INFO *boot_info) {
     if (boot_info == 0 || boot_info->MemoryMap == 0 ||
         boot_info->MemoryDescriptorSize < sizeof(EFI_MEMORY_DESCRIPTOR) ||
         boot_info->MemoryMapSize < boot_info->MemoryDescriptorSize) return false;

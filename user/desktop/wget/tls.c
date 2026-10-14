@@ -205,7 +205,7 @@ static int tls_bio_destroy(BIO *bio) {
 static const BIO_METHOD *tls_bio_method(void) {
     BIO_METHOD *method;
     if (g_tls_bio_method != 0) return g_tls_bio_method;
-    method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "LiteOS socket");
+    method = BIO_meth_new(BIO_TYPE_SOURCE_SINK, "System socket");
     if (method == 0 ||
         !BIO_meth_set_read(method, tls_bio_read) ||
         !BIO_meth_set_write(method, tls_bio_write) ||

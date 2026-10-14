@@ -2,7 +2,7 @@
 #include <kernel/vfs.h>
 #include "internal.h"
 
-#ifdef LITEOS_KERNEL_BUILD
+#ifdef OS_KERNEL_BUILD
 
 /* REFACTOR_FS_VFS_FILE_IO_OWNER: kernel file position and data I/O policy. */
 
@@ -22,9 +22,7 @@ kstatus_t vfs_truncate_node(vnode_t *vnode, uint64_t size) {
     status = backend->truncate(backend->context, size);
     vfs_backend_unlock(backend);
     if (status == K_OK) {
-        vfs_vnode_lock(vnode);
-        vnode->size = size;
-        vfs_vnode_unlock(vnode);
+        vfs_page_cache_resize(vnode, size);
     }
     return status;
 }
@@ -66,34 +64,55 @@ kstatus_t vfs_truncate(file_t *file, uint64_t size) {
     return vfs_truncate_kernel(file, size);
 }
 
+/* Both read APIs share backend locking, EOF revalidation and count bounds.
+ * Revalidate each chunk: a concurrent truncate may move EOF after progress. */
+static kstatus_t vfs_read_backend_chunk(vfs_backend_node_t *backend,
+                                       uint64_t position, void *buffer,
+                                       size_t length, uint64_t *bytes) {
+    *bytes = 0U;
+    vfs_backend_lock(backend);
+    kstatus_t status = position >= backend->size ? K_OK :
+        backend->read(backend->context, position, buffer, length, bytes);
+    vfs_backend_unlock(backend);
+    return status == K_OK && *bytes > length ? K_EIO : status;
+}
+
 kstatus_t vfs_read(file_t *file, void __user *buf, size_t len, uint64_t *bytes) {
     if (file == 0 || file->object.type != KOBJECT_TYPE_FILE || file->vnode == 0 ||
         bytes == 0 || (file->rights & VFS_OPEN_READ) == 0U) return K_EINVAL;
     if (len != 0 && !x86_user_range_valid(buf, len)) return K_EINVAL;
     vfs_backend_node_t *backend =
         (vfs_backend_node_t *)file->vnode->fs_private;
-    if (backend == 0 || backend->read == 0 || file->position > backend->size) return K_EIO;
+    if (backend == 0 || backend->read == 0) return K_EIO;
+    /* POSIX read() returns EOF, not EIO, when the file offset is at or past
+     * the end of the file.  SQLite relies on this while probing/truncating
+     * journal and database pages. */
+    *bytes = 0U;
+    if (file->position >= backend->size || len == 0U) return K_OK;
     size_t total = 0;
+    kstatus_t result = K_OK;
     while (total < len) {
         uint8_t temporary[PAGE_SIZE];
         size_t chunk = len - total;
         if (chunk > sizeof(temporary)) chunk = sizeof(temporary);
         uint64_t got = 0;
-        vfs_backend_lock(backend);
-        kstatus_t status = backend->read(backend->context, file->position,
-                                         temporary, chunk, &got);
-        vfs_backend_unlock(backend);
-        if (status != K_OK || got > chunk) return status == K_OK ? K_EIO : status;
+        kstatus_t status = vfs_read_backend_chunk(backend, file->position,
+                                                  temporary, chunk, &got);
+        if (status != K_OK) {
+            result = status;
+            break;
+        }
         if (got == 0) break;
         if (copy_to_user((uint8_t __user *)buf + total, temporary, (size_t)got) != K_OK) {
-            return K_EACCES;
+            result = K_EACCES;
+            break;
         }
         total += (size_t)got;
         file->position += got;
         if (got < chunk) break;
     }
     *bytes = total;
-    return K_OK;
+    return result;
 }
 
 kstatus_t vfs_read_kernel(file_t *file, void *buf, size_t len, uint64_t *bytes) {
@@ -101,23 +120,45 @@ kstatus_t vfs_read_kernel(file_t *file, void *buf, size_t len, uint64_t *bytes) 
         buf == 0 || bytes == 0 || (file->rights & VFS_OPEN_READ) == 0U) return K_EINVAL;
     vfs_backend_node_t *backend =
         (vfs_backend_node_t *)file->vnode->fs_private;
-    if (backend == 0 || backend->read == 0 || file->position > backend->size) return K_EIO;
+    if (backend == 0 || backend->read == 0) return K_EIO;
+    /* Keep the kernel-side API identical to the user read path at EOF. */
+    *bytes = 0U;
+    if (file->position >= backend->size || len == 0U) return K_OK;
     size_t total = 0;
+    kstatus_t result = K_OK;
     while (total < len) {
         size_t chunk = len - total;
         if (chunk > UINT32_MAX) chunk = UINT32_MAX;
         uint64_t got = 0;
-        vfs_backend_lock(backend);
-        kstatus_t status = backend->read(backend->context, file->position,
-                                         (uint8_t *)buf + total, chunk, &got);
-        vfs_backend_unlock(backend);
-        if (status != K_OK || got > chunk) return status == K_OK ? K_EIO : status;
+        kstatus_t status = vfs_read_backend_chunk(backend, file->position,
+                                                  (uint8_t *)buf + total, chunk, &got);
+        if (status != K_OK) {
+            result = status;
+            break;
+        }
         if (got == 0) break;
         total += (size_t)got;
         file->position += got;
         if (got < chunk) break;
     }
     *bytes = total;
+    return result;
+}
+
+/* Commit only a validated backend count; cache copies must not hold its lock. */
+static kstatus_t vfs_write_chunk(file_t *file, vfs_backend_node_t *backend,
+                                const void *buffer, size_t length,
+                                uint64_t *bytes) {
+    *bytes = 0U;
+    vfs_backend_lock(backend);
+    kstatus_t status = backend->write(backend->context, file->position,
+                                      buffer, length, bytes);
+    vfs_backend_unlock(backend);
+    if (status != K_OK || *bytes > length) return status == K_OK ? K_EIO : status;
+    if (*bytes != 0U) {
+        vfs_page_cache_copy_in(file->vnode, file->position, buffer, (size_t)*bytes);
+        file->position += *bytes;
+    }
     return K_OK;
 }
 
@@ -128,31 +169,29 @@ kstatus_t vfs_write(file_t *file, const void __user *buf, size_t len, uint64_t *
         (vfs_backend_node_t *)file->vnode->fs_private;
     if (backend == 0 || backend->write == 0) return K_EACCES;
     if (len != 0 && !x86_user_range_valid(buf, len)) return K_EINVAL;
+    *bytes = 0U;
     size_t total = 0;
+    kstatus_t result = K_OK;
     while (total < len) {
         uint8_t temporary[PAGE_SIZE];
         size_t chunk = len - total;
         if (chunk > sizeof(temporary)) chunk = sizeof(temporary);
         if (copy_from_user(temporary, (const uint8_t __user *)buf + total, chunk) != K_OK) {
-            return K_EACCES;
+            result = K_EACCES;
+            break;
         }
         uint64_t written = 0;
-        vfs_backend_lock(backend);
-        kstatus_t status = backend->write(backend->context, file->position,
-                                          temporary, chunk, &written);
-        vfs_backend_unlock(backend);
-        if (status != K_OK || written > chunk) {
-            return status == K_OK ? K_EIO : status;
+        kstatus_t status = vfs_write_chunk(file, backend, temporary, chunk, &written);
+        if (status != K_OK) {
+            result = status;
+            break;
         }
         if (written == 0) break;
-        vfs_page_cache_copy_in(file->vnode, file->position, temporary,
-                               (size_t)written);
         total += (size_t)written;
-        file->position += written;
         if (written < chunk) break;
     }
     *bytes = total;
-    return K_OK;
+    return result;
 }
 
 kstatus_t vfs_write_kernel(file_t *file, const void *buf, size_t len,
@@ -163,28 +202,25 @@ kstatus_t vfs_write_kernel(file_t *file, const void *buf, size_t len,
     vfs_backend_node_t *backend =
         (vfs_backend_node_t *)file->vnode->fs_private;
     if (backend == 0 || backend->write == 0) return K_EACCES;
+    *bytes = 0U;
     size_t total = 0;
+    kstatus_t result = K_OK;
     while (total < len) {
         size_t chunk = len - total;
         if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
         uint64_t written = 0;
-        vfs_backend_lock(backend);
-        kstatus_t status = backend->write(backend->context, file->position,
-                                          (const uint8_t *)buf + total, chunk,
-                                          &written);
-        vfs_backend_unlock(backend);
-        if (status != K_OK || written > chunk) {
-            return status == K_OK ? K_EIO : status;
+        kstatus_t status = vfs_write_chunk(file, backend,
+                                          (const uint8_t *)buf + total, chunk, &written);
+        if (status != K_OK) {
+            result = status;
+            break;
         }
         if (written == 0) break;
-        vfs_page_cache_copy_in(file->vnode, file->position,
-                               (const uint8_t *)buf + total, (size_t)written);
         total += (size_t)written;
-        file->position += written;
         if (written < chunk) break;
     }
     *bytes = total;
-    return K_OK;
+    return result;
 }
 
 kstatus_t vfs_fsync(file_t *file) {
@@ -194,15 +230,7 @@ kstatus_t vfs_fsync(file_t *file) {
     vfs_backend_node_t *backend =
         (vfs_backend_node_t *)file->vnode->fs_private;
     if (backend == 0) return K_EIO;
-    vfs_vnode_lock(file->vnode);
-    kstatus_t status = vfs_page_cache_flush(file->vnode);
-    vfs_vnode_unlock(file->vnode);
-    if (status != K_OK) return status;
-    if (backend->fsync == 0) return K_OK;
-    vfs_backend_lock(backend);
-    status = backend->fsync(backend->context);
-    vfs_backend_unlock(backend);
-    return status;
+    return vfs_page_cache_sync(file->vnode, 0U, UINT64_MAX);
 }
 
 void vfs_close(file_t *file) {

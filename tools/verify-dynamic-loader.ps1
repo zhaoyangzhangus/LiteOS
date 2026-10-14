@@ -21,30 +21,19 @@ function Read-Objdump([string[]]$Arguments) {
     return (& $Objdump @Arguments | Out-String)
 }
 
-$loaderHeaders = Read-Objdump @('-p', $Loader)
-$libraryHeaders = Read-Objdump @('-p', $Library)
-$testHeaders = Read-Objdump @('-p', $Test)
-$testInterpreter = Read-Objdump @('-s', '-j', '.interp', $Test)
+$python = Get-Command python3 -ErrorAction SilentlyContinue
+if (-not $python) { $python = Get-Command python -ErrorAction Stop }
+& $python.Source (Join-Path $PSScriptRoot 'verify-elf-runtime.py') $Loader $Library $Test 'libgraphics.so.1'
+if ($LASTEXITCODE -ne 0) { throw 'dynamic loader: invalid ELF runtime identity' }
 $librarySymbols = Read-Objdump @('-T', $Library)
 $testRelocations = Read-Objdump @('-R', $Test)
 
-if ($loaderHeaders -match 'NEEDED' -or $libraryHeaders -match 'NEEDED') {
-    throw 'dynamic loader: loader or graphics library has an external dependency'
-}
-if ($testHeaders -notmatch 'INTERP' -or
-    $testInterpreter -notmatch '2f6c6962' -or
-    $testInterpreter -notmatch '6c697465' -or
-    $testInterpreter -notmatch '6f732e73' -or
-    $testInterpreter -notmatch '6f2e3100') {
-    throw 'dynamic loader: test image has no LiteOS interpreter'
-}
-if ($testHeaders -notmatch 'NEEDED' -or $testHeaders -notmatch 'libliteosgfx\.so\.1') {
-    throw 'dynamic loader: test image has no graphics-library dependency'
-}
 foreach ($symbol in @(
-        'liteos_gfx_clear', 'liteos_gfx_fill_rect',
-        'liteos_gfx_gradient_rect', 'liteos_gfx_frame')) {
-    if ($librarySymbols -notmatch [regex]::Escape($symbol)) {
+        'gfx_clear', 'gfx_fill_rect',
+        'gfx_gradient_rect', 'gfx_frame')) {
+    if (-not ($librarySymbols -split '\r?\n' | Where-Object {
+        $_ -notmatch '\*UND\*' -and $_ -match ('\s' + [regex]::Escape($symbol) + '\s*$')
+    })) {
         throw "dynamic loader: missing exported graphics symbol: $symbol"
     }
 }

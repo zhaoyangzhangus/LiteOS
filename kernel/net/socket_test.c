@@ -7,6 +7,7 @@
 #include <kernel/socket.h>
 
 #include "socket_internal.h"
+#include "socket_model.h"
 
 #define SOCKET_LONG_TEST_CHUNK 1024U
 #define SOCKET_LONG_TEST_BATCH 8U
@@ -143,6 +144,38 @@ static bool socket_test_open_local_pair(uint16_t listener_port,
     *client_out = client;
     *accepted_out = accepted;
     return true;
+}
+
+static bool socket_test_peek_local(void) {
+    socket_t *listener = 0;
+    socket_t *client = 0;
+    socket_t *accepted = 0;
+    socket_ipv4_endpoint_t source = {0};
+    static const uint8_t payload[] = {'a', 'b', 'c'};
+    uint8_t received[sizeof(payload)] = {0};
+    uint64_t bytes = 0U;
+    bool success = false;
+
+    if (!socket_test_open_local_pair(17006U, 17007U, &listener, &client,
+                                     &accepted) ||
+        socket_send(client, payload, sizeof(payload), 0U, 0U, &bytes) != K_OK ||
+        bytes != sizeof(payload)) goto cleanup;
+    for (uint32_t attempt = 0U; attempt < 2U; ++attempt) {
+        if (socket_recv_peek(accepted, received, 1U, &source,
+                             1000000000ULL, &bytes) != K_OK ||
+            bytes != 1U || received[0] != payload[0]) goto cleanup;
+    }
+    if (socket_recv(accepted, received, sizeof(received), &source,
+                    1000000000ULL, &bytes) != K_OK ||
+        bytes != sizeof(payload) ||
+        !socket_check_payload(received, payload, sizeof(payload)) ||
+        (socket_poll_state(accepted) & SOCKET_POLL_READ) != 0U) goto cleanup;
+    success = true;
+cleanup:
+    socket_test_release(accepted);
+    socket_test_release(client);
+    socket_test_release(listener);
+    return success;
 }
 
 static bool socket_test_shutdown_local(void) {
@@ -303,7 +336,28 @@ cleanup:
     return success;
 }
 
+static bool socket_address6_self_test(void) {
+    uint8_t left[32] = {0}, right[32] = {0};
+    for (uint32_t a = 0; a < 16U; ++a) {
+        for (uint32_t b = 0; b < 16U; ++b) {
+            if (!socket_address6_zero(left + a) ||
+                !socket_address6_equal(left + a, right + b)) return false;
+            for (uint32_t bit = 0; bit < 128U; ++bit) {
+                uint32_t byte = bit / 8U;
+                left[a + byte] = (uint8_t)(1U << (bit % 8U));
+                if (socket_address6_zero(left + a) ||
+                    socket_address6_equal(left + a, right + b)) return false;
+                right[b + byte] = left[a + byte];
+                if (!socket_address6_equal(left + a, right + b)) return false;
+                left[a + byte] = right[b + byte] = 0U;
+            }
+        }
+    }
+    return true;
+}
+
 bool socket_self_test(void) {
+    if (!socket_address6_self_test()) return false;
     socket_t *sender = 0;
     socket_t *receiver = 0;
     socket_t *sender6 = 0;
@@ -316,6 +370,7 @@ bool socket_self_test(void) {
     socket_t *wire_accepted = 0;
     socket_t *active_client = 0;
     socket_t *active_client6 = 0;
+    socket_t *connect_timeout_client = 0;
     completion_port_t *completion_port = 0;
     const uint8_t udp_payload[] = {'s', 'o', 'c', 'k', 'e', 't'};
     const uint8_t tcp_payload[] = {'t', 'c', 'p'};
@@ -347,7 +402,8 @@ bool socket_self_test(void) {
     socket_test_zero(&captured_tcp_output, sizeof(captured_tcp_output));
     socket_test_zero(&captured_tcp6_output, sizeof(captured_tcp6_output));
 
-    if (!socket_test_shutdown_local() || !socket_test_shutdown_wire()) goto cleanup;
+    if (!socket_test_shutdown_local() || !socket_test_shutdown_wire() ||
+        !socket_test_peek_local()) goto cleanup;
 
     if (socket_create(OS_AF_INET4, OS_SOCK_DGRAM, 0, &sender) != K_OK ||
         socket_create(OS_AF_INET4, OS_SOCK_DGRAM, 0, &receiver) != K_OK ||
@@ -507,6 +563,8 @@ bool socket_self_test(void) {
     tcp_output_installed = true;
     if (socket_create(OS_AF_INET4, OS_SOCK_STREAM, 0, &active_client) != K_OK ||
         socket_connect(active_client, 0x7F000002U, 16000U) != K_OK ||
+        socket_connect_status(active_client) != K_EAGAIN ||
+        (socket_poll_state(active_client) & SOCKET_POLL_WRITE) != 0U ||
         captured_tcp_output.count != 1U ||
         captured_tcp_output.flags != NET_TCP_FLAG_SYN ||
         captured_tcp_output.payload_length != 0U ||
@@ -516,13 +574,22 @@ bool socket_self_test(void) {
             captured_tcp_output.source_address,
             captured_tcp_output.source_port,
             400U, captured_tcp_output.sequence + 1U,
-            NET_TCP_FLAG_SYN | NET_TCP_FLAG_ACK, 4096U, &active_reply) != K_OK ||
+            NET_TCP_FLAG_SYN | NET_TCP_FLAG_ACK, 0U, &active_reply) != K_OK ||
         !active_reply.valid || active_reply.flags != NET_TCP_FLAG_ACK ||
         active_reply.acknowledgement != 401U ||
+        socket_connect_status(active_client) != K_OK ||
+        (socket_poll_state(active_client) & SOCKET_POLL_WRITE) != 0U ||
+        socket_inject_tcp_ack_ipv4_window(
+            0x7F000002U, 16000U, captured_tcp_output.source_address,
+            captured_tcp_output.source_port, 401U,
+            captured_tcp_output.sequence + 1U, NET_TCP_FLAG_ACK,
+            4096U) != K_OK ||
+        (socket_poll_state(active_client) & SOCKET_POLL_WRITE) == 0U ||
         captured_tcp_output.source_port == 0U) goto cleanup;
     socket_test_zero(&captured_tcp_output, sizeof(captured_tcp_output));
     if (socket_send(active_client, tcp_payload, sizeof(tcp_payload), 0U, 0U,
                     &bytes) != K_OK || bytes != sizeof(tcp_payload) ||
+        (socket_poll_state(active_client) & SOCKET_POLL_WRITE) != 0U ||
         captured_tcp_output.count != 1U ||
         captured_tcp_output.flags != (NET_TCP_FLAG_ACK | NET_TCP_FLAG_PSH) ||
         captured_tcp_output.payload_length != sizeof(tcp_payload) ||
@@ -532,7 +599,9 @@ bool socket_self_test(void) {
             0x7F000002U, 16000U, captured_tcp_output.source_address,
             captured_tcp_output.source_port, 401U,
             captured_tcp_output.sequence + (uint32_t)sizeof(tcp_payload),
-            NET_TCP_FLAG_ACK, 4096U) != K_OK) goto cleanup;
+            NET_TCP_FLAG_ACK, 4096U) != K_OK ||
+        (socket_poll_state(active_client) & SOCKET_POLL_WRITE) == 0U)
+        goto cleanup;
     socket_test_zero(&captured_tcp_output, sizeof(captured_tcp_output));
     if (socket_send(active_client, tcp_payload, sizeof(tcp_payload), 0U, 0U,
                     &bytes) != K_OK || bytes != sizeof(tcp_payload) ||
@@ -552,6 +621,8 @@ bool socket_self_test(void) {
     };
     if (socket_create(OS_AF_INET6, OS_SOCK_STREAM, 0, &active_client6) != K_OK ||
         socket_connect_ipv6(active_client6, active_peer6, 16001U) != K_OK ||
+        socket_connect_status(active_client6) != K_EAGAIN ||
+        (socket_poll_state(active_client6) & SOCKET_POLL_WRITE) != 0U ||
         captured_tcp6_output.count != 1U ||
         captured_tcp6_output.flags != NET_TCP_FLAG_SYN ||
         captured_tcp6_output.payload_length != 0U ||
@@ -563,10 +634,14 @@ bool socket_self_test(void) {
             captured_tcp6_output.sequence + 1U,
             NET_TCP_FLAG_SYN | NET_TCP_FLAG_ACK, 4096U, &active_reply6) != K_OK ||
         !active_reply6.valid || active_reply6.flags != NET_TCP_FLAG_ACK ||
-        active_reply6.acknowledgement != 501U) goto cleanup;
+        active_reply6.acknowledgement != 501U ||
+        socket_connect_status(active_client6) != K_OK ||
+        (socket_poll_state(active_client6) & SOCKET_POLL_WRITE) == 0U)
+        goto cleanup;
     socket_test_zero(&captured_tcp6_output, sizeof(captured_tcp6_output));
     if (socket_send_ipv6(active_client6, tcp_payload, sizeof(tcp_payload), 0, 0U,
                          &bytes) != K_OK || bytes != sizeof(tcp_payload) ||
+        (socket_poll_state(active_client6) & SOCKET_POLL_WRITE) != 0U ||
         captured_tcp6_output.count != 1U ||
         captured_tcp6_output.flags != (NET_TCP_FLAG_ACK | NET_TCP_FLAG_PSH) ||
         captured_tcp6_output.payload_length != sizeof(tcp_payload) ||
@@ -576,7 +651,9 @@ bool socket_self_test(void) {
             active_peer6, 16001U, captured_tcp6_output.source_address,
             captured_tcp6_output.source_port, 501U,
             captured_tcp6_output.sequence + (uint32_t)sizeof(tcp_payload),
-            NET_TCP_FLAG_ACK, 4096U) != K_OK) goto cleanup;
+            NET_TCP_FLAG_ACK, 4096U) != K_OK ||
+        (socket_poll_state(active_client6) & SOCKET_POLL_WRITE) == 0U)
+        goto cleanup;
     socket_test_zero(&captured_tcp6_output, sizeof(captured_tcp6_output));
     if (socket_send_ipv6(active_client6, tcp_payload, sizeof(tcp_payload), 0, 0U,
                          &bytes) != K_OK || bytes != sizeof(tcp_payload) ||
@@ -586,6 +663,26 @@ bool socket_self_test(void) {
                     x86_timeout_ns_to_tsc(SOCKET_TCP_RETRANSMIT_TIMEOUT_NS) + 1U);
     if (captured_tcp6_output.count != retransmit6_count + 1U ||
         captured_tcp6_output.sequence == 0U) goto cleanup;
+
+    /* A SYN that never receives a reply must stop being pending and make
+     * the error observable to epoll/poll after the retransmit budget. */
+    if (socket_create(OS_AF_INET4, OS_SOCK_STREAM, 0,
+                      &connect_timeout_client) != K_OK ||
+        socket_connect(connect_timeout_client, 0x7F000003U, 16002U) != K_OK ||
+        socket_connect_status(connect_timeout_client) != K_EAGAIN ||
+        (socket_poll_state(connect_timeout_client) &
+         (SOCKET_POLL_WRITE | SOCKET_POLL_ERROR)) != 0U) goto cleanup;
+    uint64_t timeout_now = x86_read_tsc();
+    uint64_t timeout_step =
+        x86_timeout_ns_to_tsc(SOCKET_TCP_RETRANSMIT_TIMEOUT_NS) + 1U;
+    for (uint32_t retry = 0U; retry <= SOCKET_TCP_MAX_RETRANSMITS;
+         ++retry) {
+        timeout_now += timeout_step;
+        socket_tcp_poll(timeout_now);
+    }
+    if (socket_connect_status(connect_timeout_client) != K_EIO ||
+        (socket_poll_state(connect_timeout_client) & SOCKET_POLL_ERROR) == 0U)
+        goto cleanup;
 
     uint64_t request_id = 0U;
     os_completion_entry_t completion = {0};
@@ -630,6 +727,10 @@ cleanup:
     if (active_client6 != 0) {
         (void)socket_close(active_client6);
         object_put(active_client6);
+    }
+    if (connect_timeout_client != 0) {
+        (void)socket_close(connect_timeout_client);
+        object_put(connect_timeout_client);
     }
     if (wire_listener != 0) {
         (void)socket_close(wire_listener);

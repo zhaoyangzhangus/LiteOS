@@ -2,11 +2,11 @@
 
 #include <kernel/bootinfo.h>
 
-typedef struct liteos_init_early_hooks {
+typedef struct kernel_init_early_hooks {
     void (*write)(const CHAR8 *text);
     void (*halt)(void);
-} liteos_init_early_hooks_t;
+} kernel_init_early_hooks_t;
 
 /* Validate loader state and bring up the CPU/early platform boundary. */
-BOOLEAN liteos_init_early(LITEOS_BOOT_INFO *info,
-                          const liteos_init_early_hooks_t *hooks);
+BOOLEAN kernel_init_early(OS_BOOT_INFO *info,
+                          const kernel_init_early_hooks_t *hooks);

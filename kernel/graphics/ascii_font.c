@@ -3,7 +3,9 @@
 #include "ascii_font_internal.h"
 
 #include <kernel/kmem.h>
+#include <kernel/sched.h>
 #include <kernel/spinlock.h>
+#include <kernel/string.h>
 #include <kernel/vfs.h>
 
 /*
@@ -11,7 +13,7 @@
  * keeps the outline tables resident and rasterizes the requested ASCII face
  * into an A8 cache.  No pre-rendered glyph array is linked into the kernel.
  */
-#define ASCII_FONT_FILE_PATH       "/etc/fonts/liteos.ttf"
+#define ASCII_FONT_FILE_PATH       "/etc/fonts/default.ttf"
 #define ASCII_FONT_MAX_FILE_BYTES  (2U * 1024U * 1024U)
 #define ASCII_FONT_MAX_DIMENSION   64U
 #define ASCII_FONT_MAX_CACHE_BYTES (512U * 1024U)
@@ -42,6 +44,13 @@ static void font_test_line(ascii_font_point_t from, ascii_font_point_t to,
     int64_t intersection;
 
     if ((from.y > sample_y) == (to.y > sample_y) || from.y == to.y) return;
+    /* The crossing stays between the endpoint x coordinates, including
+     * integer division's truncation. Only a straddling segment needs it. */
+    if (from.x <= sample_x && to.x <= sample_x) return;
+    if (from.x > sample_x && to.x > sample_x) {
+        *inside = !*inside;
+        return;
+    }
     intersection = (int64_t)from.x +
         ((int64_t)(sample_y - from.y) * (to.x - from.x)) /
         (to.y - from.y);
@@ -52,6 +61,13 @@ static void font_test_quadratic(ascii_font_point_t from,
                                 ascii_font_point_t control,
                                 ascii_font_point_t to, int32_t sample_x,
                                 int32_t sample_y, bool *inside) {
+    /* Every subdivided point stays in the control-point bounds. A ray
+     * cannot cross a curve wholly above/below it or wholly to its left.
+     * Match font_test_line's strict comparisons at boundary samples. */
+    if ((from.y <= sample_y && control.y <= sample_y && to.y <= sample_y) ||
+        (from.y > sample_y && control.y > sample_y && to.y > sample_y) ||
+        (from.x <= sample_x && control.x <= sample_x && to.x <= sample_x))
+        return;
     ascii_font_point_t previous = from;
 
     for (uint32_t step = 1U; step <= 8U; ++step) {
@@ -149,14 +165,42 @@ static bool font_rasterize_glyph(uint16_t glyph, uint8_t *destination,
             &point_count, &contour_count)) {
         return false;
     }
+    if (contour_count == 0U || point_count == 0U) {
+        memset(destination, 0, (size_t)width * height);
+        return true;
+    }
+    int32_t min_x = INT32_MAX, min_y = INT32_MAX;
+    int32_t max_x = INT32_MIN, max_y = INT32_MIN;
     for (uint32_t index = 0U; index < point_count; ++index) {
         points[index].x = (int32_t)(origin_x +
             (int64_t)points[index].x * scale);
         points[index].y = (int32_t)(baseline -
             (int64_t)points[index].y * scale);
+        if (points[index].x < min_x) min_x = points[index].x;
+        if (points[index].x > max_x) max_x = points[index].x;
+        if (points[index].y < min_y) min_y = points[index].y;
+        if (points[index].y > max_y) max_y = points[index].y;
     }
+    /* Lines, implied midpoints and quadratic curves stay within their
+     * control-point bounds. Keep the boundary pixel conservatively; all
+     * samples outside this rectangle necessarily have zero coverage. */
+    uint32_t x_begin = min_x > 0 ? (uint32_t)min_x / 65536U : 0U;
+    uint32_t y_begin = min_y > 0 ? (uint32_t)min_y / 65536U : 0U;
+    uint32_t x_end = max_x >= 0 ? (uint32_t)max_x / 65536U + 1U : 0U;
+    uint32_t y_end = max_y >= 0 ? (uint32_t)max_y / 65536U + 1U : 0U;
+    if (x_begin > width) x_begin = width;
+    if (x_end > width) x_end = width;
+    if (y_begin > height) y_begin = height;
+    if (y_end > height) y_end = height;
     for (uint32_t y = 0U; y < height; ++y) {
-        for (uint32_t x = 0U; x < width; ++x) {
+        uint8_t *row = destination + (uint64_t)y * width;
+        if (y < y_begin || y >= y_end) {
+            memset(row, 0, width);
+            continue;
+        }
+        if (x_begin != 0U) memset(row, 0, x_begin);
+        if (x_end != width) memset(row + x_end, 0, width - x_end);
+        for (uint32_t x = x_begin; x < x_end; ++x) {
             uint32_t coverage = 0U;
             for (uint32_t sy = 0U; sy < ASCII_FONT_SUPERSAMPLE; ++sy) {
                 for (uint32_t sx = 0U; sx < ASCII_FONT_SUPERSAMPLE; ++sx) {
@@ -200,16 +244,16 @@ static bool font_build_cache(uint32_t width, uint32_t height,
     }
     scaled = (uint8_t *)kmalloc((size_t)cache_bytes, 0U);
     if (scaled == 0) return false;
-    for (uint64_t index = 0U; index < cache_bytes; ++index) {
-        scaled[index] = 0U;
-    }
     for (uint32_t character = ASCII_FONT_FIRST;
          character <= ASCII_FONT_LAST; ++character) {
         uint16_t glyph = ascii_font_parser_glyph_for_code(
             &g_ascii_font_parser, character);
         uint8_t *destination = scaled +
             (uint64_t)(character - ASCII_FONT_FIRST) * glyph_bytes;
-        (void)font_rasterize_glyph(glyph, destination, width, height);
+        /* A decoded glyph writes every pixel, including an empty outline.
+         * Decode failure writes none; only that slot needs blank fallback. */
+        if (!font_rasterize_glyph(glyph, destination, width, height))
+            memset(destination, 0, (size_t)glyph_bytes);
     }
     *output = scaled;
     *output_size = (size_t)cache_bytes;
@@ -316,13 +360,22 @@ uint32_t ascii_font_height(void) {
     return g_ascii_font_height;
 }
 
+static void font_user_cache_lock(void) {
+    sched_preempt_disable();
+    spinlock_lock(&g_ascii_font_user_lock);
+}
+
+static void font_user_cache_unlock(void) {
+    spinlock_unlock(&g_ascii_font_user_lock);
+    sched_preempt_enable();
+}
+
 bool ascii_font_copy_cache(uint32_t width, uint32_t height,
                            uint8_t *destination, size_t capacity) {
     uint64_t cache_bytes_u64;
     size_t cache_bytes;
     uint8_t *candidate = 0;
     uint8_t *old = 0;
-    bool cache_ready;
 
     if (g_ascii_font_parser.file == 0 || destination == 0 ||
         width == 0U || height == 0U ||
@@ -337,40 +390,32 @@ bool ascii_font_copy_cache(uint32_t width, uint32_t height,
         return false;
     }
     cache_bytes = (size_t)cache_bytes_u64;
-    spinlock_lock(&g_ascii_font_user_lock);
-    cache_ready = g_ascii_font_user_scaled != 0 &&
+    font_user_cache_lock();
+    if (g_ascii_font_user_scaled != 0 &&
         g_ascii_font_user_width == width &&
-        g_ascii_font_user_height == height;
-    spinlock_unlock(&g_ascii_font_user_lock);
-    if (!cache_ready) {
-        if (!font_build_cache(width, height, &candidate, &cache_bytes)) {
-            return false;
-        }
-        spinlock_lock(&g_ascii_font_user_lock);
-        if (g_ascii_font_user_scaled == 0 ||
-            g_ascii_font_user_width != width ||
-            g_ascii_font_user_height != height) {
-            old = g_ascii_font_user_scaled;
-            g_ascii_font_user_scaled = candidate;
-            g_ascii_font_user_width = width;
-            g_ascii_font_user_height = height;
-            candidate = 0;
-        }
-        spinlock_unlock(&g_ascii_font_user_lock);
-        if (old != 0) kfree(old);
-        if (candidate != 0) kfree(candidate);
+        g_ascii_font_user_height == height) {
+        memcpy(destination, g_ascii_font_user_scaled, cache_bytes);
+        font_user_cache_unlock();
+        return true;
     }
+    font_user_cache_unlock();
+    if (!font_build_cache(width, height, &candidate, &cache_bytes)) return false;
 
-    spinlock_lock(&g_ascii_font_user_lock);
+    /* A competing builder may have published the same face. Reuse it or
+     * publish ours, and finish copying before another size can replace it. */
+    font_user_cache_lock();
     if (g_ascii_font_user_scaled == 0 ||
         g_ascii_font_user_width != width ||
         g_ascii_font_user_height != height) {
-        spinlock_unlock(&g_ascii_font_user_lock);
-        return false;
+        old = g_ascii_font_user_scaled;
+        g_ascii_font_user_scaled = candidate;
+        g_ascii_font_user_width = width;
+        g_ascii_font_user_height = height;
+        candidate = 0;
     }
-    for (size_t index = 0U; index < cache_bytes; ++index) {
-        destination[index] = g_ascii_font_user_scaled[index];
-    }
-    spinlock_unlock(&g_ascii_font_user_lock);
+    memcpy(destination, g_ascii_font_user_scaled, cache_bytes);
+    font_user_cache_unlock();
+    if (old != 0) kfree(old);
+    if (candidate != 0) kfree(candidate);
     return true;
 }

@@ -1,4 +1,6 @@
 #include <kernel/litefs.h>
+#include <kernel/crc32.h>
+#include <kernel/string.h>
 #include <kernel/kmem.h>
 #include <kernel/vfs.h>
 
@@ -6,14 +8,11 @@
 #define LITEFS_INODES_PER_BLOCK (JOURNAL_BLOCK_SIZE / sizeof(litefs_inode_disk_t))
 
 static void litefs_zero(void *destination, size_t length) {
-    uint8_t *bytes = (uint8_t *)destination;
-    while (length-- != 0) *bytes++ = 0;
+    memset(destination, 0, length);
 }
 
 static void litefs_copy(void *destination, const void *source, size_t length) {
-    uint8_t *out = (uint8_t *)destination;
-    const uint8_t *in = (const uint8_t *)source;
-    while (length-- != 0) *out++ = *in++;
+    memmove(destination, source, length);
 }
 
 static size_t litefs_string_length(const char *text) {
@@ -31,27 +30,15 @@ static bool litefs_string_equal(const char *left, const char *right,
 
 static uint32_t litefs_crc(const uint8_t *bytes, size_t length,
                            size_t checksum_offset) {
-    uint32_t crc = UINT32_MAX;
-    for (size_t i = 0; i < length; ++i) {
-        uint8_t value = i >= checksum_offset &&
-                        i < checksum_offset + sizeof(uint32_t) ? 0U : bytes[i];
-        crc ^= value;
-        for (uint32_t bit = 0; bit < 8U; ++bit) {
-            crc = (crc >> 1) ^ ((crc & 1U) != 0U ? 0xEDB88320U : 0U);
-        }
-    }
-    return ~crc;
+    return crc32_ieee_zeroed(bytes, length, checksum_offset);
 }
 
 static void litefs_lock(litefs_t *filesystem) {
-    while (atomic_exchange_explicit(&filesystem->lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&filesystem->lock);
 }
 
 static void litefs_unlock(litefs_t *filesystem) {
-    atomic_store_explicit(&filesystem->lock.state, 0U, memory_order_release);
+    spinlock_unlock(&filesystem->lock);
 }
 
 static bool litefs_storage_valid(const journal_storage_t *storage) {
@@ -292,7 +279,7 @@ kstatus_t litefs_mount(litefs_t *filesystem, const journal_storage_t *storage,
     litefs_zero(filesystem, sizeof(*filesystem));
     filesystem->storage = *storage;
     filesystem->total_blocks = total_blocks;
-    atomic_init(&filesystem->lock.state, 0U);
+    spinlock_init(&filesystem->lock);
     if (litefs_load_super(filesystem) != K_OK ||
         journal_init(&filesystem->journal, &filesystem->storage,
                      LITEFS_JOURNAL_START, LITEFS_JOURNAL_BLOCKS) != K_OK ||

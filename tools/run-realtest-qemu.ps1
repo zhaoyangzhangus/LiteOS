@@ -114,13 +114,13 @@ if (-not $SkipBuild -and -not $FailureTest) {
     if ($LASTEXITCODE -ne 0) { throw "Real-test build failed ($LASTEXITCODE)." }
 }
 elseif (-not $SkipBuild -and $FailureTest) {
-    $kernelTarget = "$Build/esp/EFI/LITEOS/kernel.elf"
+    $kernelTarget = "$Build/esp/EFI/OS/kernel.elf"
     $makeArguments = @(
         '-f', 'GNUmakefile', '-B',
         "BUILD=$Build", 'TOOLPREFIX=x86_64-w64-mingw32-',
         'ELFTOOLPREFIX=x86_64-elf-', 'HOSTCC=gcc', 'DEBUG=2',
-        'LITEOS_DEBUG_SERIAL=1', 'LITEOS_REALTEST=1',
-        'LITEOS_REALTEST_FAILURE_TEST=1', $kernelTarget
+        'OS_DEBUG_SERIAL=1', 'OS_REALTEST=1',
+        'OS_REALTEST_FAILURE_TEST=1', $kernelTarget
     )
     Push-Location $projectRoot
     try {
@@ -134,8 +134,8 @@ elseif (-not $SkipBuild -and $FailureTest) {
 
 foreach ($requiredPath in @(
     (Join-Path $espPath 'EFI\BOOT\BOOTX64.EFI'),
-    (Join-Path $espPath 'EFI\LITEOS\kernel.elf'),
-    (Join-Path $espPath 'EFI\LITEOS\loader.conf')
+    (Join-Path $espPath 'EFI\OS\kernel.elf'),
+    (Join-Path $espPath 'EFI\OS\loader.conf')
 )) {
     if (-not (Test-Path -LiteralPath $requiredPath)) {
         throw "Missing real-test boot file: $requiredPath"
@@ -157,15 +157,15 @@ if ($Uas) {
     # the kernel exercises a single USB device: the UAS device under test.
     Copy-Item -LiteralPath $imagePath -Destination $legacyBootImagePath -Force
     $storageArguments += @(
-        '-device', 'usb-uas,id=liteos-usb-uas,bus=liteos-xhci.0,port=1',
-        '-device', 'scsi-hd,bus=liteos-usb-uas.0,scsi-id=0,lun=0,drive=liteos-realtest',
-        '-drive', ('if=none,id=liteos-boot,format=raw,file={0}' -f
+        '-device', 'usb-uas,id=vm-usb-uas,bus=vm-xhci.0,port=1',
+        '-device', 'scsi-hd,bus=vm-usb-uas.0,scsi-id=0,lun=0,drive=vm-realtest',
+        '-drive', ('if=none,id=vm-boot,format=raw,file={0}' -f
             $legacyBootImagePath),
-        '-device', 'usb-storage,id=liteos-usb-boot,drive=liteos-boot,bus=liteos-xhci.0,port=2'
+        '-device', 'usb-storage,id=vm-usb-boot,drive=vm-boot,bus=vm-xhci.0,port=2'
     )
 } else {
     $storageArguments += @(
-        '-device', 'usb-storage,id=liteos-usb-storage,drive=liteos-realtest,bus=liteos-xhci.0,port=1'
+        '-device', 'usb-storage,id=vm-usb-storage,drive=vm-realtest,bus=vm-xhci.0,port=1'
     )
 }
 
@@ -174,10 +174,10 @@ $inputArguments = if ($InputTest -or $FileManagerTest) {
         # Keep an empty Hub before the populated Hub.  This reproduces the
         # physical USB3/USB2 companion layout where stopping after the first
         # root Hub hides the keyboard.
-        '-device', 'usb-hub,id=liteos-empty-hub,bus=liteos-xhci.0,port=2,port-power=on',
-        '-device', 'usb-hub,id=liteos-input-hub,bus=liteos-xhci.0,port=3,port-power=on',
-        '-device', 'usb-kbd,id=liteos-input-kbd,bus=liteos-xhci.0,port=3.1',
-        '-device', 'usb-mouse,id=liteos-input-mouse,bus=liteos-xhci.0,port=3.2'
+        '-device', 'usb-hub,id=vm-empty-hub,bus=vm-xhci.0,port=2,port-power=on',
+        '-device', 'usb-hub,id=vm-input-hub,bus=vm-xhci.0,port=3,port-power=on',
+        '-device', 'usb-kbd,id=vm-input-kbd,bus=vm-xhci.0,port=3.1',
+        '-device', 'usb-mouse,id=vm-input-mouse,bus=vm-xhci.0,port=3.2'
     )
 } else {
     @()
@@ -198,8 +198,8 @@ $qemuArguments = @(
     '-drive', ('if=pflash,format=raw,readonly=on,file={0}' -f $firmware),
     '-boot', 'order=c'
 ) + @(
-    '-drive', ('if=none,id=liteos-realtest,format=raw,cache=directsync,file={0}' -f $imagePath),
-    '-device', 'qemu-xhci,id=liteos-xhci,msix=on'
+    '-drive', ('if=none,id=vm-realtest,format=raw,cache=directsync,file={0}' -f $imagePath),
+    '-device', 'qemu-xhci,id=vm-xhci,msix=on'
 ) + $storageArguments + $inputArguments + @(
     '-serial', "file:$serialLog"
 ) + $monitorArguments + @(
@@ -277,16 +277,16 @@ try {
             $observedLog = $serial
             if ($Uas -and -not $bootDeviceRemoved -and
                 $hmpWriter -ne $null -and
-                $serial -match 'LITEOS_KERNEL_ENTRY') {
-                $hmpWriter.WriteLine('device_del liteos-usb-boot')
+                $serial -match 'OS_KERNEL_ENTRY') {
+                $hmpWriter.WriteLine('device_del vm-usb-boot')
                 $bootDeviceRemoved = $true
             }
             if (-not $InputTest -and -not $FileManagerTest -and
-                $serial -match 'LITEOS_REALTEST_PASS') {
+                $serial -match 'OS_REALTEST_PASS') {
                 $marker = 'PASS'
                 break
             }
-            if ($serial -match 'LITEOS_REALTEST_FAIL') {
+            if ($serial -match 'OS_REALTEST_FAIL') {
                 $marker = 'FAIL'
                 break
             }
@@ -295,7 +295,7 @@ try {
             (Test-Path -LiteralPath $imagePath)) {
             try {
                 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $extractScript `
-                    -Image $imagePath -Path 'EFI/LITEOS/realtest.log' `
+                    -Image $imagePath -Path 'EFI/OS/realtest.log' `
                     -Output $liveExtractedLog 2>$null | Out-Null
             }
             catch { }
@@ -303,39 +303,39 @@ try {
                 $liveLog = Get-Content -LiteralPath $liveExtractedLog -Raw
                 $observedLog = $liveLog
                 if (-not $InputTest -and -not $FileManagerTest -and
-                    $liveLog -match 'LITEOS_REALTEST_PASS') {
+                    $liveLog -match 'OS_REALTEST_PASS') {
                     $marker = 'PASS'
-                } elseif ($liveLog -match 'LITEOS_REALTEST_FAIL') {
+                } elseif ($liveLog -match 'OS_REALTEST_FAIL') {
                     $marker = 'FAIL'
                 }
             }
             $nextImageCheck = (Get-Date).AddSeconds(2)
         }
         if (($InputTest -or $FileManagerTest) -and -not $marker) {
-            if ($observedLog -match 'LITEOS_USB_KEYBOARD_EVENT_OK') {
+            if ($observedLog -match 'OS_USB_KEYBOARD_EVENT_OK') {
                 $keyboardProbeObserved = $true
             }
         }
         if ($InputTest -and -not $marker) {
             if (-not $inputInjected -and
-                $observedLog -match 'LITEOS_REALTEST_DESKTOP_RUNNING') {
+                $observedLog -match 'OS_DESKTOP_CACHE_OK') {
                 # Super+3 opens the third dock application (Notepad).
                 $hmpWriter.WriteLine('sendkey meta_l-3 20')
                 $inputInjected = $true
             }
             if ($inputInjected -and -not $zoomInjected -and
                 $observedLog -match
-                    'LITEOS_REALTEST_DESKTOP_RUNNING[\s\S]*LITEOS_NOTEPAD_READY SIZE=22') {
+                    'OS_DESKTOP_CACHE_OK[\s\S]*OS_NOTEPAD_READY SIZE=22') {
                 $hmpWriter.WriteLine('sendkey ctrl-equal 20')
                 $zoomInjected = $true
             }
             if ($zoomInjected -and
-                $observedLog -match 'LITEOS_USB_KEYBOARD_EVENT_OK' -and
-                $observedLog -match 'LITEOS_DIAG_HID_REPORT .*PROTO=1' -and
+                $observedLog -match 'OS_USB_KEYBOARD_EVENT_OK' -and
+                $observedLog -match 'OS_DIAG_HID_REPORT .*PROTO=1' -and
                 $observedLog -match
-                    'LITEOS_DIAG_INPUT_ROUTE code=46 value=1 focus=[1-9][0-9]* target=[1-9][0-9]* delivered=1' -and
+                    'OS_DIAG_INPUT_ROUTE code=46 value=1 focus=[1-9][0-9]* target=[1-9][0-9]* delivered=1' -and
                 $observedLog -match
-                    'LITEOS_REALTEST_DESKTOP_RUNNING[\s\S]*LITEOS_NOTEPAD_READY SIZE=22[\s\S]*LITEOS_TEXT_ZOOM_SIZE=26') {
+                    'OS_DESKTOP_CACHE_OK[\s\S]*OS_NOTEPAD_READY SIZE=22[\s\S]*OS_TEXT_ZOOM_SIZE=26') {
                 $inputPassed = $true
                 $marker = 'PASS'
             }
@@ -344,13 +344,13 @@ try {
             if (-not $fileManagerLaunchInjected -and
                 $hmpWriter -ne $null -and
                 $keyboardProbeObserved -and
-                $observedLog -match 'LITEOS_REALTEST_DESKTOP_RUNNING') {
+                $observedLog -match 'OS_DESKTOP_CACHE_OK') {
                 # Super+1 opens the first dock application (File Manager).
                 $hmpWriter.WriteLine('sendkey meta_l-1 20')
                 $fileManagerLaunchInjected = $true
             }
             if ($fileManagerLaunchInjected -and
-                $observedLog -match 'LITEOS_FILEMAN_READY') {
+                $observedLog -match 'OS_FILEMAN_READY') {
                 $fileManagerNavigationInjected = $true
             }
             if ($fileManagerNavigationInjected -and
@@ -365,7 +365,7 @@ try {
             }
             if ($fileManagerNavigationInjected -and
                 $observedLog -match
-                    'LITEOS_FILEMAN_READY[\s\S]*LITEOS_NOTEPAD_READY SIZE=22') {
+                    'OS_FILEMAN_READY[\s\S]*OS_NOTEPAD_READY SIZE=22') {
                 $fileManagerPassed = $true
                 $marker = 'PASS'
             }
@@ -378,8 +378,8 @@ try {
     if (-not $InputTest -and -not $FileManagerTest -and -not $marker -and
         (Test-Path -LiteralPath $serialLog)) {
         $serial = Get-Content -LiteralPath $serialLog -Raw -ErrorAction SilentlyContinue
-        if ($serial -match 'LITEOS_REALTEST_PASS') { $marker = 'PASS' }
-        elseif ($serial -match 'LITEOS_REALTEST_FAIL') { $marker = 'FAIL' }
+        if ($serial -match 'OS_REALTEST_PASS') { $marker = 'PASS' }
+        elseif ($serial -match 'OS_REALTEST_FAIL') { $marker = 'FAIL' }
     }
     if (-not $marker -and -not $qemuProcess.HasExited) {
         throw "QEMU did not reach a real-test result within $TimeoutSeconds seconds."
@@ -396,14 +396,14 @@ finally {
 
 $logImagePath = $imagePath
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $extractScript `
-    -Image $logImagePath -Path 'EFI/LITEOS/realtest.log' -Output $extractedLog
+    -Image $logImagePath -Path 'EFI/OS/realtest.log' -Output $extractedLog
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $extractedLog)) {
-    throw 'The QEMU FAT image did not contain EFI/LITEOS/realtest.log.'
+    throw 'The QEMU FAT image did not contain EFI/OS/realtest.log.'
 }
 $realtestLog = Get-Content -LiteralPath $extractedLog -Raw
 if ($Uas) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $extractScript `
-        -Image $legacyBootImagePath -Path 'EFI/LITEOS/realtest.log' `
+        -Image $legacyBootImagePath -Path 'EFI/OS/realtest.log' `
         -Output $loaderExtractedLog
     if ($LASTEXITCODE -ne 0 -or
         -not (Test-Path -LiteralPath $loaderExtractedLog)) {
@@ -416,19 +416,19 @@ if ($Uas) {
     $loaderLogPath = $extractedLog
 }
 if (-not $marker) {
-    if ($realtestLog -match 'LITEOS_REALTEST_PASS') { $marker = 'PASS' }
-    elseif ($realtestLog -match 'LITEOS_REALTEST_FAIL') { $marker = 'FAIL' }
+    if ($realtestLog -match 'OS_REALTEST_PASS') { $marker = 'PASS' }
+    elseif ($realtestLog -match 'OS_REALTEST_FAIL') { $marker = 'FAIL' }
 }
 if (-not $marker) { throw 'The QEMU real-test log has no PASS/FAIL marker.' }
 if ($marker -ne $expectedMarker) {
     throw "QEMU real-test expected $expectedMarker but observed $marker."
 }
-if ($loaderLog -notmatch 'LITEOS_LOADER_BEGIN') {
-    throw 'Real-test loader log is missing marker: LITEOS_LOADER_BEGIN'
+if ($loaderLog -notmatch 'OS_LOADER_BEGIN') {
+    throw 'Real-test loader log is missing marker: OS_LOADER_BEGIN'
 }
 foreach ($requiredMarker in @(
-    'LITEOS_REALTEST_LOG_READY',
-    "LITEOS_REALTEST_$expectedMarker"
+    'OS_REALTEST_LOG_READY',
+    "OS_REALTEST_$expectedMarker"
 )) {
     if ($realtestLog -notmatch [regex]::Escape($requiredMarker)) {
         throw "Real-test log is missing marker: $requiredMarker"
@@ -442,7 +442,7 @@ if ($FileManagerTest -and -not $fileManagerPassed) {
 }
 if ($Uas) {
     $uasSerialLog = Get-Content -LiteralPath $serialLog -Raw -ErrorAction SilentlyContinue
-    if ($uasSerialLog -notmatch 'LITEOS_UAS_SCSI_OK') {
+    if ($uasSerialLog -notmatch 'OS_UAS_SCSI_OK') {
         throw 'QEMU UAS test did not complete a SCSI command on the UAS transport.'
     }
 }
@@ -459,6 +459,6 @@ Set-Content -LiteralPath $resultPath -Value @(
     "input_test=$inputPassed",
     "file_manager_test=$fileManagerPassed",
     "boot_device_removed=$bootDeviceRemoved",
-    "uas_scsi=$($Uas -and $uasSerialLog -match 'LITEOS_UAS_SCSI_OK')"
+    "uas_scsi=$($Uas -and $uasSerialLog -match 'OS_UAS_SCSI_OK')"
 )
 Write-Host "QEMU real-test $mode passed: $extractedLog"

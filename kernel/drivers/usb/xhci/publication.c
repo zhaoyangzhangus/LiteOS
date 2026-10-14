@@ -113,7 +113,7 @@ bool xhci_publish_working_device(xhci_state_t *state) {
     xhci_recompute_topology(state);
     if (slot_dev->context.msc_configured &&
         !usb_msc_schedule_attach(slot)) {
-        liteos_serial_write("LITEOS_USB_MSC_ATTACH_QUEUE_FAIL\r\n");
+        kernel_serial_write("OS_USB_MSC_ATTACH_QUEUE_FAIL\r\n");
     }
     return true;
 }

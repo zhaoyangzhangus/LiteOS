@@ -3,11 +3,18 @@
 #include <arch/x86_64/cpu.h>
 #include <arch/x86_64/paging.h>
 #include <kernel/dma.h>
+#include <kernel/console.h>
 #include <kernel/net_core.h>
 #include <kernel/socket.h>
 #include <kernel/telemetry.h>
 
 #include "core_internal.h"
+
+#if OS_DEBUG_SERIAL
+static uint32_t g_debug_arp_rx_logs;
+static uint32_t g_debug_udp_rx_logs;
+static uint32_t g_debug_udp_dispatch_logs;
+#endif
 
 static void e1000_runtime_zero(void *memory, size_t size) {
     uint8_t *bytes = (uint8_t *)memory;
@@ -18,6 +25,61 @@ static void e1000_runtime_copy(void *destination, const void *source, size_t siz
     uint8_t *out = (uint8_t *)destination;
     const uint8_t *in = (const uint8_t *)source;
     while (size-- != 0) *out++ = *in++;
+}
+
+static bool e1000_build_tcp_reset_reply(const e1000_rx_packet_t *packet,
+                                        socket_tcp_reply_t *reply) {
+    if (reply == 0) return false;
+    e1000_runtime_zero(reply, sizeof(*reply));
+    if (packet == 0 || packet->protocol != SOCKET_PROTOCOL_TCP ||
+        packet->payload_length > sizeof(packet->payload) ||
+        (packet->flags & NET_TCP_FLAG_RST) != 0U) {
+        return false;
+    }
+
+    reply->valid = true;
+    reply->window = 0U;
+    if ((packet->flags & NET_TCP_FLAG_ACK) != 0U) {
+        /* RFC 9293: reset an ACK-bearing segment at its acknowledged seq. */
+        reply->flags = NET_TCP_FLAG_RST;
+        reply->sequence = packet->acknowledgement;
+    } else {
+        /* A reset to a non-ACK segment acknowledges its sequence space. */
+        reply->flags = NET_TCP_FLAG_RST | NET_TCP_FLAG_ACK;
+        reply->acknowledgement = packet->sequence + packet->payload_length;
+        if ((packet->flags & NET_TCP_FLAG_SYN) != 0U)
+            ++reply->acknowledgement;
+        if ((packet->flags & NET_TCP_FLAG_FIN) != 0U)
+            ++reply->acknowledgement;
+    }
+    return true;
+}
+
+bool e1000_unmatched_tcp_reset_self_test(void) {
+    e1000_rx_packet_t packet = {0};
+    socket_tcp_reply_t reply = {0};
+
+    packet.protocol = SOCKET_PROTOCOL_TCP;
+    packet.flags = NET_TCP_FLAG_ACK | NET_TCP_FLAG_FIN;
+    packet.acknowledgement = 0x12345678U;
+    if (!e1000_build_tcp_reset_reply(&packet, &reply) || !reply.valid ||
+        reply.flags != NET_TCP_FLAG_RST ||
+        reply.sequence != packet.acknowledgement ||
+        reply.acknowledgement != 0U) {
+        return false;
+    }
+
+    packet.sequence = 0xFFFFFFFDU;
+    packet.flags = NET_TCP_FLAG_SYN;
+    packet.payload_length = 4U;
+    if (!e1000_build_tcp_reset_reply(&packet, &reply) || !reply.valid ||
+        reply.flags != (NET_TCP_FLAG_RST | NET_TCP_FLAG_ACK) ||
+        reply.sequence != 0U || reply.acknowledgement != 2U) {
+        return false;
+    }
+
+    packet.flags = NET_TCP_FLAG_RST | NET_TCP_FLAG_ACK;
+    return !e1000_build_tcp_reset_reply(&packet, &reply) && !reply.valid;
 }
 
 static bool e1000_enqueue_packet(e1000_state_t *state,
@@ -129,6 +191,15 @@ bool e1000_dispatch_software_queues(e1000_state_t *state) {
                         packet.window);
                 } else {
                     socket_tcp_reply_t reply = {0};
+                    /* ACK is independent of payload/PSH/FIN. Complete the
+                     * local send before applying receive-window policy. */
+                    if ((packet.flags & NET_TCP_FLAG_ACK) != 0U) {
+                        (void)socket_inject_tcp_ack_ipv4_window(
+                            packet.source_address, packet.source_port,
+                            packet.destination_address, packet.destination_port,
+                            packet.sequence, packet.acknowledgement, packet.flags,
+                            packet.window);
+                    }
                     status = socket_inject_tcp_ipv4_reply(
                         packet.source_address, packet.source_port,
                         packet.destination_address, packet.destination_port,
@@ -136,6 +207,13 @@ bool e1000_dispatch_software_queues(e1000_state_t *state) {
                         packet.payload_length, &reply);
                     /* 杩炵画鏁版嵁銆侀噸澶嶆暟鎹€佷贡搴忔暟鎹拰 FIN 閮借杩斿洖褰撳墠 ACK/绐楀彛銆?*/
                     if (reply.valid && !e1000_send_tcp_reply(state, &packet, &reply)) {
+                        status = K_EIO;
+                    }
+                }
+                if (status == K_ENOENT) {
+                    socket_tcp_reply_t reset = {0};
+                    if (e1000_build_tcp_reset_reply(&packet, &reset) &&
+                        !e1000_send_tcp_reply(state, &packet, &reset)) {
                         status = K_EIO;
                     }
                 }
@@ -186,12 +264,26 @@ bool e1000_dispatch_software_queues(e1000_state_t *state) {
                         packet.window);
                 } else {
                     socket_tcp_reply_t reply = {0};
+                    if ((packet.flags & NET_TCP_FLAG_ACK) != 0U) {
+                        (void)socket_inject_tcp_ack_ipv6_window(
+                            packet.source_address6, packet.source_port,
+                            packet.destination_address6, packet.destination_port,
+                            packet.sequence, packet.acknowledgement, packet.flags,
+                            packet.window);
+                    }
                     status = socket_inject_tcp_ipv6_reply(
                         packet.source_address6, packet.source_port,
                         packet.destination_address6, packet.destination_port,
                         packet.sequence, packet.flags, packet.payload,
                         packet.payload_length, &reply);
                     if (reply.valid && !e1000_send_tcp_reply6(state, &packet, &reply)) {
+                        status = K_EIO;
+                    }
+                }
+                if (status == K_ENOENT) {
+                    socket_tcp_reply_t reset = {0};
+                    if (e1000_build_tcp_reset_reply(&packet, &reset) &&
+                        !e1000_send_tcp_reply6(state, &packet, &reset)) {
                         status = K_EIO;
                     }
                 }
@@ -209,6 +301,16 @@ bool e1000_dispatch_software_queues(e1000_state_t *state) {
                                            packet.destination_port,
                                            packet.payload,
                                            packet.payload_length);
+#if OS_DEBUG_SERIAL
+                if (g_debug_udp_dispatch_logs < 128U) {
+                    kernel_serial_printf_serial_only(
+                        "OS_UDP_DISPATCH src=%x:%u dst=%x:%u status=%d\r\n",
+                        packet.source_address, packet.source_port,
+                        packet.destination_address, packet.destination_port,
+                        status);
+                    ++g_debug_udp_dispatch_logs;
+                }
+#endif
             } else status = K_EINVAL;
             if (status == K_OK) received = true;
         }
@@ -250,9 +352,19 @@ bool e1000_process_rx_frame(e1000_state_t *state, const uint8_t *buffer,
     } else if (length != 0U &&
                    net_arp_parse_ipv4(buffer, length, &arp_view) == K_OK) {
             /* ARP 鍙洿鏂扮紦瀛橈紱鍥炲绛栫暐鐢变笂灞傜綉缁滅鐞嗗櫒鍐冲畾銆?*/
-            received = net_arp_cache_update(&state->arp_cache, arp_view.sender_address,
-                                            arp_view.sender_mac,
-                                            telemetry_timestamp()) == K_OK || received;
+            bool arp_updated = net_arp_cache_update(
+                &state->arp_cache, arp_view.sender_address, arp_view.sender_mac,
+                telemetry_timestamp()) == K_OK;
+            received = arp_updated || received;
+#if OS_DEBUG_SERIAL
+            if (g_debug_arp_rx_logs < 16U) {
+                kernel_serial_printf_serial_only(
+                    "OS_ARP_RX sender=%x updated=%u target=%x\r\n",
+                    arp_view.sender_address, arp_updated ? 1U : 0U,
+                    arp_view.target_address);
+                ++g_debug_arp_rx_logs;
+            }
+#endif
             /* 鍙湁閰嶇疆浜嗘湰鏈?IPv4 涓旂洰鏍囧湴鍧€鍛戒腑鏃舵墠鍥炲 ARP銆?*/
             if (!e1000_arp_reply(state, &arp_view)) received = true;
             /* A pending TCP SYN/data segment may have been held only because
@@ -274,6 +386,16 @@ bool e1000_process_rx_frame(e1000_state_t *state, const uint8_t *buffer,
             packet.source_port = view.source_port;
             packet.destination_port = view.destination_port;
             packet.payload_length = view.payload_length;
+#if OS_DEBUG_SERIAL
+            if (g_debug_udp_rx_logs < 128U) {
+                kernel_serial_printf_serial_only(
+                    "OS_UDP_RX src=%x:%u dst=%x:%u len=%u\r\n",
+                    view.source_address, view.source_port,
+                    view.destination_address, view.destination_port,
+                    view.payload_length);
+                ++g_debug_udp_rx_logs;
+            }
+#endif
             if (view.payload_length <= sizeof(packet.payload)) {
                 e1000_runtime_copy(packet.payload, view.payload, view.payload_length);
                 received = e1000_enqueue_packet(

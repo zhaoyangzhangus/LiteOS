@@ -21,11 +21,12 @@ static spinlock_t g_pi_lock;
 static atomic_uint g_pi_init_state;
 
 static void pi_initialize(void) {
+    if (atomic_load_explicit(&g_pi_init_state, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_pi_init_state, &expected, 1U,
                                                  memory_order_acq_rel,
                                                  memory_order_acquire)) {
-        atomic_init(&g_pi_lock.state, 0U);
+        spinlock_init(&g_pi_lock);
         atomic_store_explicit(&g_pi_init_state, 2U, memory_order_release);
         return;
     }
@@ -35,14 +36,11 @@ static void pi_initialize(void) {
 }
 
 static void pi_lock(void) {
-    while (atomic_exchange_explicit(&g_pi_lock.state, 1U,
-                                     memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_pi_lock);
 }
 
 static void pi_unlock(void) {
-    atomic_store_explicit(&g_pi_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_pi_lock);
 }
 
 static kmutex_t *mutex_from_owner_node(list_head_t *node) {
@@ -125,7 +123,7 @@ void kmutex_init(kmutex_t *mutex, bool priority_inheritance) {
 kstatus_t kmutex_try_lock(kmutex_t *mutex) {
     if (mutex == 0 || !mutex->initialized) return K_EINVAL;
     thread_t *current = sched_current_thread();
-    if (current == 0 || current->sched_class == SCHED_CLASS_IDLE) return K_EPERM;
+    if (current == 0) return K_EPERM;
     pi_lock();
     kstatus_t status;
     if (mutex->owner == 0) {

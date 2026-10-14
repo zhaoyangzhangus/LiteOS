@@ -7,6 +7,8 @@
 #define PTE_USER              (1ULL << 2)
 #define PTE_WRITE_THROUGH     (1ULL << 3)
 #define PTE_CACHE_DISABLE     (1ULL << 4)
+#define PTE_ACCESSED          (1ULL << 5)
+#define PTE_DIRTY             (1ULL << 6)
 #define PTE_LARGE             (1ULL << 7)
 #define PTE_GLOBAL            (1ULL << 8)
 #define PTE_PAT_LARGE         (1ULL << 12)

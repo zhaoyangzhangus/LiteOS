@@ -1,5 +1,5 @@
 #ifdef __ELF__
-    .section .rdata
+    .section .rdata,"a",@progbits
 #else
     .section .rdata,"dr"
 #endif

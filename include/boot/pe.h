@@ -92,7 +92,7 @@ typedef struct {
     UINT64 Size;
     EFI_PHYSICAL_ADDRESS Entry;
     UINT64 PreferredBase;
-} LITEOS_PE_IMAGE;
+} OS_PE_IMAGE;
 
 EFI_STATUS pe_load(EFI_BOOT_SERVICES *bs, const UINT8 *file, UINTN file_size,
-                   LITEOS_PE_IMAGE *out);
+                   OS_PE_IMAGE *out);

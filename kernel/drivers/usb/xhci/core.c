@@ -90,10 +90,7 @@ static void xhci_event_restore_flags(uint64_t flags) {
 void xhci_event_lock(xhci_state_t *state) {
     if (state == 0) return;
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&state->event_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&state->event_lock);
     __atomic_store_n(&state->event_lock_owner, x86_current_cpu_index(),
                      __ATOMIC_RELEASE);
     state->event_lock_saved_flags = xhci_event_save_flags();
@@ -101,12 +98,9 @@ void xhci_event_lock(xhci_state_t *state) {
 }
 
 bool xhci_event_try_lock(xhci_state_t *state) {
-    unsigned expected = 0U;
     if (state == 0) return false;
     sched_preempt_disable();
-    if (!atomic_compare_exchange_strong_explicit(
-            &state->event_lock.state, &expected, 1U,
-            memory_order_acquire, memory_order_relaxed)) {
+    if (!spinlock_try_lock(&state->event_lock)) {
         sched_preempt_enable();
         return false;
     }
@@ -121,8 +115,7 @@ void xhci_event_unlock(xhci_state_t *state) {
     if (state == 0) return;
     uint64_t saved_flags = state->event_lock_saved_flags;
     __atomic_store_n(&state->event_lock_owner, UINT32_MAX, __ATOMIC_RELEASE);
-    atomic_store_explicit(&state->event_lock.state, 0U,
-                          memory_order_release);
+    spinlock_unlock(&state->event_lock);
     xhci_event_restore_flags(saved_flags);
     sched_preempt_enable();
 }
@@ -133,7 +126,7 @@ bool xhci_core_initialize(xhci_state_t *state, const pci_device_t *pci) {
     for (size_t i = 0; i < sizeof(*state); ++i) {
         ((uint8_t *)state)[i] = 0U;
     }
-    atomic_init(&state->event_lock.state, 0U);
+    spinlock_init(&state->event_lock);
     state->event_lock_owner = UINT32_MAX;
     state->pci = pci;
 
@@ -163,16 +156,16 @@ bool xhci_core_initialize(xhci_state_t *state, const pci_device_t *pci) {
     state->context_size = (hcc_params1 & (1U << 2)) != 0U ? 64U : 32U;
     uint8_t max_psa_exponent = (uint8_t)((hcc_params1 >> 12) & 0x0FU);
     state->max_primary_stream_array_size = 1U << (max_psa_exponent + 1U);
-    liteos_realtest_mark_number("XHCI_HCS_PARAMS1", hcs_params1);
-    liteos_realtest_mark_number("XHCI_HCS_PARAMS2", hcs_params2);
-    liteos_realtest_mark_number("XHCI_SCRATCHPAD_COUNT",
+    realtest_mark_number("XHCI_HCS_PARAMS1", hcs_params1);
+    realtest_mark_number("XHCI_HCS_PARAMS2", hcs_params2);
+    realtest_mark_number("XHCI_SCRATCHPAD_COUNT",
                                 state->scratchpad_count);
-    liteos_realtest_mark_number("XHCI_HCC_PARAMS1", hcc_params1);
-    liteos_realtest_mark_number("XHCI_MAX_PSA_EXPONENT", max_psa_exponent);
-    liteos_realtest_mark_number("XHCI_MAX_PSA_SIZE",
+    realtest_mark_number("XHCI_HCC_PARAMS1", hcc_params1);
+    realtest_mark_number("XHCI_MAX_PSA_EXPONENT", max_psa_exponent);
+    realtest_mark_number("XHCI_MAX_PSA_SIZE",
                                 state->max_primary_stream_array_size);
-    liteos_realtest_mark_number("XHCI_VERSION", state->hci_version);
-    liteos_realtest_mark_number("XHCI_CONTEXT_SIZE", state->context_size);
+    realtest_mark_number("XHCI_VERSION", state->hci_version);
+    realtest_mark_number("XHCI_CONTEXT_SIZE", state->context_size);
 
     if (cap_length < 0x20U || state->max_slots == 0U ||
         state->max_ports == 0U || doorbell_offset >= state->mmio_span ||

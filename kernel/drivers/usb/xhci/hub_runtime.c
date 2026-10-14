@@ -213,10 +213,10 @@ bool xhci_hub_runtime_start(
         xhci_device_context_t *hub =
             &slot_dev->context;
 
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_ARM_BEGIN\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_ARM_BEGIN\r\n");
         if(!xhci_hub_ack_all_port_changes_device(state, hub))
         {
-            liteos_serial_write_serial_only("LITEOS_DIAG_HUB_ARM_ACK_FAIL\r\n");
+            kernel_serial_write_serial_only("OS_DIAG_HUB_ARM_ACK_FAIL\r\n");
             if(xhci_last_error() == 0U)
             {
                 xhci_set_error(75U);
@@ -233,7 +233,7 @@ bool xhci_hub_runtime_start(
             return false;
         }
 
-        liteos_serial_write_serial_only("LITEOS_DIAG_HUB_ARM_QUEUED\r\n");
+        kernel_serial_write_serial_only("OS_DIAG_HUB_ARM_QUEUED\r\n");
     }
 
     return true;
@@ -443,10 +443,10 @@ static bool xhci_hub_runtime_reconcile_one(
             (hub->hub_change_bitmap & (1U << (port - 1U))) != 0U;
         if(child_present && reported_change)
         {
-            liteos_serial_write_serial_only(
+            kernel_serial_write_serial_only(
                 connected
-                    ? "LITEOS_DIAG_HUB_CHILD_CONNECTED\r\n"
-                    : "LITEOS_DIAG_HUB_CHILD_DISCONNECTED\r\n");
+                    ? "OS_DIAG_HUB_CHILD_CONNECTED\r\n"
+                    : "OS_DIAG_HUB_CHILD_DISCONNECTED\r\n");
         }
 
         (void)xhci_hub_ack_port_changes_device(
@@ -456,12 +456,12 @@ static bool xhci_hub_runtime_reconcile_one(
         {
             if(child_present || reported_change)
             {
-                liteos_serial_write_serial_only(
-                    "LITEOS_DIAG_HUB_DISCONNECT\r\n");
-                liteos_serial_write_serial_only(
+                kernel_serial_write_serial_only(
+                    "OS_DIAG_HUB_DISCONNECT\r\n");
+                kernel_serial_write_serial_only(
                     child_present && child_slot != 0U
-                        ? "LITEOS_DIAG_HUB_CHILD_FOUND\r\n"
-                        : "LITEOS_DIAG_HUB_CHILD_MISSING\r\n");
+                        ? "OS_DIAG_HUB_CHILD_FOUND\r\n"
+                        : "OS_DIAG_HUB_CHILD_MISSING\r\n");
             }
 
             if(child_present &&
@@ -607,7 +607,7 @@ bool xhci_hub_runtime_reconcile(
     xhci_recompute_topology(state);
     if(changed)
     {
-        liteos_serial_write_serial_only("LITEOS_USB_RUNTIME_HUB_CHANGE\r\n");
+        kernel_serial_write_serial_only("OS_USB_RUNTIME_HUB_CHANGE\r\n");
     }
     return changed;
 }

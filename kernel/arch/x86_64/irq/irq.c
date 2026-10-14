@@ -15,6 +15,9 @@ static atomic_uint g_irq_initialized;
 static irq_slot_t g_irq_slots[IRQ_VECTOR_LAST + 1U];
 
 static void irq_initialize(void) {
+    /* The release publication below makes the table ready for readers.
+     * Steady-state IRQ dispatch must not write its shared init cache line. */
+    if (atomic_load_explicit(&g_irq_initialized, memory_order_acquire) == 2U) return;
     unsigned expected = 0U;
     if (atomic_compare_exchange_strong_explicit(&g_irq_initialized, &expected, 1U,
                                                 memory_order_acq_rel,
@@ -32,31 +35,36 @@ static void irq_initialize(void) {
     }
 }
 
-static void irq_lock(void) {
-    while (atomic_exchange_explicit(&g_irq_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+static uint64_t irq_lock(void) {
+    uint64_t flags;
+    /* Dispatch reads this table in interrupt context. Mask local interrupts
+     * before initialization and locking, including its first publication. */
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    irq_initialize();
+    spinlock_lock(&g_irq_lock);
+    return flags;
 }
 
-static void irq_unlock(void) {
-    atomic_store_explicit(&g_irq_lock.state, 0U, memory_order_release);
+static void irq_unlock(uint64_t flags) {
+    spinlock_unlock(&g_irq_lock);
+    if ((flags & (1ULL << 9)) != 0U) {
+        __asm__ volatile ("sti" : : : "memory");
+    }
 }
 
 kstatus_t irq_register(uint8_t vector, irq_handler_t handler, void *context) {
     if (vector < IRQ_VECTOR_FIRST || vector > IRQ_VECTOR_LAST || handler == 0) {
         return K_EINVAL;
     }
-    irq_initialize();
-    irq_lock();
+    uint64_t flags = irq_lock();
     irq_slot_t *slot = &g_irq_slots[vector];
     if (slot->handler != 0) {
-        irq_unlock();
+        irq_unlock(flags);
         return K_EBUSY;
     }
     slot->handler = handler;
     slot->context = context;
-    irq_unlock();
+    irq_unlock(flags);
     return K_OK;
 }
 
@@ -64,33 +72,31 @@ kstatus_t irq_unregister(uint8_t vector, irq_handler_t handler, void *context) {
     if (vector < IRQ_VECTOR_FIRST || vector > IRQ_VECTOR_LAST || handler == 0) {
         return K_EINVAL;
     }
-    irq_initialize();
-    irq_lock();
+    uint64_t flags = irq_lock();
     irq_slot_t *slot = &g_irq_slots[vector];
     if (slot->handler != handler || slot->context != context) {
-        irq_unlock();
+        irq_unlock(flags);
         return K_ENOENT;
     }
     slot->handler = 0;
     slot->context = 0;
-    irq_unlock();
+    irq_unlock(flags);
     return K_OK;
 }
 
 void x86_irq_dispatch(struct arch_trap_frame *frame) {
     if (frame == 0 || frame->vector < IRQ_VECTOR_FIRST ||
         frame->vector > IRQ_VECTOR_LAST) {
-        liteos_lapic_end_of_interrupt();
+        lapic_end_of_interrupt();
         return;
     }
-    irq_initialize();
     uint8_t vector = (uint8_t)frame->vector;
-    irq_lock();
+    uint64_t flags = irq_lock();
     irq_handler_t handler = g_irq_slots[vector].handler;
     void *context = g_irq_slots[vector].context;
-    irq_unlock();
+    irq_unlock(flags);
     if (handler != 0) handler(vector, frame, context);
-    liteos_lapic_end_of_interrupt();
+    lapic_end_of_interrupt();
 }
 
 static void irq_self_test_handler(uint8_t vector, struct arch_trap_frame *frame,

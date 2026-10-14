@@ -1,4 +1,5 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
+#include <uapi/linux_abi.h>
 
 #define LIBC_ATEXIT_MAX 128U
 #define LIBC_AT_QUICK_EXIT_MAX 32U
@@ -48,8 +49,21 @@ void quick_exit(int status) {
 }
 
 void _exit(int status) {
-    (void)liteos_syscall6(OS_SYS_PROCESS_EXIT, (uint64_t)(uint32_t)status,
+    /* The same DSO serves native System services and Linux-personality
+     * Chromium.  OS_SYS_PROCESS_EXIT is syscall 1 in the native ABI, but
+     * Linux syscall 1 is write; probe through a native-only high syscall to
+     * select the correct exit ABI before issuing the terminal call. */
+    int64_t native_probe = __libc_linux_syscall6(
+        OS_SYS_DEBUG_QUERY, 0U, 0U, 0U, 0U, 0U, 0U);
+    if (native_probe == -38LL) {
+        (void)__libc_linux_syscall6(
+            LINUX_SYS_EXIT_GROUP, (uint64_t)(uint32_t)status,
                           0U, 0U, 0U, 0U, 0U);
+    } else {
+        (void)__libc_native_syscall6(
+            OS_SYS_PROCESS_EXIT, (uint64_t)(uint32_t)status,
+            0U, 0U, 0U, 0U, 0U);
+    }
     for (;;) __asm__ volatile("pause");
 }
 

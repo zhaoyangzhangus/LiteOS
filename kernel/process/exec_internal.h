@@ -18,7 +18,11 @@
 #define ELF_PF_WRITE          2U
 #define ELF_PF_READ           4U
 #define ELF_MAX_PROGRAMS      128U
-#define ELF_MAX_SEGMENT_SIZE  (256ULL * 1024ULL * 1024ULL)
+/* Chrome's text segment is larger than the original 256 MiB loader guard.
+ * The VFS exec path now streams file data in bounded chunks, so this limit
+ * applies to one mapped PT_LOAD rather than requiring a same-sized contiguous
+ * kernel allocation. */
+#define ELF_MAX_SEGMENT_SIZE  (1ULL * 1024ULL * 1024ULL * 1024ULL)
 #define ELF_PIE_BIAS          0x0000000040000000ULL
 #define ELF_INTERP_BIAS       0x0000000020000000ULL
 #define ELF_INTERP_MAX        4096U
@@ -58,9 +62,11 @@ typedef struct elf_validation {
     uint64_t phdr_address;
     uint64_t interp_offset;
     uint64_t interp_size;
+    uint64_t load_end;
     bool has_interpreter;
 } elf_validation_t;
 
 /* Failure-only PROCESS_EXEC progress snapshot used by the runtime test. */
 uint32_t process_exec_debug_stage(void);
 uint32_t process_exec_debug_status(void);
+void process_exec_debug_reset(void);

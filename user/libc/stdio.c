@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -30,18 +30,18 @@ typedef struct format_spec {
 
 static FILE g_stderr = {
     .descriptor = STDERR_FILENO,
-    .flags = LITEOS_FILE_WRITE,
+    .flags = LIBC_FILE_WRITE,
     .ungot = EOF,
 };
 static FILE g_stdout = {
     .descriptor = STDOUT_FILENO,
-    .flags = LITEOS_FILE_WRITE | LITEOS_FILE_LINE_BUFFERED,
+    .flags = LIBC_FILE_WRITE | LIBC_FILE_LINE_BUFFERED,
     .ungot = EOF,
     .next = &g_stderr,
 };
 static FILE g_stdin = {
     .descriptor = STDIN_FILENO,
-    .flags = LITEOS_FILE_READ,
+    .flags = LIBC_FILE_READ,
     .ungot = EOF,
     .next = &g_stdout,
 };
@@ -52,17 +52,17 @@ FILE *stderr = &g_stderr;
 static FILE *g_streams = &g_stdin;
 
 static bool stream_is_open(const FILE *stream) {
-    return stream != 0 && (stream->flags & LITEOS_FILE_CLOSED) == 0U;
+    return stream != 0 && (stream->flags & LIBC_FILE_CLOSED) == 0U;
 }
 
 static bool stream_can_read(const FILE *stream) {
     return stream_is_open(stream) &&
-           (stream->flags & LITEOS_FILE_READ) != 0U;
+           (stream->flags & LIBC_FILE_READ) != 0U;
 }
 
 static bool stream_can_write(const FILE *stream) {
     return stream_is_open(stream) &&
-           (stream->flags & LITEOS_FILE_WRITE) != 0U;
+           (stream->flags & LIBC_FILE_WRITE) != 0U;
 }
 
 static void register_stream(FILE *stream) {
@@ -112,15 +112,15 @@ static int flush_stream(FILE *stream) {
         errno = EBADF;
         return -1;
     }
-    if ((stream->flags & LITEOS_FILE_WRITE_BUFFER) == 0U) return 0;
+    if ((stream->flags & LIBC_FILE_WRITE_BUFFER) == 0U) return 0;
     if (write_all(stream->descriptor, stream->buffer,
                   stream->buffer_position) < 0) {
-        stream->flags |= LITEOS_FILE_ERROR;
+        stream->flags |= LIBC_FILE_ERROR;
         return -1;
     }
     stream->buffer_position = 0U;
     stream->buffer_length = 0U;
-    stream->flags &= ~LITEOS_FILE_WRITE_BUFFER;
+    stream->flags &= ~LIBC_FILE_WRITE_BUFFER;
     return 0;
 }
 
@@ -129,19 +129,21 @@ static int flush_stream(FILE *stream) {
  * writing or seeks. */
 static int discard_read_buffer(FILE *stream) {
     size_t unread = 0U;
-    if ((stream->flags & LITEOS_FILE_READ_BUFFER) != 0U) {
+    if ((stream->flags & LIBC_FILE_READ_BUFFER) != 0U) {
         unread = stream->buffer_length - stream->buffer_position;
     }
     if (stream->ungot != EOF) ++unread;
+    unread += stream->wide_ungot_length;
     if (unread != 0U && lseek(stream->descriptor, -(off_t)unread,
                               SEEK_CUR) < 0) {
-        stream->flags |= LITEOS_FILE_ERROR;
+        stream->flags |= LIBC_FILE_ERROR;
         return -1;
     }
     stream->buffer_position = 0U;
     stream->buffer_length = 0U;
     stream->ungot = EOF;
-    stream->flags &= ~LITEOS_FILE_READ_BUFFER;
+    stream->wide_ungot_length = 0U;
+    stream->flags &= ~LIBC_FILE_READ_BUFFER;
     return 0;
 }
 
@@ -154,7 +156,7 @@ static int stream_seek(FILE *stream, off_t offset, int whence) {
         return -1;
     }
     if (lseek(stream->descriptor, offset, whence) < 0) return -1;
-    stream->flags &= ~(LITEOS_FILE_EOF | LITEOS_FILE_ERROR);
+    stream->flags &= ~(LIBC_FILE_EOF | LIBC_FILE_ERROR);
     stream->ungot = EOF;
     return 0;
 }
@@ -173,10 +175,10 @@ static int stream_position(FILE *stream, off_t *result) {
     if (flush_stream(stream) < 0) return -1;
     position = lseek(stream->descriptor, 0, SEEK_CUR);
     if (position < 0) return -1;
-    if ((stream->flags & LITEOS_FILE_READ_BUFFER) != 0U) {
+    if ((stream->flags & LIBC_FILE_READ_BUFFER) != 0U) {
         if (stream->buffer_position > stream->buffer_length) {
             errno = EIO;
-            stream->flags |= LITEOS_FILE_ERROR;
+            stream->flags |= LIBC_FILE_ERROR;
             return -1;
         }
         unread = stream->buffer_length - stream->buffer_position;
@@ -190,7 +192,7 @@ static int stream_position(FILE *stream, off_t *result) {
     }
     if (unread > (size_t)INT64_MAX || position < (off_t)unread) {
         errno = EIO;
-        stream->flags |= LITEOS_FILE_ERROR;
+        stream->flags |= LIBC_FILE_ERROR;
         return -1;
     }
     *result = position - (off_t)unread;
@@ -200,10 +202,10 @@ static int stream_position(FILE *stream, off_t *result) {
 static int prepare_read(FILE *stream) {
     if (!stream_can_read(stream)) {
         errno = EBADF;
-        if (stream != 0) stream->flags |= LITEOS_FILE_ERROR;
+        if (stream != 0) stream->flags |= LIBC_FILE_ERROR;
         return -1;
     }
-    if ((stream->flags & LITEOS_FILE_WRITE_BUFFER) != 0U &&
+    if ((stream->flags & LIBC_FILE_WRITE_BUFFER) != 0U &&
         flush_stream(stream) < 0) return -1;
     return 0;
 }
@@ -211,10 +213,10 @@ static int prepare_read(FILE *stream) {
 static int prepare_write(FILE *stream) {
     if (!stream_can_write(stream)) {
         errno = EBADF;
-        if (stream != 0) stream->flags |= LITEOS_FILE_ERROR;
+        if (stream != 0) stream->flags |= LIBC_FILE_ERROR;
         return -1;
     }
-    if ((stream->flags & LITEOS_FILE_READ_BUFFER) != 0U ||
+    if ((stream->flags & LIBC_FILE_READ_BUFFER) != 0U ||
         stream->ungot != EOF) {
         if (discard_read_buffer(stream) < 0) return -1;
     }
@@ -228,50 +230,60 @@ static int fill_input_buffer(FILE *stream) {
         unsigned char value;
         result = read(stream->descriptor, &value, 1U);
         if (result < 0) {
-            stream->flags |= LITEOS_FILE_ERROR;
+            stream->flags |= LIBC_FILE_ERROR;
             return -1;
         }
         if (result == 0) {
-            stream->flags |= LITEOS_FILE_EOF;
+            stream->flags |= LIBC_FILE_EOF;
             return 0;
         }
         /* A stream with no buffer has no safe place to retain a byte.  The
          * standard streams are normally unbuffered, so return it via the
          * one-byte pushback slot. */
         stream->ungot = value;
-        stream->flags &= ~LITEOS_FILE_EOF;
+        stream->flags &= ~LIBC_FILE_EOF;
         return 1;
     }
     result = read(stream->descriptor, stream->buffer, stream->buffer_size);
     if (result < 0) {
-        stream->flags |= LITEOS_FILE_ERROR;
+        stream->flags |= LIBC_FILE_ERROR;
         return -1;
     }
     if (result == 0) {
-        stream->flags |= LITEOS_FILE_EOF;
+        stream->flags |= LIBC_FILE_EOF;
         return 0;
     }
     stream->buffer_position = 0U;
     stream->buffer_length = (size_t)result;
-    stream->flags |= LITEOS_FILE_READ_BUFFER;
-    stream->flags &= ~LITEOS_FILE_EOF;
+    stream->flags |= LIBC_FILE_READ_BUFFER;
+    stream->flags &= ~LIBC_FILE_EOF;
     return 1;
 }
 
 static int stream_get_character(FILE *stream) {
     if (prepare_read(stream) < 0) return EOF;
+    if (stream->wide_ungot_length != 0U) {
+        int value = stream->wide_ungot[0];
+        if (stream->wide_ungot_length > 1U) {
+            memmove(stream->wide_ungot, stream->wide_ungot + 1,
+                    stream->wide_ungot_length - 1U);
+        }
+        --stream->wide_ungot_length;
+        stream->flags &= ~LIBC_FILE_EOF;
+        return value;
+    }
     if (stream->ungot != EOF) {
         int value = stream->ungot;
         stream->ungot = EOF;
-        stream->flags &= ~LITEOS_FILE_EOF;
+        stream->flags &= ~LIBC_FILE_EOF;
         return value;
     }
-    if ((stream->flags & LITEOS_FILE_READ_BUFFER) == 0U ||
+    if ((stream->flags & LIBC_FILE_READ_BUFFER) == 0U ||
         stream->buffer_position >= stream->buffer_length) {
         if (fill_input_buffer(stream) <= 0) return EOF;
     }
     if (stream->ungot != EOF) return stream_get_character(stream);
-    stream->flags &= ~LITEOS_FILE_EOF;
+    stream->flags &= ~LIBC_FILE_EOF;
     return stream->buffer[stream->buffer_position++];
 }
 
@@ -280,17 +292,26 @@ static size_t stream_read_bytes(FILE *stream, void *buffer, size_t length) {
     size_t completed = 0U;
     if (prepare_read(stream) < 0) return 0U;
     while (completed < length) {
+        if (stream->wide_ungot_length != 0U) {
+            cursor[completed++] = stream->wide_ungot[0];
+            if (stream->wide_ungot_length > 1U) {
+                memmove(stream->wide_ungot, stream->wide_ungot + 1,
+                        stream->wide_ungot_length - 1U);
+            }
+            --stream->wide_ungot_length;
+            continue;
+        }
         if (stream->ungot != EOF) {
             cursor[completed++] = (unsigned char)stream->ungot;
             stream->ungot = EOF;
             continue;
         }
-        if ((stream->flags & LITEOS_FILE_READ_BUFFER) == 0U ||
+        if ((stream->flags & LIBC_FILE_READ_BUFFER) == 0U ||
             stream->buffer_position >= stream->buffer_length) {
             if (fill_input_buffer(stream) <= 0) break;
         }
         if (stream->ungot != EOF) continue;
-        if ((stream->flags & LITEOS_FILE_READ_BUFFER) != 0U) {
+        if ((stream->flags & LIBC_FILE_READ_BUFFER) != 0U) {
             size_t available = stream->buffer_length - stream->buffer_position;
             size_t amount = length - completed;
             if (amount > available) amount = available;
@@ -313,12 +334,12 @@ static size_t stream_write_bytes(FILE *stream, const void *buffer,
             ssize_t result = write(stream->descriptor, cursor + completed,
                                     length - completed);
             if (result < 0) {
-                stream->flags |= LITEOS_FILE_ERROR;
+                stream->flags |= LIBC_FILE_ERROR;
                 break;
             }
             if (result == 0) {
                 errno = EIO;
-                stream->flags |= LITEOS_FILE_ERROR;
+                stream->flags |= LIBC_FILE_ERROR;
                 break;
             }
             completed += (size_t)result;
@@ -332,10 +353,10 @@ static size_t stream_write_bytes(FILE *stream, const void *buffer,
         memcpy(stream->buffer + stream->buffer_position,
                cursor + completed, amount);
         stream->buffer_position += amount;
-        stream->flags |= LITEOS_FILE_WRITE_BUFFER;
+        stream->flags |= LIBC_FILE_WRITE_BUFFER;
         completed += amount;
         if (stream->buffer_position == stream->buffer_size ||
-            ((stream->flags & LITEOS_FILE_LINE_BUFFERED) != 0U &&
+            ((stream->flags & LIBC_FILE_LINE_BUFFERED) != 0U &&
              memchr(stream->buffer + stream->buffer_position - amount,
                     '\n', amount) != 0)) {
             if (flush_stream(stream) < 0) break;
@@ -354,7 +375,7 @@ static FILE *create_stream(int descriptor, uint32_t flags) {
     stream->buffer = (unsigned char *)malloc(LIBC_BUFSIZ);
     if (stream->buffer != 0) {
         stream->buffer_size = LIBC_BUFSIZ;
-        stream->flags |= LITEOS_FILE_OWN_BUFFER;
+        stream->flags |= LIBC_FILE_OWN_BUFFER;
     }
     register_stream(stream);
     return stream;
@@ -382,26 +403,21 @@ static bool parse_file_mode(const char *mode, int *open_flags,
     *stream_flags = 0U;
     switch (mode[0]) {
     case 'r':
-        *open_flags = plus ? OS_FILE_OPEN_READ | OS_FILE_OPEN_WRITE :
-                             OS_FILE_OPEN_READ;
-        *stream_flags = LITEOS_FILE_READ | (plus ? LITEOS_FILE_WRITE : 0U);
+        *open_flags = plus ? O_RDWR : O_RDONLY;
+        *stream_flags = LIBC_FILE_READ | (plus ? LIBC_FILE_WRITE : 0U);
         break;
     case 'w':
-        *open_flags = OS_FILE_OPEN_WRITE | OS_FILE_OPEN_CREATE |
-                      OS_FILE_OPEN_TRUNCATE;
-        if (plus) *open_flags |= OS_FILE_OPEN_READ;
-        *stream_flags = LITEOS_FILE_WRITE | (plus ? LITEOS_FILE_READ : 0U);
+        *open_flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
+        *stream_flags = LIBC_FILE_WRITE | (plus ? LIBC_FILE_READ : 0U);
         break;
     case 'a':
-        *open_flags = OS_FILE_OPEN_WRITE | OS_FILE_OPEN_CREATE |
-                      OS_FILE_OPEN_APPEND;
-        if (plus) *open_flags |= OS_FILE_OPEN_READ;
-        *stream_flags = LITEOS_FILE_WRITE | LITEOS_FILE_APPEND |
-                        (plus ? LITEOS_FILE_READ : 0U);
+        *open_flags = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
+        *stream_flags = LIBC_FILE_WRITE | LIBC_FILE_APPEND |
+                        (plus ? LIBC_FILE_READ : 0U);
         break;
     default: return false;
     }
-    if (exclusive) *open_flags |= OS_FILE_OPEN_EXCLUSIVE;
+    if (exclusive) *open_flags |= O_EXCL;
     if (close_on_exec) *open_flags |= O_CLOEXEC;
     return true;
 }
@@ -417,7 +433,7 @@ FILE *fopen(const char *path, const char *mode) {
     }
     descriptor = open(path, open_flags, 0666U);
     if (descriptor < 0) return 0;
-    if ((stream_flags & LITEOS_FILE_APPEND) != 0U) {
+    if ((stream_flags & LIBC_FILE_APPEND) != 0U) {
         (void)lseek(descriptor, 0, SEEK_END);
     }
     stream = create_stream(descriptor, stream_flags);
@@ -462,10 +478,10 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     (void)fflush(stream);
     (void)close(stream->descriptor);
     (void)remove_temporary_file(stream);
-    if ((stream->flags & LITEOS_FILE_OWN_BUFFER) != 0U) free(stream->buffer);
+    if ((stream->flags & LIBC_FILE_OWN_BUFFER) != 0U) free(stream->buffer);
     descriptor = open(path, open_flags, 0666U);
     if (descriptor < 0) {
-        stream->flags = LITEOS_FILE_CLOSED;
+        stream->flags = LIBC_FILE_CLOSED;
         stream->buffer = 0;
         stream->buffer_size = 0U;
         return 0;
@@ -474,11 +490,11 @@ FILE *freopen(const char *path, const char *mode, FILE *stream) {
     stream->flags = stream_flags;
     stream->buffer = (unsigned char *)malloc(LIBC_BUFSIZ);
     stream->buffer_size = stream->buffer != 0 ? LIBC_BUFSIZ : 0U;
-    if (stream->buffer != 0) stream->flags |= LITEOS_FILE_OWN_BUFFER;
+    if (stream->buffer != 0) stream->flags |= LIBC_FILE_OWN_BUFFER;
     stream->buffer_position = 0U;
     stream->buffer_length = 0U;
     stream->ungot = EOF;
-    if ((stream_flags & LITEOS_FILE_APPEND) != 0U) {
+    if ((stream_flags & LIBC_FILE_APPEND) != 0U) {
         (void)lseek(descriptor, 0, SEEK_END);
     }
     return stream;
@@ -500,9 +516,9 @@ int fclose(FILE *stream) {
     if (close(stream->descriptor) < 0) result = EOF;
     if (remove_temporary_file(stream) < 0) result = EOF;
     unregister_stream(stream);
-    if ((stream->flags & LITEOS_FILE_OWN_BUFFER) != 0U) free(stream->buffer);
+    if ((stream->flags & LIBC_FILE_OWN_BUFFER) != 0U) free(stream->buffer);
     stream->descriptor = -1;
-    stream->flags = LITEOS_FILE_CLOSED;
+    stream->flags = LIBC_FILE_CLOSED;
     stream->buffer = 0;
     stream->buffer_size = 0U;
     stream->buffer_position = 0U;
@@ -551,7 +567,7 @@ int fflush(FILE *stream) {
         errno = EBADF;
         return EOF;
     }
-    if ((stream->flags & LITEOS_FILE_READ_BUFFER) != 0U &&
+    if ((stream->flags & LIBC_FILE_READ_BUFFER) != 0U &&
         discard_read_buffer(stream) < 0) return EOF;
     return flush_stream(stream) < 0 ? EOF : 0;
 }
@@ -560,10 +576,26 @@ int fgetc(FILE *stream) {
     return stream_get_character(stream);
 }
 
+int getc(FILE *stream) {
+    return fgetc(stream);
+}
+
+int getchar(void) {
+    return fgetc(stdin);
+}
+
 int fputc(int value, FILE *stream) {
     unsigned char character = (unsigned char)value;
     return stream_write_bytes(stream, &character, 1U) == 1U ?
            (int)character : EOF;
+}
+
+int putc(int value, FILE *stream) {
+    return fputc(value, stream);
+}
+
+int putchar(int value) {
+    return fputc(value, stdout);
 }
 
 char *fgets(char *buffer, int capacity, FILE *stream) {
@@ -624,7 +656,7 @@ wint_t fgetwc(FILE *stream) {
         if (character == EOF) {
             if (!mbsinit(&state)) {
                 errno = EILSEQ;
-                stream->flags |= LITEOS_FILE_ERROR;
+                stream->flags |= LIBC_FILE_ERROR;
             }
             return WEOF;
         }
@@ -632,11 +664,30 @@ wint_t fgetwc(FILE *stream) {
         result = mbrtowc(&value, (const char *)&byte, 1U, &state);
         if (result == (size_t)-2) continue;
         if (result == (size_t)-1) {
-            stream->flags |= LITEOS_FILE_ERROR;
+            stream->flags |= LIBC_FILE_ERROR;
             return WEOF;
         }
         return (wint_t)value;
     }
+}
+
+wint_t ungetwc(wint_t value, FILE *stream) {
+    char encoded[4];
+    mbstate_t state = {0};
+    size_t length;
+    if (value == WEOF || !stream_can_read(stream) ||
+        stream->ungot != EOF || stream->wide_ungot_length != 0U) {
+        errno = EINVAL;
+        return WEOF;
+    }
+    length = wcrtomb(encoded, (wchar_t)value, &state);
+    if (length == (size_t)-1 || length > sizeof(stream->wide_ungot)) {
+        return WEOF;
+    }
+    memcpy(stream->wide_ungot, encoded, length);
+    stream->wide_ungot_length = (unsigned int)length;
+    stream->flags &= ~LIBC_FILE_EOF;
+    return value;
 }
 
 wint_t fputwc(wchar_t value, FILE *stream) {
@@ -702,10 +753,6 @@ wint_t putwchar(wchar_t value) {
     return fputwc(value, stdout);
 }
 
-int putchar(int value) {
-    return fputc(value, stdout);
-}
-
 int puts(const char *text) {
     if (fputs(text, stdout) == EOF || fputc('\n', stdout) == EOF) return EOF;
     return 0;
@@ -747,15 +794,15 @@ int fsetpos(FILE *stream, const off_t *position) {
 }
 
 int feof(FILE *stream) {
-    return stream != 0 && (stream->flags & LITEOS_FILE_EOF) != 0U;
+    return stream != 0 && (stream->flags & LIBC_FILE_EOF) != 0U;
 }
 
 int ferror(FILE *stream) {
-    return stream != 0 && (stream->flags & LITEOS_FILE_ERROR) != 0U;
+    return stream != 0 && (stream->flags & LIBC_FILE_ERROR) != 0U;
 }
 
 void clearerr(FILE *stream) {
-    if (stream != 0) stream->flags &= ~(LITEOS_FILE_EOF | LITEOS_FILE_ERROR);
+    if (stream != 0) stream->flags &= ~(LIBC_FILE_EOF | LIBC_FILE_ERROR);
 }
 
 int ungetc(int value, FILE *stream) {
@@ -764,7 +811,7 @@ int ungetc(int value, FILE *stream) {
         return EOF;
     }
     stream->ungot = (unsigned char)value;
-    stream->flags &= ~LITEOS_FILE_EOF;
+    stream->flags &= ~LIBC_FILE_EOF;
     return (unsigned char)value;
 }
 
@@ -785,13 +832,13 @@ int setvbuf(FILE *stream, char *buffer, int mode, size_t size) {
         return -1;
     }
     if (fflush(stream) != 0) return -1;
-    if ((stream->flags & LITEOS_FILE_OWN_BUFFER) != 0U) free(stream->buffer);
+    if ((stream->flags & LIBC_FILE_OWN_BUFFER) != 0U) free(stream->buffer);
     stream->buffer = 0;
     stream->buffer_size = 0U;
     stream->buffer_position = 0U;
     stream->buffer_length = 0U;
-    stream->flags &= ~(LITEOS_FILE_OWN_BUFFER | LITEOS_FILE_LINE_BUFFERED |
-                       LITEOS_FILE_READ_BUFFER | LITEOS_FILE_WRITE_BUFFER);
+    stream->flags &= ~(LIBC_FILE_OWN_BUFFER | LIBC_FILE_LINE_BUFFERED |
+                       LIBC_FILE_READ_BUFFER | LIBC_FILE_WRITE_BUFFER);
     if (mode == LIBC_IONBF) return 0;
     if (replacement == 0) {
         if (size == 0U) size = LIBC_BUFSIZ;
@@ -806,8 +853,8 @@ int setvbuf(FILE *stream, char *buffer, int mode, size_t size) {
     }
     stream->buffer = replacement;
     stream->buffer_size = size;
-    if (own_replacement) stream->flags |= LITEOS_FILE_OWN_BUFFER;
-    if (mode == LIBC_IOLBF) stream->flags |= LITEOS_FILE_LINE_BUFFERED;
+    if (own_replacement) stream->flags |= LIBC_FILE_OWN_BUFFER;
+    if (mode == LIBC_IOLBF) stream->flags |= LIBC_FILE_LINE_BUFFERED;
     return 0;
 }
 
@@ -1649,6 +1696,52 @@ static void scan_store_unsigned(va_list arguments, char length, uint64_t value) 
     else *va_arg(arguments, unsigned int *) = (unsigned int)value;
 }
 
+static int scan_digit_value(int value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+/* Return whether value can extend the numeric token already collected.  In
+ * particular, '-' is only a sign at the beginning; treating it as a generic
+ * candidate makes a format such as "%lx-%lx" consume both addresses. */
+static bool scan_numeric_candidate(int base, const char *token, size_t length,
+                                   int value) {
+    size_t prefix = 0U;
+    int effective_base = base;
+    int digit;
+
+    if (value == EOF) return false;
+    if (length == 0U && (value == '+' || value == '-')) return true;
+    if (length != 0U && (token[0] == '+' || token[0] == '-')) prefix = 1U;
+
+    if (length == prefix && value != '+' && value != '-') {
+        if (value == '0' && (base == 0 || base == 8 || base == 10 ||
+                             base == 16)) return true;
+        digit = scan_digit_value(value);
+        return digit >= 0 && (base == 0 || digit < base);
+    }
+
+    if ((base == 0 || base == 16) && length == prefix + 1U &&
+        token[prefix] == '0' && (value == 'x' || value == 'X')) {
+        return true;
+    }
+
+    if (base == 0) {
+        if (length >= prefix + 2U && token[prefix] == '0' &&
+            (token[prefix + 1U] == 'x' || token[prefix + 1U] == 'X')) {
+            effective_base = 16;
+        } else if (length > prefix && token[prefix] == '0') {
+            effective_base = 8;
+        } else {
+            effective_base = 10;
+        }
+    }
+    digit = scan_digit_value(value);
+    return digit >= 0 && digit < effective_base;
+}
+
 static int scan_formatted(scan_source_t *source, const char *format,
                           va_list arguments) {
     int assignments = 0;
@@ -1776,11 +1869,8 @@ static int scan_formatted(scan_source_t *source, const char *format,
             while (count + 1U < sizeof(token) &&
                    (width == 0U || count < width)) {
                 int value = source->get(source);
-                bool candidate = (value >= '0' && value <= '9') ||
-                                 (value >= 'a' && value <= 'f') ||
-                                 (value >= 'A' && value <= 'F') ||
-                                 value == '+' || value == '-' || value == 'x' ||
-                                 value == 'X';
+                bool candidate = scan_numeric_candidate(base, token, count,
+                                                         value);
                 if (value == EOF || !candidate) {
                     if (value != EOF) (void)source->unget(source, value);
                     break;
@@ -1895,7 +1985,7 @@ int remove(const char *path) {
 }
 
 FILE *tmpfile(void) {
-    char path[LIBC_TMPNAM_SIZE] = "/tmp/liteos-tmp-XXXXXX";
+    char path[LIBC_TMPNAM_SIZE] = "/tmp/tmp-XXXXXX";
     int descriptor = mkstemp(path);
     FILE *stream;
     if (descriptor < 0) return 0;
@@ -1929,7 +2019,7 @@ char *tmpnam(char *buffer) {
     static unsigned int sequence;
     static char storage[LIBC_TMPNAM_SIZE];
     char *result = buffer != 0 ? buffer : storage;
-    if (snprintf(result, LIBC_TMPNAM_SIZE, "/tmp/liteos-tmp-%u", sequence++) < 0) {
+    if (snprintf(result, LIBC_TMPNAM_SIZE, "/tmp/tmp-%u", sequence++) < 0) {
         errno = EOVERFLOW;
         return 0;
     }
@@ -2042,3 +2132,12 @@ size_t fwrite_unlocked(const void *buffer, size_t size, size_t count,
 int fflush_unlocked(FILE *stream) {
     return fflush(stream);
 }
+
+/* Imported ISO C99 names share the existing scanner implementation. These
+ * exports do not imply compatibility with glibc FILE layout or symbol versions. */
+extern __typeof__(sscanf) __isoc99_sscanf __attribute__((alias("sscanf")));
+extern __typeof__(vsscanf) __isoc99_vsscanf __attribute__((alias("vsscanf")));
+extern __typeof__(fscanf) __isoc99_fscanf __attribute__((alias("fscanf")));
+extern __typeof__(vfscanf) __isoc99_vfscanf __attribute__((alias("vfscanf")));
+extern __typeof__(scanf) __isoc99_scanf __attribute__((alias("scanf")));
+extern __typeof__(vscanf) __isoc99_vscanf __attribute__((alias("vscanf")));

@@ -29,8 +29,8 @@ if [[ ! -f "$metrics_path" || ! -f "$log_path" ]]; then
 fi
 
 if [[ "$storage" == auto ]]; then
-    if grep -Fq -- 'LITEOS_ROOT_SOURCE=NVME' "$log_path" ||
-       grep -Fq -- 'LITEOS_NVME_HW_OK' "$log_path"; then
+    if grep -Fq -- 'OS_ROOT_SOURCE=NVME' "$log_path" ||
+       grep -Fq -- 'OS_NVME_HW_OK' "$log_path"; then
         storage=nvme
     else
         storage=usb
@@ -48,7 +48,7 @@ function field(key, i, value) {
     }
     return ""
 }
-($1 == "LITEOS_BENCH" || $1 == "LITEOS_BENCH_VALUE") {
+($1 == "OS_BENCH" || $1 == "OS_BENCH_VALUE") {
     name = field("name")
     if (name != "") print name
 }' "$log_path" | sort -u)

@@ -10,7 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$buildName = if ($Build) { $Build } elseif ($env:LITEOS_BUILD) { $env:LITEOS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
+$buildName = if ($Build) { $Build } elseif ($env:OS_BUILD) { $env:OS_BUILD } elseif ($env:BUILD) { $env:BUILD } else { 'build' }
 if ([IO.Path]::IsPathRooted($buildName) -or $buildName -match '(^|[\\/])\.\.(?:[\\/]|$)') {
     throw "Build directory must be relative to the project: $buildName"
 }
@@ -30,7 +30,7 @@ function Invoke-WslBuild([string]$distro, [string]$command) {
         }
     $status = $LASTEXITCODE
     if ($status -ne 0) {
-        throw "LiteOS build failed in WSL ($status). See $buildLog."
+        throw "System build failed in WSL ($status). See $buildLog."
     }
 }
 
@@ -38,9 +38,20 @@ function Get-WslDistro {
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if (-not $wsl) { return $null }
 
-    $preferred = @($env:LITEOS_WSL_DISTRO, 'Debian', 'Ubuntu')
+    $preferred = @($env:OS_WSL_DISTRO, 'Debian', 'Ubuntu')
+    try {
+        # wsl.exe can exist as the Windows optional-feature stub even when WSL
+        # is not installed.  In that case `wsl -l -q` writes an error and
+        # PowerShell turns it into a NativeCommandError under Stop mode.
+        $rawAvailable = @(& $wsl.Source -l -q 2>$null)
+    }
+    catch {
+        return $null
+    }
+    if ($LASTEXITCODE -ne 0) { return $null }
+
     $available = @(
-        (& $wsl.Source -l -q 2>$null) |
+        $rawAvailable |
             ForEach-Object { ("$_" -replace "`0", '').Trim() } |
             Where-Object { $_ }
     )
@@ -113,15 +124,15 @@ if ($qemu) {
 $useNativeQemu = $qemu -and $qemuImg -and $firmware
 $nativePrefix = if ($ToolPrefix) {
     $ToolPrefix
-} elseif ($env:LITEOS_TOOLPREFIX) {
-    $env:LITEOS_TOOLPREFIX
+} elseif ($env:OS_TOOLPREFIX) {
+    $env:OS_TOOLPREFIX
 } elseif ($env:TOOLPREFIX) {
     $env:TOOLPREFIX
 } else {
     'x86_64-w64-mingw32-'
 }
 $useNativeToolchain = Test-NativeToolchain $nativePrefix
-$kernel = Join-Path $buildDirectory 'esp\EFI\LITEOS\kernel.elf'
+$kernel = Join-Path $buildDirectory 'esp\EFI\OS\kernel.elf'
 $bootloader = Join-Path $buildDirectory 'esp\EFI\BOOT\BOOTX64.EFI'
 
 if ($useNativeQemu) {
@@ -142,14 +153,14 @@ if ($useNativeQemu) {
     elseif (-not $distro) {
         if (-not (Test-Path -LiteralPath $kernel) -or
             -not (Test-Path -LiteralPath $bootloader)) {
-            throw 'Native QEMU is available, but no native LiteOS toolchain or WSL distribution was found.'
+            throw 'Native QEMU is available, but no native System toolchain or WSL distribution was found.'
         }
         Write-Verbose 'Environment: Windows native QEMU (existing build)'
     } else {
         $wslRoot = Get-WslProjectRoot $distro
         $escapedRoot = $wslRoot.Replace("'", "'\''")
         $escapedBuildName = $buildName.Replace("'", "'\''")
-        $buildCommand = "cd '$escapedRoot' && BUILD='$escapedBuildName' ./build-wsl.sh esp DEBUG=2 LITEOS_DEBUG_SERIAL=1"
+        $buildCommand = "cd '$escapedRoot' && make -f GNUmakefile esp BUILD='$escapedBuildName' DEBUG=2 OS_DEBUG_SERIAL=1 -j4"
         Write-Verbose "Environment: Windows native QEMU + WSL fallback build ($distro)"
         Invoke-WslBuild $distro $buildCommand
     }
@@ -188,7 +199,7 @@ if ($NvmeRoot) {
 if ($AllDisks) {
     $runArguments += ' --all-disks'
 }
-$protocolPrefix = if ($Debug) { 'LITEOS_DEBUG_PROTOCOL=1 ' } else { '' }
+$protocolPrefix = if ($Debug) { 'OS_DEBUG_PROTOCOL=1 ' } else { '' }
 $runCommand = "cd '$escapedRoot' && BUILD='$escapedBuildName' $protocolPrefix$runArguments"
 Write-Verbose "Environment: WSL QEMU ($distro)"
 & wsl.exe -d $distro -- bash -lc $runCommand

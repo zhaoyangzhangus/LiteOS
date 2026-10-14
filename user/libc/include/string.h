@@ -1,7 +1,10 @@
 #pragma once
 
-#include <liteos/libc.h>
+#include <libc/libc.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 void *memccpy(void *destination, const void *source, int value, size_t length);
 void *memchr(const void *buffer, int value, size_t length);
 void *memrchr(const void *buffer, int value, size_t length);
@@ -26,3 +29,6 @@ char *stpncpy(char *destination, const char *source, size_t length);
 size_t strlcpy(char *destination, const char *source, size_t capacity);
 size_t strlcat(char *destination, const char *source, size_t capacity);
 char *strcasestr(const char *text, const char *needle);
+#ifdef __cplusplus
+}
+#endif

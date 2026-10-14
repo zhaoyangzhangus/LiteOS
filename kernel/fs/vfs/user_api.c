@@ -6,11 +6,21 @@
 static bool vfs_copy_path_from_user(const char __user *source,
                                     char destination[VFS_PATH_LIMIT]) {
     if (source == 0) return false;
-    for (size_t i = 0; i + 1U < VFS_PATH_LIMIT; ++i) {
-        char value = 0;
-        if (copy_from_user(&value, source + i, sizeof(value)) != K_OK) return false;
-        destination[i] = value;
-        if (value == 0) return i != 0 && destination[0] == '/';
+    for (size_t i = 0; i + 1U < VFS_PATH_LIMIT;) {
+        uintptr_t address = (uintptr_t)source;
+        if (i > UINTPTR_MAX - address) return false;
+        address += i;
+        /* Never copy across a page boundary: a terminating NUL in this
+         * page must not require the following user page to be accessible. */
+        size_t chunk = PAGE_SIZE - (address & (PAGE_SIZE - 1U));
+        size_t remaining = VFS_PATH_LIMIT - 1U - i;
+        if (chunk > remaining) chunk = remaining;
+        if (copy_from_user(destination + i, (const void __user *)address,
+                           chunk) != K_OK) return false;
+        for (size_t j = 0; j < chunk; ++j) {
+            if (destination[i + j] == 0) return i + j != 0 && destination[0] == '/';
+        }
+        i += chunk;
     }
     destination[VFS_PATH_LIMIT - 1U] = 0;
     return false;
@@ -46,5 +56,14 @@ kstatus_t vfs_mkdir(const char __user *path, uint32_t mode) {
     char kernel_path[VFS_PATH_LIMIT];
     if (!vfs_copy_path_from_user(path, kernel_path)) return K_EACCES;
     return vfs_mkdir_kernel(kernel_path, mode);
+}
+
+kstatus_t vfs_rename(const char __user *old_path,
+                     const char __user *new_path) {
+    char kernel_old_path[VFS_PATH_LIMIT];
+    char kernel_new_path[VFS_PATH_LIMIT];
+    if (!vfs_copy_path_from_user(old_path, kernel_old_path) ||
+        !vfs_copy_path_from_user(new_path, kernel_new_path)) return K_EACCES;
+    return vfs_rename_kernel(kernel_old_path, kernel_new_path);
 }
 

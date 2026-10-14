@@ -65,7 +65,7 @@ typedef struct {
     page_t *base;
     uint64_t free_mask;
     uint32_t partial_head;
-    uint32_t reserved;
+    uint32_t contiguous_pages; /* metadata span cached when base is installed */
 } page_local_pool_t;
 
 typedef struct __attribute__((aligned(CACHELINE_SIZE))) {
@@ -92,6 +92,7 @@ _Static_assert(sizeof(page_remote_heads_t) == CACHELINE_SIZE,
 extern page_section_t g_sections[PAGE_DB_MAX_SECTIONS];
 extern page_pool_section_t g_pool_sections[PAGE_DB_MAX_SECTIONS];
 extern uint32_t g_section_count;
+extern bool g_pool_sections_ordered;
 extern list_head_t g_free_lists[PAGE_ZONE_COUNT][BUDDY_MAX_ORDER + 1U];
 extern spinlock_t g_page_lock;
 extern reserved_range_t g_reserved[PAGE_DB_MAX_RESERVED];
@@ -141,25 +142,25 @@ static inline uint64_t align_up_group(uint64_t pfn) {
 static inline void lock_pages(void) {
     /* Keep Buddy ownership on one CPU while another CPU may be waiting. */
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&g_page_lock.state, 1U,
-                                    memory_order_acquire) != 0U) {
-        __asm__ volatile ("pause");
-    }
+    spinlock_lock(&g_page_lock);
 }
 
 static inline void unlock_pages(void) {
-    atomic_store_explicit(&g_page_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&g_page_lock);
     sched_preempt_enable();
 }
 
 /* page_db.c: metadata and Buddy ownership. */
 page_t *page_for_pfn(pfn_t pfn);
+/* Clamp *count to contiguous metadata in one section; holes return NULL. */
+page_t *page_span_for_pfn(pfn_t pfn, uint64_t *count);
 page_t *page_for_address(uint64_t physical);
 void mark_compound(page_t *head, uint8_t order, bool free_page);
-bool block_is_free(uint64_t physical, uint8_t order);
 void insert_block(uint64_t physical, uint8_t order);
 page_t *take_from_zone_locked(uint8_t zone, uint8_t order);
 void free_block_locked(page_t *head, uint8_t order);
+void page_stats_note_alloc(uint8_t order);
+void page_stats_note_free(uint8_t order);
 
 /* percpu_page.c: pooled allocation and the order-zero public fast path. */
 page_t *pool_alloc_small(uint8_t zone, uint8_t order, uint32_t cpu);

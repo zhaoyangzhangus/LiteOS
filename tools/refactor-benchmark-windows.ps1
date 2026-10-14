@@ -41,12 +41,12 @@ if (-not $NoBuild) {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildScript `
         -Build $Build -Debug 2 -Serial
     if ($LASTEXITCODE -ne 0) {
-        throw "Native LiteOS build failed ($LASTEXITCODE)."
+        throw "Native System build failed ($LASTEXITCODE)."
     }
 }
 
-$kernelPath = Join-Path $buildDirectory 'esp\EFI\LITEOS\kernel.elf'
-$kernelRelative = "$Build/esp/EFI/LITEOS/kernel.elf"
+$kernelPath = Join-Path $buildDirectory 'esp\EFI\OS\kernel.elf'
+$kernelRelative = "$Build/esp/EFI/OS/kernel.elf"
 if (-not (Test-Path -LiteralPath $kernelPath)) {
     throw "Kernel ELF not found in $Build."
 }
@@ -96,11 +96,11 @@ function Stop-NativeRun([System.Diagnostics.Process]$runner,
 function Read-BenchmarkMetrics([string]$path) {
     $values = @{}
     foreach ($line in Get-Content -LiteralPath $path) {
-        if ($line -match '^LITEOS_BENCH(?:_VALUE)?\s+name=(\S+)\s+(?:cycles|value)=(\d+)') {
+        if ($line -match '^OS_BENCH(?:_VALUE)?\s+name=(\S+)\s+(?:cycles|value)=(\d+)') {
             $values[$Matches[1]] = [UInt64]$Matches[2]
             continue
         }
-        if ($line -match '^LITEOS_PERF_KMALLOC_OK\b') {
+        if ($line -match '^OS_PERF_KMALLOC_OK\b') {
             foreach ($field in [regex]::Matches($line, '\b(MIN|MEDIAN|P95|AVG|MAX)=(\d+)')) {
                 $name = switch ($field.Groups[1].Value) {
                     'MIN' { 'kmalloc.min_tsc' }
@@ -217,11 +217,11 @@ for ($run = 1; $run -le $Runs; ++$run) {
             if (Test-Path -LiteralPath $serialLog) {
                 $serial = Read-SharedText $serialLog
                 if (-not $success -and
-                    $serial.Contains('LITEOS_USER_RUNTIME_OK') -and
-                    $serial.Contains('LITEOS_USER_RUNTIME_SUBTESTS_OK') -and
-                    $serial.Contains('LITEOS_USERMODE_OK') -and
-                    $serial.Contains('LITEOS_WINDOW_OK') -and
-                    $serial.Contains('LITEOS_NET_DHCP_OK')) {
+                    $serial.Contains('OS_USER_RUNTIME_OK') -and
+                    $serial.Contains('OS_USER_RUNTIME_SUBTESTS_OK') -and
+                    $serial.Contains('OS_USERMODE_OK') -and
+                    $serial.Contains('OS_WINDOW_OK') -and
+                    $serial.Contains('OS_NET_DHCP_OK')) {
                     $success = $true
                 }
             }
@@ -258,10 +258,10 @@ for ($run = 1; $run -le $Runs; ++$run) {
     }
 
     $storageMarker = if ($Storage -eq 'nvme') {
-        'LITEOS_NVME_HW_OK'
+        'OS_NVME_HW_OK'
     }
     else {
-        'LITEOS_USB_MSC_FOUND'
+        'OS_USB_MSC_FOUND'
     }
     if (-not (Read-SharedText $savedLog).Contains($storageMarker)) {
         throw "QEMU round $run did not produce the requested $Storage storage marker: $storageMarker"
@@ -276,7 +276,7 @@ for ($run = 1; $run -le $Runs; ++$run) {
     $parsed = Read-BenchmarkMetrics $savedLog
     $values = $parsed.Values
     if ($values.Count -eq 0) {
-        throw "QEMU round $run produced no LITEOS_BENCH or kmalloc metrics."
+        throw "QEMU round $run produced no OS_BENCH or kmalloc metrics."
     }
     if ($null -eq $metricNames) {
         $metricNames = @($values.Keys | Sort-Object)
@@ -326,7 +326,7 @@ foreach ($metric in $metricNames) {
 $temporaryOutput = "$OutputPath.tmp.$PID"
 try {
     $lines = @(
-        '# LiteOS native Windows refactor benchmark baseline v1'
+        '# System native Windows refactor benchmark baseline v1'
         "# runs=$Runs cpu=$Cpu seconds=$Seconds"
         "# storage=$Storage profile=$(if ($Storage -eq 'nvme') { 'nvme-qemu' } else { 'usb-msc' }) accel=tcg"
         "metric`tcount`tmin`tmedian`tp95`tmax"

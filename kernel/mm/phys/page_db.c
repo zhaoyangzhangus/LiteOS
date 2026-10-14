@@ -7,6 +7,8 @@
 page_section_t g_sections[PAGE_DB_MAX_SECTIONS];
 page_pool_section_t g_pool_sections[PAGE_DB_MAX_SECTIONS];
 uint32_t g_section_count;
+static bool g_sections_pfn_ordered;
+bool g_pool_sections_ordered;
 list_head_t g_free_lists[PAGE_ZONE_COUNT][BUDDY_MAX_ORDER + 1U];
 spinlock_t g_page_lock;
 reserved_range_t g_reserved[PAGE_DB_MAX_RESERVED];
@@ -19,6 +21,17 @@ uint32_t g_pool_group_count;
 page_o0_cache_t g_o0_cache[MAX_CPUS] __attribute__((aligned(CACHELINE_SIZE)));
 page_small_cache_t g_small_cache[MAX_CPUS] __attribute__((aligned(CACHELINE_SIZE)));
 page_remote_heads_t g_remote_heads[MAX_CPUS] __attribute__((aligned(CACHELINE_SIZE)));
+
+typedef struct __attribute__((aligned(CACHELINE_SIZE))) {
+    atomic_int_fast64_t delta_pages;
+} page_memory_delta_t;
+
+_Static_assert(sizeof(page_memory_delta_t) == CACHELINE_SIZE,
+               "physical memory counters must not share cache lines");
+
+static uint64_t g_memory_total_pages;
+static uint64_t g_memory_initial_free_pages;
+static page_memory_delta_t g_memory_page_deltas[MAX_CPUS];
 
 static bool range_end(uint64_t start, uint64_t size, uint64_t *end) {
     if (size == 0) {
@@ -59,18 +72,61 @@ static bool reserved(uint64_t start, uint64_t end) {
 }
 
 
+static void check_section_pfn_order(void) {
+    g_sections_pfn_ordered = true;
+    for (uint32_t i = 0U; i < g_section_count; ++i) {
+        const page_section_t *section = &g_sections[i];
+        if (section->present_pages == 0U ||
+            (i != 0U &&
+             (section->base_pfn < g_sections[i - 1U].base_pfn ||
+              section->base_pfn - g_sections[i - 1U].base_pfn <
+                  g_sections[i - 1U].present_pages))) {
+            g_sections_pfn_ordered = false;
+            return;
+        }
+    }
+}
+
 static page_t *section_page(const page_section_t *section, uint64_t index) {
     return index < section->present_pages ? &section->pages[index] : 0;
 }
 
-page_t *page_for_pfn(pfn_t pfn) {
+static page_section_t *section_for_pfn(pfn_t pfn) {
+    /* Metadata addresses retain boot order for page_to_phys(). Only use
+     * binary PFN lookup after proving physical ranges ordered/nonoverlapping;
+     * unusual firmware maps keep the original first-match semantics. */
+    if (g_sections_pfn_ordered) {
+        uint32_t first = 0U, end = g_section_count;
+        while (first < end) {
+            uint32_t middle = first + (end - first) / 2U;
+            page_section_t *section = &g_sections[middle];
+            if (pfn < section->base_pfn) end = middle;
+            else if (pfn - section->base_pfn < section->present_pages) return section;
+            else first = middle + 1U;
+        }
+        return 0;
+    }
     for (uint32_t i = 0; i < g_section_count; ++i) {
         page_section_t *section = &g_sections[i];
         if (pfn >= section->base_pfn && pfn - section->base_pfn < section->present_pages) {
-            return section_page(section, pfn - section->base_pfn);
+            return section;
         }
     }
     return 0;
+}
+
+page_t *page_for_pfn(pfn_t pfn) {
+    page_section_t *section = section_for_pfn(pfn);
+    return section != 0 ? section_page(section, pfn - section->base_pfn) : 0;
+}
+
+page_t *page_span_for_pfn(pfn_t pfn, uint64_t *count) {
+    page_section_t *section = section_for_pfn(pfn);
+    if (section == 0) return 0;
+    uint64_t index = pfn - section->base_pfn;
+    uint64_t available = section->present_pages - index;
+    if (*count > available) *count = available;
+    return section_page(section, index);
 }
 
 page_t *page_for_address(uint64_t physical) {
@@ -80,6 +136,27 @@ page_t *page_for_address(uint64_t physical) {
 
 static uint8_t page_zone(uint64_t physical) {
     return physical < (1ULL << 32) ? PAGE_ZONE_DMA32 : PAGE_ZONE_NORMAL;
+}
+
+static void check_pool_section_order(void) {
+    uint64_t previous_base = 0U, previous_end = 0U;
+    g_pool_sections_ordered = true;
+    for (uint32_t i = 0U; i < g_section_count; ++i) {
+        const page_pool_section_t *section = &g_pool_sections[i];
+        uint64_t span = (uint64_t)section->group_count << PAGE_POOL_GROUP_SHIFT;
+        if (span == 0U || section->group_base_pfn > UINT64_MAX - span ||
+            (section->group_base_pfn & (PAGE_POOL_GROUP_SLOTS - 1U)) != 0U) {
+            g_pool_sections_ordered = false;
+            return;
+        }
+        uint64_t end = section->group_base_pfn + span;
+        if (i != 0U && (section->group_base_pfn < previous_base || end < previous_end)) {
+            g_pool_sections_ordered = false;
+            return;
+        }
+        previous_base = section->group_base_pfn;
+        previous_end = end;
+    }
 }
 
 static void initialize_page(page_t *page, uint64_t physical, bool free_page) {
@@ -96,39 +173,47 @@ static void initialize_page(page_t *page, uint64_t physical, bool free_page) {
 void mark_compound(page_t *head, uint8_t order, bool free_page) {
     uint64_t count = 1ULL << order;
     uint64_t physical = page_to_phys(head).value;
-    for (uint64_t i = 0; i < count; ++i) {
-        page_t *page = page_for_address(physical + i * PAGE_SIZE);
-        if (page == 0) continue;
-        page->flags = free_page ? PAGE_FREE : 0U;
-        page->owner = free_page ? PAGE_OWNER_BUDDY : PAGE_OWNER_NONE;
-        page->order = i == 0 ? order : 0;
-        page->u.compound.head = head;
-        page->u.compound.index = i;
-        if (i == 0) page->flags |= PAGE_COMPOUND_HEAD;
-        else page->flags |= PAGE_COMPOUND_TAIL;
-        atomic_store_explicit(&page->refs, i == 0 && !free_page ? 1U : 0U,
-                              memory_order_relaxed);
+    for (uint64_t i = 0; i < count;) {
+        pfn_t pfn = (physical + i * PAGE_SIZE) >> PAGE_SHIFT;
+        uint64_t span = count - i;
+        page_t *pages = page_span_for_pfn(pfn, &span);
+        if (pages == 0) { ++i; continue; }
+        /* Buddy blocks can cross adjacent sections with separate metadata.
+         * Resolve each span once, never assume head + i crosses a section. */
+        for (uint64_t j = 0; j < span; ++j, ++i) {
+            page_t *page = &pages[j];
+            page->flags = free_page ? PAGE_FREE : 0U;
+            page->owner = free_page ? PAGE_OWNER_BUDDY : PAGE_OWNER_NONE;
+            page->order = i == 0 ? order : 0;
+            page->u.compound.head = head;
+            page->u.compound.index = i;
+            if (i == 0) page->flags |= PAGE_COMPOUND_HEAD;
+            else page->flags |= PAGE_COMPOUND_TAIL;
+            atomic_store_explicit(&page->refs, i == 0 && !free_page ? 1U : 0U,
+                                  memory_order_relaxed);
+        }
     }
 }
 
-bool block_is_free(uint64_t physical, uint8_t order) {
-    page_t *head = page_for_address(physical);
+static bool block_is_free(const page_t *head, uint8_t order) {
     return head != 0 && (head->flags & (PAGE_FREE | PAGE_COMPOUND_HEAD)) ==
            (PAGE_FREE | PAGE_COMPOUND_HEAD) && head->order == order;
 }
 
-void insert_block(uint64_t physical, uint8_t order) {
-    page_t *head = page_for_address(physical);
+static void insert_known_block(page_t *head, uint8_t order) {
     if (head == 0 || order > BUDDY_MAX_ORDER) return;
     mark_compound(head, order, true);
     list_add(&g_free_lists[head->zone][order], &head->u.free_node);
 }
 
-static bool block_can_be_free(uint64_t physical, uint8_t order) {
-    uint64_t count = 1ULL << order;
+void insert_block(uint64_t physical, uint8_t order) {
+    insert_known_block(page_for_address(physical), order);
+}
+
+/* Boot construction already bounds the candidate within one section. */
+static bool pages_are_free(const page_t *pages, uint64_t count) {
     for (uint64_t i = 0; i < count; ++i) {
-        page_t *page = page_for_address(physical + i * PAGE_SIZE);
-        if (page == 0 || (page->flags & PAGE_FREE) == 0) return false;
+        if ((pages[i].flags & PAGE_FREE) == 0) return false;
     }
     return true;
 }
@@ -148,15 +233,64 @@ static void build_free_lists(void) {
             while (order < BUDDY_MAX_ORDER) {
                 uint8_t next_order = (uint8_t)(order + 1U);
                 uint64_t block_pages = 1ULL << next_order;
+                /* The first page/previous half is already known free.
+                 * Check only the newly added half after section/alignment
+                 * bounds pass; boot construction has no concurrent frees. */
                 if (index + block_pages > section->present_pages ||
                     ((section->base_pfn + index) & (block_pages - 1ULL)) != 0 ||
-                    !block_can_be_free(physical, next_order)) break;
+                    !pages_are_free(&section->pages[index + (1ULL << order)],
+                                    1ULL << order)) break;
                 order = next_order;
             }
             insert_block(physical, order);
             index += 1ULL << order;
         }
     }
+}
+
+void page_stats_note_alloc(uint8_t order) {
+    uint32_t cpu;
+    if (order > BUDDY_MAX_ORDER) return;
+    cpu = x86_current_cpu_index_fast();
+    if (cpu >= MAX_CPUS) cpu = 0U;
+    atomic_fetch_sub_explicit(&g_memory_page_deltas[cpu].delta_pages,
+                              (int64_t)(1ULL << order),
+                              memory_order_relaxed);
+}
+
+void page_stats_note_free(uint8_t order) {
+    uint32_t cpu;
+    if (order > BUDDY_MAX_ORDER) return;
+    cpu = x86_current_cpu_index_fast();
+    if (cpu >= MAX_CPUS) cpu = 0U;
+    atomic_fetch_add_explicit(&g_memory_page_deltas[cpu].delta_pages,
+                              (int64_t)(1ULL << order),
+                              memory_order_relaxed);
+}
+
+kstatus_t page_memory_get_stats(uint64_t *total_pages, uint64_t *free_pages) {
+    int64_t delta_pages = 0;
+    uint64_t free_count;
+    if (total_pages == 0 || free_pages == 0) return K_EINVAL;
+    if (!g_initialized) return K_EPERM;
+    for (uint32_t cpu = 0U; cpu < MAX_CPUS; ++cpu) {
+        delta_pages += atomic_load_explicit(
+            &g_memory_page_deltas[cpu].delta_pages, memory_order_relaxed);
+    }
+    free_count = g_memory_initial_free_pages;
+    if (delta_pages < 0) {
+        uint64_t allocated_pages = (uint64_t)(-(delta_pages + 1)) + 1U;
+        free_count = allocated_pages > free_count ? 0U :
+                     free_count - allocated_pages;
+    } else if ((uint64_t)delta_pages > UINT64_MAX - free_count) {
+        free_count = UINT64_MAX;
+    } else {
+        free_count += (uint64_t)delta_pages;
+    }
+    *total_pages = g_memory_total_pages;
+    *free_pages = free_count > g_memory_total_pages ?
+                  g_memory_total_pages : free_count;
+    return K_OK;
 }
 
 static bool choose_metadata(const EFI_MEMORY_DESCRIPTOR *map, uint64_t map_size,
@@ -205,7 +339,7 @@ static uint64_t count_usable_pages(const EFI_MEMORY_DESCRIPTOR *map, uint64_t ma
     return total;
 }
 
-/* Match the exact page-section splitting used by liteos_mm_init(). */
+/* Match the exact page-section splitting used by mm_boot_init(). */
 static uint64_t count_pool_groups(const EFI_MEMORY_DESCRIPTOR *map, uint64_t map_size,
                                   uint64_t descriptor_size) {
     uint64_t total = 0;
@@ -249,7 +383,8 @@ page_t *take_from_zone_locked(uint8_t zone, uint8_t order) {
             uint64_t buddy = physical + (1ULL << source_order) * PAGE_SIZE;
             insert_block(buddy, source_order);
         }
-        block = page_for_address(physical);
+        /* Splitting only inserts higher-address buddies; the original block
+         * metadata remains the head of the allocated lower half. */
         mark_compound(block, order, false);
         return block;
     }
@@ -263,15 +398,18 @@ void free_block_locked(page_t *head, uint8_t order) {
     while (order < BUDDY_MAX_ORDER) {
         uint64_t buddy_physical = physical ^ ((1ULL << order) * PAGE_SIZE);
         page_t *buddy = page_for_address(buddy_physical);
-        if (buddy == 0 || !block_is_free(buddy_physical, order)) break;
+        if (!block_is_free(buddy, order)) break;
         list_del(&buddy->u.free_node);
-        if (buddy_physical < physical) physical = buddy_physical;
+        if (buddy_physical < physical) {
+            physical = buddy_physical;
+            head = buddy;
+        }
         ++order;
     }
-    insert_block(physical, order);
+    insert_known_block(head, order);
 }
 
-bool liteos_mm_init(LITEOS_BOOT_INFO *boot_info) {
+bool mm_boot_init(OS_BOOT_INFO *boot_info) {
     if (g_initialized || boot_info == 0 || boot_info->MemoryMap == 0 ||
         boot_info->MemoryDescriptorSize < sizeof(EFI_MEMORY_DESCRIPTOR) ||
         boot_info->MemoryMapSize < boot_info->MemoryDescriptorSize) return false;
@@ -327,6 +465,7 @@ bool liteos_mm_init(LITEOS_BOOT_INFO *boot_info) {
 
     g_section_count = 0;
     uint64_t metadata_offset = 0;
+    uint64_t initial_free_pages = 0U;
     uint32_t group_offset = 0;
     for (uint64_t offset = 0; offset <= map_size - descriptor_size; offset += descriptor_size) {
         const EFI_MEMORY_DESCRIPTOR *descriptor =
@@ -383,8 +522,10 @@ bool liteos_mm_init(LITEOS_BOOT_INFO *boot_info) {
 
             for (uint32_t page_index = 0; page_index < pages; ++page_index) {
                 uint64_t physical = start + (uint64_t)page_index * PAGE_SIZE;
+                bool free_page = !reserved(physical, physical + PAGE_SIZE);
                 initialize_page(&section->pages[page_index], physical,
-                                !reserved(physical, physical + PAGE_SIZE));
+                                free_page);
+                if (free_page) ++initial_free_pages;
             }
             metadata_offset += (uint64_t)pages * sizeof(page_t);
             start = section_end;
@@ -400,7 +541,15 @@ bool liteos_mm_init(LITEOS_BOOT_INFO *boot_info) {
     atomic_init(&g_page_lock.state, 0U);
     pool_init_cpu_state();
 
+    g_memory_total_pages = total_pages;
+    g_memory_initial_free_pages = initial_free_pages;
+    for (uint32_t cpu = 0U; cpu < MAX_CPUS; ++cpu) {
+        atomic_init(&g_memory_page_deltas[cpu].delta_pages, 0);
+    }
+
     /* page_to_phys() is needed while build_free_lists() writes Buddy metadata. */
+    check_section_pfn_order();
+    check_pool_section_order();
     g_initialized = true;
     build_free_lists();
 
@@ -415,12 +564,25 @@ page_t *phys_to_page(paddr_t pa) {
 
 paddr_t page_to_phys(const page_t *page) {
     if (page == 0 || !g_initialized) return paddr_make(UINT64_MAX);
-    for (uint32_t i = 0; i < g_section_count; ++i) {
-        const page_section_t *section = &g_sections[i];
-        if (page >= section->pages && page < section->pages + section->present_pages) {
-            uint64_t index = (uint64_t)(page - section->pages);
+    /* Boot appends metadata spans in address order, independently of the
+     * firmware's physical-range order. No auxiliary lookup table is needed. */
+    uintptr_t address = (uintptr_t)page;
+    uint32_t first = 0U, end = g_section_count;
+    while (first < end) {
+        uint32_t middle = first + (end - first) / 2U;
+        const page_section_t *section = &g_sections[middle];
+        uintptr_t start = (uintptr_t)section->pages;
+        if (address < start) {
+            end = middle;
+            continue;
+        }
+        uintptr_t offset = address - start;
+        uint64_t index = offset / sizeof(page_t);
+        if (index < section->present_pages) {
+            if (offset % sizeof(page_t) != 0U) break;
             return paddr_make((section->base_pfn + index) << PAGE_SHIFT);
         }
+        first = middle + 1U;
     }
     return paddr_make(UINT64_MAX);
 }

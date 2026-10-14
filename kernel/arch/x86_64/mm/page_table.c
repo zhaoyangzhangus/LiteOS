@@ -1,20 +1,34 @@
 #include <arch/x86_64/paging.h>
 #include <arch/x86_64/cpu.h>
+#include <kernel/console.h>
 #include <kernel/mm.h>
 #include <kernel/sched.h>
 #include <kernel/spinlock.h>
 
 #include "mmu_internal.h"
 
-static spinlock_t g_page_table_lock;
-static atomic_uint g_page_table_owner;
+#define PAGE_TABLE_USER_GUARDS 64U
+typedef struct {
+    spinlock_t lock;
+    atomic_uint owner;
+} __attribute__((aligned(64))) page_table_guard_t;
+/* Shared kernel tables always use guard zero; private user roots use stable
+ * stripes. Hash collisions serialize safely, without lifetime hooks. */
+static page_table_guard_t g_page_table_guards[PAGE_TABLE_USER_GUARDS + 1U];
+static atomic_uint g_page_table_cpu_guard[MAX_CPUS];
 static atomic_uint g_page_table_waiter;
 static atomic_uint_fast64_t g_page_table_wait_count;
 
 static uint64_t *table_from_physical(uint64_t physical);
 
-static void table_lock(void) {
-    uint32_t cpu_index = x86_current_cpu_index();
+static uint32_t table_guard_index(paddr_t root, uint64_t address) {
+    if (address > X86_64_USER_TOP) return 0U;
+    uint64_t key = root.value >> PAGE_SHIFT;
+    return 1U + (uint32_t)((key ^ (key >> 6) ^ (key >> 12)) &
+                           (PAGE_TABLE_USER_GUARDS - 1U));
+}
+
+static void table_lock(paddr_t root, uint64_t address) {
     uint64_t saved_flags = 0;
     bool enabled_delivery = false;
 
@@ -22,11 +36,15 @@ static void table_lock(void) {
      * A page-table operation can span allocation, TLB shootdown, and the
      * final PTE publication.  It may enable interrupts while waiting so a
      * remote TLB IPI can be acknowledged, but the current thread must not be
-     * switched away while it owns this global lock.
+     * switched away while it owns this guard.
      */
     sched_preempt_disable();
-    while (atomic_exchange_explicit(&g_page_table_lock.state, 1U,
-                                     memory_order_acquire) != 0U) {
+    uint32_t cpu_index = x86_current_cpu_index();
+    uint32_t index = table_guard_index(root, address);
+    page_table_guard_t *guard = &g_page_table_guards[index];
+    atomic_store_explicit(&g_page_table_cpu_guard[cpu_index], index,
+                          memory_order_relaxed);
+    while (!spinlock_try_lock(&guard->lock)) {
         atomic_store_explicit(&g_page_table_waiter, cpu_index,
                               memory_order_release);
         atomic_fetch_add_explicit(&g_page_table_wait_count, 1U,
@@ -38,9 +56,12 @@ static void table_lock(void) {
             __asm__ volatile ("sti" : : : "memory");
             enabled_delivery = true;
         }
-        __asm__ volatile ("pause");
+        do {
+            __asm__ volatile ("pause");
+        } while (atomic_load_explicit(&guard->lock.state,
+                                       memory_order_relaxed) != 0U);
     }
-    atomic_store_explicit(&g_page_table_owner, cpu_index,
+    atomic_store_explicit(&guard->owner, cpu_index,
                           memory_order_release);
     atomic_store_explicit(&g_page_table_waiter, UINT32_MAX,
                           memory_order_release);
@@ -53,16 +74,23 @@ static void table_lock(void) {
 }
 
 static void table_unlock(void) {
-    atomic_store_explicit(&g_page_table_owner, UINT32_MAX,
+    uint32_t cpu_index = x86_current_cpu_index();
+    uint32_t index = atomic_load_explicit(&g_page_table_cpu_guard[cpu_index],
+                                          memory_order_relaxed);
+    page_table_guard_t *guard = &g_page_table_guards[index];
+    atomic_store_explicit(&guard->owner, UINT32_MAX,
                           memory_order_release);
-    atomic_store_explicit(&g_page_table_lock.state, 0U, memory_order_release);
+    spinlock_unlock(&guard->lock);
     sched_preempt_enable();
 }
 
 void x86_page_table_arch_init(void) {
-    atomic_init(&g_page_table_lock.state, 0U);
-    atomic_store_explicit(&g_page_table_owner, UINT32_MAX,
-                          memory_order_relaxed);
+    for (uint32_t index = 0U; index <= PAGE_TABLE_USER_GUARDS; ++index) {
+        spinlock_init(&g_page_table_guards[index].lock);
+        atomic_init(&g_page_table_guards[index].owner, UINT32_MAX);
+    }
+    for (uint32_t cpu = 0U; cpu < MAX_CPUS; ++cpu)
+        atomic_init(&g_page_table_cpu_guard[cpu], 0U);
     atomic_store_explicit(&g_page_table_waiter, UINT32_MAX,
                           memory_order_relaxed);
     atomic_init(&g_page_table_wait_count, 0U);
@@ -73,12 +101,20 @@ void x86_page_table_arch_init(void) {
 void x86_page_table_debug_state(uint32_t *lock_state, uint32_t *owner_cpu,
                                 uint32_t *waiter_cpu,
                                 uint64_t *wait_count) {
+    /* Diagnostic describes the latest waiter's stripe, or this CPU's last
+     * stripe. There is no single global owner for independent user roots. */
+    uint32_t waiter = atomic_load_explicit(&g_page_table_waiter,
+                                           memory_order_acquire);
+    uint32_t cpu = waiter < MAX_CPUS ? waiter : x86_current_cpu_index();
+    uint32_t index = atomic_load_explicit(&g_page_table_cpu_guard[cpu],
+                                          memory_order_relaxed);
+    page_table_guard_t *guard = &g_page_table_guards[index];
     if (lock_state != 0) {
-        *lock_state = atomic_load_explicit(&g_page_table_lock.state,
+        *lock_state = atomic_load_explicit(&guard->lock.state,
                                            memory_order_acquire);
     }
     if (owner_cpu != 0) {
-        *owner_cpu = atomic_load_explicit(&g_page_table_owner,
+        *owner_cpu = atomic_load_explicit(&guard->owner,
                                           memory_order_acquire);
     }
     if (waiter_cpu != 0) {
@@ -97,7 +133,7 @@ void x86_sync_kernel_half(paddr_t target, paddr_t kernel_root) {
     uint64_t *target_pml4 = table_from_physical(target.value);
     uint64_t *kernel_pml4 = table_from_physical(kernel_root.value);
     if (target_pml4 == 0 || kernel_pml4 == 0) return;
-    table_lock();
+    table_lock(kernel_root, UINT64_MAX);
     for (uint32_t index = 256U; index < 512U; ++index) {
         target_pml4[index] = kernel_pml4[index];
     }
@@ -113,7 +149,14 @@ static kstatus_t next_table(uint64_t *entry, bool user, uint64_t **next) {
         if ((*entry & PTE_LARGE) != 0) return K_EBUSY;
         if (user) *entry |= PTE_USER;
         *next = table_from_physical(*entry);
-        return *next != 0 ? K_OK : K_EIO;
+        if (*next == 0) {
+            (void)kernel_serial_printf_serial_only(
+                "OS_PT_NEXT_TABLE_FAIL entry=%llx physical=%llx\r\n",
+                (unsigned long long)*entry,
+                (unsigned long long)(*entry & PTE_ADDRESS_MASK));
+            return K_EIO;
+        }
+        return K_OK;
     }
     page_t *page = page_alloc(0, PAGE_ALLOC_ZERO);
     if (page == 0) return K_ENOMEM;
@@ -126,6 +169,9 @@ static kstatus_t next_table(uint64_t *entry, bool user, uint64_t **next) {
     *entry = physical.value | PTE_PRESENT | PTE_WRITE | (user ? PTE_USER : 0U);
     *next = table_from_physical(physical.value);
     if (*next == 0) {
+        (void)kernel_serial_printf_serial_only(
+            "OS_PT_ALLOC_TABLE_FAIL physical=%llx\r\n",
+            (unsigned long long)physical.value);
         *entry = 0;
         page_free(page);
         return K_EIO;
@@ -161,7 +207,7 @@ kstatus_t x86_map_page(paddr_t root, vaddr_t virtual_address, paddr_t physical_a
     uint32_t i1 = (uint32_t)((va >> 12) & 0x1FFU);
     bool user = (flags & X86_PAGE_USER) != 0;
 
-    table_lock();
+    table_lock(root, va);
     uint64_t *pdpt;
     uint64_t *pd;
     uint64_t *pt;
@@ -200,7 +246,7 @@ kstatus_t x86_translate_page(paddr_t root, vaddr_t virtual_address,
     uint64_t va = (uint64_t)virtual_address;
     if (!x86_is_canonical(va) || physical_address == 0) return K_EINVAL;
     /* 页表释放也受同一把锁保护，避免遍历到刚被 unmap 回收的中间页表。 */
-    table_lock();
+    table_lock(root, va);
     uint64_t *table = table_from_physical(root.value);
     if (table == 0) {
         table_unlock();
@@ -229,6 +275,12 @@ kstatus_t x86_translate_page(paddr_t root, vaddr_t virtual_address,
         }
         table = table_from_physical(entry);
         if (table == 0) {
+            (void)kernel_serial_printf_serial_only(
+                "OS_PT_TRANSLATE_WALK_FAIL level=%u root=%llx va=%llx "
+                "entry=%llx physical=%llx\r\n",
+                level, (unsigned long long)root.value,
+                (unsigned long long)va, (unsigned long long)entry,
+                (unsigned long long)(entry & PTE_ADDRESS_MASK));
             table_unlock();
             return K_EIO;
         }
@@ -251,7 +303,7 @@ kstatus_t x86_unmap_page(paddr_t root, vaddr_t virtual_address, paddr_t *old_phy
     uint32_t i2 = (uint32_t)((va >> 21) & 0x1FFU);
     uint32_t i1 = (uint32_t)((va >> 12) & 0x1FFU);
 
-    table_lock();
+    table_lock(root, va);
     if ((pml4[i4] & (PTE_PRESENT | PTE_LARGE)) != PTE_PRESENT) {
         table_unlock();
         return K_ENOENT;
@@ -295,6 +347,246 @@ kstatus_t x86_unmap_page(paddr_t root, vaddr_t virtual_address, paddr_t *old_phy
     return K_OK;
 }
 
+kstatus_t x86_unmap_user_page_batch(paddr_t root, const vaddr_t *addresses,
+                                   size_t count, size_t *unmapped) {
+    uint64_t *entries[X86_USER_UNMAP_BATCH_MAX];
+    uint64_t saved[X86_USER_UNMAP_BATCH_MAX];
+    size_t resident_count = 0U;
+    if (unmapped == 0) return K_EINVAL;
+    *unmapped = 0U;
+    if (root.value == 0U || addresses == 0 || count == 0U ||
+        count > X86_USER_UNMAP_BATCH_MAX) return K_EINVAL;
+    uint64_t *pml4 = table_from_physical(root.value);
+    if (pml4 == 0) return K_EINVAL;
+    for (size_t index = 0U; index < count; ++index) {
+        uint64_t va = addresses[index];
+        if (va > X86_64_USER_TOP || (va & (PAGE_SIZE - 1U)) != 0U ||
+            (index != 0U && va <= addresses[index - 1U])) return K_EINVAL;
+    }
+    table_lock(root, 0U);
+    /* Validate the whole batch before changing any PTE. Missing leaves are
+     * harmless; huge, supervisor and global mappings are not batchable. */
+    for (size_t index = 0U; index < count; ++index) {
+        uint64_t va = addresses[index];
+        uint64_t *table = pml4;
+        for (uint32_t shift = 39U; shift > 12U; shift -= 9U) {
+            uint64_t entry = table[(va >> shift) & 511U];
+            if ((entry & PTE_PRESENT) == 0U) { table = 0; break; }
+            if ((entry & PTE_LARGE) != 0U) {
+                table_unlock(); return K_EINVAL;
+            }
+            table = table_from_physical(entry);
+            if (table == 0) { table_unlock(); return K_EIO; }
+        }
+        if (table == 0) continue;
+        uint64_t *entry = &table[(va >> 12) & 511U];
+        if ((*entry & PTE_PRESENT) == 0U) continue;
+        if ((*entry & (PTE_USER | PTE_GLOBAL)) != PTE_USER) {
+            table_unlock(); return K_EINVAL;
+        }
+        entries[resident_count] = entry;
+        saved[resident_count++] = *entry;
+    }
+    if (resident_count == 0U) { table_unlock(); return K_OK; }
+    for (size_t index = 0U; index < resident_count; ++index) *entries[index] = 0U;
+    if (!x86_tlb_shootdown_root(root)) {
+        /* No ownership is released until every target CPU acknowledges. */
+        for (size_t index = 0U; index < resident_count; ++index)
+            *entries[index] = saved[index];
+        table_unlock(); return K_EIO;
+    }
+    for (size_t index = 0U; index < resident_count; ++index) {
+        page_t *page = phys_to_page(paddr_make(saved[index] & PTE_ADDRESS_MASK));
+        if (page != 0)
+            atomic_fetch_sub_explicit(&page->mapcount, 1, memory_order_relaxed);
+    }
+    /* Sorted addresses share their PT/PD/PDPT. Scan each table for emptiness
+     * only at its group's last address, not once per removed leaf. Rewalk
+     * before reclaiming; saved parent pointers may have been freed. A hole
+     * at a group's end still needs to trigger ancestor reclamation. */
+    for (size_t index = 0U; index < count; ++index) {
+        uint64_t va = addresses[index];
+        if (index + 1U < count && (addresses[index + 1U] >> 21) == (va >> 21))
+            continue;
+        uint32_t i4 = (uint32_t)((va >> 39) & 511U);
+        uint32_t i3 = (uint32_t)((va >> 30) & 511U);
+        uint32_t i2 = (uint32_t)((va >> 21) & 511U);
+        if ((pml4[i4] & PTE_PRESENT) == 0U) continue;
+        uint64_t *pdpt = table_from_physical(pml4[i4]);
+        if ((pdpt[i3] & PTE_PRESENT) != 0U) {
+            uint64_t *pd = table_from_physical(pdpt[i3]);
+            if ((pd[i2] & PTE_PRESENT) != 0U) {
+                uint64_t *pt = table_from_physical(pd[i2]);
+                release_dynamic_table(&pd[i2], pt);
+            }
+            if (index + 1U == count || (addresses[index + 1U] >> 30) != (va >> 30))
+                release_dynamic_table(&pdpt[i3], pd);
+        }
+        if (index + 1U == count || (addresses[index + 1U] >> 39) != (va >> 39))
+            release_dynamic_table(&pml4[i4], pdpt);
+    }
+    *unmapped = resident_count;
+    table_unlock();
+    return K_OK;
+}
+
+/*
+ * Walk only the page-table entries that cover a range.  A Linux MAP_NORESERVE
+ * reservation creates a VMA but normally creates no user page tables at all;
+ * probing the top-level entries makes mprotect/munmap of such a range O(number
+ * of populated page-table branches), rather than O(number of virtual pages).
+ * The caller receives a conservative "present" result for malformed page
+ * tables so the existing per-page error handling remains in force.
+ */
+static bool page_table_range_has_present_locked(const uint64_t *table,
+                                                uint32_t level,
+                                                uint64_t table_base,
+                                                uint64_t start,
+                                                uint64_t end) {
+    const uint32_t shift = 12U + (level - 1U) * 9U;
+    const uint64_t span = 1ULL << shift;
+    uint64_t first;
+    uint64_t last;
+
+    if (table == 0 || level == 0U || start >= end) return true;
+
+    first = start <= table_base ? 0U : (start - table_base) / span;
+    last = (end - 1U) <= table_base ? 0U :
+           ((end - 1U - table_base) / span);
+    if (first >= 512U) return false;
+    if (last >= 512U) last = 511U;
+
+    for (uint64_t index = first; index <= last; ++index) {
+        uint64_t entry = table[index];
+        uint64_t entry_base = table_base + index * span;
+        uint64_t entry_end = entry_base + span;
+
+        if ((entry & PTE_PRESENT) == 0U) continue;
+        if (level == 1U || (entry & PTE_LARGE) != 0U) return true;
+
+        uint64_t *child = table_from_physical(entry);
+        if (child == 0) return true;
+        uint64_t child_start = start > entry_base ? start : entry_base;
+        uint64_t child_end = end < entry_end ? end : entry_end;
+        if (page_table_range_has_present_locked(
+                child, level - 1U, entry_base, child_start, child_end)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool x86_page_range_has_present_pages(paddr_t root, vaddr_t start,
+                                      uint64_t end) {
+    uint64_t begin = (uint64_t)start;
+    uint64_t *pml4;
+    bool present;
+
+    /* The VM layer passes canonical user ranges.  Be conservative for any
+     * unexpected input so this helper cannot hide an existing error. */
+    if (begin >= end || !x86_is_canonical(begin) ||
+        end > X86_64_USER_TOP + 1ULL) {
+        return true;
+    }
+
+    table_lock(root, begin);
+    pml4 = table_from_physical(root.value);
+    present = pml4 == 0 ? true :
+              page_table_range_has_present_locked(
+                  pml4, 4U, 0U, begin, end);
+    table_unlock();
+    return present;
+}
+
+static kstatus_t page_table_next_present_locked(const uint64_t *table,
+                                                uint32_t level,
+                                                uint64_t table_base,
+                                                uint64_t start, uint64_t end,
+                                                vaddr_t *address) {
+    if (table == 0 || level == 0U || start >= end) return K_EIO;
+    const uint64_t span = 1ULL << (12U + (level - 1U) * 9U);
+    uint64_t first = start <= table_base ? 0U : (start - table_base) / span;
+    uint64_t last = (end - 1U - table_base) / span;
+    if (first >= 512U) return K_ENOENT;
+    if (last >= 512U) last = 511U;
+    for (uint64_t index = first; index <= last; ++index) {
+        const uint64_t entry = table[index];
+        if ((entry & PTE_PRESENT) == 0U) continue;
+        const uint64_t base = table_base + index * span;
+        const uint64_t begin = start > base ? start : base;
+        const uint64_t limit = end < base + span ? end : base + span;
+        if (level == 1U || (entry & PTE_LARGE) != 0U) {
+            *address = (vaddr_t)begin;
+            return K_OK;
+        }
+        uint64_t *child = table_from_physical(entry);
+        if (child == 0) return K_EIO;
+        kstatus_t status = page_table_next_present_locked(
+            child, level - 1U, base, begin, limit, address);
+        if (status != K_ENOENT) return status;
+    }
+    return K_ENOENT;
+}
+
+kstatus_t x86_next_present_page(paddr_t root, vaddr_t start, uint64_t end,
+                                vaddr_t *address) {
+    if (address == 0 || (uint64_t)start >= end ||
+        ((uint64_t)start & (PAGE_SIZE - 1ULL)) != 0U ||
+        (end & (PAGE_SIZE - 1ULL)) != 0U ||
+        !x86_is_canonical((uint64_t)start) || end > X86_64_USER_TOP + 1ULL) {
+        return K_EINVAL;
+    }
+    table_lock(root, start);
+    uint64_t *pml4 = table_from_physical(root.value);
+    kstatus_t status = pml4 == 0 ? K_EIO :
+        page_table_next_present_locked(pml4, 4U, 0U, start, end, address);
+    table_unlock();
+    return status;
+}
+
+/* Defer only user, non-global permission changes; callers never use this to
+ * replace physical pages or free mappings. A root flush completes the batch. */
+kstatus_t x86_protect_user_page_deferred(paddr_t root, vaddr_t address,
+    uint32_t flags, enum x86_cache_mode cache_mode, bool *changed) {
+    uint64_t va = (uint64_t)address;
+    if (changed == 0) return K_EINVAL;
+    *changed = false;
+    if (root.value == 0 || va > X86_64_USER_TOP ||
+        (va & (PAGE_SIZE - 1ULL)) != 0 ||
+        (flags & (X86_PAGE_USER | X86_PAGE_GLOBAL)) != X86_PAGE_USER) {
+        return K_EINVAL;
+    }
+    const uint32_t indices[4] = {
+        (uint32_t)((va >> 39) & 511U), (uint32_t)((va >> 30) & 511U),
+        (uint32_t)((va >> 21) & 511U), (uint32_t)((va >> 12) & 511U)};
+    table_lock(root, va);
+    uint64_t *table = table_from_physical(root.value);
+    if (table == 0) { table_unlock(); return K_EINVAL; }
+    for (uint32_t level = 0; level < 3U; ++level) {
+        uint64_t entry = table[indices[level]];
+        if ((entry & (PTE_PRESENT | PTE_LARGE)) != PTE_PRESENT) {
+            table_unlock(); return K_ENOENT;
+        }
+        table = table_from_physical(entry);
+        if (table == 0) { table_unlock(); return K_EIO; }
+    }
+    uint64_t old = table[indices[3]];
+    if ((old & PTE_PRESENT) == 0) { table_unlock(); return K_ENOENT; }
+    if ((old & (PTE_USER | PTE_GLOBAL)) != PTE_USER) {
+        table_unlock(); return K_EINVAL;
+    }
+    uint64_t entry = (old & (PTE_ADDRESS_MASK | PTE_ACCESSED | PTE_DIRTY)) |
+        PTE_PRESENT | PTE_USER | x86_pte_cache_bits(cache_mode, false);
+    if ((flags & X86_PAGE_WRITE) != 0) entry |= PTE_WRITE;
+    if ((flags & X86_PAGE_EXEC) == 0) entry |= PTE_NO_EXECUTE;
+    if (entry != old) {
+        table[indices[3]] = entry;
+        *changed = true;
+    }
+    table_unlock();
+    return K_OK;
+}
+
 kstatus_t x86_protect_page(paddr_t root, vaddr_t virtual_address, uint32_t flags,
                            enum x86_cache_mode cache_mode) {
     uint64_t va = (uint64_t)virtual_address;
@@ -307,7 +599,7 @@ kstatus_t x86_protect_page(paddr_t root, vaddr_t virtual_address, uint32_t flags
         (uint32_t)((va >> 21) & 0x1FFU),
         (uint32_t)((va >> 12) & 0x1FFU),
     };
-    table_lock();
+    table_lock(root, va);
     uint64_t *table = pml4;
     for (uint32_t level = 0; level < 3U; ++level) {
         uint64_t entry = table[indices[level]];
@@ -317,6 +609,12 @@ kstatus_t x86_protect_page(paddr_t root, vaddr_t virtual_address, uint32_t flags
         }
         table = table_from_physical(entry);
         if (table == 0) {
+            (void)kernel_serial_printf_serial_only(
+                "OS_PT_PROTECT_WALK_FAIL level=%u root=%llx va=%llx "
+                "entry=%llx physical=%llx\r\n",
+                level, (unsigned long long)root.value,
+                (unsigned long long)va, (unsigned long long)entry,
+                (unsigned long long)(entry & PTE_ADDRESS_MASK));
             table_unlock();
             return K_EIO;
         }
@@ -332,7 +630,26 @@ kstatus_t x86_protect_page(paddr_t root, vaddr_t virtual_address, uint32_t flags
     if ((flags & X86_PAGE_USER) != 0) entry |= PTE_USER;
     if ((flags & X86_PAGE_GLOBAL) != 0) entry |= PTE_GLOBAL;
     if ((flags & X86_PAGE_EXEC) == 0) entry |= PTE_NO_EXECUTE;
+    /* A repeated COW fork usually visits already read-only PTEs. Preserve
+     * hardware accounting bits and avoid a remote shootdown when neither
+     * the mapping nor its permissions/cache policy has changed. */
+    entry |= old & (PTE_ACCESSED | PTE_DIRTY);
+    if (entry == old) {
+        table_unlock();
+        return K_OK;
+    }
     table[indices[3]] = entry;
+    /* A user write-permission upgrade cannot expose another physical page or
+     * revoke access. Remote read-only translations remain safe: their next
+     * write faults and the VM fault handler invalidates that local entry.
+     * Keep synchronous shootdown for replacements, restrictions and globals. */
+    if (va <= X86_64_USER_TOP &&
+        (old & (PTE_USER | PTE_GLOBAL | PTE_WRITE)) == PTE_USER &&
+        entry == (old | PTE_WRITE)) {
+        __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");
+        table_unlock();
+        return K_OK;
+    }
     if (!x86_tlb_shootdown_page(root, (vaddr_t)va)) {
         table[indices[3]] = old;
         __asm__ volatile ("invlpg (%0)" : : "r"(va) : "memory");

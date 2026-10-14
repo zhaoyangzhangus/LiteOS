@@ -23,6 +23,10 @@ enum vm_map_flags {
     VM_MAP_FIXED   = 1u << 2,
     VM_MAP_STACK   = 1u << 3,
     VM_MAP_GUARD   = 1u << 4,
+    /* Linux-compatible JIT mappings may temporarily use RWX permissions. */
+    VM_MAP_ALLOW_RWX = 1u << 5,
+    /* Allocate below 2 GiB; bounds are checked under the address-space lock. */
+    VM_MAP_LOW32 = 1u << 6,
 };
 
 enum vm_object_type {
@@ -30,6 +34,7 @@ enum vm_object_type {
     VM_OBJECT_FILE,
     VM_OBJECT_SHARED,
     VM_OBJECT_DEVICE,
+    VM_OBJECT_PAGE_ARRAY,
 };
 
 enum vm_object_flags {
@@ -62,6 +67,11 @@ typedef struct vm_object {
         } file;
         struct { void *shared_root; } shared;
         struct { paddr_t phys; uint64_t length; uint32_t cache_mode; } device;
+        struct {
+            uint64_t *pages;
+            uint64_t page_count;
+            uint32_t cache_mode;
+        } page_array;
     } u;
     void *private_data;
     void (*private_release)(void *private_data);
@@ -87,6 +97,7 @@ typedef struct vm_area {
     rb_node_t rb;
     list_head_t ordered_node;
 
+    uint64_t subtree_min_start;
     uint64_t subtree_max_end;
     uint64_t subtree_max_gap;
 } vm_area_t;
@@ -101,6 +112,10 @@ typedef struct vm_space {
     uint32_t reserved;
 
     rwlock_t map_lock;
+    /* Diagnostic ownership, written only while map_lock is held. */
+    uint64_t map_lock_started;
+    uint64_t map_lock_caller;
+    uint64_t map_lock_tid;
     rb_root_t areas;
     list_head_t area_list;
 
@@ -108,6 +123,8 @@ typedef struct vm_space {
 
     cpumask_t active_cpus;
     atomic_uint_fast64_t tlb_generation;
+    /* Invalidates faults that began before MADV_DONTNEED discarded backing. */
+    atomic_uint_fast64_t advice_generation;
 
     atomic_uint_fast64_t rss_pages;
     atomic_uint_fast64_t commit_pages;
@@ -127,20 +144,37 @@ kstatus_t vm_object_create_device(paddr_t phys, uint64_t length,
                                   uint32_t cache_mode, void *private_data,
                                   void (*private_release)(void *private_data),
                                   vm_object_t **out);
+kstatus_t vm_object_create_page_array(const uint64_t *physical_pages,
+                                      uint64_t page_count,
+                                      uint32_t cache_mode,
+                                      void *private_data,
+                                      void (*private_release)(void *private_data),
+                                      vm_object_t **out);
 
 /* 创建可被多个地址空间映射并共享后备页的共享对象。 */
 kstatus_t vm_object_create_shared(size_t size, vm_object_t **out);
 
 kstatus_t vm_map_object(vm_space_t *mm, vm_object_t *object, vaddr_t *inout_addr,
                         uint64_t offset, size_t size, uint32_t prot, uint32_t flags);
+/* Atomically replace overlapping VMAs; requires VM_MAP_FIXED. */
+kstatus_t vm_map_object_replace(vm_space_t *mm, vm_object_t *object,
+                                vaddr_t *inout_addr, uint64_t offset, size_t size,
+                                uint32_t prot, uint32_t flags);
 kstatus_t vm_unmap(vm_space_t *mm, vaddr_t addr, size_t size);
 kstatus_t vm_protect(vm_space_t *mm, vaddr_t addr, size_t size, uint32_t prot);
+kstatus_t vm_protect_allow_rwx(vm_space_t *mm, vaddr_t addr, size_t size,
+                               uint32_t prot);
 bool vm_range_is_mapped(vm_space_t *mm, vaddr_t addr, size_t size);
 kstatus_t vm_sync(vm_space_t *mm, vaddr_t addr, size_t size, uint32_t flags);
 kstatus_t vm_advise(vm_space_t *mm, vaddr_t addr, size_t size, uint32_t advice);
 kstatus_t vm_handle_fault(vm_space_t *mm, const vm_fault_info_t *fault);
 /* Populate an already mapped, page-aligned range without entering user mode. */
 kstatus_t vm_populate_range(vm_space_t *mm, vaddr_t start, size_t length);
+/* Hold a resident anonymous/shared user page across unmap. Write pins resolve
+ * COW before acquiring the reference. Release once with vm_unpin_user_page. */
+kstatus_t vm_pin_user_page(vm_space_t *mm, vaddr_t address, bool writable,
+                           page_t **out);
+void vm_unpin_user_page(page_t *page);
 /* Resolve the current thread's user page fault.  The architecture layer only
  * supplies CR2, the CPU error code, and whether the entry came from user or
  * uaccess code; VM owns address-space and permission policy. */
@@ -157,6 +191,12 @@ kstatus_t vm_object_create_device(paddr_t phys, uint64_t length,
                                   uint32_t cache_mode, void *private_data,
                                   void (*private_release)(void *private_data),
                                   vm_object_t **out);
+kstatus_t vm_object_create_page_array(const uint64_t *physical_pages,
+                                      uint64_t page_count,
+                                      uint32_t cache_mode,
+                                      void *private_data,
+                                      void (*private_release)(void *private_data),
+                                      vm_object_t **out);
 void vm_object_get(vm_object_t *object);
 void vm_object_put(vm_object_t *object);
 

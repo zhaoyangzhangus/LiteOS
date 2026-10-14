@@ -1,4 +1,4 @@
-#include "liteos/libc.h"
+#include "libc/libc.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -75,7 +75,7 @@ struct dirent *readdir(DIR *directory) {
     request.path = (uint64_t)(uintptr_t)directory->path;
     request.index = directory->index;
     errno = 0;
-    status = liteos_syscall6(OS_SYS_FILE_ENUMERATE,
+    status = __libc_native_syscall6(OS_SYS_FILE_ENUMERATE,
                              (uint64_t)(uintptr_t)&request,
                              0U, 0U, 0U, 0U, 0U);
     if (status < 0) {
